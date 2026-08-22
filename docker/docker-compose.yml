@@ -1,0 +1,45 @@
+# Siku sync service (production) — signaling + encrypted mailbox
+#
+# Usage:
+#   docker compose -f docker/docker-compose.yml up -d
+#
+# Environment overrides (create a .env next to this file):
+#   JWT_SECRET=<long random string>   # REQUIRED in production
+#   RELAY_DOMAIN=relay.example.com    # for Caddy TLS
+
+services:
+  sync-relay:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: siku-sync-relay
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      RELAY_HOST: 0.0.0.0
+      RELAY_PORT: "8080"
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      RELAY_DB_PATH: /data/accounts.json
+    volumes:
+      - siku-relay-data:/data
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: siku-sync-relay-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      RELAY_DOMAIN: ${RELAY_DOMAIN:?set RELAY_DOMAIN in .env}
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    command: |
+      caddy reverse-proxy --from $${RELAY_DOMAIN} --to sync-relay:8080
+
+volumes:
+  siku-relay-data:
+  caddy-data:
+  caddy-config:

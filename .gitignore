@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+src-tauri/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# Tauri
+src-tauri/icons/rustup-init.exe
+
+# Tauri generated
+# src-tauri/gen/
+
+# TypeScript
+*.tsbuildinfo
+
+# Build artifacts
+*.zip
+*.msi
+*.deb
+*.AppImage
+
+# Test artifacts
+tests/screenshots/
+*.png
+!src-tauri/icons/*.png
+!src-tauri/icons/*.icns
+!src-tauri/icons/*.ico
+shellagent-demo
+test-results
+
+# Icon generation venv
+.venv-icons/__pycache__/
+siku.db*

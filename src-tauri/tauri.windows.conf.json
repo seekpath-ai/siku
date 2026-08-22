@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "resources": [
+      "bin/pdfium.dll",
+      "bin/PDFIUM-LICENSE.txt",
+      "ext/crsqlite.dll"
+    ]
+  }
+}

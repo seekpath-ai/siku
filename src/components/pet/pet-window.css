@@ -1,0 +1,63 @@
+/* Pet window: transparent full-surface drag region with the ball centered. */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: transparent !important;
+  overflow: hidden;
+}
+
+.pet-window {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  cursor: grab;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.pet-window:active {
+  cursor: grabbing;
+}
+
+/* Ball stays pinned to the window's top-left corner (screen position never
+   changes when the window resizes to show the bubble). */
+.pet-ball-fixed {
+  position: absolute;
+  left: 4px;
+  top: 4px;
+}
+
+/* Speech bubble floating below the ball (window resizes downward to show it). */
+.pet-bubble {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  background: var(--surface, #24242B);
+  border: 1px solid #3a3a44;
+  color: var(--text-primary, #F5F5F5);
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 7px 11px;
+  border-radius: 8px;
+  white-space: nowrap;
+  max-width: 236px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+}
+
+/* Arrow at the bubble's top pointing up at the ball (ball center is at
+   window x=24, bubble starts at left=8 → arrow at 16px). */
+.pet-bubble-arrow {
+  position: absolute;
+  top: -5px;
+  left: 16px;
+  transform: rotate(45deg);
+  width: 8px;
+  height: 8px;
+  background: var(--surface, #24242B);
+  border-left: 1px solid #3a3a44;
+  border-top: 1px solid #3a3a44;
+}

@@ -1,0 +1,93 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "siku",
+  "version": "1.0.0",
+  "identifier": "com.siku.reader",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "思库",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 500,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "visible": false,
+        "zoomHotkeysEnabled": true
+      },
+      {
+        "label": "splashscreen",
+        "title": "思库",
+        "url": "splashscreen.html",
+        "width": 1200,
+        "height": 800,
+        "center": true,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' http://asset.localhost blob:; connect-src 'self' ipc: ipc://localhost http://ipc.localhost http://localhost:* http://asset.localhost https://asset.localhost asset: blob:; img-src 'self' asset: http://asset.localhost blob: data:; script-src 'self' 'unsafe-eval' 'unsafe-inline' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self' blob:; media-src 'self' http://asset.localhost https://asset.localhost asset: blob:",
+      "dangerousDisableAssetCspModification": ["style-src"],
+      "assetProtocol": {
+        "enable": true,
+        "scope": {
+          "allow": ["**"],
+          "requireLiteralLeadingDot": false
+        }
+      },
+      "capabilities": ["default"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "rpm", "appimage", "msi", "nsis", "dmg"],
+    "createUpdaterArtifacts": true,
+    "category": "Productivity",
+    "icon": [
+      "icons/16x16.png",
+      "icons/20x20.png",
+      "icons/24x24.png",
+      "icons/32x32.png",
+      "icons/40x40.png",
+      "icons/48x48.png",
+      "icons/64x64.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/256x256.png",
+      "icons/512x512.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": []
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    },
+    "updater": {
+      "active": true,
+      "dialog": false,
+      "endpoints": [
+        "https://github.com/seekpath-ai/siku/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI1Q0E2NkMwMjlBMUNFNTUKUldSVnpxRXB3R2JLSlloYWIwVlZpMUtNMk04YXhwRlhxRnp5Z2RER0twUTBvYU40M3pPekhsdVMK"
+    }
+  }
+}

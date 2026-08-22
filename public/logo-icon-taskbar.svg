@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="思库 Siku">
+  <!-- 透明背景，适合 Windows 任务栏 -->
+
+  <!-- 四库方块：纯色高亮青蓝，更饱满 -->
+  <g fill="#22D3EE">
+    <rect x="142" y="142" width="340" height="340" rx="72"/>
+    <rect x="542" y="142" width="340" height="340" rx="72"/>
+    <rect x="142" y="542" width="340" height="340" rx="72"/>
+    <rect x="542" y="542" width="340" height="340" rx="72"/>
+  </g>
+
+  <!-- 中心火花：纯色同心圆，跨渲染器一致 -->
+  <circle cx="512" cy="512" r="120" fill="#FB8500" opacity="0.55"/>
+  <circle cx="512" cy="512" r="70" fill="#FFB703"/>
+  <circle cx="512" cy="512" r="28" fill="#FFFFFF" opacity="0.95"/>
+</svg>

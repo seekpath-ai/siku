@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="思库 Siku">
+  <!-- 背景：深青黑，比 Windows 深色任务栏略深但带明显青调 -->
+  <rect width="1024" height="1024" rx="220" fill="#0B1724"/>
+
+  <!-- 四库方块：纯色高亮青蓝 -->
+  <g fill="#22D3EE">
+    <rect x="192" y="192" width="300" height="300" rx="56"/>
+    <rect x="532" y="192" width="300" height="300" rx="56"/>
+    <rect x="192" y="532" width="300" height="300" rx="56"/>
+    <rect x="532" y="532" width="300" height="300" rx="56"/>
+  </g>
+
+  <!-- 十字分隔 -->
+  <g stroke="#0B1724" stroke-width="22" stroke-linecap="round">
+    <line x1="512" y1="192" x2="512" y2="832"/>
+    <line x1="192" y1="512" x2="832" y2="512"/>
+  </g>
+
+  <!-- 中心火花：纯色同心圆，跨渲染器一致 -->
+  <circle cx="512" cy="512" r="96" fill="#FB8500" opacity="0.55"/>
+  <circle cx="512" cy="512" r="58" fill="#FFB703"/>
+  <circle cx="512" cy="512" r="24" fill="#FFFFFF" opacity="0.95"/>
+</svg>

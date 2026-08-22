@@ -1,0 +1,31 @@
+# 生产环境 Compose：仅本机暴露 + 数据持久化 + 健康检查
+# 用法：
+#   JWT_SECRET=your-strong-secret docker-compose -f docker-compose.prod.yml up -d --build
+# 然后由 nginx（宿主机）反向代理 wss/https 到 127.0.0.1:8080，见 README「生产部署」。
+services:
+  relay:
+    build: .
+    restart: unless-stopped
+    # 只绑定本机回环地址：对外访问一律走 nginx 的 TLS 反代
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      - RELAY_HOST=0.0.0.0
+      - RELAY_PORT=8080
+      # 必填：不设置则启动即失败（防止误用默认开发密钥上线）
+      - JWT_SECRET=${JWT_SECRET:?请通过环境变量设置强密钥，禁止使用默认值}
+      - RELAY_DB_PATH=/data/relay.json
+      - HEARTBEAT_INTERVAL_SECONDS=30
+      - HEARTBEAT_TIMEOUT_SECONDS=120
+      - RUST_LOG=info
+    volumes:
+      - relay-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  relay-data:

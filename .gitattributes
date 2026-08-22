@@ -1,0 +1,29 @@
+# Auto-detect text files, normalize to LF on commit
+* text=auto
+
+# Source code — LF
+*.rs      text eol=lf
+*.ts      text eol=lf
+*.tsx     text eol=lf
+*.js      text eol=lf
+*.json    text eol=lf
+*.css     text eol=lf
+*.html    text eol=lf
+*.md      text eol=lf
+*.sql     text eol=lf
+*.toml    text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+
+# Generated schemas — LF (same as source)
+gen/schemas/*.json text eol=lf
+
+# Binary / images — no conversion
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.ico     binary
+*.pdf     binary
+*.woff2   binary
+*.wasm    binary

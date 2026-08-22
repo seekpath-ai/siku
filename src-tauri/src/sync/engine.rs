@@ -1,0 +1,1916 @@
+use crate::sync::attachments::{
+    collect_missing_blob_hashes, read_blob_base64, write_blob_from_base64,
+};
+use crate::sync::crdt::{apply_changes, export_changes_since, ChangesetMessage};
+use crate::sync::mailbox_client::MailboxClient;
+use crate::sync::types::MailboxMessage;
+use crate::sync::webrtc_peer::SyncSession;
+use anyhow::{Context, Result};
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tracing::{info, warn};
+
+/// Snapshot of the current sync session status for the UI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncStatus {
+    pub connected: bool,
+    pub peer_device_id: Option<String>,
+    pub last_sync_at: Option<String>,
+    pub last_error: Option<String>,
+    /// Current transport: "p2p", "mailbox", or "none".
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// Number of changesets waiting in the local outbox.
+    #[serde(default)]
+    pub outbox_pending: i64,
+    /// Cumulative row-changes successfully sent to the peer (incl. mailbox).
+    #[serde(default)]
+    pub pushed: i64,
+    /// Cumulative row-changes received and applied from the peer (incl.
+    /// mailbox and full snapshots).
+    #[serde(default)]
+    pub pulled: i64,
+    /// Session kind: "lan" (local pairing) or "cloud" (account auto-sync).
+    /// The UI shows it only on the matching tab — LAN and cloud sessions
+    /// share one engine slot, so a cloud session must not light up the LAN
+    /// tab and vice versa.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+fn default_transport() -> String {
+    "none".to_string()
+}
+
+/// Wire message envelope exchanged over the sync DataChannel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum SyncMessage {
+    #[serde(rename = "changeset")]
+    Changeset(ChangesetMessage),
+    #[serde(rename = "full_snapshot")]
+    FullSnapshot { statements: Vec<String> },
+    #[serde(rename = "chunk")]
+    Chunk {
+        id: String,
+        index: usize,
+        total: usize,
+        data: String, // base64 slice
+    },
+    #[serde(rename = "pull")]
+    Pull,
+    #[serde(rename = "attachment_request")]
+    AttachmentRequest { hashes: Vec<(String, String)> },
+    #[serde(rename = "attachment_payload")]
+    AttachmentPayload {
+        hash: String,
+        ext: String,
+        data: String, // base64
+    },
+}
+
+/// DataChannel messages above this size are split into chunks: WebRTC SCTP
+/// rejects oversized datagrams (default max message size is 16KB, so keep a
+/// conservative threshold — snapshots with hundreds of rows easily exceed it).
+const MAX_WIRE_MSG: usize = 16_000;
+
+/// Interval of the background incremental push loop (seconds). While a sync
+/// session is alive, local changes are pushed to the peer on this cadence —
+/// no manual "sync now" needed for continuous sync.
+const SYNC_PUSH_INTERVAL_SECS: u64 = 15;
+
+/// device_settings keys persisting sync progress per peer. Progress must be
+/// keyed by peer: a global watermark would make a freshly reconnected peer
+/// skip changes that were only delivered to a different peer.
+const CURSOR_KEY_PREFIX: &str = "sync.cursor.sent.";
+const SNAPSHOT_SENT_KEY_PREFIX: &str = "sync.snapshot.sent.";
+
+/// device_settings key storing the last db_version successfully sent to a peer.
+pub fn sent_cursor_key(peer_key: &str) -> String {
+    format!("{CURSOR_KEY_PREFIX}{peer_key}")
+}
+
+/// device_settings key storing whether the full snapshot was already sent to a
+/// peer (avoids re-sending the whole database on every reconnect).
+pub fn snapshot_sent_key(peer_key: &str) -> String {
+    format!("{SNAPSHOT_SENT_KEY_PREFIX}{peer_key}")
+}
+
+/// Load persisted sync progress for a peer: `(last sent db_version,
+/// full_snapshot_sent)`. Unknown peers start from zero (full re-export).
+pub async fn load_peer_progress(
+    db: &sqlx::SqlitePool,
+    peer_key: &str,
+) -> (i64, bool) {
+    let sent = crate::core::settings_service::get_device_setting(db, &sent_cursor_key(peer_key))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let snapshot_sent = crate::core::settings_service::get_device_setting(
+        db,
+        &snapshot_sent_key(peer_key),
+    )
+    .await
+    .ok()
+    .flatten()
+    .map(|v| v == "1")
+    .unwrap_or(false);
+    (sent, snapshot_sent)
+}
+
+/// Reassembles chunked messages on the receiving side.
+struct ChunkAssembler {
+    parts: HashMap<String, (usize, Vec<Option<Vec<u8>>>)>,
+}
+
+impl ChunkAssembler {
+    fn new() -> Self {
+        Self {
+            parts: HashMap::new(),
+        }
+    }
+
+    /// Feed one chunk; returns the full message bytes when complete.
+    fn push(&mut self, id: &str, index: usize, total: usize, data: &str) -> Option<Vec<u8>> {
+        use base64::Engine as _;
+        let entry = self
+            .parts
+            .entry(id.to_string())
+            .or_insert_with(|| (total, vec![None; total]));
+        if index >= total {
+            return None;
+        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap_or_default();
+        entry.1[index] = Some(decoded);
+        if entry.1.iter().all(|p| p.is_some()) {
+            let mut out = Vec::new();
+            for part in &entry.1 {
+                if let Some(p) = part {
+                    out.extend_from_slice(p);
+                }
+            }
+            self.parts.remove(id);
+            return Some(out);
+        }
+        None
+    }
+}
+
+/// Manages a single sync session with a peer: WebRTC DataChannel + CR-SQLite changesets + blobs.
+pub struct SyncEngine {
+    session: Arc<SyncSession>,
+    db: SqlitePool,
+    app_data_dir: PathBuf,
+    last_sent_db_version: Mutex<i64>,
+    last_applied_db_version: Mutex<i64>,
+    status: Mutex<SyncStatus>,
+    mailbox: Option<MailboxClient>,
+    sync_key: Option<[u8; crate::sync::crypto::SYNC_KEY_LEN]>,
+    full_snapshot_sent: Mutex<bool>,
+    assembler: std::sync::Mutex<ChunkAssembler>,
+    /// Set by `stop()`; message handlers spawned by `start()` bail out when
+    /// set, so a "disconnected" engine stops applying peer data even though
+    /// the callback closures still hold an Arc to this engine.
+    stopped: std::sync::atomic::AtomicBool,
+    /// Session kind: "lan" / "cloud" / "unknown" (see SyncStatus::kind).
+    kind: String,
+    /// Stable identity of the peer used to persist sync progress
+    /// (device id, or "lan" when unknown).
+    peer_key: String,
+}
+
+fn decode_nonce(b64: &str) -> [u8; crate::sync::crypto::NONCE_LEN] {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .unwrap_or([0u8; crate::sync::crypto::NONCE_LEN])
+}
+
+/// Tables included in a full snapshot: core sync tables, plus optional ones
+/// when the user enabled syncing them.
+async fn snapshot_tables(db: &SqlitePool) -> Vec<&'static str> {
+    let mut tables = crate::core::db::CORE_SYNC_TABLES.to_vec();
+    let optional = crate::core::settings_service::load_device_settings(db)
+        .await
+        .unwrap_or_default();
+    if optional.sync_optional_data {
+        tables.extend(crate::core::db::OPTIONAL_SYNC_TABLES.iter().copied());
+    }
+    tables
+}
+
+impl SyncEngine {
+    pub fn new(
+        session: Arc<SyncSession>,
+        db: SqlitePool,
+        app_data_dir: PathBuf,
+        peer_device_id: Option<String>,
+    ) -> Self {
+        Self {
+            session,
+            db,
+            app_data_dir,
+            last_sent_db_version: Mutex::new(0),
+            last_applied_db_version: Mutex::new(0),
+            status: Mutex::new(SyncStatus {
+                connected: true,
+                peer_device_id,
+                transport: "p2p".to_string(),
+                ..Default::default()
+            }),
+            mailbox: None,
+            sync_key: None,
+            full_snapshot_sent: Mutex::new(false),
+            assembler: std::sync::Mutex::new(ChunkAssembler::new()),
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            kind: "unknown".to_string(),
+            peer_key: String::new(),
+        }
+    }
+
+    /// Tag this session as a LAN pairing or cloud auto-sync session.
+    pub fn with_kind(mut self, kind: &str) -> Self {
+        self.kind = kind.to_string();
+        self
+    }
+
+    /// Set the stable peer identity used to persist sync progress. Falls back
+    /// to the peer device id; callers with a LAN guest that carries no id may
+    /// pass an explicit key.
+    pub fn with_peer_key(mut self, peer_key: &str) -> Self {
+        self.peer_key = peer_key.to_string();
+        self
+    }
+
+    /// Restore persisted sync progress for the peer: the last db_version
+    /// already sent to it and whether the full snapshot was delivered. New
+    /// sessions then only send the delta instead of the whole history.
+    pub fn with_peer_progress(mut self, sent_db_version: i64, snapshot_sent: bool) -> Self {
+        *self.last_sent_db_version.get_mut() = sent_db_version;
+        *self.full_snapshot_sent.get_mut() = snapshot_sent;
+        self
+    }
+
+    /// Stop this engine: mark it stopped so in-flight handlers bail out,
+    /// close the WebRTC connection and shut down the mailbox transport.
+    /// Safe to call multiple times.
+    pub async fn stop(&self) {
+        self.stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.session.close().await;
+        if let Some(mb) = &self.mailbox {
+            mb.shutdown();
+        }
+        self.status.lock().await.connected = false;
+        info!("sync engine stopped");
+    }
+
+    /// Send a message, splitting it into chunks when it exceeds the SCTP
+    /// datagram limit.
+    async fn send_message(&self, msg: &SyncMessage) -> Result<()> {
+        let json = serde_json::to_string(msg).context("serialize sync message")?;
+        if json.len() <= MAX_WIRE_MSG {
+            info!(bytes = json.len(), "sending sync message");
+            return self.session.send_text(json).await.context("send sync message");
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let bytes = json.into_bytes();
+        let total = bytes.len().div_ceil(MAX_WIRE_MSG);
+        info!(bytes = bytes.len(), total, "splitting large sync message into chunks");
+        for (index, part) in bytes.chunks(MAX_WIRE_MSG).enumerate() {
+            use base64::Engine as _;
+            let chunk = SyncMessage::Chunk {
+                id: id.clone(),
+                index,
+                total,
+                data: base64::engine::general_purpose::STANDARD.encode(part),
+            };
+            let chunk_json = serde_json::to_string(&chunk).context("serialize chunk")?;
+            self.session
+                .send_text(chunk_json)
+                .await
+                .with_context(|| format!("send chunk {index}/{total}"))?;
+        }
+        Ok(())
+    }
+
+    /// Attach an encrypted mailbox transport. When set, changes that cannot be
+    /// sent over the DataChannel fall back to the mailbox.
+    pub fn with_mailbox(mut self, mailbox: MailboxClient) -> Self {
+        self.mailbox = Some(mailbox);
+        self
+    }
+
+    /// Set the account sync key used to encrypt mailbox payloads.
+    pub fn with_sync_key(mut self, key: [u8; crate::sync::crypto::SYNC_KEY_LEN]) -> Self {
+        self.sync_key = Some(key);
+        self
+    }
+
+    pub async fn status(&self) -> SyncStatus {
+        let mut s = self.status.lock().await.clone();
+        s.kind = Some(self.kind.clone());
+        s
+    }
+
+    pub async fn mark_synced(&self) {
+        self.status.lock().await.last_sync_at = Some(crate::core::time::now_iso());
+    }
+
+    /// Persist the sent watermark for this peer so a future session (or the
+    /// offline mailbox path) can resume from here instead of re-exporting the
+    /// whole history. Best-effort: failures only log.
+    async fn persist_sent_cursor(&self) {
+        if self.peer_key.is_empty() {
+            return;
+        }
+        let v = *self.last_sent_db_version.lock().await;
+        let _ = crate::core::settings_service::set_device_setting(
+            &self.db,
+            &sent_cursor_key(&self.peer_key),
+            &v.to_string(),
+        )
+        .await;
+    }
+
+    async fn persist_snapshot_sent(&self) {
+        if self.peer_key.is_empty() {
+            return;
+        }
+        let _ = crate::core::settings_service::set_device_setting(
+            &self.db,
+            &snapshot_sent_key(&self.peer_key),
+            "1",
+        )
+        .await;
+    }
+
+    pub async fn set_connected(&self, connected: bool) {
+        self.status.lock().await.connected = connected;
+    }
+
+    pub async fn set_last_error(&self, error: Option<String>) {
+        self.status.lock().await.last_error = error;
+    }
+
+    /// Send the current local changeset to the peer.
+    pub async fn push(&self) -> Result<()> {
+        let since = *self.last_sent_db_version.lock().await;
+        let msg = export_changes_since(&self.db, since).await?;
+        if msg.changes.is_empty() {
+            info!("no local changes to push");
+            return Ok(());
+        }
+        let sent = msg.changes.len() as i64;
+        let envelope = SyncMessage::Changeset(msg);
+        self.send_message(&envelope).await.context("send changeset")?;
+        *self.last_sent_db_version.lock().await = envelope.to_db_version().unwrap_or(since);
+        self.persist_sent_cursor().await;
+        self.status.lock().await.pushed += sent;
+        self.mark_synced().await;
+        info!(
+            to_db_version = envelope.to_db_version().unwrap_or(since),
+            "pushed changeset"
+        );
+        Ok(())
+    }
+
+    /// Request missing blobs after a changeset has been applied.
+    ///
+    /// Tries the live DataChannel first; if that fails and a mailbox transport
+    /// is attached, deposits the request into the peer's mailbox so offline
+    /// devices can fetch PDFs/attachments when they come back online.
+    async fn request_missing_blobs(&self) -> Result<()> {
+        let missing = collect_missing_blob_hashes(&self.db, &self.app_data_dir).await?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        info!(count = missing.len(), "requesting missing blobs");
+        let msg = SyncMessage::AttachmentRequest { hashes: missing };
+        if let Err(e) = self.send_message(&msg).await {
+            if let Some(peer) = self.status.lock().await.peer_device_id.clone() {
+                if self.mailbox.is_some() {
+                    if let Err(e2) = self.deposit_message_to(&peer, &msg).await {
+                        return Err(e2).with_context(|| {
+                            format!("data channel failed ({e}) and mailbox deposit failed")
+                        });
+                    }
+                    info!(to = %peer, "deposited attachment request to mailbox");
+                    return Ok(());
+                }
+            }
+            return Err(e).context("send attachment request");
+        }
+        Ok(())
+    }
+
+    /// Encrypt and deposit a sync message for a specific peer device.
+    async fn deposit_message_to(
+        &self,
+        to_device_id: &str,
+        msg: &SyncMessage,
+    ) -> Result<()> {
+        let Some(mailbox) = &self.mailbox else {
+            anyhow::bail!("mailbox transport not available");
+        };
+        let Some(key) = &self.sync_key else {
+            anyhow::bail!("sync key not available");
+        };
+        let json = serde_json::to_string(msg).context("serialize mailbox sync message")?;
+        let (ciphertext, nonce) =
+            crate::sync::crypto::encrypt_bytes(key, json.as_bytes()).map_err(anyhow::Error::msg)?;
+        mailbox
+            .deposit_encrypted(to_device_id, ciphertext, nonce, None)
+            .await
+            .context("deposit sync message to mailbox")
+    }
+
+    /// Receive and apply a changeset from the peer.
+    pub async fn handle_changeset(&self, msg: ChangesetMessage) -> Result<()> {
+        let received = msg.changes.len() as i64;
+        apply_changes(&self.db, &msg).await?;
+        let mut applied = self.last_applied_db_version.lock().await;
+        *applied = applied.max(msg.to_db_version);
+        drop(applied);
+        self.status.lock().await.pulled += received;
+        self.mark_synced().await;
+        self.request_missing_blobs().await?;
+        Ok(())
+    }
+
+    /// Handle an attachment-related message from the peer.
+    pub async fn handle_attachment_message(&self, msg: SyncMessage) -> Result<()> {
+        match msg {
+            SyncMessage::AttachmentRequest { hashes } => {
+                info!(count = hashes.len(), "received blob request");
+                for (hash, ext) in hashes {
+                    match read_blob_base64(&self.app_data_dir, &hash, &ext) {
+                        Ok(Some(data)) => {
+                            // Route through send_message: real PDFs/blobs exceed
+                            // the SCTP datagram limit and must be chunked.
+                            let payload = SyncMessage::AttachmentPayload {
+                                hash: hash.clone(),
+                                ext: ext.clone(),
+                                data,
+                            };
+                            if let Err(e) = self.send_message(&payload).await {
+                                // DataChannel unavailable: try mailbox fallback
+                                // when we know which peer asked.
+                                if let Some(peer) =
+                                    self.status.lock().await.peer_device_id.clone()
+                                {
+                                    if let Err(e2) = self.deposit_message_to(&peer, &payload).await
+                                    {
+                                        warn!(
+                                            error = %e,
+                                            error2 = %e2,
+                                            hash = %hash,
+                                            "failed to send blob payload over data channel and mailbox"
+                                        );
+                                    } else {
+                                        info!(to = %peer, hash = %hash, "deposited blob payload to mailbox");
+                                    }
+                                } else {
+                                    warn!(error = %e, hash = %hash, "failed to send blob payload");
+                                }
+                            }
+                        }
+                        Ok(None) => warn!(hash = %hash, "peer requested blob we do not have"),
+                        Err(e) => warn!(error = %e, hash = %hash, "failed to read blob"),
+                    }
+                }
+            }
+            SyncMessage::AttachmentPayload { hash, ext, data } => {
+                if let Err(e) = write_blob_from_base64(&self.app_data_dir, &hash, &ext, &data) {
+                    warn!(error = %e, hash = %hash, "failed to write received blob");
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// One-shot bidirectional sync: push then pull. Records the outcome in
+    /// `last_error` so the UI can show the failure reason.
+    pub async fn sync_once(&self) -> Result<()> {
+        match self.sync_once_inner().await {
+            Ok(()) => {
+                self.status.lock().await.last_error = None;
+                Ok(())
+            }
+            Err(e) => {
+                self.status.lock().await.last_error = Some(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    async fn sync_once_inner(&self) -> Result<()> {
+        info!("sync_once starting");
+        // First time on this connection: exchange a full snapshot so
+        // pre-CRR history (which never appears in crsql_changes) reaches the
+        // peer. Idempotent INSERT OR REPLACE, so re-sending is harmless.
+        {
+            let mut sent = self.full_snapshot_sent.lock().await;
+            if !*sent {
+                let tables = snapshot_tables(&self.db).await;
+                let statements = crate::sync::crdt::export_full_snapshot(&self.db, &tables).await?;
+                if !statements.is_empty() {
+                    let msg = SyncMessage::FullSnapshot {
+                        statements: statements.clone(),
+                    };
+                    self.send_message(&msg).await.context("send full snapshot")?;
+                    info!(count = statements.len(), "sent full snapshot");
+                    self.persist_snapshot_sent().await;
+                }
+                *sent = true;
+            }
+        }
+        self.push().await?;
+        // Request peer changes by sending a lightweight pull request.
+        let msg = SyncMessage::Pull;
+        self.send_message(&msg).await.context("send pull request")?;
+        self.mark_synced().await;
+        info!("sync_once done");
+        Ok(())
+    }
+
+    // ── Encrypted mailbox fallback ─────────────────────────────────────────
+
+    /// Export local changes, encrypt them with the account sync key, and
+    /// deposit them into the peer's mailbox. When the deposit fails (relay
+    /// unreachable) the message is written to the local outbox for retry.
+    pub async fn sync_over_mailbox(&self, to_device_id: &str) -> Result<()> {
+        let Some(mailbox) = &self.mailbox else {
+            anyhow::bail!("mailbox transport disabled (no session mailbox)");
+        };
+        let Some(key) = &self.sync_key else {
+            anyhow::bail!("no sync key configured; mailbox sync unavailable");
+        };
+
+        let since = *self.last_sent_db_version.lock().await;
+        let msg = export_changes_since(&self.db, since).await?;
+        if msg.changes.is_empty() {
+            return Ok(());
+        }
+        let sent = msg.changes.len() as i64;
+        let envelope = SyncMessage::Changeset(msg);
+        let json = serde_json::to_string(&envelope).context("serialize changeset")?;
+        let (ciphertext, nonce) =
+            crate::sync::crypto::encrypt_bytes(key, json.as_bytes()).map_err(anyhow::Error::msg)?;
+
+        match mailbox.deposit_encrypted(to_device_id, ciphertext.clone(), nonce, None).await {
+            Ok(()) => {
+                let v = envelope.to_db_version().unwrap_or(since);
+                *self.last_sent_db_version.lock().await = v;
+                self.persist_sent_cursor().await;
+                self.status.lock().await.pushed += sent;
+                self.mark_synced().await;
+                info!(to = %to_device_id, to_db_version = v, "changeset deposited to mailbox");
+                self.set_transport("mailbox").await;
+            }
+            Err(e) => {
+                warn!(error = %e, "mailbox deposit failed; writing to outbox");
+                self.write_outbox(to_device_id, &ciphertext, &nonce).await?;
+                self.refresh_outbox_count().await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle a decrypted mailbox message: apply the changeset (and any
+    /// attachment request/response), then ack.
+    pub async fn handle_mailbox_message(&self, mb_msg: MailboxMessage) -> Result<()> {
+        let Some(mailbox) = &self.mailbox else {
+            return Ok(());
+        };
+        let Some(key) = &self.sync_key else {
+            return Ok(());
+        };
+        use base64::Engine as _;
+        let nonce = base64::engine::general_purpose::STANDARD
+            .decode(&mb_msg.nonce)
+            .context("decode nonce")?;
+        let ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(&mb_msg.ciphertext)
+            .context("decode ciphertext")?;
+        let plaintext = crate::sync::crypto::decrypt_bytes(key, &nonce, &ciphertext)
+            .map_err(anyhow::Error::msg)?;
+        let envelope: SyncMessage = serde_json::from_slice(&plaintext).context("parse changeset")?;
+        match envelope {
+            SyncMessage::Changeset(cs) => {
+                self.handle_changeset(cs).await?;
+                info!(from = %mb_msg.from_device_id, "applied mailbox changeset");
+                // The changeset may reference blobs (paper PDFs, note images)
+                // that the mailbox path does not automatically carry. Request
+                // them from the sender so they arrive as follow-up mailbox
+                // messages.
+                if let Err(e) = self.request_missing_blobs_from(&mb_msg.from_device_id).await {
+                    warn!(error = %e, from = %mb_msg.from_device_id, "mailbox blob request failed");
+                }
+            }
+            SyncMessage::Pull => {
+                // Peer asked for our changes over the mailbox; reply by
+                // depositing our changeset back.
+                if let Err(e) = self.sync_over_mailbox(&mb_msg.from_device_id).await {
+                    warn!(error = %e, "mailbox pull reply failed");
+                }
+            }
+            attachment_msg @ (SyncMessage::AttachmentRequest { .. } | SyncMessage::AttachmentPayload { .. }) => {
+                if let Err(e) = self.handle_attachment_message_for(&mb_msg.from_device_id, attachment_msg).await {
+                    warn!(error = %e, from = %mb_msg.from_device_id, "mailbox attachment message failed");
+                }
+            }
+            other => warn!(msg = ?other, "ignoring unsupported mailbox message"),
+        }
+        mailbox.ack(vec![mb_msg.id]).await.ok();
+        self.set_transport("mailbox").await;
+        Ok(())
+    }
+
+    /// Request missing blobs from a specific peer via mailbox.
+    async fn request_missing_blobs_from(&self, peer_device_id: &str) -> Result<()> {
+        let missing = collect_missing_blob_hashes(&self.db, &self.app_data_dir).await?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        info!(count = missing.len(), to = %peer_device_id, "requesting missing blobs over mailbox");
+        let msg = SyncMessage::AttachmentRequest { hashes: missing };
+        self.deposit_message_to(peer_device_id, &msg).await
+    }
+
+    /// Handle an attachment message that arrived over mailbox: answer requests
+    /// by depositing payloads back to the sender, and write received payloads.
+    async fn handle_attachment_message_for(
+        &self,
+        from_device_id: &str,
+        msg: SyncMessage,
+    ) -> Result<()> {
+        match msg {
+            SyncMessage::AttachmentRequest { hashes } => {
+                info!(count = hashes.len(), from = %from_device_id, "received mailbox blob request");
+                for (hash, ext) in hashes {
+                    match read_blob_base64(&self.app_data_dir, &hash, &ext) {
+                        Ok(Some(data)) => {
+                            let payload = SyncMessage::AttachmentPayload {
+                                hash: hash.clone(),
+                                ext: ext.clone(),
+                                data,
+                            };
+                            if let Err(e) = self.deposit_message_to(from_device_id, &payload).await
+                            {
+                                warn!(error = %e, hash = %hash, "failed to deposit blob payload");
+                            }
+                        }
+                        Ok(None) => warn!(hash = %hash, "peer requested blob we do not have"),
+                        Err(e) => warn!(error = %e, hash = %hash, "failed to read blob"),
+                    }
+                }
+            }
+            SyncMessage::AttachmentPayload { hash, ext, data } => {
+                write_blob_from_base64(&self.app_data_dir, &hash, &ext, &data)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Retry delivering queued outbox messages; drop ones that succeed.
+    /// The outbox stores the ciphertext base64-encoded (see `write_outbox`);
+    /// it must be decoded before re-depositing — feeding the base64 text into
+    /// `deposit_encrypted` double-encodes it and the peer can never decrypt it.
+    pub async fn flush_outbox(&self) -> Result<()> {
+        let Some(mailbox) = &self.mailbox else {
+            return Ok(());
+        };
+        flush_outbox_with(&self.db, mailbox).await
+    }
+
+    async fn write_outbox(&self, to_device_id: &str, ciphertext: &[u8], nonce: &[u8]) -> Result<()> {
+        write_outbox_row(&self.db, to_device_id, ciphertext, nonce).await
+    }
+
+    async fn refresh_outbox_count(&self) {
+        let count: Result<i64, _> = sqlx::query_scalar("SELECT count(*) FROM sync_outbox")
+            .fetch_one(&self.db)
+            .await;
+        if let Ok(n) = count {
+            self.status.lock().await.outbox_pending = n;
+        }
+    }
+
+    async fn set_transport(&self, transport: &str) {
+        self.status.lock().await.transport = transport.to_string();
+    }    /// Start continuous sync in the background.
+    pub fn start(self: Arc<Self>) {
+        let engine = self.clone();
+        // Mark the session disconnected when the peer closes the channel, so
+        // the UI stops showing "connected" and manual syncs fail fast with a
+        // meaningful state instead of a dead-channel send error.
+        self.session.on_close({
+            let engine = engine.clone();
+            move || {
+                let engine = engine.clone();
+                tokio::spawn(async move {
+                    engine.status.lock().await.connected = false;
+                    info!("sync engine connection closed by peer");
+                });
+            }
+        });
+        self.session.on_message(move |text| {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                if engine.stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                match serde_json::from_str::<SyncMessage>(&text) {
+                    Ok(SyncMessage::Pull) => {
+                        if let Err(e) = engine.push().await {
+                            warn!(error = %e, "push failed in response to pull");
+                        }
+                    }
+                    Ok(SyncMessage::Chunk {
+                        id,
+                        index,
+                        total,
+                        data,
+                    }) => {
+                        let complete = {
+                            let mut asm = engine.assembler.lock().unwrap();
+                            asm.push(&id, index, total, &data)
+                        };
+                        if let Some(bytes) = complete {
+                            match serde_json::from_slice::<SyncMessage>(&bytes) {
+                                Ok(SyncMessage::Changeset(cs)) => {
+                                    if let Err(e) = engine.handle_changeset(cs).await {
+                                        warn!(error = %e, "apply chunked changeset failed");
+                                    }
+                                }
+                                Ok(SyncMessage::FullSnapshot { statements }) => {
+                                    match crate::sync::crdt::apply_full_snapshot(&engine.db, &statements).await {
+                                        Ok(()) => {
+                                            engine.status.lock().await.pulled += statements.len() as i64;
+                                            // A snapshot can bring in rows (e.g. note
+                                            // Markdown referencing `blobs/...`) without a
+                                            // following changeset; request the referenced
+                                            // files explicitly or they never arrive.
+                                            if let Err(e) = engine.request_missing_blobs().await {
+                                                warn!(error = %e, "request missing blobs after chunked snapshot failed");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, "apply chunked snapshot failed");
+                                        }
+                                    }
+                                }
+                                Ok(SyncMessage::Pull) => {
+                                    if let Err(e) = engine.push().await {
+                                        warn!(error = %e, "push failed for chunked pull");
+                                    }
+                                }
+                                Ok(
+                                    msg @ (SyncMessage::AttachmentRequest { .. }
+                                    | SyncMessage::AttachmentPayload { .. }),
+                                ) => {
+                                    if let Err(e) = engine.handle_attachment_message(msg).await {
+                                        warn!(error = %e, "handle chunked attachment message failed");
+                                    }
+                                }
+                                Ok(other) => warn!(msg = ?other, "unexpected chunked message"),
+                                Err(e) => warn!(error = %e, "parse chunked message failed"),
+                            }
+                        }
+                    }
+                    Ok(SyncMessage::Changeset(cs)) => {
+                        if let Err(e) = engine.handle_changeset(cs).await {
+                            warn!(error = %e, "apply changeset failed");
+                        }
+                    }
+                    Ok(SyncMessage::FullSnapshot { statements }) => {
+                        match crate::sync::crdt::apply_full_snapshot(&engine.db, &statements).await {
+                            Ok(()) => {
+                                engine.status.lock().await.pulled += statements.len() as i64;
+                                // Request blob files referenced by the snapshot
+                                // (note images, paper PDFs) — see above.
+                                if let Err(e) = engine.request_missing_blobs().await {
+                                    warn!(error = %e, "request missing blobs after snapshot failed");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "apply full snapshot failed");
+                            }
+                        }
+                    }
+                    Ok(
+                        msg @ (SyncMessage::AttachmentRequest { .. }
+                        | SyncMessage::AttachmentPayload { .. }),
+                    ) => {
+                        if let Err(e) = engine.handle_attachment_message(msg).await {
+                            warn!(error = %e, "handle attachment message failed");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, text = %text, "failed to parse sync message"),
+                }
+            });
+        });
+
+        let engine = self.clone();
+        self.session.on_close(move || {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine.set_connected(false).await;
+                engine.set_transport("none").await;
+                warn!("sync data channel closed");
+            });
+        });
+
+        // Route encrypted mailbox batches into the same changeset pipeline.
+        if let Some(mailbox) = &self.mailbox {
+            let engine = self.clone();
+            mailbox.on_batch(move |messages| {
+                let engine = engine.clone();
+                tokio::spawn(async move {
+                    for msg in messages {
+                        if let Err(e) = engine.handle_mailbox_message(msg).await {
+                            warn!(error = %e, "handle mailbox message failed");
+                        }
+                    }
+                });
+            });
+        }
+
+        // Continuous incremental sync: while the session is alive, push local
+        // changes to the peer on a fixed cadence and drain the encrypted
+        // outbox. `push` is a no-op when there is nothing new, so an idle
+        // session costs one cheap query per tick.
+        {
+            let engine = self.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                    SYNC_PUSH_INTERVAL_SECS,
+                ));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    if engine.stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    if !engine.status().await.connected {
+                        // Marked disconnected (channel died / peer closed).
+                        // Keep probing: only a message that actually crosses
+                        // the wire proves the channel recovered (e.g. after a
+                        // transient send failure). `push()` with nothing new
+                        // returns Ok without sending anything, so it must not
+                        // be used as the probe — on a dead channel it would
+                        // flip the status back to "已连接" (host stopped, but
+                        // the guest shows connected again). A `Pull` request is
+                        // tiny and always hits the wire.
+                        let probe = SyncMessage::Pull;
+                        if let Err(e) = engine.send_message(&probe).await {
+                            warn!(error = %e, "push probe failed; still disconnected");
+                            continue;
+                        }
+                        engine.set_connected(true).await;
+                        engine.set_last_error(None).await;
+                        continue;
+                    }
+                    if let Err(e) = engine.push().await {
+                        // A real send failure means the peer is unreachable —
+                        // surface it immediately so the UI does not keep
+                        // showing "已连接" while syncs fail.
+                        warn!(error = %e, "periodic push failed; marking session disconnected");
+                        engine.set_connected(false).await;
+                        engine.set_last_error(Some(e.to_string())).await;
+                        continue;
+                    }
+                    if engine.mailbox.is_some() {
+                        if let Err(e) = engine.flush_outbox().await {
+                            warn!(error = %e, "periodic outbox flush failed");
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Deliver queued outbox messages through the given mailbox transport; drop
+/// rows that are delivered, bump `retry_count` on failure. Also refreshes the
+/// `sync_outbox` table only — engine status is updated by callers that have
+/// one. Free function so the command layer can flush without a live engine.
+pub async fn flush_outbox_with(db: &SqlitePool, mailbox: &MailboxClient) -> Result<()> {
+    let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT id, to_device_id, ciphertext, nonce, retry_count FROM sync_outbox ORDER BY created_at LIMIT 50",
+    )
+    .fetch_all(db)
+    .await
+    .context("read outbox")?;
+    for (id, to_device_id, ciphertext, nonce, _retries) in rows {
+        let ct = match base64::engine::general_purpose::STANDARD.decode(&ciphertext) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(id = %id, error = %e, "outbox ciphertext is not valid base64; dropping");
+                sqlx::query("DELETE FROM sync_outbox WHERE id = ?")
+                    .bind(&id)
+                    .execute(db)
+                    .await?;
+                continue;
+            }
+        };
+        match mailbox
+            .deposit_encrypted(&to_device_id, ct, decode_nonce(&nonce), None)
+            .await
+        {
+            Ok(()) => {
+                sqlx::query("DELETE FROM sync_outbox WHERE id = ?")
+                    .bind(&id)
+                    .execute(db)
+                    .await?;
+                info!(id = %id, to = %to_device_id, "outbox message delivered");
+            }
+            Err(e) => {
+                sqlx::query("UPDATE sync_outbox SET retry_count = retry_count + 1 WHERE id = ?")
+                    .bind(&id)
+                    .execute(db)
+                    .await?;
+                warn!(id = %id, error = %e, "outbox retry failed");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Encrypt and deposit local changes for `to_device_id` into its mailbox via
+/// `relay`. Resumes from the peer's persisted cursor and advances it on
+/// success; on a dead transport the changeset is queued into the outbox.
+/// Used by the auto-sync proxy so changes reach a peer that is currently
+/// offline — the relay stores them until the peer next connects.
+pub async fn deliver_changes_mailbox(
+    db: &SqlitePool,
+    relay: &crate::sync::relay_client::RelayClient,
+    key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
+    to_device_id: &str,
+    peer_key: &str,
+) -> Result<i64> {
+    use base64::Engine as _;
+    let (since, _) = load_peer_progress(db, peer_key).await;
+    let changes = export_changes_since(db, since).await?;
+    if changes.changes.is_empty() {
+        return Ok(since);
+    }
+    let delivered_to = changes.to_db_version;
+    let json = serde_json::to_string(&SyncMessage::Changeset(changes)).context("serialize")?;
+    let (ciphertext, nonce) =
+        crate::sync::crypto::encrypt_bytes(key, json.as_bytes()).map_err(anyhow::Error::msg)?;
+    let payload = crate::sync::types::MailboxDepositPayload {
+        to_device_id: to_device_id.to_string(),
+        ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+        nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
+        ttl_seconds: Some(7 * 24 * 3600),
+    };
+    if relay
+        .send(crate::sync::types::RelayClientMsg::MailboxDeposit { payload })
+        .is_err()
+    {
+        // Transport dead: queue for retry instead of losing the changes.
+        warn!(to = %to_device_id, "mailbox deposit send failed; queuing to outbox");
+        write_outbox_row(db, to_device_id, &ciphertext, &nonce).await?;
+        return Ok(since);
+    }
+    let _ = crate::core::settings_service::set_device_setting(
+        db,
+        &sent_cursor_key(peer_key),
+        &delivered_to.to_string(),
+    )
+    .await;
+    info!(to = %to_device_id, to_db_version = delivered_to, "changeset deposited to mailbox (offline)");
+    Ok(delivered_to)
+}
+
+/// Decrypt one mailbox message into its wire envelope (no side effects).
+pub async fn decrypt_mailbox_message(
+    key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
+    msg: &crate::sync::types::MailboxMessage,
+) -> Result<SyncMessage> {
+    use base64::Engine as _;
+    let nonce = base64::engine::general_purpose::STANDARD
+        .decode(&msg.nonce)
+        .context("decode nonce")?;
+    let ciphertext = base64::engine::general_purpose::STANDARD
+        .decode(&msg.ciphertext)
+        .context("decode ciphertext")?;
+    let plaintext = crate::sync::crypto::decrypt_bytes(key, &nonce, &ciphertext)
+        .map_err(anyhow::Error::msg)?;
+    serde_json::from_slice(&plaintext).context("parse changeset")
+}
+
+/// Decrypt one mailbox message and apply its changeset locally. Returns the
+/// parsed envelope so callers can react to `Pull` requests.
+pub async fn decrypt_and_apply_mailbox_message(
+    db: &SqlitePool,
+    key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
+    msg: &crate::sync::types::MailboxMessage,
+) -> Result<SyncMessage> {
+    let envelope = decrypt_mailbox_message(key, msg).await?;
+    if let SyncMessage::Changeset(cs) = &envelope {
+        apply_changes(db, cs).await?;
+    }
+    Ok(envelope)
+}
+
+/// device_settings key recording the highest db_version already applied from
+/// account-level archive messages sent by a given device.
+pub fn account_applied_cursor_key(from_device_id: &str) -> String {
+    format!("sync.cursor.applied.account.{from_device_id}")
+}
+
+/// Encrypt and deposit a sync message for a specific peer through a relay
+/// connection. Used by the mailbox-only path (no live P2P DataChannel).
+async fn deposit_sync_message_to(
+    relay: &crate::sync::relay_client::RelayClient,
+    key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
+    to_device_id: &str,
+    msg: &SyncMessage,
+) -> Result<()> {
+    use base64::Engine as _;
+    let json = serde_json::to_string(msg).context("serialize mailbox sync message")?;
+    let (ciphertext, nonce) =
+        crate::sync::crypto::encrypt_bytes(key, json.as_bytes()).map_err(anyhow::Error::msg)?;
+    relay
+        .send(crate::sync::types::RelayClientMsg::MailboxDeposit {
+            payload: crate::sync::types::MailboxDepositPayload {
+                to_device_id: to_device_id.to_string(),
+                ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+                nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
+                ttl_seconds: Some(7 * 24 * 3600),
+            },
+        })
+        .context("deposit sync message to mailbox")
+}
+
+/// Decrypt and apply a batch of mailbox messages, then acknowledge them.
+/// `Pull` requests are answered by depositing our changeset back through the
+/// same relay connection. Account-level messages (the offline archive shared
+/// by every device of the account) are filtered by a per-sender applied
+/// cursor so repeated fetches are no-ops. Used by the auto-sync proxy so a
+/// freshly logged-in device picks up changes its peers deposited while it was
+/// offline — no P2P session required.
+pub async fn handle_mailbox_batch(
+    db: &SqlitePool,
+    app_data_dir: &std::path::Path,
+    key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
+    relay: &crate::sync::relay_client::RelayClient,
+    messages: Vec<crate::sync::types::MailboxMessage>,
+) -> Result<()> {
+    let mut ack_ids = Vec::with_capacity(messages.len());
+    for mb_msg in messages {
+        ack_ids.push(mb_msg.id.clone());
+        let envelope = match decrypt_mailbox_message(key, &mb_msg).await {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, from = %mb_msg.from_device_id, "mailbox message decrypt failed");
+                continue;
+            }
+        };
+        match envelope {
+            SyncMessage::Changeset(cs) => {
+                if mb_msg.account_level {
+                    // Account-level archive: skip what we already applied from
+                    // this sender, then record the new watermark.
+                    let cursor_key = account_applied_cursor_key(&mb_msg.from_device_id);
+                    let applied: i64 =
+                        crate::core::settings_service::get_device_setting(db, &cursor_key)
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0);
+                    if cs.to_db_version <= applied {
+                        continue;
+                    }
+                    apply_changes(db, &cs).await?;
+                    let _ = crate::core::settings_service::set_device_setting(
+                        db,
+                        &cursor_key,
+                        &cs.to_db_version.to_string(),
+                    )
+                    .await;
+                    info!(from = %mb_msg.from_device_id, to_db_version = cs.to_db_version, "applied account-level mailbox changeset");
+                } else {
+                    apply_changes(db, &cs).await?;
+                    info!(from = %mb_msg.from_device_id, "applied per-device mailbox changeset");
+                }
+                // The mailbox path carries row changes, not blob files. Ask the
+                // sender for any referenced blobs (paper PDFs, note images).
+                if let Err(e) = request_missing_blobs_over_relay(
+                    db,
+                    app_data_dir,
+                    key,
+                    relay,
+                    &mb_msg.from_device_id,
+                )
+                .await
+                {
+                    warn!(error = %e, from = %mb_msg.from_device_id, "mailbox blob request failed");
+                }
+            }
+            SyncMessage::Pull => {
+                // Peer asked for our changes over the mailbox; reply by
+                // depositing our changeset back (per-device to the requester).
+                if let Err(e) =
+                    deliver_changes_mailbox(db, relay, key, &mb_msg.from_device_id, &mb_msg.from_device_id)
+                        .await
+                {
+                    warn!(error = %e, "mailbox pull reply failed");
+                }
+            }
+            attachment_msg @ (SyncMessage::AttachmentRequest { .. } | SyncMessage::AttachmentPayload { .. }) => {
+                if let Err(e) = handle_mailbox_attachment_message(
+                    app_data_dir,
+                    key,
+                    relay,
+                    &mb_msg.from_device_id,
+                    attachment_msg,
+                )
+                .await
+                {
+                    warn!(error = %e, from = %mb_msg.from_device_id, "mailbox attachment message failed");
+                }
+            }
+            other => warn!(msg = ?other, "ignoring unsupported mailbox message"),
+        }
+    }
+    if !ack_ids.is_empty() {
+        let _ = relay.send(crate::sync::types::RelayClientMsg::MailboxAck {
+            payload: crate::sync::types::MailboxAckPayload {
+                message_ids: ack_ids,
+            },
+        });
+    }
+    Ok(())
+}
+
+/// Request blobs referenced by synced rows from a specific peer via mailbox.
+async fn request_missing_blobs_over_relay(
+    db: &SqlitePool,
+    app_data_dir: &std::path::Path,
+    key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
+    relay: &crate::sync::relay_client::RelayClient,
+    peer_device_id: &str,
+) -> Result<()> {
+    let missing = collect_missing_blob_hashes(db, app_data_dir).await?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    info!(count = missing.len(), to = %peer_device_id, "requesting missing blobs over mailbox");
+    let msg = SyncMessage::AttachmentRequest { hashes: missing };
+    deposit_sync_message_to(relay, key, peer_device_id, &msg).await
+}
+
+/// Handle an attachment request/payload that arrived over the mailbox path.
+async fn handle_mailbox_attachment_message(
+    app_data_dir: &std::path::Path,
+    key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
+    relay: &crate::sync::relay_client::RelayClient,
+    from_device_id: &str,
+    msg: SyncMessage,
+) -> Result<()> {
+    match msg {
+        SyncMessage::AttachmentRequest { hashes } => {
+            info!(count = hashes.len(), from = %from_device_id, "received mailbox blob request");
+            for (hash, ext) in hashes {
+                match read_blob_base64(app_data_dir, &hash, &ext) {
+                    Ok(Some(data)) => {
+                        let payload = SyncMessage::AttachmentPayload {
+                            hash: hash.clone(),
+                            ext: ext.clone(),
+                            data,
+                        };
+                        if let Err(e) =
+                            deposit_sync_message_to(relay, key, from_device_id, &payload).await
+                        {
+                            warn!(error = %e, hash = %hash, "failed to deposit blob payload");
+                        }
+                    }
+                    Ok(None) => warn!(hash = %hash, "peer requested blob we do not have"),
+                    Err(e) => warn!(error = %e, hash = %hash, "failed to read blob"),
+                }
+            }
+        }
+        SyncMessage::AttachmentPayload { hash, ext, data } => {
+            write_blob_from_base64(app_data_dir, &hash, &ext, &data)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Queue an encrypted changeset into the local outbox for later delivery.
+/// Free function so the command layer (offline mailbox fallback) can enqueue
+/// without a live engine.
+pub async fn write_outbox_row(
+    db: &SqlitePool,
+    to_device_id: &str,
+    ciphertext: &[u8],
+    nonce: &[u8],
+) -> Result<()> {
+    use base64::Engine as _;
+    sqlx::query(
+        "INSERT INTO sync_outbox (id, to_device_id, ciphertext, nonce, ttl_seconds, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(to_device_id)
+    .bind(base64::engine::general_purpose::STANDARD.encode(ciphertext))
+    .bind(base64::engine::general_purpose::STANDARD.encode(nonce))
+    .bind(7 * 24 * 3600i64)
+    .bind(crate::core::time::now_iso())
+    .execute(db)
+    .await
+    .context("write outbox")?;
+    Ok(())
+}
+
+impl SyncMessage {
+    fn to_db_version(&self) -> Option<i64> {
+        match self {
+            SyncMessage::Changeset(cs) => Some(cs.to_db_version),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::db::{
+        register_crr_tables, tests::connect_with_crsqlite, CORE_SYNC_TABLES, SCHEMA_INIT_SQL,
+    };
+    use anyhow::Context;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+    use webrtc::api::interceptor_registry::register_default_interceptors;
+    use webrtc::api::media_engine::MediaEngine;
+    use webrtc::api::setting_engine::SettingEngine;
+    use webrtc::api::APIBuilder;
+    use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+    use webrtc::ice_transport::ice_server::RTCIceServer;
+    use webrtc::peer_connection::configuration::RTCConfiguration;
+    use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+    use webrtc::peer_connection::RTCPeerConnection;
+
+    async fn create_test_db() -> anyhow::Result<(SqlitePool, PathBuf)> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-engine-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("test.db");
+        let db = connect_with_crsqlite(&path).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db).await?;
+        register_crr_tables(&db, CORE_SYNC_TABLES).await?;
+        Ok((db, dir))
+    }
+
+    async fn create_peer_connection() -> anyhow::Result<Arc<RTCPeerConnection>> {
+        let mut m = MediaEngine::default();
+        m.register_default_codecs()?;
+        let mut registry = webrtc::interceptor::registry::Registry::new();
+        registry = register_default_interceptors(registry, &mut m)?;
+        let api = APIBuilder::new()
+            .with_media_engine(m)
+            .with_interceptor_registry(registry)
+            .with_setting_engine(SettingEngine::default())
+            .build();
+        let config = RTCConfiguration {
+            ice_servers: vec![RTCIceServer {
+                urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        Ok(Arc::new(api.new_peer_connection(config).await?))
+    }
+
+    async fn connect_sessions() -> anyhow::Result<(SyncSession, SyncSession)> {
+        let pc_a = create_peer_connection().await?;
+        let pc_b = create_peer_connection().await?;
+
+        let dc_a = pc_a
+            .create_data_channel("siku-sync", None)
+            .await
+            .context("create data channel")?;
+
+        let (dc_b_tx, mut dc_b_rx) =
+            mpsc::unbounded_channel::<Arc<webrtc::data_channel::RTCDataChannel>>();
+        pc_b.on_data_channel(Box::new(move |d| {
+            let tx = dc_b_tx.clone();
+            Box::pin(async move {
+                let _ = tx.send(d);
+            })
+        }));
+
+        // Exchange SDP.
+        let offer = pc_a.create_offer(None).await.context("create offer")?;
+        pc_a.set_local_description(offer.clone()).await?;
+        pc_b.set_remote_description(RTCSessionDescription::offer(offer.sdp)?)
+            .await?;
+        let answer = pc_b.create_answer(None).await.context("create answer")?;
+        pc_b.set_local_description(answer.clone()).await?;
+        pc_a.set_remote_description(RTCSessionDescription::answer(answer.sdp)?)
+            .await?;
+
+        // Exchange ICE candidates.
+        let (ice_a_tx, mut ice_a_rx) = mpsc::unbounded_channel::<RTCIceCandidateInit>();
+        pc_a.on_ice_candidate(Box::new(move |c| {
+            let tx = ice_a_tx.clone();
+            Box::pin(async move {
+                if let Some(c) = c {
+                    if let Ok(init) = c.to_json() {
+                        let _ = tx.send(init);
+                    }
+                }
+            })
+        }));
+        let (ice_b_tx, mut ice_b_rx) = mpsc::unbounded_channel::<RTCIceCandidateInit>();
+        pc_b.on_ice_candidate(Box::new(move |c| {
+            let tx = ice_b_tx.clone();
+            Box::pin(async move {
+                if let Some(c) = c {
+                    if let Ok(init) = c.to_json() {
+                        let _ = tx.send(init);
+                    }
+                }
+            })
+        }));
+
+        let pc_a2 = pc_a.clone();
+        let pc_b2 = pc_b.clone();
+        tokio::spawn(async move {
+            while let Some(init) = ice_a_rx.recv().await {
+                let _ = pc_b2.add_ice_candidate(init).await;
+            }
+        });
+        tokio::spawn(async move {
+            while let Some(init) = ice_b_rx.recv().await {
+                let _ = pc_a2.add_ice_candidate(init).await;
+            }
+        });
+
+        // Wait for data channel to open on A and be received on B.
+        let (open_tx, mut open_rx) = mpsc::channel::<()>(1);
+        dc_a.on_open(Box::new(move || {
+            let _ = open_tx.try_send(());
+            Box::pin(async {})
+        }));
+
+        timeout(Duration::from_secs(30), open_rx.recv())
+            .await
+            .context("data channel open timeout")?
+            .context("open channel closed")?;
+
+        let dc_b = timeout(Duration::from_secs(5), dc_b_rx.recv())
+            .await
+            .context("wait for data channel on B")?
+            .context("dc channel closed")?;
+
+        Ok((
+            SyncSession { pc: pc_a, dc: dc_a },
+            SyncSession { pc: pc_b, dc: dc_b },
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sync_engine_exchanges_changes_over_datachannel() -> anyhow::Result<()> {
+        let (sess_a, sess_b) = connect_sessions().await?;
+        let (db_a, dir_a) = create_test_db().await?;
+        let (db_b, dir_b) = create_test_db().await?;
+
+        let engine_a = Arc::new(SyncEngine::new(
+            Arc::new(sess_a),
+            db_a.clone(),
+            dir_a.clone(),
+            None,
+        ));
+        let engine_b = Arc::new(SyncEngine::new(
+            Arc::new(sess_b),
+            db_b.clone(),
+            dir_b.clone(),
+            None,
+        ));
+        engine_a.clone().start();
+        engine_b.clone().start();
+
+        // Insert a paper and note on A.
+        sqlx::query(
+            "INSERT INTO papers (id, title, created_at, updated_at, imported_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("p1")
+        .bind("Paper One")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&db_a)
+        .await?;
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, content, content_plain, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind("n1")
+        .bind(1i64)
+        .bind("Note One")
+        .bind("Hello **world**")
+        .bind("Hello world")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&db_a)
+        .await?;
+
+        engine_a.sync_once().await?;
+
+        // Give async message handlers time to run.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let paper_count: (i64,) = sqlx::query_as("SELECT count(*) FROM papers WHERE id = 'p1'")
+            .fetch_one(&db_b)
+            .await?;
+        assert_eq!(paper_count.0, 1, "paper should be synced to B");
+        let note_count: (i64,) = sqlx::query_as("SELECT count(*) FROM notes WHERE id = 'n1'")
+            .fetch_one(&db_b)
+            .await?;
+        assert_eq!(note_count.0, 1, "note should be synced to B");
+
+        sqlx::query("SELECT crsql_finalize()")
+            .execute(&db_a)
+            .await?;
+        sqlx::query("SELECT crsql_finalize()")
+            .execute(&db_b)
+            .await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sync_engine_transfers_missing_blobs() -> anyhow::Result<()> {
+        let (sess_a, sess_b) = connect_sessions().await?;
+        let (db_a, dir_a) = create_test_db().await?;
+        let (db_b, dir_b) = create_test_db().await?;
+
+        let engine_a = Arc::new(SyncEngine::new(
+            Arc::new(sess_a),
+            db_a.clone(),
+            dir_a.clone(),
+            None,
+        ));
+        let engine_b = Arc::new(SyncEngine::new(
+            Arc::new(sess_b),
+            db_b.clone(),
+            dir_b.clone(),
+            None,
+        ));
+        engine_a.clone().start();
+        engine_b.clone().start();
+
+        // Create a blob on A and reference it from a paper.
+        let blob_bytes = b"fake pdf content".to_vec();
+        let rel_path = crate::file_store::write_blob(&dir_a, &blob_bytes, "pdf")?;
+        let hash = crate::file_store::sha256_hex(&blob_bytes);
+
+        sqlx::query(
+            "INSERT INTO papers (id, title, file_path, created_at, updated_at, imported_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("p1")
+        .bind("Paper One")
+        .bind(&rel_path)
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&db_a)
+        .await?;
+
+        engine_a.sync_once().await?;
+
+        // Wait for changeset + blob request + blob payload.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let paper_count: (i64,) = sqlx::query_as("SELECT count(*) FROM papers WHERE id = 'p1'")
+            .fetch_one(&db_b)
+            .await?;
+        assert_eq!(paper_count.0, 1, "paper metadata should be synced to B");
+
+        let blob_exists = crate::file_store::has_blob(&dir_b, &hash);
+        assert!(blob_exists, "blob should be transferred to B");
+
+        sqlx::query("SELECT crsql_finalize()")
+            .execute(&db_a)
+            .await?;
+        sqlx::query("SELECT crsql_finalize()")
+            .execute(&db_b)
+            .await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
+    /// Real PDFs are hundreds of KB to several MB — far above the 16KB SCTP
+    /// datagram limit, so blob payloads must be split into chunks and
+    /// reassembled on the receiving side. The small-blob test above only
+    /// exercises the direct-send path; this one proves the chunked path
+    /// transfers a large blob byte-for-byte.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sync_engine_transfers_large_blob_in_chunks() -> anyhow::Result<()> {
+        let (sess_a, sess_b) = connect_sessions().await?;
+        let (db_a, dir_a) = create_test_db().await?;
+        let (db_b, dir_b) = create_test_db().await?;
+
+        let engine_a = Arc::new(SyncEngine::new(
+            Arc::new(sess_a),
+            db_a.clone(),
+            dir_a.clone(),
+            None,
+        ));
+        let engine_b = Arc::new(SyncEngine::new(
+            Arc::new(sess_b),
+            db_b.clone(),
+            dir_b.clone(),
+            None,
+        ));
+        engine_a.clone().start();
+        engine_b.clone().start();
+
+        // ~300KB pseudo-PDF: representative of a real paper, guaranteed to
+        // exceed MAX_WIRE_MSG and exercise the chunker.
+        let blob_bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let rel_path = crate::file_store::write_blob(&dir_a, &blob_bytes, "pdf")?;
+        let hash = crate::file_store::sha256_hex(&blob_bytes);
+        assert!(blob_bytes.len() > super::MAX_WIRE_MSG, "test must exceed the chunk threshold");
+
+        sqlx::query(
+            "INSERT INTO papers (id, title, file_path, created_at, updated_at, imported_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("p-big")
+        .bind("Big Paper")
+        .bind(&rel_path)
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&db_a)
+        .await?;
+
+        engine_a.sync_once().await?;
+
+        // Wait for changeset + blob request + chunked blob payloads.
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+
+        let paper_count: (i64,) = sqlx::query_as("SELECT count(*) FROM papers WHERE id = 'p-big'")
+            .fetch_one(&db_b)
+            .await?;
+        assert_eq!(paper_count.0, 1, "paper metadata should be synced to B");
+
+        assert!(
+            crate::file_store::has_blob(&dir_b, &hash),
+            "large blob should be transferred to B"
+        );
+        let received = std::fs::read(crate::file_store::blob_path(&dir_b, &hash, "pdf"))?;
+        assert_eq!(
+            received,
+            blob_bytes,
+            "chunked transfer must reproduce the blob byte-for-byte"
+        );
+
+        sqlx::query("SELECT crsql_finalize()")
+            .execute(&db_a)
+            .await?;
+        sqlx::query("SELECT crsql_finalize()")
+            .execute(&db_b)
+            .await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
+    /// Note images are embedded in note Markdown as `![...](blobs/<hash>.png)`
+    /// and must be transferred along with the note, or synced devices show
+    /// broken images.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sync_engine_transfers_note_image_blob() -> anyhow::Result<()> {
+        let (sess_a, sess_b) = connect_sessions().await?;
+        let (db_a, dir_a) = create_test_db().await?;
+        let (db_b, dir_b) = create_test_db().await?;
+
+        let engine_a = Arc::new(SyncEngine::new(
+            Arc::new(sess_a),
+            db_a.clone(),
+            dir_a.clone(),
+            None,
+        ));
+        let engine_b = Arc::new(SyncEngine::new(
+            Arc::new(sess_b),
+            db_b.clone(),
+            dir_b.clone(),
+            None,
+        ));
+        engine_a.clone().start();
+        engine_b.clone().start();
+
+        // A note on A references a pasted image stored in the blob store.
+        let img_bytes: Vec<u8> = (0..40_000u32).map(|i| (i % 200) as u8).collect();
+        let rel_path = crate::file_store::write_blob(&dir_a, &img_bytes, "png")?;
+        let hash = crate::file_store::sha256_hex(&img_bytes);
+        let content = format!("![Pasted image]({rel_path})");
+
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, content, content_plain, tags, aliases, created_at, updated_at) \
+             VALUES ('n1', 1, 'note-with-img', ?, ?, '[]', '[]', ?, ?)",
+        )
+        .bind(&content)
+        .bind(&content)
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&db_a)
+        .await?;
+
+        engine_a.sync_once().await?;
+
+        // Wait for note changeset + blob request + blob payload.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        let note_count: (i64,) = sqlx::query_as("SELECT count(*) FROM notes WHERE id = 'n1'")
+            .fetch_one(&db_b)
+            .await?;
+        assert_eq!(note_count.0, 1, "note should be synced to B");
+
+        assert!(
+            crate::file_store::has_blob(&dir_b, &hash),
+            "note image blob should be transferred to B"
+        );
+        let received = std::fs::read(crate::file_store::blob_path(&dir_b, &hash, "png"))?;
+        assert_eq!(received, img_bytes, "note image must be byte-identical");
+
+        sqlx::query("SELECT crsql_finalize()")
+            .execute(&db_a)
+            .await?;
+        sqlx::query("SELECT crsql_finalize()")
+            .execute(&db_b)
+            .await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
+    /// Offline delivery: A encrypts a changeset into a mailbox message; B
+    /// decrypts and applies it without any live P2P session. This is the core
+    /// of the "edit on device A while B is offline, then B logs in and gets
+    /// the changes" flow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mailbox_message_decrypt_and_apply() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-mailbox-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a_path = dir.join("a.db");
+        let db_b_path = dir.join("b.db");
+        let db_a = crate::core::db::tests::connect_with_crsqlite(&db_a_path).await?;
+        let db_b = crate::core::db::tests::connect_with_crsqlite(&db_b_path).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db_a).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db_b).await?;
+        crate::core::db::register_crr_tables(&db_a, crate::core::db::CORE_SYNC_TABLES).await?;
+        crate::core::db::register_crr_tables(&db_b, crate::core::db::CORE_SYNC_TABLES).await?;
+
+        // A edits a note, then (offline) exports the changeset and encrypts it.
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, content, content_plain, tags, aliases, created_at, updated_at) \
+             VALUES ('n-offline', 1, 'offline-note', 'body', 'body', '[]', '[]', ?, ?)",
+        )
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&db_a)
+        .await?;
+        let changes = crate::sync::crdt::export_changes_since(&db_a, 0).await?;
+        assert!(!changes.changes.is_empty(), "A must have changes to deliver");
+
+        let key = crate::sync::crypto::generate_sync_key();
+        let json = serde_json::to_string(&SyncMessage::Changeset(changes))?;
+        let (ciphertext, nonce) = crate::sync::crypto::encrypt_bytes(&key, json.as_bytes())
+            .map_err(anyhow::Error::msg)?;
+        use base64::Engine as _;
+        let msg = crate::sync::types::MailboxMessage {
+            id: "m1".to_string(),
+            from_device_id: "device-a".to_string(),
+            ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+            nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
+            account_level: false,
+        };
+
+        // B (no session, no peer) decrypts and applies the message.
+        let envelope =
+            decrypt_and_apply_mailbox_message(&db_b, &key, &msg).await?;
+        assert!(
+            matches!(envelope, SyncMessage::Changeset(_)),
+            "envelope should be a changeset"
+        );
+
+        let note_count: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM notes WHERE id = 'n-offline'")
+                .fetch_one(&db_b)
+                .await?;
+        assert_eq!(note_count.0, 1, "offline note must appear on B after mailbox apply");
+
+        // Tampered ciphertext must be rejected.
+        let mut tampered = msg.clone();
+        let last = tampered.ciphertext.len() - 1;
+        let mut bytes = tampered.ciphertext.into_bytes();
+        bytes[last] = if bytes[last] == b'A' { b'B' } else { b'A' };
+        tampered.ciphertext = String::from_utf8(bytes)?;
+        assert!(
+            decrypt_and_apply_mailbox_message(&db_b, &key, &tampered).await.is_err(),
+            "tampered mailbox message must be rejected"
+        );
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
+    /// The mailbox-only path (no live P2P DataChannel) must still transfer
+    /// referenced blobs. A sends a paper changeset, B applies it and requests
+    /// the missing PDF, A deposits the blob payload back, and B writes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mailbox_batch_transfers_missing_blob() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-mailbox-blob-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a = crate::core::db::tests::connect_with_crsqlite(&dir.join("a.db")).await?;
+        let db_b = crate::core::db::tests::connect_with_crsqlite(&dir.join("b.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db_a).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db_b).await?;
+        crate::core::db::register_crr_tables(&db_a, crate::core::db::CORE_SYNC_TABLES).await?;
+        crate::core::db::register_crr_tables(&db_b, crate::core::db::CORE_SYNC_TABLES).await?;
+
+        let dir_a = dir.join("a_blobs");
+        let dir_b = dir.join("b_blobs");
+        std::fs::create_dir_all(&dir_a)?;
+        std::fs::create_dir_all(&dir_b)?;
+
+        // A creates a paper whose PDF lives in A's blob store.
+        let blob_bytes = b"fake pdf content for mailbox sync".to_vec();
+        let rel_path = crate::file_store::write_blob(&dir_a, &blob_bytes, "pdf")?;
+        let hash = crate::file_store::sha256_hex(&blob_bytes);
+        sqlx::query(
+            "INSERT INTO papers (id, title, file_path, created_at, updated_at, imported_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("p1")
+        .bind("Paper One")
+        .bind(&rel_path)
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&db_a)
+        .await?;
+
+        let key = crate::sync::crypto::generate_sync_key();
+        use base64::Engine as _;
+
+        // A sends the changeset to B as an encrypted mailbox message.
+        let changes = crate::sync::crdt::export_changes_since(&db_a, 0).await?;
+        let changeset_json = serde_json::to_string(&SyncMessage::Changeset(changes))?;
+        let (ct, nonce) = crate::sync::crypto::encrypt_bytes(&key, changeset_json.as_bytes())
+            .map_err(anyhow::Error::msg)?;
+        let msg_to_b = crate::sync::types::MailboxMessage {
+            id: "m1".to_string(),
+            from_device_id: "device-a".to_string(),
+            ciphertext: base64::engine::general_purpose::STANDARD.encode(&ct),
+            nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
+            account_level: false,
+        };
+
+        // B applies the changeset and should deposit an AttachmentRequest back to A.
+        let (b_to_a_tx, mut b_to_a_rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay_b = crate::sync::relay_client::RelayClient::new_for_test(b_to_a_tx);
+        handle_mailbox_batch(&db_b, &dir_b, &key, &relay_b, vec![msg_to_b]).await?;
+
+        let paper_count: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM papers WHERE id = 'p1'")
+                .fetch_one(&db_b)
+                .await?;
+        assert_eq!(paper_count.0, 1, "paper metadata must be synced to B");
+
+        let deposit = b_to_a_rx
+            .recv()
+            .await
+            .context("B did not send attachment request")?;
+        let crate::sync::types::RelayClientMsg::MailboxDeposit { payload: req_payload } = deposit else {
+            anyhow::bail!("expected mailbox deposit from B, got {:?}", deposit);
+        };
+        let req_ct = req_payload.ciphertext.clone();
+        let req_nonce = req_payload.nonce.clone();
+        let req_envelope = decrypt_mailbox_message(
+            &key,
+            &crate::sync::types::MailboxMessage {
+                id: "req".to_string(),
+                from_device_id: "device-b".to_string(),
+                ciphertext: req_payload.ciphertext,
+                nonce: req_payload.nonce,
+                account_level: false,
+            },
+        )
+        .await?;
+        let SyncMessage::AttachmentRequest { hashes } = req_envelope else {
+            anyhow::bail!("expected attachment request, got {:?}", req_envelope);
+        };
+        assert_eq!(hashes, vec![(hash.clone(), "pdf".to_string())]);
+
+        // A receives the request and deposits the blob payload back to B.
+        let (a_to_b_tx, mut a_to_b_rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay_a = crate::sync::relay_client::RelayClient::new_for_test(a_to_b_tx);
+        handle_mailbox_batch(
+            &db_a,
+            &dir_a,
+            &key,
+            &relay_a,
+            vec![crate::sync::types::MailboxMessage {
+                id: "req".to_string(),
+                from_device_id: "device-b".to_string(),
+                ciphertext: req_ct,
+                nonce: req_nonce,
+                account_level: false,
+            }],
+        )
+        .await?;
+
+        let payload_deposit = a_to_b_rx
+            .recv()
+            .await
+            .context("A did not send blob payload")?;
+        let crate::sync::types::RelayClientMsg::MailboxDeposit { payload: payload_payload } = payload_deposit else {
+            anyhow::bail!("expected mailbox deposit from A, got {:?}", payload_deposit);
+        };
+
+        // B receives the payload and writes the blob.
+        handle_mailbox_batch(
+            &db_b,
+            &dir_b,
+            &key,
+            &relay_b,
+            vec![crate::sync::types::MailboxMessage {
+                id: "payload".to_string(),
+                from_device_id: "device-a".to_string(),
+                ciphertext: payload_payload.ciphertext,
+                nonce: payload_payload.nonce,
+                account_level: false,
+            }],
+        )
+        .await?;
+
+        assert!(
+            crate::file_store::has_blob(&dir_b, &hash),
+            "blob must be written on B after mailbox payload"
+        );
+        let received = std::fs::read(crate::file_store::blob_path(&dir_b, &hash, "pdf"))?;
+        assert_eq!(received, blob_bytes, "mailbox-transferred blob must be byte-identical");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+}

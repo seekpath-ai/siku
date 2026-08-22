@@ -1,0 +1,511 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #1A1A1E;
+  --surface: #24242B;
+  --surface-hover: #2E2E36;
+  --primary: #E67E22;
+  --accent: #27AE60;
+  --text-primary: #F5F5F5;
+  --text-secondary: #9CA3AF;
+}
+
+body {
+  background-color: var(--background);
+  color: var(--text-primary);
+  font-family: 'Inter', 'PingFang SC', 'Noto Sans SC', sans-serif;
+}
+
+/* In the Tauri window the body must stay transparent so the CSS rounded
+   corners on the app shell let the desktop show through the corners. */
+body.in-tauri {
+  background-color: transparent;
+}
+
+/* Frameless window drag region (Windows / Linux fallback) */
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+.titlebar-drag button,
+.titlebar-drag a,
+.titlebar-drag [data-no-drag] {
+  -webkit-app-region: no-drag;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--background);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--surface-hover);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3E3E46;
+}
+
+/* ===== pdf.js TextLayer styles ===== */
+.pdf-text-layer {
+  position: absolute;
+  text-align: initial;
+  inset: 0;
+  overflow: hidden;
+  opacity: 1;
+  line-height: 1;
+  -webkit-text-size-adjust: none;
+  -moz-text-size-adjust: none;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 0;
+  color-scheme: only light;
+
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+
+.pdf-text-layer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  user-select: text;
+}
+
+.pdf-text-layer > :not(.markedContent),
+.pdf-text-layer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x))
+    scale(var(--min-font-size-inv));
+}
+
+.pdf-text-layer .markedContent {
+  display: contents;
+}
+
+.pdf-text-layer .endOfContent {
+  display: block;
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: 0;
+  cursor: default;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  user-select: none;
+}
+
+.pdf-text-layer.selecting .endOfContent {
+  top: 0;
+}
+
+/* ===== Search Highlight styles ===== */
+.pdf-text-layer .highlight {
+  --highlight-bg-color: rgba(180, 0, 170, 0.25);
+  --highlight-selected-bg-color: rgba(230, 126, 34, 0.4);
+  margin: -1px;
+  padding: 1px;
+  background-color: var(--highlight-bg-color);
+  border-radius: 4px;
+}
+
+.pdf-text-layer .highlight.appended {
+  position: initial;
+}
+
+.pdf-text-layer .highlight.begin {
+  border-radius: 4px 0 0 4px;
+}
+
+.pdf-text-layer .highlight.end {
+  border-radius: 0 4px 4px 0;
+}
+
+.pdf-text-layer .highlight.middle {
+  border-radius: 0;
+}
+
+.pdf-text-layer .highlight.selected {
+  background-color: var(--highlight-selected-bg-color);
+  scroll-margin-top: 50px;
+}
+
+/*
+ * The native selection background is painted at the font's ascent+descent
+ * height regardless of line-height, so for PDFs whose text items include
+ * line leading, adjacent lines' highlights touch and the inter-line gap
+ * gets painted too. We hide the native background and draw shrunken
+ * overlay rects from JS instead (see PdfViewer.tsx "selection overlay").
+ */
+.pdf-text-layer ::-moz-selection {
+  background: transparent;
+  color: transparent;
+}
+
+.pdf-text-layer ::selection {
+  background: transparent;
+  color: transparent;
+}
+
+/* Hide selection while the text layer is being re-rendered (e.g. on zoom). */
+.pdf-text-layer.selectionRendering ::-moz-selection,
+.pdf-text-layer.selectionRendering ::selection {
+  background: transparent;
+  color: transparent;
+}
+
+.pdf-text-layer br::-moz-selection,
+.pdf-text-layer br::selection {
+  background: transparent;
+}
+
+/* Custom selection overlay (drawn by PdfViewer): one <svg><path> per page,
+ * single fill so overlapping rects never double-darken. */
+.pdf-selection-overlay path {
+  fill: rgba(0 0 255 / 0.25);
+  fill: color-mix(in srgb, AccentColor, transparent 50%);
+}
+
+/* ── Obsidian-style Live Preview (CodeMirror decorations) ── */
+.cm-live-h1 { font-size: 1.7em; font-weight: 700; }
+.cm-live-h2 { font-size: 1.45em; font-weight: 700; }
+.cm-live-h3 { font-size: 1.25em; font-weight: 600; }
+.cm-live-h4 { font-size: 1.1em; font-weight: 600; }
+.cm-live-h5 { font-size: 1em; font-weight: 600; }
+.cm-live-h6 { font-size: 0.9em; font-weight: 600; color: var(--text-secondary); }
+.cm-live-strong { font-weight: 700; }
+.cm-live-em { font-style: italic; }
+.cm-live-strike { text-decoration: line-through; opacity: 0.7; }
+.cm-live-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+.cm-live-quote {
+  color: var(--text-secondary);
+  border-left: 2px solid rgba(255, 255, 255, 0.15);
+  padding-left: 8px;
+}
+.cm-live-link.cm-live-link { color: var(--primary); text-decoration: underline; cursor: pointer; }
+.cm-live-wiki.cm-live-wiki { color: var(--primary); text-decoration: underline; cursor: pointer; }
+
+/* ==highlight== (Obsidian flavour) */
+.cm-live-highlight { background: rgba(250, 204, 21, 0.28); border-radius: 2px; padding: 0 1px; }
+
+/* Rendered task checkbox is clickable (toggles [ ]/[x]) */
+.cm-live-task { cursor: pointer; user-select: none; }
+
+/* ── CodeMirror: force dark/transparent editor background (app theme) ── */
+.cm-editor,
+.cm-editor.cm-focused,
+.cm-theme-dark .cm-editor,
+.cm-theme-light .cm-editor {
+  background-color: transparent !important;
+}
+.cm-editor .cm-gutters {
+  background-color: transparent !important;
+}
+
+/* ── Live Preview: dimmed markdown syntax markers ── */
+.cm-live-marker { opacity: 0.35; }
+
+/* CodeBlock syntax highlight (digit-free class names: the numeric highlight
+   pass must never match inside the markup it inserts).
+   Palette matches the editor's oneDark theme so read mode and live preview
+   render code identically. */
+.cb-kw { color: #c678dd; }
+.cb-fn { color: #61afef; }
+.cb-num { color: #d19a66; }
+.cb-str { color: #98c379; }
+.cb-com { color: #5c6370; font-style: italic; }
+
+/* ── Pet (global domain-agent assistant) ── */
+@keyframes pet-breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+}
+.pet-ball { animation: pet-breathe 3s ease-in-out infinite; }
+@keyframes pet-blink {
+  0%, 88%, 100% { transform: scaleY(1); }
+  94% { transform: scaleY(0.1); }
+}
+.pet-eye { animation: pet-blink 3s infinite; }
+@keyframes pet-think {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-1.5px); }
+}
+.pet-thinking .pet-eye { animation: pet-think 0.6s ease-in-out infinite; }
+
+/* ── CodeMirror merge view (note version diff) ── */
+.cm-mergeView { height: 100%; }
+.cm-mergeView .cm-editor { height: 100%; }
+.cm-mergeView .cm-merge-gap { background: var(--surface); }
+
+/* ── Live Preview: rendered math (KaTeX) & tables ── */
+.cm-live-math {
+  padding: 0 2px;
+  white-space: nowrap;
+  cursor: text;
+}
+/* Block math: vertical spacing via padding on the widget — margins are
+   excluded from CM's block-widget height measurement and would desync
+   click coordinates. */
+.cm-live-math-block { display: block; padding: 0.4em 0; }
+.cm-live-math-block .katex-display { margin: 0; }
+.cm-live-table {
+  /* padding, not margin: same height-map reason as above */
+  padding: 6px 0;
+  overflow-x: auto;
+  padding-right: 0.75rem;
+  cursor: text;
+  position: relative;
+}
+/* Copy buttons: corner button copies the whole table (markdown source),
+   per-cell buttons copy that cell's text. Hover-only, so they add no visual
+   noise while editing. */
+.cm-live-table-copy,
+.cm-live-table-cellcopy {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  padding: 1px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  background: #24242B;
+  color: var(--text-secondary);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 1;
+}
+.cm-live-table-copy { top: 8px; right: 0; }
+.cm-live-table-cellcopy { top: 1px; right: 1px; }
+.cm-live-table:hover .cm-live-table-copy,
+.cm-live-table td:hover .cm-live-table-cellcopy,
+.cm-live-table th:hover .cm-live-table-cellcopy { opacity: 1; }
+.cm-live-table-copy:hover,
+.cm-live-table-cellcopy:hover { color: var(--text-primary); border-color: rgba(255, 255, 255, 0.3); }
+.cm-live-table-copy.copied,
+.cm-live-table-cellcopy.copied { color: #27AE60; opacity: 1; }
+.cm-live-table th,
+.cm-live-table td { position: relative; }
+
+/* ── Live Preview: code blocks, lists, tasks, rules, images ── */
+.cm-live-codeblock {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  color: #E5E7EB;
+  background: rgba(0, 0, 0, 0.32);
+}
+/* Fenced code block (Obsidian style): full-width lines + collapsed fences */
+.cm-live-codeblock-line {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+  color: #E5E7EB;
+  background: rgba(0, 0, 0, 0.32);
+  padding-left: 10px;
+  padding-right: 10px;
+}
+.cm-live-codeblock-first {
+  border-radius: 6px 6px 0 0;
+  padding-top: 6px;
+}
+.cm-live-codeblock-last {
+  border-radius: 0 0 6px 6px;
+  padding-bottom: 6px;
+}
+.cm-live-fence {
+  font-size: 0;
+  /* Absolute px: 0.4em would compute against font-size: 0 and collapse to 0. */
+  line-height: 2px;
+}
+.cm-live-code-header {
+  float: right;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+  opacity: 0.45;
+  transition: opacity 0.15s;
+  user-select: none;
+}
+.cm-live-code-header:hover { opacity: 1; }
+.cm-live-code-lang {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+.cm-live-code-copy {
+  font-size: 10px;
+  color: var(--text-secondary);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  padding: 0 5px;
+  cursor: pointer;
+  background: transparent;
+}
+.cm-live-code-copy:hover { color: var(--text-primary); border-color: rgba(255, 255, 255, 0.3); }
+.cm-live-bullet {
+  color: var(--primary);
+  margin-right: 2px;
+}
+.cm-live-listmark {
+  color: var(--primary);
+  font-weight: 600;
+}
+.cm-live-task {
+  color: var(--primary);
+  margin: 0 2px;
+}
+/* Horizontal rule rendered as a slim line decoration: text hidden with
+   font-size: 0, the rule drawn via border-top. Padding (not margin) keeps
+   the line's measured height in sync with what CM computes. Clicking the
+   line places the caret on the `---` source, which then reappears. */
+.cm-live-hr-line {
+  font-size: 0;
+  line-height: 4px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.2);
+  background-clip: padding-box;
+}
+.cm-live-image {
+  max-width: 100%;
+  max-height: 320px;
+  object-fit: contain;
+  border-radius: 6px;
+  margin: 0.3em 0;
+  vertical-align: middle;
+  cursor: text;
+}
+.cm-live-table table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.875em;
+  color: #D1D5DB;
+}
+.cm-live-table th,
+.cm-live-table td {
+  border: 1px solid #333333;
+  padding: 4px 12px;
+  text-align: left;
+  vertical-align: top;
+}
+.cm-live-table th {
+  background: rgba(255, 255, 255, 0.05);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.cm-live-table tr:nth-child(even) td {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* ── Typography (prose) — map app theme into prose-invert variables ── */
+.prose.prose-invert {
+  --tw-prose-body: #D1D5DB;
+  --tw-prose-headings: var(--text-primary);
+  --tw-prose-lead: var(--text-secondary);
+  --tw-prose-links: var(--primary);
+  --tw-prose-bold: var(--text-primary);
+  --tw-prose-counters: var(--text-secondary);
+  --tw-prose-bullets: var(--text-secondary);
+  --tw-prose-hr: #333333;
+  --tw-prose-quotes: var(--text-primary);
+  --tw-prose-quote-borders: rgba(255, 255, 255, 0.18);
+  --tw-prose-captions: var(--text-secondary);
+  --tw-prose-code: #F0ABFC;
+  --tw-prose-pre-code: #E5E7EB;
+  --tw-prose-pre-bg: #0d0d0d;
+  --tw-prose-th-borders: #3E3E46;
+  --tw-prose-td-borders: #333333;
+}
+.prose.prose-invert :where(pre):not(:where([class~="not-prose"] *)) {
+  border: 1px solid #333333;
+  border-radius: 8px;
+}
+.prose.prose-invert :where(table):not(:where([class~="not-prose"] *)) {
+  font-size: 0.875rem;
+}
+/* Full grid borders for tables — keep in sync with `.cm-live-table`
+   (Live Preview widget) so both render identically. */
+.prose.prose-invert :where(table):not(:where([class~="not-prose"] *)) {
+  border-collapse: collapse;
+  width: 100%;
+}
+.prose.prose-invert :where(th):not(:where([class~="not-prose"] *)),
+.prose.prose-invert :where(td):not(:where([class~="not-prose"] *)) {
+  border: 1px solid #333333;
+  padding: 4px 12px;
+  text-align: left;
+  vertical-align: top;
+}
+.prose.prose-invert :where(th):not(:where([class~="not-prose"] *)) {
+  background: rgba(255, 255, 255, 0.05);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.prose.prose-invert :where(tr):not(:where([class~="not-prose"] *)):nth-child(even) :where(td) {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* Explicit heading sizes as a fallback — typography's generated rules can be
+   missing in stale dev builds (preflight then leaves h1-h6 at inherit).
+   Values match typography defaults so this is invisible when it does load. */
+.prose.prose-invert :where(h1, h2, h3, h4, h5, h6):not(:where([class~="not-prose"] *)) {
+  color: var(--tw-prose-headings, var(--text-primary));
+  font-weight: 700;
+  line-height: 1.25;
+}
+.prose.prose-invert :where(h1):not(:where([class~="not-prose"] *)) { font-size: 2em; }
+.prose.prose-invert :where(h2):not(:where([class~="not-prose"] *)) { font-size: 1.5em; }
+.prose.prose-invert :where(h3):not(:where([class~="not-prose"] *)) { font-size: 1.25em; }
+.prose.prose-invert :where(h4):not(:where([class~="not-prose"] *)) { font-size: 1.1em; }
+.prose.prose-invert :where(h5):not(:where([class~="not-prose"] *)) { font-size: 1em; }
+.prose.prose-invert :where(h6):not(:where([class~="not-prose"] *)) { font-size: 0.9em; color: var(--text-secondary); }
+.prose.prose-invert :where(a):not(:where([class~="not-prose"] *)) {
+  text-decoration: none;
+}
+.prose.prose-invert :where(a):not(:where([class~="not-prose"] *)):hover {
+  text-decoration: underline;
+}
+
+/* Onboarding wizard step transition */
+@keyframes siku-onboard-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Brief highlight flash for notes matched by filters (search / tag / AI). */
+@keyframes flash-match {
+  0%, 100% { background-color: transparent; }
+  20%, 60% { background-color: rgba(230, 126, 34, 0.35); }
+}
+.flash-match {
+  animation: flash-match 1.2s ease-in-out 2;
+}
+
+/* Brief green flash confirming a successful drag-and-drop move. */
+@keyframes flash-success {
+  0%, 100% { background-color: transparent; }
+  20%, 60% { background-color: rgba(39, 174, 96, 0.35); }
+}
+.flash-success {
+  animation: flash-success 0.9s ease-in-out 1;
+}

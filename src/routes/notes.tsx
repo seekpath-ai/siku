@@ -1,0 +1,498 @@
+import { useState, useEffect } from 'react';
+import { createRoute } from '@tanstack/react-router';
+import { Route as RootRoute } from './__root';
+import { NoteList } from '@/components/notes/NoteList';
+import { NoteEditor } from '@/components/notes/NoteEditor';
+import { VaultSwitcher } from '@/components/notes/VaultSwitcher';
+import { HelpDialog } from '@/components/notes/HelpDialog';
+import { NotesSettingsModal } from '@/components/notes/NotesSettingsModal';
+import { ListPanel } from '@/components/layout/ListPanel';
+import { Folder } from 'lucide-react';
+import { useShellStore } from '@/stores/shellStore';
+import { useDialog } from '@/hooks/useDialog';
+import { usePetContextStore } from '@/stores/petContextStore';
+import { useTabStore } from '@/stores/tabStore';
+import type { Note, Vault } from '@/lib/types';
+import {
+  notesListAll,
+  notesCreate,
+  notesUpdate,
+  notesDelete,
+  notesMove,
+  notesGetBacklinks,
+  vaultList,
+  vaultCurrent,
+  vaultCreate,
+  vaultRename,
+  vaultDelete,
+  vaultSetCurrent,
+  vaultExport,
+  vaultImport,
+} from '@/lib/tauri';
+import { pickDirectory } from '@/lib/pickDirectory';
+
+function NotesPage() {
+  const [notes, setNotes] = useState<Note[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [activeNote, setActiveNote] = useState<Note | null>(null);
+  const [backlinks, setBacklinks] = useState<{ id: string; title: string; context: string; created_at: string }[]>([]);
+  const [vaults, setVaults] = useState<Vault[]>([]);
+  const [currentVault, setCurrentVault] = useState<Vault | null>(null);
+  const [vaultOpen, setVaultOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  // Bumped after a version restore so NoteEditor remounts with fresh data.
+  const [editorKey, setEditorKey] = useState(0);
+  const { setSidePanelCollapsed } = useShellStore();
+  const { alert, confirm } = useDialog();
+  const { note: noteParam } = Route.useSearch();
+
+  useEffect(() => { loadNotes(); }, []);
+
+  // Reload notes when a new note is created from outside the notes page (e.g. Ctrl+N).
+  useEffect(() => {
+    const handler = () => loadNotes();
+    window.addEventListener('siku:note-created', handler);
+    return () => window.removeEventListener('siku:note-created', handler);
+  }, []);
+
+  // Activate a note passed via URL (?note=<id>) — used by "open in new window".
+  useEffect(() => {
+    if (noteParam) setActiveId(noteParam);
+  }, [noteParam]);
+
+  const loadVaults = async () => {
+    try {
+      const [list, current] = await Promise.all([vaultList(), vaultCurrent()]);
+      setVaults(list);
+      setCurrentVault(current);
+    } catch (err) {
+      console.error('load vaults:', err);
+    }
+  };
+
+  useEffect(() => { loadVaults(); }, []);
+
+  const handleSwitchVault = async (id: string) => {
+    try {
+      const v = await vaultSetCurrent(id);
+      setCurrentVault(v);
+      setActiveId(null);
+      setActiveNote(null);
+      setBacklinks([]);
+      await loadNotes();
+    } catch (err) {
+      console.error('switch vault:', err);
+    }
+  };
+
+  const handleCreateVault = async (name: string) => {
+    try {
+      const v = await vaultCreate(name);
+      await vaultSetCurrent(v.id);
+      setCurrentVault(v);
+      await Promise.all([loadNotes(), loadVaults()]);
+      setActiveId(null);
+      setActiveNote(null);
+      setBacklinks([]);
+    } catch (err) {
+      console.error('create vault:', err);
+    }
+  };
+
+  const handleRenameVault = async (id: string, name: string) => {
+    try {
+      const v = await vaultRename(id, name);
+      if (currentVault?.id === id) setCurrentVault(v);
+      await loadVaults();
+    } catch (err) {
+      console.error('rename vault:', err);
+    }
+  };
+
+  const handleDeleteVault = async (id: string) => {
+    try {
+      await vaultDelete(id);
+      if (currentVault?.id === id) {
+        setActiveId(null);
+        setActiveNote(null);
+        setBacklinks([]);
+        await Promise.all([loadNotes(), loadVaults()]);
+      } else {
+        await loadVaults();
+      }
+    } catch (err) {
+      console.error('delete vault:', err);
+    }
+  };
+
+  const handleExportVault = async () => {
+    if (!currentVault) return;
+    const dir = await pickDirectory();
+    if (!dir) return;
+    try {
+      const n = await vaultExport(currentVault.id, dir);
+      await alert(`已导出 ${n} 篇笔记到：\n${dir}`, '导出完成');
+    } catch (err) {
+      console.error('export vault:', err);
+      await alert(`导出失败：${err}`, '导出失败');
+    }
+  };
+
+  const handleImportVault = async () => {
+    if (!currentVault) return;
+    const dir = await pickDirectory();
+    if (!dir) return;
+    const ok = await confirm(`将把「${dir}」中的 Markdown 笔记导入当前库「${currentVault.name}」，继续吗？`);
+    if (!ok) return;
+    try {
+      const r = await vaultImport(currentVault.id, dir);
+      await loadNotes();
+      await alert(`已导入 ${r.imported} 篇笔记${r.skipped ? `，跳过 ${r.skipped} 个非笔记文件` : ''}`, '导入完成');
+    } catch (err) {
+      console.error('import vault:', err);
+      await alert(`导入失败：${err}`, '导入失败');
+    }
+  };
+
+  const loadNotes = async () => {
+    try {
+      setNotes(await notesListAll());
+    } catch (err) {
+      console.error('load notes:', err);
+    }
+  };
+
+  useEffect(() => {
+    if (activeId) {
+      const n = notes.find((note) => note.id === activeId);
+      setActiveNote(n || null);
+      // Expose the focused note to the global pet.
+      usePetContextStore.getState().setContext(
+        n ? { page: 'notes', objectId: n.id, title: n.title || '未命名笔记' } : null
+      );
+      loadBacklinks(activeId);
+    } else {
+      setActiveNote(null);
+      setBacklinks([]);
+      usePetContextStore.getState().setContext(null);
+    }
+  }, [activeId, notes]);
+
+  // Clear the pet context when leaving the notes page.
+  useEffect(() => () => usePetContextStore.getState().setContext(null), []);
+
+  const loadBacklinks = async (id: string) => {
+    try {
+      setBacklinks(await notesGetBacklinks(id));
+    } catch {
+      setBacklinks([]);
+    }
+  };
+
+  const handleCreate = async () => {
+    try {
+      const note = await notesCreate('新笔记', '', undefined, undefined);
+      await loadNotes();
+      setActiveId(note.id);
+    } catch (err) {
+      console.error('create note:', err);
+    }
+  };
+
+  /** Create a folder (named "未命名文件夹") and return its id so the list can
+   *  immediately enter rename mode — Obsidian-style. */
+  const handleCreateFolder = async (): Promise<string> => {
+    try {
+      const note = await notesCreate('未命名文件夹', '', undefined, undefined, true);
+      await loadNotes();
+      return note.id;
+    } catch (err) {
+      console.error('create folder:', err);
+      return '';
+    }
+  };
+
+  const handleCreateSubNote = async (parentId: string) => {
+    try {
+      const note = await notesCreate('新子笔记', '', undefined, parentId);
+      await loadNotes();
+      setActiveId(note.id);
+    } catch (err) {
+      console.error('create sub-note:', err);
+    }
+  };
+
+  const handleCreateSubFolder = async (parentId: string): Promise<string> => {
+    try {
+      const note = await notesCreate('未命名文件夹', '', undefined, parentId, true);
+      await loadNotes();
+      return note.id;
+    } catch (err) {
+      console.error('create sub-folder:', err);
+      return '';
+    }
+  };
+
+  const handleRename = async (id: string, title: string) => {
+    try {
+      await notesUpdate(id, title, undefined, undefined);
+      await loadNotes();
+    } catch (err) {
+      console.error('rename note:', err);
+    }
+  };
+
+  const handleUpdate = async (id: string, title: string, content: string) => {
+    try {
+      await notesUpdate(id, title, content, undefined);
+      await loadNotes();
+    } catch (err) {
+      console.error('update note:', err);
+      throw err;
+    }
+  };
+
+  const handleUpdateAliases = async (id: string, aliases: string[]) => {
+    try {
+      await notesUpdate(id, undefined, undefined, undefined, JSON.stringify(aliases));
+      await loadNotes();
+    } catch (err) {
+      console.error('update aliases:', err);
+    }
+  };
+
+  /** Ids of a note/folder plus all its descendants (recursive delete target). */
+  const collectSubtreeIds = (rootId: string): string[] => {
+    const ids = [rootId];
+    for (let i = 0; i < ids.length; i++) {
+      for (const n of notes) {
+        if (n.parent_id === ids[i]) ids.push(n.id);
+      }
+    }
+    return ids;
+  };
+
+  /** `confirmed = true` when the caller (e.g. NoteEditor) already showed a
+   *  confirmation dialog. The backend deletes the whole subtree recursively. */
+  const handleDelete = async (id: string, confirmed?: boolean) => {
+    const subtree = collectSubtreeIds(id);
+    if (!confirmed) {
+      const target = notes.find((n) => n.id === id);
+      const childCount = subtree.length - 1;
+      const ok = await confirm(
+        childCount > 0
+          ? `确定删除文件夹「${target?.title ?? ''}」吗？其中的 ${childCount} 个子项将一并删除，此操作不可撤销。`
+          : `确定删除「${target?.title ?? ''}」吗？此操作不可撤销。`
+      );
+      if (!ok) return;
+    }
+    try {
+      await notesDelete(id);
+      if (activeId && subtree.includes(activeId)) {
+        setActiveId(null);
+        setActiveNote(null);
+      }
+      // Close any open tabs for the deleted note and its descendants.
+      const tabStore = useTabStore.getState();
+      for (const nid of subtree) tabStore.close(`note_${nid}`);
+      await loadNotes();
+    } catch (err) {
+      console.error('delete note:', err);
+    }
+  };
+
+  /** Bulk delete with a single confirmation covering the union of subtrees. */
+  const handleBulkDelete = async (ids: string[]) => {
+    const all = new Set<string>();
+    for (const id of ids) {
+      for (const nid of collectSubtreeIds(id)) all.add(nid);
+    }
+    const ok = await confirm(
+      all.size > ids.length
+        ? `确定删除选中的 ${ids.length} 项吗？连同子项共 ${all.size} 个对象将被删除，此操作不可撤销。`
+        : `确定删除选中的 ${ids.length} 项吗？此操作不可撤销。`
+    );
+    if (!ok) return;
+    try {
+      for (const id of ids) await notesDelete(id);
+      if (activeId && all.has(activeId)) {
+        setActiveId(null);
+        setActiveNote(null);
+      }
+      const tabStore = useTabStore.getState();
+      for (const nid of all) tabStore.close(`note_${nid}`);
+      await loadNotes();
+    } catch (err) {
+      console.error('bulk delete notes:', err);
+    }
+  };
+
+  const handleMoveToRoot = async (id: string) => {
+    try {
+      await notesMove(id, null);
+      await loadNotes();
+    } catch (err) {
+      console.error('move to root:', err);
+    }
+  };
+
+  const handleMoveToFolder = async (id: string, parentId: string | null) => {
+    try {
+      await notesMove(id, parentId);
+      await loadNotes();
+    } catch (err) {
+      console.error('move note:', err);
+    }
+  };
+
+  const handleToggleFavorite = async (id: string, fav: boolean) => {
+    try {
+      await notesUpdate(id, undefined, undefined, undefined, undefined, fav ? 1 : 0);
+      await loadNotes();
+    } catch (err) {
+      console.error('toggle favorite:', err);
+    }
+  };
+
+  const handleBulkCreateFolder = async (ids: string[]): Promise<string> => {
+    try {
+      // Find a common parent if all selected notes share one; otherwise root.
+      const selected = notes.filter((n) => ids.includes(n.id));
+      const parents = new Set(selected.map((n) => n.parent_id ?? null));
+      const parentId = parents.size === 1 ? ([...parents][0] as string | null) : null;
+      const folder = await notesCreate('未命名文件夹', '', undefined, parentId ?? undefined, true);
+      for (const id of ids) {
+        await notesMove(id, folder.id);
+      }
+      await loadNotes();
+      return folder.id;
+    } catch (err) {
+      console.error('bulk create folder:', err);
+      return '';
+    }
+  };
+
+  const handleBulkMove = async (ids: string[], parentId: string | null) => {
+    try {
+      for (const id of ids) {
+        await notesMove(id, parentId);
+      }
+      await loadNotes();
+    } catch (err) {
+      console.error('bulk move:', err);
+    }
+  };
+
+  const handleCreateLink = async (title: string) => {
+    try {
+      const note = await notesCreate(title, '', undefined, undefined);
+      await loadNotes();
+      setActiveId(note.id);
+    } catch (err) {
+      console.error('create note from link:', err);
+    }
+  };
+
+  const handleVersionRestored = async () => {
+    await loadNotes();
+    setEditorKey((k) => k + 1);
+  };
+
+  const handleConvertMention = async (noteId: string) => {
+    if (!activeNote) return;
+    const note = notes.find((n) => n.id === noteId);
+    if (!note) return;
+    const link = `[[${activeNote.title}]]`;
+    const newContent = note.content.trimStart().startsWith(link)
+      ? note.content
+      : `${link}\n\n${note.content}`;
+    try {
+      await notesUpdate(noteId, undefined, newContent, undefined);
+      await loadNotes();
+      if (activeId) {
+        loadBacklinks(activeId);
+      }
+    } catch (err) {
+      console.error('convert mention:', err);
+    }
+  };
+
+  return (
+    <div className="flex h-full">
+      <ListPanel width={260}>
+        <NoteList
+          notes={notes}
+          activeNoteId={activeId}
+          onSelect={setActiveId}
+          onCreate={handleCreate}
+          onCreateFolder={handleCreateFolder}
+          onCreateSubNote={handleCreateSubNote}
+          onCreateSubFolder={handleCreateSubFolder}
+          onRename={handleRename}
+          onDelete={handleDelete}
+          onBulkDelete={handleBulkDelete}
+          onToggleFavorite={handleToggleFavorite}
+          onMoveToRoot={handleMoveToRoot}
+          onMoveToFolder={handleMoveToFolder}
+          onBulkCreateFolder={handleBulkCreateFolder}
+          onBulkMove={handleBulkMove}
+          onClose={() => setSidePanelCollapsed(true)}
+          currentVaultName={currentVault?.name ?? 'cognitive-archive'}
+          onOpenVault={() => setVaultOpen(true)}
+          onOpenHelp={() => setHelpOpen(true)}
+          onOpenSettings={() => setSettingsOpen(true)}
+        />
+      </ListPanel>
+      <div className="flex-1 flex min-w-0 bg-background">
+        {activeNote ? (
+          <NoteEditor
+            key={editorKey}
+            note={activeNote}
+            notes={notes}
+            onUpdate={handleUpdate}
+            onUpdateAliases={handleUpdateAliases}
+            onNavigate={setActiveId}
+            onCreateLink={handleCreateLink}
+            onDelete={handleDelete}
+            onToggleFavorite={handleToggleFavorite}
+            backlinkCount={backlinks.length}
+            backlinks={backlinks}
+            onConvertMention={handleConvertMention}
+            onVersionRestored={handleVersionRestored}
+          />
+        ) : (
+          <div className="flex flex-col items-center justify-center h-full w-full text-text-secondary">
+            <Folder size={48} className="mb-3 opacity-30" />
+            <p className="text-sm">选择或新建一篇笔记</p>
+          </div>
+        )}
+      </div>
+
+      {vaultOpen && (
+        <VaultSwitcher
+          vaults={vaults}
+          currentVaultId={currentVault?.id ?? null}
+          onSwitch={handleSwitchVault}
+          onCreate={handleCreateVault}
+          onRename={handleRenameVault}
+          onDelete={handleDeleteVault}
+          onExport={handleExportVault}
+          onImport={handleImportVault}
+          onClose={() => setVaultOpen(false)}
+        />
+      )}
+      {helpOpen && <HelpDialog onClose={() => setHelpOpen(false)} />}
+      {settingsOpen && <NotesSettingsModal onClose={() => setSettingsOpen(false)} />}
+    </div>
+  );
+}
+
+export const Route = createRoute({
+  getParentRoute: () => RootRoute,
+  path: '/notes',
+  validateSearch: (search: Record<string, unknown>) => ({
+    note: typeof search.note === 'string' ? search.note : undefined,
+  }),
+  component: NotesPage,
+});

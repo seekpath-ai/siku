@@ -124,7 +124,7 @@ Siku 把这些揉成一件事：**让 AI 在你本地的知识库里干活。**
 ```bash
 # 克隆仓库
 git clone https://github.com/seekpath-ai/siku.git
-cd Zhiji
+cd siku
 
 # 安装依赖
 pnpm install
@@ -164,8 +164,8 @@ cargo clippy      # Lint 检查
 推送 `v*` 标签触发 GitHub Actions 三平台构建（Windows / macOS Universal / Linux），产物进入**草稿 Release**，检查无误后在网页上手动发布：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
 发版前提：

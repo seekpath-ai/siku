@@ -29,6 +29,10 @@ pub struct Device {
     pub revoked_at: Option<String>,
     pub last_seen_at: Option<String>,
     pub created_at: String,
+    /// Opaque refresh token for this device. Devices created before this field
+    /// existed will have None and must re-login to obtain one.
+    #[serde(default)]
+    pub refresh_token: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -159,6 +163,7 @@ impl Db {
                         revoked_at: None,
                         last_seen_at: Some(crate::now_iso()),
                         created_at: crate::now_iso(),
+                        refresh_token: None,
                     },
                 );
                 self.persist(&snap);
@@ -181,6 +186,28 @@ impl Db {
             .collect();
         list.sort_by(|a, b| a.created_at.cmp(&b.created_at));
         list
+    }
+
+    pub fn set_device_refresh_token(
+        &self,
+        device_id: &str,
+        refresh_token: &str,
+    ) -> anyhow::Result<()> {
+        let mut snap = self.inner.lock().unwrap();
+        let Some(dev) = snap.devices.get_mut(device_id) else {
+            anyhow::bail!("device not found");
+        };
+        dev.refresh_token = Some(refresh_token.to_string());
+        self.persist(&snap);
+        Ok(())
+    }
+
+    pub fn find_device_by_refresh_token(&self, token: &str) -> Option<Device> {
+        let snap = self.inner.lock().unwrap();
+        snap.devices
+            .values()
+            .find(|d| d.refresh_token.as_deref() == Some(token))
+            .cloned()
     }
 
     pub fn revoke_device(&self, user_id: &str, device_id: &str) -> bool {

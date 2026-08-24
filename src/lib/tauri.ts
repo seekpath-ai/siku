@@ -1240,16 +1240,16 @@ export async function suggestDeviceName(): Promise<string> {
   return invoke<string>('suggest_device_name');
 }
 
-export async function deviceList(relayUrl: string, token: string): Promise<AccountDeviceRow[]> {
-  return invoke<AccountDeviceRow[]>('device_list', { relayUrl, token });
+export async function deviceList(relayUrl: string): Promise<AccountDeviceRow[]> {
+  return invoke<AccountDeviceRow[]>('device_list', { relayUrl });
 }
 
-export async function deviceRevoke(relayUrl: string, token: string, deviceId: string): Promise<void> {
-  return invoke<void>('device_revoke', { relayUrl, token, deviceId });
+export async function deviceRevoke(relayUrl: string, deviceId: string): Promise<void> {
+  return invoke<void>('device_revoke', { relayUrl, deviceId });
 }
 
-export async function deviceRename(relayUrl: string, token: string, deviceId: string, name: string): Promise<void> {
-  return invoke<void>('device_rename', { relayUrl, token, deviceId, name });
+export async function deviceRename(relayUrl: string, deviceId: string, name: string): Promise<void> {
+  return invoke<void>('device_rename', { relayUrl, deviceId, name });
 }
 
 export async function setSyncConfig(config: SyncConfig): Promise<void> {

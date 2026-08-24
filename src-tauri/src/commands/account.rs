@@ -9,6 +9,7 @@ use tracing::info;
 
 pub const ACCOUNT_RELAY_URL_KEY: &str = "account.relay_url";
 pub const ACCOUNT_TOKEN_KEY: &str = "account.token";
+pub const ACCOUNT_REFRESH_TOKEN_KEY: &str = "account.refresh_token";
 pub const ACCOUNT_USER_ID_KEY: &str = "account.user_id";
 pub const ACCOUNT_EMAIL_KEY: &str = "account.email";
 pub const ACCOUNT_DEVICE_NAME_KEY: &str = "account.device_name";
@@ -53,6 +54,102 @@ async fn http_post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
         return Err(format!("{}: {}", status, text.chars().take(200).collect::<String>()));
     }
     serde_json::from_str(&text).map_err(|e| format!("parse response: {e}"))
+}
+
+/// Decode the `exp` claim from a JWT without verifying the signature.
+/// Returns the Unix timestamp, or None if the token is malformed.
+fn decode_jwt_exp(token: &str) -> Option<i64> {
+    let payload_b64 = token.split('.').nth(1)?;
+    use base64::Engine as _;
+    let padded = match payload_b64.len() % 4 {
+        0 => payload_b64.to_string(),
+        r => format!("{}{}", payload_b64, "=".repeat(4 - r)),
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(padded)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims.get("exp")?.as_i64()
+}
+
+/// Clear locally stored account credentials.
+pub async fn clear_account_credentials(db: &sqlx::SqlitePool) {
+    let _ = settings_service::set_device_setting(db, ACCOUNT_TOKEN_KEY, "").await;
+    let _ = settings_service::set_device_setting(db, ACCOUNT_REFRESH_TOKEN_KEY, "").await;
+    let _ = settings_service::set_device_setting(db, ACCOUNT_USER_ID_KEY, "").await;
+    let _ = settings_service::set_device_setting(db, ACCOUNT_EMAIL_KEY, "").await;
+}
+
+/// Refresh the access token using the stored refresh token.
+/// On success returns the new access token and persists both tokens.
+/// On definitive auth failure (invalid refresh token) it clears credentials.
+pub async fn refresh_access_token(
+    db: &sqlx::SqlitePool,
+    relay_url: &str,
+) -> Result<String, String> {
+    let refresh_token = settings_service::get_device_setting(db, ACCOUNT_REFRESH_TOKEN_KEY)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if refresh_token.is_empty() {
+        return Err("登录已过期，请重新登录".to_string());
+    }
+
+    let base_url = crate::sync::onboarding::normalize_http_base(relay_url);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let resp = client
+        .post(format!("{}/api/refresh", base_url.trim_end_matches('/')))
+        .json(&serde_json::json!({ "refresh_token": refresh_token }))
+        .send()
+        .await
+        .map_err(|e| format!("刷新登录状态失败: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        clear_account_credentials(db).await;
+        return Err("登录已过期，请重新登录".to_string());
+    }
+    if !status.is_success() {
+        return Err(format!("刷新登录状态失败: {} {}", status, text.chars().take(200).collect::<String>()));
+    }
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("parse refresh response: {e}"))?;
+    let access_token = json
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or("refresh response missing access_token")?
+        .to_string();
+    let new_refresh_token = json
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&refresh_token)
+        .to_string();
+    settings_service::set_device_setting(db, ACCOUNT_TOKEN_KEY, &access_token).await?;
+    settings_service::set_device_setting(db, ACCOUNT_REFRESH_TOKEN_KEY, &new_refresh_token).await?;
+    Ok(access_token)
+}
+
+/// Check whether the stored access token is expired or about to expire.
+/// Returns true when there is a token and it is valid for at least 5 minutes.
+pub async fn access_token_is_fresh(db: &sqlx::SqlitePool) -> bool {
+    let token = settings_service::get_device_setting(db, ACCOUNT_TOKEN_KEY)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if token.is_empty() {
+        return false;
+    }
+    let Some(exp) = decode_jwt_exp(&token) else {
+        return false;
+    };
+    let now = chrono::Utc::now().timestamp();
+    // Treat as stale if it expires within 5 minutes.
+    exp > now + 300
 }
 
 /// Register a new account.
@@ -102,6 +199,11 @@ pub async fn auth_login(
         .and_then(|v| v.as_str())
         .ok_or("login response missing access_token")?
         .to_string();
+    let refresh_token = resp
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .ok_or("login response missing refresh_token")?
+        .to_string();
     let user_id = resp
         .get("user_id")
         .and_then(|v| v.as_str())
@@ -115,6 +217,7 @@ pub async fn auth_login(
     let db = &state.db;
     settings_service::set_device_setting(db, ACCOUNT_RELAY_URL_KEY, &relay_url).await?;
     settings_service::set_device_setting(db, ACCOUNT_TOKEN_KEY, &access_token).await?;
+    settings_service::set_device_setting(db, ACCOUNT_REFRESH_TOKEN_KEY, &refresh_token).await?;
     settings_service::set_device_setting(db, ACCOUNT_USER_ID_KEY, &user_id).await?;
     settings_service::set_device_setting(db, ACCOUNT_EMAIL_KEY, &email).await?;
     settings_service::set_device_setting(db, ACCOUNT_DEVICE_NAME_KEY, &device_name).await?;
@@ -164,6 +267,7 @@ pub async fn auth_logout(
 
     let db = &state.db;
     let _ = settings_service::set_device_setting(db, ACCOUNT_TOKEN_KEY, "").await;
+    let _ = settings_service::set_device_setting(db, ACCOUNT_REFRESH_TOKEN_KEY, "").await;
     let _ = settings_service::set_device_setting(db, ACCOUNT_USER_ID_KEY, "").await;
     let _ = settings_service::set_device_setting(db, ACCOUNT_EMAIL_KEY, "").await;
     Ok(())
@@ -211,25 +315,71 @@ pub async fn auth_status(state: State<'_, AppState>) -> Result<AuthInfo, String>
     })
 }
 
-/// List the account's devices (requires a valid token).
-#[tauri::command]
-pub async fn device_list(relay_url: String, token: String) -> Result<Vec<DeviceRow>, String> {
-    let relay_url = crate::sync::onboarding::normalize_http_base(&relay_url);
+async fn stored_access_token(db: &sqlx::SqlitePool) -> Result<String, String> {
+    settings_service::get_device_setting(db, ACCOUNT_TOKEN_KEY)
+        .await
+        .ok()
+        .flatten()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "登录已过期，请重新登录".to_string())
+}
+
+async fn auth_request(
+    state: &AppState,
+    relay_url: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<(reqwest::StatusCode, String), String> {
+    let base_url = crate::sync::onboarding::normalize_http_base(relay_url);
+    let token = stored_access_token(&state.db).await?;
+    let url = format!("{}/{}", base_url.trim_end_matches('/'), path);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
-    let resp = client
-        .get(format!("{}/api/devices", relay_url.trim_end_matches('/')))
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
+    let mut req = client.request(method.clone(), url).header("Authorization", format!("Bearer {token}"));
+    if let Some(ref b) = body {
+        req = req.json(b);
+    }
+    let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
+
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        // Access token expired: try to refresh once and retry the original request.
+        let new_token = refresh_access_token(&state.db, relay_url).await?;
+        let mut req2 = client
+            .request(method, format!("{}/{}", base_url.trim_end_matches('/'), path))
+            .header("Authorization", format!("Bearer {new_token}"));
+        if let Some(ref b) = body {
+            req2 = req2.json(b);
+        }
+        let resp2 = req2.send().await.map_err(|e| format!("request failed: {e}"))?;
+        let status2 = resp2.status();
+        let text2 = resp2.text().await.unwrap_or_default();
+        if status2 == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("登录已过期，请重新登录".to_string());
+        }
+        if !status2.is_success() {
+            return Err(format!("{}: {}", status2, text2.chars().take(200).collect::<String>()));
+        }
+        return Ok((status2, text2));
+    }
+
     if !status.is_success() {
         return Err(format!("{}: {}", status, text.chars().take(200).collect::<String>()));
     }
+    Ok((status, text))
+}
+
+/// List the account's devices (requires a valid token).
+#[tauri::command]
+pub async fn device_list(
+    state: State<'_, AppState>,
+    relay_url: String,
+) -> Result<Vec<DeviceRow>, String> {
+    let (_, text) = auth_request(&state, &relay_url, reqwest::Method::GET, "api/devices", None).await?;
     let rows: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
     Ok(rows
         .into_iter()
@@ -245,53 +395,36 @@ pub async fn device_list(relay_url: String, token: String) -> Result<Vec<DeviceR
 /// Revoke a device (kills its token on next use).
 #[tauri::command]
 pub async fn device_revoke(
+    state: State<'_, AppState>,
     relay_url: String,
-    token: String,
     device_id: String,
 ) -> Result<(), String> {
-    let relay_url = crate::sync::onboarding::normalize_http_base(&relay_url);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
-    let resp = client
-        .delete(format!("{}/api/devices/{}", relay_url.trim_end_matches('/'), device_id))
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("{}: {}", status, text.chars().take(200).collect::<String>()));
-    }
+    auth_request(
+        &state,
+        &relay_url,
+        reqwest::Method::DELETE,
+        &format!("api/devices/{}", device_id),
+        None,
+    )
+    .await?;
     Ok(())
 }
 
 /// Rename a device.
 #[tauri::command]
 pub async fn device_rename(
+    state: State<'_, AppState>,
     relay_url: String,
-    token: String,
     device_id: String,
     name: String,
 ) -> Result<(), String> {
-    let relay_url = crate::sync::onboarding::normalize_http_base(&relay_url);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
-    let resp = client
-        .patch(format!("{}/api/devices/{}", relay_url.trim_end_matches('/'), device_id))
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&serde_json::json!({ "name": name }))
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("{}: {}", status, text.chars().take(200).collect::<String>()));
-    }
+    auth_request(
+        &state,
+        &relay_url,
+        reqwest::Method::PATCH,
+        &format!("api/devices/{}", device_id),
+        Some(serde_json::json!({ "name": name })),
+    )
+    .await?;
     Ok(())
 }

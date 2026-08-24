@@ -711,6 +711,7 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/register", post(api_register))
         .route("/api/login", post(api_login))
+        .route("/api/refresh", post(api_refresh))
         .route("/api/devices", get(api_list_devices))
         .route("/api/devices/:id", patch(api_rename_device).delete(api_revoke_device))
         .with_state(state)
@@ -752,6 +753,7 @@ struct LoginRequest {
 #[derive(Serialize)]
 struct LoginResponse {
     access_token: String,
+    refresh_token: String,
     user_id: String,
     /// Account-level sync key (base64), same for every device of the account.
     sync_key: String,
@@ -765,22 +767,67 @@ async fn api_login(
         .auth
         .login(&state.db, &req.email.trim(), &req.password)
         .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+    let device_id = req.device_id.trim();
     let _ = state
         .db
-        .register_device(&user_id, &req.device_id.trim(), &req.device_name.trim());
+        .register_device(&user_id, device_id, &req.device_name.trim());
     let token = state
         .auth
-        .issue_device_token(&user_id, &req.device_id.trim())
+        .issue_device_token(&user_id, device_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let refresh_token = state.auth.issue_refresh_token();
+    let _ = state
+        .db
+        .set_device_refresh_token(device_id, &refresh_token);
     let sync_key = state
         .auth
         .sync_key(&state.db, &user_id)
         .unwrap_or_default();
-    info!(user_id = %user_id, device_id = %req.device_id, "device logged in");
+    info!(user_id = %user_id, device_id = %device_id, "device logged in");
     Ok(axum::Json(LoginResponse {
         access_token: token,
+        refresh_token,
         user_id,
         sync_key,
+    }))
+}
+
+#[derive(Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+#[derive(Serialize)]
+struct RefreshResponse {
+    access_token: String,
+    refresh_token: String,
+    user_id: String,
+}
+
+async fn api_refresh(
+    State(state): State<Arc<AppState>>,
+    axum::Json(req): axum::Json<RefreshRequest>,
+) -> Result<axum::Json<RefreshResponse>, (StatusCode, String)> {
+    let device = state
+        .auth
+        .validate_refresh_token(&state.db, &req.refresh_token)
+        .ok_or((StatusCode::UNAUTHORIZED, "invalid refresh token".to_string()))?;
+    if device.revoked_at.is_some() {
+        return Err((StatusCode::UNAUTHORIZED, "device revoked".to_string()));
+    }
+    let token = state
+        .auth
+        .issue_device_token(&device.user_id, &device.id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Rotate the refresh token on every use.
+    let new_refresh_token = state.auth.issue_refresh_token();
+    let _ = state
+        .db
+        .set_device_refresh_token(&device.id, &new_refresh_token);
+    Ok(axum::Json(RefreshResponse {
+        access_token: token,
+        refresh_token: new_refresh_token,
+        user_id: device.user_id,
     }))
 }
 

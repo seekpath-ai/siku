@@ -52,6 +52,23 @@ impl Auth {
         Ok(encode(&Header::new(Algorithm::HS256), &claims, &key)?)
     }
 
+    /// Issue an opaque refresh token for a device.
+    pub fn issue_refresh_token(&self) -> String {
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Validate a refresh token by looking it up in the database.
+    pub fn validate_refresh_token(
+        &self,
+        db: &crate::db::Db,
+        token: &str,
+    ) -> Option<crate::db::Device> {
+        db.find_device_by_refresh_token(token)
+    }
+
     /// Register a new account. Returns Err when the email is taken.
     pub fn register(&self, db: &Db, email: &str, password: &str) -> anyhow::Result<String> {
         if db.get_user_by_email(email).is_some() {

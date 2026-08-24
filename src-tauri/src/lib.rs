@@ -573,14 +573,31 @@ pub fn run() {
                     .flatten()
                     .unwrap_or_default();
                     if !relay_url.is_empty() && !token.is_empty() {
-                        crate::commands::sync::spawn_auto_sync_proxy(
-                            &handle2.state::<crate::commands::sync::SyncState>(),
-                            &handle2.state::<AppState>(),
-                            &relay_url,
-                            &token,
-                        )
-                        .await;
-                        tracing::info!("restored account auto-sync proxy at startup");
+                        let token_to_use = if crate::commands::account::access_token_is_fresh(&db).await {
+                            token
+                        } else {
+                            match crate::commands::account::refresh_access_token(&db, &relay_url).await {
+                                Ok(new_token) => {
+                                    tracing::info!("refreshed access token at startup");
+                                    new_token
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "failed to refresh access token at startup; clearing stored credentials");
+                                    let _ = crate::commands::account::clear_account_credentials(&db).await;
+                                    String::new()
+                                }
+                            }
+                        };
+                        if !token_to_use.is_empty() {
+                            crate::commands::sync::spawn_auto_sync_proxy(
+                                &handle2.state::<crate::commands::sync::SyncState>(),
+                                &handle2.state::<AppState>(),
+                                &relay_url,
+                                &token_to_use,
+                            )
+                            .await;
+                            tracing::info!("restored account auto-sync proxy at startup");
+                        }
                     }
                 }
 

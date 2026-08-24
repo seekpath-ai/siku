@@ -79,14 +79,26 @@ export function AccountSettings({ onLoggedIn }: Props) {
       .catch(() => {});
   }, []);
 
+  const isAuthError = (e: unknown) => {
+    const msg = String(e);
+    return msg.includes('401') || msg.includes('Unauthorized') || msg.includes('登录已过期');
+  };
+
   const refreshDevices = useCallback(
     async (showLoading = true) => {
       if (!auth?.access_token) return;
       if (showLoading) setLoadingDevices(true);
       try {
-        setDevices(await deviceList(httpBase, auth.access_token));
+        setDevices(await deviceList(httpBase));
       } catch (e) {
-        setError(`加载设备列表失败: ${e}`);
+        if (isAuthError(e)) {
+          await authLogout().catch(() => {});
+          setAuth(null);
+          setDevices([]);
+          setError('登录已过期，请重新登录');
+        } else {
+          setError(`加载设备列表失败: ${e}`);
+        }
       } finally {
         if (showLoading) setLoadingDevices(false);
       }
@@ -146,10 +158,17 @@ export function AccountSettings({ onLoggedIn }: Props) {
     if (!next || next.trim() === currentName) return;
     setBusy(true);
     try {
-      await deviceRename(httpBase, auth!.access_token, deviceId, next.trim());
+      await deviceRename(httpBase, deviceId, next.trim());
       await refreshDevices();
     } catch (e) {
-      setError(`改名失败: ${e}`);
+      if (isAuthError(e)) {
+        await authLogout().catch(() => {});
+        setAuth(null);
+        setDevices([]);
+        setError('登录已过期，请重新登录');
+      } else {
+        setError(`改名失败: ${e}`);
+      }
     } finally {
       setBusy(false);
     }
@@ -165,10 +184,17 @@ export function AccountSettings({ onLoggedIn }: Props) {
     if (!auth) return;
     setBusy(true);
     try {
-      await deviceRevoke(httpBase, auth.access_token, deviceId);
+      await deviceRevoke(httpBase, deviceId);
       await refreshDevices();
     } catch (e) {
-      setError(`吊销失败: ${e}`);
+      if (isAuthError(e)) {
+        await authLogout().catch(() => {});
+        setAuth(null);
+        setDevices([]);
+        setError('登录已过期，请重新登录');
+      } else {
+        setError(`吊销失败: ${e}`);
+      }
     } finally {
       setBusy(false);
     }

@@ -25,6 +25,19 @@ function formatTime(iso: string): string {
   }
 }
 
+function formatTokenUsage(message: ChatMessage): string {
+  if (message.tokens_in != null && message.tokens_out != null) {
+    const hit = message.tokens_in_hit != null && message.tokens_in_hit > 0
+      ? `（命中 ${message.tokens_in_hit}）`
+      : '';
+    return `输入 ${message.tokens_in}${hit} · 输出 ${message.tokens_out}`;
+  }
+  if (message.tokens_used != null && message.tokens_used > 0) {
+    return `${message.tokens_used} tokens`;
+  }
+  return '';
+}
+
 function parseToolCalls(json: string | null): ToolCallInfo[] {
   if (!json) return [];
   try {
@@ -104,9 +117,6 @@ export function MessageBubble({ message, agentSteps = [] }: Props) {
               {message.model}
             </span>
           )}
-          {message.tokens_used != null && message.tokens_used > 0 && (
-            <span className="text-[10px] text-codex-muted">{message.tokens_used} tokens</span>
-          )}
           <span className="text-[11px] text-codex-muted">{formatTime(message.created_at)}</span>
           <button
             onClick={handleCopy}
@@ -168,6 +178,12 @@ export function MessageBubble({ message, agentSteps = [] }: Props) {
             >
               {message.content}
             </ReactMarkdown>
+          </div>
+        )}
+
+        {!isUser && (message.tokens_in != null || message.tokens_out != null || message.tokens_used != null) && (
+          <div className="text-right mt-2 text-[10px] text-codex-muted select-none">
+            {formatTokenUsage(message)}
           </div>
         )}
       </div>

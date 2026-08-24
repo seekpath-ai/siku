@@ -583,7 +583,7 @@ pub(crate) async fn run_agent_turn(
     let memory = MemoryStore::new(memory_path.clone());
 
     // Save user message to DB
-    chat::save_chat_message(&state.db, &session_id, "user", &content, None, None, None, None, None, None).await?;
+    chat::save_chat_message(&state.db, &session_id, "user", &content, None, None, None, None, None, None, None, None, None).await?;
 
     // Load history BEFORE appending current user message, then append it.
     // The engine itself will prepend the current user message to the prompt.
@@ -698,9 +698,12 @@ pub(crate) async fn run_agent_turn(
                     final_content.clone()
                 };
                 // Save final assistant message without reasoning/tool_calls (steps hold those).
-                let tokens_used = if total_tokens > 0 { Some(total_tokens as i32) } else { None };
+                let tokens_used = if total_tokens.total() > 0 { Some(total_tokens.total() as i32) } else { None };
+                let tokens_in = if total_tokens.tokens_in > 0 { Some(total_tokens.tokens_in as i32) } else { None };
+                let tokens_in_hit = if total_tokens.tokens_in_hit > 0 { Some(total_tokens.tokens_in_hit as i32) } else { None };
+                let tokens_out = if total_tokens.tokens_out > 0 { Some(total_tokens.tokens_out as i32) } else { None };
                 let message_id = match chat::save_chat_message(
-                    &db, &sid, "assistant", &display_content, None, tokens_used, None, None, None, None,
+                    &db, &sid, "assistant", &display_content, None, tokens_used, tokens_in, tokens_in_hit, tokens_out, None, None, None, None,
                 ).await {
                     Ok(id) => Some(id),
                     Err(e) => {
@@ -747,6 +750,10 @@ pub(crate) async fn run_agent_turn(
                     tool_result: None,
                     status: None,
                     duration_ms: None,
+                    tokens_used,
+                    tokens_in,
+                    tokens_in_hit,
+                    tokens_out,
                 });
             }
             Err(e) => {

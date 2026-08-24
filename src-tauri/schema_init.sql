@@ -291,6 +291,9 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     citations TEXT,
     model TEXT,
     tokens_used INTEGER,
+    tokens_in INTEGER,
+    tokens_in_hit INTEGER,
+    tokens_out INTEGER,
     created_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);

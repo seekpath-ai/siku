@@ -351,6 +351,17 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_messages.reasoning_content: {}", e))?;
 
+    // Migration: token usage breakdown for assistant messages
+    add_column_if_missing(&db, "chat_messages", "tokens_in", "INTEGER")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chat_messages.tokens_in: {}", e))?;
+    add_column_if_missing(&db, "chat_messages", "tokens_in_hit", "INTEGER")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chat_messages.tokens_in_hit: {}", e))?;
+    add_column_if_missing(&db, "chat_messages", "tokens_out", "INTEGER")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chat_messages.tokens_out: {}", e))?;
+
     // Migration: sync chat_sessions columns added for agent features
     add_column_if_missing(&db, "chat_sessions", "llm_models", "TEXT")
         .await

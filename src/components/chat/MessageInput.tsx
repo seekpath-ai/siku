@@ -76,6 +76,9 @@ export function MessageInput({ disabled }: Props) {
       citations: null,
       model: null,
       tokens_used: null,
+      tokens_in: null,
+      tokens_in_hit: null,
+      tokens_out: null,
       created_at: new Date().toISOString(),
     });
 
@@ -93,6 +96,9 @@ export function MessageInput({ disabled }: Props) {
         citations: null,
         model: null,
         tokens_used: null,
+        tokens_in: null,
+        tokens_in_hit: null,
+        tokens_out: null,
         created_at: new Date().toISOString(),
       });
     }

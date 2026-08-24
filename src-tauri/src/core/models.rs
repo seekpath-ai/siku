@@ -185,6 +185,9 @@ pub struct ChatMessage {
     pub citations: Option<String>,
     pub model: Option<String>,
     pub tokens_used: Option<i32>,
+    pub tokens_in: Option<i32>,
+    pub tokens_in_hit: Option<i32>,
+    pub tokens_out: Option<i32>,
     pub created_at: String,
 }
 

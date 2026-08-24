@@ -278,12 +278,18 @@ impl LlmClient for OpenAiClient {
                     if let Some(usage) = json["usage"].as_object() {
                         let tokens_in = usage["prompt_tokens"].as_u64().unwrap_or(0) as u32;
                         let tokens_out = usage["completion_tokens"].as_u64().unwrap_or(0) as u32;
+                        // Some providers (e.g. DeepSeek) split prompt tokens into
+                        // cache hit / miss. Fall back to zero when absent.
+                        let tokens_in_hit = usage["prompt_cache_hit_tokens"]
+                            .as_u64()
+                            .or_else(|| usage["cache_read_input_tokens"].as_u64())
+                            .unwrap_or(0) as u32;
                         if tokens_in > 0 || tokens_out > 0 {
                             let _ = sender.send(StreamEvent {
                                 event_type: "usage".to_string(),
                                 content: None,
                                 tool_call: None,
-                                usage: Some(super::LlmUsage { tokens_in, tokens_out }),
+                                usage: Some(super::LlmUsage { tokens_in, tokens_in_hit, tokens_out }),
                             });
                         }
                     }

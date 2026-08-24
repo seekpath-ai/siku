@@ -315,6 +315,7 @@ impl LlmClient for AnthropicClient {
         let mut current_tool_index: u32 = 0;
         let mut current_tool_id = String::new();
         let mut tokens_in: u32 = 0;
+        let mut tokens_in_hit: u32 = 0;
         let mut tokens_out: u32 = 0;
 
         while let Some(chunk) = stream.next().await {
@@ -333,6 +334,9 @@ impl LlmClient for AnthropicClient {
                             Some("message_start") => {
                                 if let Some(usage) = json["usage"]["input_tokens"].as_u64() {
                                     tokens_in = usage as u32;
+                                }
+                                if let Some(hit) = json["usage"]["cache_read_input_tokens"].as_u64() {
+                                    tokens_in_hit = hit as u32;
                                 }
                             }
                             Some("content_block_delta") => {
@@ -403,7 +407,7 @@ impl LlmClient for AnthropicClient {
                                         event_type: "usage".to_string(),
                                         content: None,
                                         tool_call: None,
-                                        usage: Some(super::LlmUsage { tokens_in, tokens_out }),
+                                        usage: Some(super::LlmUsage { tokens_in, tokens_in_hit, tokens_out }),
                                     });
                                 }
                             }

@@ -266,6 +266,9 @@ export interface ChatMessage {
   citations: string | null;
   model: string | null;
   tokens_used: number | null;
+  tokens_in: number | null;
+  tokens_in_hit: number | null;
+  tokens_out: number | null;
   created_at: string;
 }
 
@@ -312,6 +315,10 @@ export interface AgentStreamEvent {
   tool_result?: string;
   status?: string;
   duration_ms?: number;
+  tokens_used?: number | null;
+  tokens_in?: number | null;
+  tokens_in_hit?: number | null;
+  tokens_out?: number | null;
 }
 
 // ============================================================

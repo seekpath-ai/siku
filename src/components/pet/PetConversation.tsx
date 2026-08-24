@@ -497,6 +497,9 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
                         citations: null,
                         model: null,
                         tokens_used: null,
+                        tokens_in: null,
+                        tokens_in_hit: null,
+                        tokens_out: null,
                         created_at: new Date().toISOString(),
                       };
                       usePetStore.setState((s) => ({ messages: [...s.messages, localMsg], streamContent: '' }));

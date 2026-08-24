@@ -243,7 +243,7 @@ impl LlmClient for OllamaClient {
                                     event_type: "usage".to_string(),
                                     content: None,
                                     tool_call: None,
-                                    usage: Some(super::LlmUsage { tokens_in, tokens_out }),
+                                    usage: Some(super::LlmUsage { tokens_in, tokens_in_hit: 0, tokens_out }),
                                 });
                             }
                         }

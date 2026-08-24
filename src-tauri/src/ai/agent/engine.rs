@@ -22,6 +22,11 @@ pub struct AgentEvent {
     pub tool_result: Option<String>,
     pub status: Option<String>,
     pub duration_ms: Option<i32>,
+    /// Token usage breakdown for terminal done/cancelled events.
+    pub tokens_used: Option<i32>,
+    pub tokens_in: Option<i32>,
+    pub tokens_in_hit: Option<i32>,
+    pub tokens_out: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -179,12 +184,16 @@ impl AgentEngine {
             tool_result,
             status,
             duration_ms,
+            tokens_used: None,
+            tokens_in: None,
+            tokens_in_hit: None,
+            tokens_out: None,
         });
     }
 
     /// Process a user message with streaming output via event channel.
     /// Returns the final assistant content, the ReAct steps, whether the
-    /// turn was cancelled, and the total token usage across all LLM rounds.
+    /// turn was cancelled, and the token usage across all LLM rounds.
     /// Does NOT emit the terminal done/cancelled event — the caller emits it
     /// after persisting the results.
     pub async fn process_message(
@@ -194,7 +203,7 @@ impl AgentEngine {
         event_tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
         approval_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ApprovalResponse>,
         ask_rx: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
-    ) -> Result<(String, Vec<AgentStep>, bool, u32), String> {
+    ) -> Result<(String, Vec<AgentStep>, bool, crate::ai::llm::LlmUsage), String> {
         let span = info_span!("agent_turn", session_id = %self.session_id);
         let _guard = span.enter();
         let sid = self.session_id.clone();
@@ -246,7 +255,11 @@ impl AgentEngine {
         let mut steps: Vec<AgentStep> = Vec::new();
         let mut round = 0;
         let mut last_approval_at: Option<std::time::Instant> = None;
-        let mut total_tokens: u32 = 0;
+        let mut usage = crate::ai::llm::LlmUsage {
+            tokens_in: 0,
+            tokens_in_hit: 0,
+            tokens_out: 0,
+        };
 
         let mut cancelled = false;
         loop {
@@ -296,7 +309,7 @@ impl AgentEngine {
                     }
                     event = stream_rx.recv() => {
                         match event {
-                            Some(StreamEvent { event_type, content, tool_call, usage }) => {
+                            Some(StreamEvent { event_type, content, tool_call, usage: round_usage }) => {
                                 if self.is_cancelled() {
                                     info!(round, "agent cancelled during streaming");
                                     cancelled = true;
@@ -331,8 +344,10 @@ impl AgentEngine {
                                         }
                                     }
                                     "usage" => {
-                                        if let Some(u) = usage {
-                                            total_tokens = total_tokens.saturating_add(u.total());
+                                        if let Some(u) = round_usage {
+                                            usage.tokens_in = usage.tokens_in.saturating_add(u.tokens_in);
+                                            usage.tokens_in_hit = usage.tokens_in_hit.saturating_add(u.tokens_in_hit);
+                                            usage.tokens_out = usage.tokens_out.saturating_add(u.tokens_out);
                                         }
                                     }
                                     _ => {}
@@ -389,7 +404,9 @@ impl AgentEngine {
                     }
                     "usage" => {
                         if let Some(u) = event.usage {
-                            total_tokens = total_tokens.saturating_add(u.total());
+                            usage.tokens_in = usage.tokens_in.saturating_add(u.tokens_in);
+                            usage.tokens_in_hit = usage.tokens_in_hit.saturating_add(u.tokens_in_hit);
+                            usage.tokens_out = usage.tokens_out.saturating_add(u.tokens_out);
                         }
                     }
                     _ => {}
@@ -656,6 +673,6 @@ impl AgentEngine {
             info!(content_len = reply.len(), "agent turn complete");
         }
 
-        Ok((reply, steps, cancelled, total_tokens))
+        Ok((reply, steps, cancelled, usage))
     }
 }

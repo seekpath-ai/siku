@@ -131,15 +131,23 @@ pub struct FunctionDef {
 }
 
 /// Token usage for a single LLM call.
+///
+/// `tokens_in_hit` counts prompt tokens served from cache (e.g. DeepSeek
+/// `prompt_cache_hit_tokens`, Anthropic `cache_read_input_tokens`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct LlmUsage {
     pub tokens_in: u32,
+    pub tokens_in_hit: u32,
     pub tokens_out: u32,
 }
 
 impl LlmUsage {
     pub fn total(&self) -> u32 {
         self.tokens_in.saturating_add(self.tokens_out)
+    }
+
+    pub fn miss(&self) -> u32 {
+        self.tokens_in.saturating_sub(self.tokens_in_hit)
     }
 }
 

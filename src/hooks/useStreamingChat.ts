@@ -144,7 +144,10 @@ export function useStreamingChat() {
                 tool_calls: null,
                 citations: null,
                 model: null,
-                tokens_used: null,
+                tokens_used: e.tokens_used ?? null,
+                tokens_in: e.tokens_in ?? null,
+                tokens_in_hit: e.tokens_in_hit ?? null,
+                tokens_out: e.tokens_out ?? null,
                 created_at: new Date().toISOString(),
               });
               state.linkAgentSteps(messageId, e.session_id);
@@ -189,7 +192,10 @@ export function useStreamingChat() {
                 tool_calls: null,
                 citations: null,
                 model: null,
-                tokens_used: null,
+                tokens_used: e.tokens_used ?? null,
+                tokens_in: e.tokens_in ?? null,
+                tokens_in_hit: e.tokens_in_hit ?? null,
+                tokens_out: e.tokens_out ?? null,
                 created_at: new Date().toISOString(),
               });
               state.linkAgentSteps(messageId, e.session_id);
@@ -218,6 +224,9 @@ export function useStreamingChat() {
               citations: null,
               model: null,
               tokens_used: null,
+              tokens_in: null,
+              tokens_in_hit: null,
+              tokens_out: null,
               created_at: new Date().toISOString(),
             });
             state.clearStreamContent();

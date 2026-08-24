@@ -135,6 +135,9 @@ export const usePetStore = create<PetState>((set, get) => ({
       citations: null,
       model: null,
       tokens_used: null,
+      tokens_in: null,
+      tokens_in_hit: null,
+      tokens_out: null,
       created_at: new Date().toISOString(),
     };
     set((s) => ({

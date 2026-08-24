@@ -42,7 +42,8 @@ pub async fn get_note(db: &SqlitePool, id: &str) -> Result<Note, String> {
         .ok_or_else(|| format!("note not found: {id}"))
 }
 
-/// Update a note
+/// Update a note. When `touch` is `Some(false)` the `updated_at` timestamp is
+/// left untouched so the note keeps its current position in the tree.
 #[instrument(skip(db))]
 pub async fn update_note(
     db: &SqlitePool,
@@ -52,7 +53,9 @@ pub async fn update_note(
     paper_id: Option<&str>,
     aliases: Option<&str>,
     is_favorite: Option<i32>,
+    touch: Option<bool>,
 ) -> Result<Note, String> {
+    let touch = touch.unwrap_or(true);
     let now = time::now_iso();
 
     // System folders (e.g. the "我的图书馆" library root) cannot be renamed.
@@ -65,29 +68,54 @@ pub async fn update_note(
         if let Some((1,)) = sys {
             return Err("不能重命名系统目录「我的图书馆」".to_string());
         }
-        sqlx::query("UPDATE notes SET title = ?, updated_at = ? WHERE id = ?")
-            .bind(t).bind(&now).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        if touch {
+            sqlx::query("UPDATE notes SET title = ?, updated_at = ? WHERE id = ?")
+                .bind(t).bind(&now).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        } else {
+            sqlx::query("UPDATE notes SET title = ? WHERE id = ?")
+                .bind(t).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        }
     }
     if let Some(c) = content {
         let plain = strip_markdown(c);
         let tags = parse_tags(c);
-        sqlx::query("UPDATE notes SET content = ?, content_plain = ?, tags = ?, updated_at = ? WHERE id = ?")
-            .bind(c).bind(&plain).bind(&tags).bind(&now).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        if touch {
+            sqlx::query("UPDATE notes SET content = ?, content_plain = ?, tags = ?, updated_at = ? WHERE id = ?")
+                .bind(c).bind(&plain).bind(&tags).bind(&now).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        } else {
+            sqlx::query("UPDATE notes SET content = ?, content_plain = ?, tags = ? WHERE id = ?")
+                .bind(c).bind(&plain).bind(&tags).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        }
 
         let links = parse_wiki_links(c);
         update_note_links(db, id, &links).await?;
     }
     if let Some(pid) = paper_id {
-        sqlx::query("UPDATE notes SET paper_id = ?, updated_at = ? WHERE id = ?")
-            .bind(pid).bind(&now).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        if touch {
+            sqlx::query("UPDATE notes SET paper_id = ?, updated_at = ? WHERE id = ?")
+                .bind(pid).bind(&now).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        } else {
+            sqlx::query("UPDATE notes SET paper_id = ? WHERE id = ?")
+                .bind(pid).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        }
     }
     if let Some(a) = aliases {
-        sqlx::query("UPDATE notes SET aliases = ?, updated_at = ? WHERE id = ?")
-            .bind(a).bind(&now).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        if touch {
+            sqlx::query("UPDATE notes SET aliases = ?, updated_at = ? WHERE id = ?")
+                .bind(a).bind(&now).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        } else {
+            sqlx::query("UPDATE notes SET aliases = ? WHERE id = ?")
+                .bind(a).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        }
     }
     if let Some(f) = is_favorite {
-        sqlx::query("UPDATE notes SET is_favorite = ?, updated_at = ? WHERE id = ?")
-            .bind(f).bind(&now).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        if touch {
+            sqlx::query("UPDATE notes SET is_favorite = ?, updated_at = ? WHERE id = ?")
+                .bind(f).bind(&now).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        } else {
+            sqlx::query("UPDATE notes SET is_favorite = ? WHERE id = ?")
+                .bind(f).bind(id).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        }
     }
 
     get_note(db, id).await
@@ -605,7 +633,7 @@ pub async fn add_excerpt_to_paper(
         Some((id,)) => {
             let note = get_note(db, &id).await?;
             let new_content = format!("{}\n\n---\n\n{}", note.content, excerpt);
-            update_note(db, &id, None, Some(&new_content), None, None, None).await
+            update_note(db, &id, None, Some(&new_content), None, None, None, None).await
         }
         None => {
             let note = create_note(db, &title, excerpt, Some(paper_id), parent.as_deref(), vault_id, false).await?;

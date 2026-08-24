@@ -694,8 +694,8 @@ export async function notesCreate(title: string, content: string, paperId?: stri
 export async function notesGet(id: string): Promise<Note> {
   return invoke<Note>('notes_get', { id });
 }
-export async function notesUpdate(id: string, title?: string, content?: string, paperId?: string, aliases?: string, isFavorite?: number): Promise<Note> {
-  return invoke<Note>('notes_update', { id, title, content, paperId, aliases, isFavorite });
+export async function notesUpdate(id: string, title?: string, content?: string, paperId?: string, aliases?: string, isFavorite?: number, touch?: boolean): Promise<Note> {
+  return invoke<Note>('notes_update', { id, title, content, paperId, aliases, isFavorite, touch });
 }
 export async function notesDelete(id: string): Promise<void> {
   return invoke<void>('notes_delete', { id });

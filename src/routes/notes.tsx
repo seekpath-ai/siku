@@ -190,9 +190,9 @@ function NotesPage() {
     }
   };
 
-  const handleCreate = async () => {
+  const handleCreate = async (parentId?: string) => {
     try {
-      const note = await notesCreate('新笔记', '', undefined, undefined);
+      const note = await notesCreate('新笔记', '', undefined, parentId);
       await loadNotes();
       setActiveId(note.id);
     } catch (err) {
@@ -236,7 +236,7 @@ function NotesPage() {
 
   const handleRename = async (id: string, title: string) => {
     try {
-      await notesUpdate(id, title, undefined, undefined);
+      await notesUpdate(id, title, undefined, undefined, undefined, undefined, false);
       await loadNotes();
     } catch (err) {
       console.error('rename note:', err);

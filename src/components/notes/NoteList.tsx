@@ -15,7 +15,8 @@ interface Props {
   notes: Note[];
   activeNoteId: string | null;
   onSelect: (id: string) => void;
-  onCreate: () => void;
+  /** Create a new note under the given parent folder (undefined = root). */
+  onCreate: (parentId?: string) => void;
   onCreateFolder: () => Promise<string>;
   onCreateSubNote: (parentId: string) => void;
   onCreateSubFolder: (parentId: string) => Promise<string>;
@@ -261,11 +262,14 @@ export function NoteList({
         cancelRename();
         return;
       }
-      if (name) onRename(renamingId, name);
+      const current = noteMap.get(renamingId)?.title ?? '';
+      if (name && name !== current) {
+        onRename(renamingId, name);
+      }
     }
     setRenamingId(null);
     setRenameValue('');
-  }, [renamingId, renameValue, onRename, cancelRename, alert]);
+  }, [renamingId, renameValue, onRename, cancelRename, alert, noteMap]);
 
   const openContextMenu = useCallback((e: MouseEvent, note: Note) => {
     e.preventDefault();
@@ -838,7 +842,17 @@ export function NoteList({
         <span className="text-xs font-semibold text-text-secondary uppercase tracking-wider">{title}</span>
         <div className="flex items-center gap-0.5">
           <button
-            onClick={onCreate}
+            onClick={() => {
+              let parentId: string | undefined;
+              if (selectedIds.size === 1) {
+                const id = selectedIds.values().next().value as string | undefined;
+                const note = id ? noteMap.get(id) : undefined;
+                if (note) {
+                  parentId = note.is_folder === 1 ? note.id : (note.parent_id ?? undefined);
+                }
+              }
+              onCreate(parentId);
+            }}
             className="w-6 h-6 rounded flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors"
             title="新建笔记"
           >

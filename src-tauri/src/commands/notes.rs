@@ -71,8 +71,9 @@ pub async fn notes_get(state: State<'_, AppState>, id: String) -> Result<Note, S
 pub async fn notes_update(
     state: State<'_, AppState>, id: String, title: Option<String>,
     content: Option<String>, paper_id: Option<String>, aliases: Option<String>, is_favorite: Option<i32>,
+    touch: Option<bool>,
 ) -> Result<Note, String> {
-    crate::core::note_service::update_note(&state.db, &id, title.as_deref(), content.as_deref(), paper_id.as_deref(), aliases.as_deref(), is_favorite).await
+    crate::core::note_service::update_note(&state.db, &id, title.as_deref(), content.as_deref(), paper_id.as_deref(), aliases.as_deref(), is_favorite, touch).await
 }
 
 #[tauri::command]
@@ -187,5 +188,5 @@ pub async fn note_version_restore(
         .map_err(|e| format!("db: {e}"))?;
     }
 
-    crate::core::note_service::update_note(&state.db, &v.note_id, Some(&v.title), Some(&v.content), None, None, None).await
+    crate::core::note_service::update_note(&state.db, &v.note_id, Some(&v.title), Some(&v.content), None, None, None, None).await
 }

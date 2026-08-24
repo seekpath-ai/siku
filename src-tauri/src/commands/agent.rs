@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+
 use tauri::{AppHandle, Emitter, Manager, State};
 use tracing::{error, info, instrument};
 
@@ -413,13 +413,14 @@ pub async fn agent_pin_session(
 }
 
 /// Cancel a running agent turn for a session.
-/// The engine checks the flag between streaming chunks / rounds and stops.
+/// The cancellation token is watched by the engine via `tokio::select!`,
+/// allowing LLM streams and tool calls to be aborted promptly.
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn agent_cancel(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
-    let flags = state.cancel_flags.lock().await;
-    if let Some(flag) = flags.get(&session_id) {
-        flag.store(true, Ordering::SeqCst);
+    let tokens = state.cancel_tokens.lock().await;
+    if let Some(token) = tokens.get(&session_id) {
+        token.cancel();
     }
     Ok(())
 }
@@ -523,11 +524,12 @@ pub(crate) async fn run_agent_turn(
         None => None,
     };
 
-    // Per-turn cancellation flag.
-    let cancel_flag = Arc::new(AtomicBool::new(false));
+    // Per-turn cancellation token. The engine and long-running tools/streams
+    // watch it via `tokio::select!` so the user can abort promptly.
+    let cancel_token = tokio_util::sync::CancellationToken::new();
     {
-        let mut flags = state.cancel_flags.lock().await;
-        flags.insert(session_id.clone(), cancel_flag.clone());
+        let mut tokens = state.cancel_tokens.lock().await;
+        tokens.insert(session_id.clone(), cancel_token.clone());
     }
 
     // Build per-agent LLM client from active block
@@ -628,7 +630,7 @@ pub(crate) async fn run_agent_turn(
         state.db.clone(),
         config.clone(),
         memory,
-        cancel_flag.clone(),
+        cancel_token.clone(),
         project_dir,
         context_prompt,
     );
@@ -662,7 +664,7 @@ pub(crate) async fn run_agent_turn(
     let sid = session_id.clone();
     let app_clone = app_handle.clone();
     let spawn_memory_path = memory_path.clone();
-    let cancel_flags = state.cancel_flags.clone();
+    let cancel_tokens = state.cancel_tokens.clone();
     let tracked = state.background_tasks.clone();
 
     crate::spawn_tracked(&tracked, async move {
@@ -680,13 +682,13 @@ pub(crate) async fn run_agent_turn(
             senders.remove(&sid);
         }
         {
-            let mut flags = cancel_flags.lock().await;
-            flags.remove(&sid);
+            let mut tokens = cancel_tokens.lock().await;
+            tokens.remove(&sid);
         }
 
         let mem = MemoryStore::new(spawn_memory_path);
         match result {
-            Ok((final_content, steps, cancelled)) => {
+            Ok((final_content, steps, cancelled, total_tokens)) => {
                 // Never persist an empty reply — an empty assistant row
                 // renders as a blank bubble after the frontend reloads on
                 // done. Fall back to a visible placeholder.
@@ -696,8 +698,9 @@ pub(crate) async fn run_agent_turn(
                     final_content.clone()
                 };
                 // Save final assistant message without reasoning/tool_calls (steps hold those).
+                let tokens_used = if total_tokens > 0 { Some(total_tokens as i32) } else { None };
                 let message_id = match chat::save_chat_message(
-                    &db, &sid, "assistant", &display_content, None, None, None, None, None, None,
+                    &db, &sid, "assistant", &display_content, None, tokens_used, None, None, None, None,
                 ).await {
                     Ok(id) => Some(id),
                     Err(e) => {

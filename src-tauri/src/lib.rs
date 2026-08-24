@@ -20,9 +20,9 @@ pub struct AppState {
             >,
         >,
     >,
-    pub cancel_flags: std::sync::Arc<
+    pub cancel_tokens: std::sync::Arc<
         tokio::sync::Mutex<
-            std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+            std::collections::HashMap<String, tokio_util::sync::CancellationToken>,
         >,
     >,
     /// Background tasks (bash run_in_background).
@@ -235,18 +235,18 @@ async fn run_shutdown_cleanup_async(
     // database connections before we try to finalize CR-SQLite.
     let _ = state.shutdown_tx.send(());
 
-    // 2. Cancel any in-flight agent turns. Each turn polls
-    // its cancel flag at the start of every ReAct round.
+    // 2. Cancel any in-flight agent turns. The CancellationToken is
+    // watched by the engine via tokio::select! as well as polled each round.
     {
-        let flags = state.cancel_flags.lock().await;
-        let session_ids: Vec<String> = flags.keys().cloned().collect();
-        for flag in flags.values() {
-            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let tokens = state.cancel_tokens.lock().await;
+        let session_ids: Vec<String> = tokens.keys().cloned().collect();
+        for token in tokens.values() {
+            token.cancel();
         }
         info!(
             session_ids = ?session_ids,
-            "set cancel flags for {} agent turn(s)",
-            flags.len()
+            "cancelled {} agent turn(s)",
+            tokens.len()
         );
     }
 
@@ -256,9 +256,9 @@ async fn run_shutdown_cleanup_async(
     // sleep so a quiet app closes immediately.
     let has_work: bool;
     {
-        let flags = state.cancel_flags.lock().await;
+        let tokens = state.cancel_tokens.lock().await;
         let mut handles = state.background_tasks.lock().await;
-        has_work = !flags.is_empty() || !handles.is_empty();
+        has_work = !tokens.is_empty() || !handles.is_empty();
         if has_work {
             // Agent turns may be waiting on an LLM response; a few
             // seconds covers the common case where the model has just
@@ -521,7 +521,7 @@ pub fn run() {
                     approval_senders: std::sync::Arc::new(tokio::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),
-                    cancel_flags: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    cancel_tokens: std::sync::Arc::new(tokio::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),
                     tasks: crate::core::tasks::new_task_store(),

@@ -130,6 +130,19 @@ pub struct FunctionDef {
     pub parameters: serde_json::Value,
 }
 
+/// Token usage for a single LLM call.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LlmUsage {
+    pub tokens_in: u32,
+    pub tokens_out: u32,
+}
+
+impl LlmUsage {
+    pub fn total(&self) -> u32 {
+        self.tokens_in.saturating_add(self.tokens_out)
+    }
+}
+
 /// LLM response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
@@ -147,6 +160,8 @@ pub struct StreamEvent {
     pub event_type: String,
     pub content: Option<String>,
     pub tool_call: Option<ToolCallDelta>,
+    /// Populated once by the provider at the end of the stream, if available.
+    pub usage: Option<LlmUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

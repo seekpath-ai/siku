@@ -32,6 +32,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 regex = "1"
 tokio = { version = "1.42", features = ["full"] }
+tokio-util = "0.7"
 sqlx = { version = "0.8.2", features = ["sqlite", "runtime-tokio", "time"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }

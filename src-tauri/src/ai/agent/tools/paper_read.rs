@@ -48,10 +48,12 @@ impl Tool for PaperReadTool {
 
     fn description(&self) -> &str {
         "Get a paper's metadata, abstract and paginated text chunks. \
-         Each chunk is ~2000 characters and every call counts against your context budget, \
-         which is also capped per call. The response marks where the body ends — chunks after \
-         that (references/appendix) are excluded by default. Use offset/limit to read only \
-         the parts relevant to the question."
+         Raw chunks target ~512 tokens, which is roughly 500–4000 characters depending on the \
+         language and whether a long paragraph/sentence could not be split. Every call counts \
+         against your context budget, which is also capped per call. The response marks where \
+         the body ends — chunks after that (references/appendix) are excluded by default. Use \
+         offset/limit to read only the parts relevant to the question, and set max_chars high \
+         enough to avoid truncating the chunks you need."
     }
 
     fn parameters(&self) -> Vec<ToolParameter> {
@@ -83,7 +85,7 @@ impl Tool for PaperReadTool {
             ToolParameter {
                 name: "max_chars".into(),
                 param_type: "integer".into(),
-                description: "Per-chunk character cap. Default comes from the app settings (typically 500), which truncates most chunks to previews — fine for locating content. A normal chunk is ~2000 characters.".into(),
+                description: "Per-chunk character cap. Default comes from the app settings (typically 500), which truncates most chunks to short previews — fine for locating content. Raw chunks can reach several thousand characters when a long paragraph or sentence cannot be split; set this high enough to avoid truncation.".into(),
                 required: false,
             },
             ToolParameter {

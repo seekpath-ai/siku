@@ -206,6 +206,7 @@ impl LlmClient for OllamaClient {
                                         event_type: "delta".to_string(),
                                         content: Some(content.to_string()),
                                         tool_call: None,
+                                        usage: None,
                                     });
                                 }
 
@@ -226,9 +227,24 @@ impl LlmClient for OllamaClient {
                                                     arguments: func_args,
                                                 }),
                                             }),
+                                            usage: None,
                                         });
                                     }
                                 }
+                            }
+                        }
+
+                        // Ollama's final streaming chunk carries usage stats.
+                        if json["done"].as_bool().unwrap_or(false) {
+                            let tokens_in = json["prompt_eval_count"].as_u64().unwrap_or(0) as u32;
+                            let tokens_out = json["eval_count"].as_u64().unwrap_or(0) as u32;
+                            if tokens_in > 0 || tokens_out > 0 {
+                                let _ = sender.send(StreamEvent {
+                                    event_type: "usage".to_string(),
+                                    content: None,
+                                    tool_call: None,
+                                    usage: Some(super::LlmUsage { tokens_in, tokens_out }),
+                                });
                             }
                         }
                     }

@@ -314,6 +314,8 @@ impl LlmClient for AnthropicClient {
         let mut stream = resp.bytes_stream();
         let mut current_tool_index: u32 = 0;
         let mut current_tool_id = String::new();
+        let mut tokens_in: u32 = 0;
+        let mut tokens_out: u32 = 0;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| format!("stream read error: {e}"))?;
@@ -328,6 +330,11 @@ impl LlmClient for AnthropicClient {
                 if let Some(data) = line.strip_prefix("data: ") {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
                         match json["type"].as_str() {
+                            Some("message_start") => {
+                                if let Some(usage) = json["usage"]["input_tokens"].as_u64() {
+                                    tokens_in = usage as u32;
+                                }
+                            }
                             Some("content_block_delta") => {
                                 let delta_type = json["delta"]["type"].as_str();
                                 match delta_type {
@@ -337,6 +344,7 @@ impl LlmClient for AnthropicClient {
                                                 event_type: "delta".to_string(),
                                                 content: Some(content.to_string()),
                                                 tool_call: None,
+                                                usage: None,
                                             });
                                         }
                                     }
@@ -353,6 +361,7 @@ impl LlmClient for AnthropicClient {
                                                         arguments: Some(partial.to_string()),
                                                     }),
                                                 }),
+                                                usage: None,
                                             });
                                         }
                                     }
@@ -381,6 +390,20 @@ impl LlmClient for AnthropicClient {
                                                 arguments: None,
                                             }),
                                         }),
+                                        usage: None,
+                                    });
+                                }
+                            }
+                            Some("message_delta") => {
+                                if let Some(usage) = json["usage"]["output_tokens"].as_u64() {
+                                    tokens_out = usage as u32;
+                                }
+                                if tokens_in > 0 || tokens_out > 0 {
+                                    let _ = sender.send(StreamEvent {
+                                        event_type: "usage".to_string(),
+                                        content: None,
+                                        tool_call: None,
+                                        usage: Some(super::LlmUsage { tokens_in, tokens_out }),
                                     });
                                 }
                             }

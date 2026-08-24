@@ -50,7 +50,7 @@ pub struct AgentEngine {
     config: AgentConfig,
     session_id: String,
     db: SqlitePool,
-    cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancel_token: tokio_util::sync::CancellationToken,
     project_dir: Option<String>,
     /// Extra context injected into the system prompt (pet domain agents).
     context_prompt: Option<String>,
@@ -64,7 +64,7 @@ impl AgentEngine {
         db: SqlitePool,
         config: AgentConfig,
         memory_store: MemoryStore,
-        cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        cancel_token: tokio_util::sync::CancellationToken,
         project_dir: Option<String>,
         context_prompt: Option<String>,
     ) -> Self {
@@ -79,14 +79,14 @@ impl AgentEngine {
             config,
             session_id,
             db,
-            cancel_flag,
+            cancel_token,
             project_dir,
             context_prompt,
         }
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancel_flag.load(std::sync::atomic::Ordering::Relaxed)
+        self.cancel_token.is_cancelled()
     }
 
     /// Some models wrap tool arguments as `{"arguments": {...}}` instead of
@@ -132,10 +132,15 @@ impl AgentEngine {
             None,
             None,
         );
-        match tokio::time::timeout(std::time::Duration::from_secs(300), ask_rx.recv()).await {
-            Ok(Some(answers)) => answers.to_string(),
-            Ok(None) => "AskUserQuestion failed: channel closed".to_string(),
-            Err(_) => "AskUserQuestion timed out".to_string(),
+        match tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => None,
+            result = tokio::time::timeout(std::time::Duration::from_secs(300), ask_rx.recv()) => Some(result),
+        } {
+            Some(Ok(Some(answers))) => answers.to_string(),
+            Some(Ok(None)) => "AskUserQuestion failed: channel closed".to_string(),
+            Some(Err(_)) => "AskUserQuestion timed out".to_string(),
+            None => "AskUserQuestion cancelled by user".to_string(),
         }
     }
 
@@ -178,9 +183,10 @@ impl AgentEngine {
     }
 
     /// Process a user message with streaming output via event channel.
-    /// Returns the final assistant content, the ReAct steps, and whether the
-    /// turn was cancelled. Does NOT emit the terminal done/cancelled event —
-    /// the caller emits it after persisting the results.
+    /// Returns the final assistant content, the ReAct steps, whether the
+    /// turn was cancelled, and the total token usage across all LLM rounds.
+    /// Does NOT emit the terminal done/cancelled event — the caller emits it
+    /// after persisting the results.
     pub async fn process_message(
         &self,
         user_message: &str,
@@ -188,7 +194,7 @@ impl AgentEngine {
         event_tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
         approval_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ApprovalResponse>,
         ask_rx: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
-    ) -> Result<(String, Vec<AgentStep>, bool), String> {
+    ) -> Result<(String, Vec<AgentStep>, bool, u32), String> {
         let span = info_span!("agent_turn", session_id = %self.session_id);
         let _guard = span.enter();
         let sid = self.session_id.clone();
@@ -240,6 +246,7 @@ impl AgentEngine {
         let mut steps: Vec<AgentStep> = Vec::new();
         let mut round = 0;
         let mut last_approval_at: Option<std::time::Instant> = None;
+        let mut total_tokens: u32 = 0;
 
         let mut cancelled = false;
         loop {
@@ -281,9 +288,15 @@ impl AgentEngine {
             tokio::pin!(llm_fut);
             loop {
                 tokio::select! {
+                    biased;
+                    _ = self.cancel_token.cancelled() => {
+                        info!(round, "agent cancelled during streaming");
+                        cancelled = true;
+                        break;
+                    }
                     event = stream_rx.recv() => {
                         match event {
-                            Some(StreamEvent { event_type, content, tool_call }) => {
+                            Some(StreamEvent { event_type, content, tool_call, usage }) => {
                                 if self.is_cancelled() {
                                     info!(round, "agent cancelled during streaming");
                                     cancelled = true;
@@ -315,6 +328,11 @@ impl AgentEngine {
                                     "finish" => {
                                         if let Some(ref c) = content {
                                             round_finish = Some(c.clone());
+                                        }
+                                    }
+                                    "usage" => {
+                                        if let Some(u) = usage {
+                                            total_tokens = total_tokens.saturating_add(u.total());
                                         }
                                     }
                                     _ => {}
@@ -367,6 +385,11 @@ impl AgentEngine {
                     "finish" => {
                         if let Some(ref c) = event.content {
                             round_finish = Some(c.clone());
+                        }
+                    }
+                    "usage" => {
+                        if let Some(u) = event.usage {
+                            total_tokens = total_tokens.saturating_add(u.total());
                         }
                     }
                     _ => {}
@@ -490,21 +513,25 @@ impl AgentEngine {
                     } else {
                         self.emit(&event_tx, "tool_approval_required", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), Some(args.clone()), None, None, None);
 
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(300),
-                            approval_rx.recv(),
-                        ).await {
-                            Ok(Some(ApprovalResponse::Approved)) => {
+                        match tokio::select! {
+                            biased;
+                            _ = self.cancel_token.cancelled() => None,
+                            result = tokio::time::timeout(
+                                std::time::Duration::from_secs(300),
+                                approval_rx.recv(),
+                            ) => Some(result),
+                        } {
+                            Some(Ok(Some(ApprovalResponse::Approved))) => {
                                 last_approval_at = Some(std::time::Instant::now());
                                 true
                             }
-                            Ok(Some(ApprovalResponse::ModifiedArgs(new_args))) => {
+                            Some(Ok(Some(ApprovalResponse::ModifiedArgs(new_args)))) => {
                                 args = new_args;
                                 last_approval_at = Some(std::time::Instant::now());
                                 true
                             }
-                            Ok(Some(ApprovalResponse::Declined)) | Ok(None) => false,
-                            Err(_) => {
+                            Some(Ok(Some(ApprovalResponse::Declined))) | Some(Ok(None)) | None => false,
+                            Some(Err(_)) => {
                                 self.emit(&event_tx, "tool_result", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), None, Some("Error: approval timeout".into()), Some("timeout".into()), None);
                                 false
                             }
@@ -533,11 +560,20 @@ impl AgentEngine {
                 }
 
                 let start = std::time::Instant::now();
-                // Allow long-running tools (e.g. bash up to 5min).
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(320),
-                    self.tool_registry.execute(&tc.function.name, args.clone()),
-                ).await;
+                // Allow long-running tools (e.g. bash up to 5min), but abort
+                // promptly when the user hits stop.
+                let result = tokio::select! {
+                    biased;
+                    _ = self.cancel_token.cancelled() => {
+                        info!(round, tool_name=%tc.function.name, "agent cancelled during tool execution");
+                        cancelled = true;
+                        break;
+                    }
+                    result = tokio::time::timeout(
+                        std::time::Duration::from_secs(320),
+                        self.tool_registry.execute(&tc.function.name, args.clone()),
+                    ) => result,
+                };
 
                 let duration_ms = start.elapsed().as_millis() as i32;
                 let (tool_result, tool_status) = match result {
@@ -620,6 +656,6 @@ impl AgentEngine {
             info!(content_len = reply.len(), "agent turn complete");
         }
 
-        Ok((reply, steps, cancelled))
+        Ok((reply, steps, cancelled, total_tokens))
     }
 }

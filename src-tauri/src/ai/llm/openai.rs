@@ -219,6 +219,7 @@ impl LlmClient for OpenAiClient {
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
             "stream": true,
+            "stream_options": { "include_usage": true },
         });
 
         let resp = self
@@ -272,6 +273,21 @@ impl LlmClient for OpenAiClient {
                         Err(_) => continue,
                     };
 
+                    // OpenAI sends a final chunk with empty choices and usage info
+                    // when stream_options.include_usage is true.
+                    if let Some(usage) = json["usage"].as_object() {
+                        let tokens_in = usage["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+                        let tokens_out = usage["completion_tokens"].as_u64().unwrap_or(0) as u32;
+                        if tokens_in > 0 || tokens_out > 0 {
+                            let _ = sender.send(StreamEvent {
+                                event_type: "usage".to_string(),
+                                content: None,
+                                tool_call: None,
+                                usage: Some(super::LlmUsage { tokens_in, tokens_out }),
+                            });
+                        }
+                    }
+
                     let choices = match json["choices"].as_array() {
                         Some(c) if !c.is_empty() => c,
                         _ => continue,
@@ -285,6 +301,7 @@ impl LlmClient for OpenAiClient {
                                 event_type: "reasoning".to_string(),
                                 content: Some(reasoning.to_string()),
                                 tool_call: None,
+                                usage: None,
                             });
                         }
                     }
@@ -296,6 +313,7 @@ impl LlmClient for OpenAiClient {
                                 event_type: "delta".to_string(),
                                 content: Some(content.to_string()),
                                 tool_call: None,
+                                usage: None,
                             });
                         }
                     }
@@ -319,6 +337,7 @@ impl LlmClient for OpenAiClient {
                                         arguments: func_args,
                                     }),
                                 }),
+                                usage: None,
                             });
                         }
                     }
@@ -333,6 +352,7 @@ impl LlmClient for OpenAiClient {
                                 event_type: "finish".to_string(),
                                 content: Some(fr.to_string()),
                                 tool_call: None,
+                                usage: None,
                             });
                         }
                     }

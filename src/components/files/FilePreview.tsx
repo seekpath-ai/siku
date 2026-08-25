@@ -65,7 +65,7 @@ export function FilePreview({ fileId, onBack }: { fileId: string; onBack?: () =>
   const fileExt = file?.name.split('.').pop()?.toLowerCase() ?? 'text';
 
   return (
-    <div className="flex flex-col h-full bg-background">
+    <div className="flex flex-col h-full flex-1 min-w-0 bg-background">
       {/* Header */}
       <div className="flex items-center gap-2 px-3 h-10 border-b border-surface-hover shrink-0">
         {onBack && (

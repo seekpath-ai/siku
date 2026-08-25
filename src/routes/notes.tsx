@@ -203,6 +203,23 @@ function NotesPage() {
   // Reload the vault's managed files when the current vault is known/switched.
   useEffect(() => { loadFiles(); }, [loadFiles]);
 
+  // Reload note/file lists when sync applies remote changes. Debounced
+  // because changesets and mailbox batches can arrive in bursts.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const unlisten = listen('sync:remote_applied', () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        loadNotes();
+        loadFiles();
+      }, 500);
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      unlisten.then((fn) => fn());
+    };
+  }, [loadFiles]);
+
   useEffect(() => {
     if (activeId) {
       const n = notes.find((note) => note.id === activeId);

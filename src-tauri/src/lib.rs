@@ -468,6 +468,9 @@ pub fn run() {
             }
 
             let handle = app.handle().clone();
+            // Sync engine tasks emit UI events (e.g. "remote changes applied")
+            // through this handle.
+            sync::register_app_handle(handle.clone());
 
             // Phase 1: fast synchronous init happens in Phase 2 after DB + settings.
 

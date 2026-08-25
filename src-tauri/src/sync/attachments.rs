@@ -114,6 +114,20 @@ pub async fn collect_missing_blob_hashes(
     Ok(missing)
 }
 
+/// Maximum blob size served through the mailbox. A mailbox message is one
+/// relay frame holding the entire base64 payload (~1.33x wire size, ~2.7x
+/// memory after encryption) and the relay has no per-message size guard, so
+/// oversized blobs are only served over a live P2P DataChannel (which chunks
+/// them via `MAX_WIRE_MSG`) instead.
+pub const MAX_MAILBOX_BLOB_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Whether the blob is small enough to be served through the mailbox.
+pub fn blob_fits_mailbox(app_data_dir: &std::path::Path, hash: &str, ext: &str) -> bool {
+    std::fs::metadata(file_store::blob_path(app_data_dir, hash, ext))
+        .map(|m| m.len() <= MAX_MAILBOX_BLOB_BYTES)
+        .unwrap_or(false)
+}
+
 /// Read a blob and encode it as base64 for transport.
 pub fn read_blob_base64(
     app_data_dir: &std::path::Path,

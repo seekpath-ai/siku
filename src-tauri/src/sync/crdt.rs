@@ -81,6 +81,12 @@ pub async fn export_changes_since(db: &SqlitePool, since_db_version: i64) -> Res
     let mut max_db_version = since_db_version;
 
     for row in rows {
+        // Advance the export watermark for EVERY row in range — including
+        // filtered-out ones (disabled optional tables, non-syncable settings).
+        // Otherwise a range containing only filtered rows leaves
+        // `to_db_version` stuck and every push re-scans the same rows.
+        let db_version: i64 = row.try_get("db_version").unwrap_or_default();
+        max_db_version = max_db_version.max(db_version);
         let table: String = row.try_get("table").unwrap_or_default();
         if !table_sync_enabled(&table) {
             continue;
@@ -89,8 +95,6 @@ pub async fn export_changes_since(db: &SqlitePool, since_db_version: i64) -> Res
         if setting_row_non_syncable(&table, &pk) {
             continue;
         }
-        let db_version: i64 = row.try_get("db_version").unwrap_or_default();
-        max_db_version = max_db_version.max(db_version);
         changes.push(CrsqlChange {
             table,
             pk,
@@ -692,6 +696,52 @@ mod tests {
         sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
         db_a.close().await;
         db_b.close().await;
+        Ok(())
+    }
+
+    /// Regression: rows filtered out of the export (here a non-syncable
+    /// settings row) must still advance the export watermark, otherwise every
+    /// push re-scans the same range forever.
+    #[tokio::test]
+    async fn export_watermark_advances_past_filtered_rows() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-crdt-watermark-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a_path = dir.join("a.db");
+        let db_a = connect_with_crsqlite(&db_a_path).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db_a).await?;
+        register_crr_tables(&db_a, CORE_SYNC_TABLES).await?;
+        register_crr_tables(&db_a, OPTIONAL_SYNC_TABLES).await?;
+
+        // `app_settings` embeds API keys and must never be synced.
+        sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)")
+            .bind("app_settings")
+            .bind("{\"default_llm\":{\"api_key\":\"secret\"}}")
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&db_a)
+            .await?;
+
+        let changes = export_changes_since(&db_a, 0).await?;
+        assert!(
+            changes.changes.is_empty(),
+            "non-syncable settings row must be filtered out"
+        );
+        assert!(
+            changes.to_db_version > 0,
+            "watermark must still advance past filtered rows, got {}",
+            changes.to_db_version
+        );
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        db_a.close().await;
         Ok(())
     }
 

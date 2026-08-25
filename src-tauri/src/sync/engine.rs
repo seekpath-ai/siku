@@ -1,5 +1,5 @@
 use crate::sync::attachments::{
-    collect_missing_blob_hashes, read_blob_base64, write_blob_from_base64,
+    blob_fits_mailbox, collect_missing_blob_hashes, read_blob_base64, write_blob_from_base64,
 };
 use crate::sync::crdt::{apply_changes, export_changes_since, ChangesetMessage};
 use crate::sync::mailbox_client::MailboxClient;
@@ -444,6 +444,7 @@ impl SyncEngine {
         drop(applied);
         self.status.lock().await.pulled += received;
         self.mark_synced().await;
+        crate::sync::emit_remote_applied(received);
         self.request_missing_blobs().await?;
         Ok(())
     }
@@ -465,8 +466,16 @@ impl SyncEngine {
                             };
                             if let Err(e) = self.send_message(&payload).await {
                                 // DataChannel unavailable: try mailbox fallback
-                                // when we know which peer asked.
-                                if let Some(peer) =
+                                // when we know which peer asked. Oversized blobs
+                                // are not mailbox-eligible (single-frame limit);
+                                // they only sync while P2P is up.
+                                if !blob_fits_mailbox(&self.app_data_dir, &hash, &ext) {
+                                    warn!(
+                                        error = %e,
+                                        hash = %hash,
+                                        "failed to send blob payload; too large for mailbox fallback"
+                                    );
+                                } else if let Some(peer) =
                                     self.status.lock().await.peer_device_id.clone()
                                 {
                                     if let Err(e2) = self.deposit_message_to(&peer, &payload).await
@@ -660,6 +669,10 @@ impl SyncEngine {
             SyncMessage::AttachmentRequest { hashes } => {
                 info!(count = hashes.len(), from = %from_device_id, "received mailbox blob request");
                 for (hash, ext) in hashes {
+                    if !blob_fits_mailbox(&self.app_data_dir, &hash, &ext) {
+                        warn!(hash = %hash, "blob exceeds mailbox size limit; only P2P will carry it");
+                        continue;
+                    }
                     match read_blob_base64(&self.app_data_dir, &hash, &ext) {
                         Ok(Some(data)) => {
                             let payload = SyncMessage::AttachmentPayload {
@@ -760,6 +773,7 @@ impl SyncEngine {
                                     match crate::sync::crdt::apply_full_snapshot(&engine.db, &statements).await {
                                         Ok(()) => {
                                             engine.status.lock().await.pulled += statements.len() as i64;
+                                            crate::sync::emit_remote_applied(statements.len() as i64);
                                             // A snapshot can bring in rows (e.g. note
                                             // Markdown referencing `blobs/...`) without a
                                             // following changeset; request the referenced
@@ -800,6 +814,7 @@ impl SyncEngine {
                         match crate::sync::crdt::apply_full_snapshot(&engine.db, &statements).await {
                             Ok(()) => {
                                 engine.status.lock().await.pulled += statements.len() as i64;
+                                crate::sync::emit_remote_applied(statements.len() as i64);
                                 // Request blob files referenced by the snapshot
                                 // (note images, paper PDFs) — see above.
                                 if let Err(e) = engine.request_missing_blobs().await {
@@ -904,11 +919,53 @@ impl SyncEngine {
     }
 }
 
+/// Outbox rows are abandoned after this many delivery attempts — a message
+/// that fails 50 times is poison (undeliverable), and retrying it forever
+/// would let the outbox grow without bound while the relay is unreachable.
+const MAX_OUTBOX_RETRIES: i64 = 50;
+
+/// Drop outbox rows that can never be delivered: poison messages (too many
+/// retries) and expired ones (the relay keeps mailbox messages for the same
+/// TTL anyway, so older payloads would be dropped on arrival).
+async fn prune_outbox(db: &SqlitePool) -> Result<()> {
+    let poisoned = sqlx::query("DELETE FROM sync_outbox WHERE retry_count >= ?")
+        .bind(MAX_OUTBOX_RETRIES)
+        .execute(db)
+        .await
+        .context("prune poisoned outbox rows")?
+        .rows_affected();
+    if poisoned > 0 {
+        warn!(count = poisoned, "dropped poisoned outbox messages");
+    }
+
+    let rows: Vec<(String, i64, String)> =
+        sqlx::query_as("SELECT id, ttl_seconds, created_at FROM sync_outbox")
+            .fetch_all(db)
+            .await
+            .context("read outbox for expiry sweep")?;
+    let now = chrono::Utc::now();
+    for (id, ttl_seconds, created_at) in rows {
+        let expired = chrono::DateTime::parse_from_rfc3339(&created_at)
+            .map(|t| t.with_timezone(&chrono::Utc) + chrono::Duration::seconds(ttl_seconds) < now)
+            .unwrap_or(false);
+        if expired {
+            sqlx::query("DELETE FROM sync_outbox WHERE id = ?")
+                .bind(&id)
+                .execute(db)
+                .await
+                .context("drop expired outbox row")?;
+            info!(id = %id, "dropped expired outbox message");
+        }
+    }
+    Ok(())
+}
+
 /// Deliver queued outbox messages through the given mailbox transport; drop
 /// rows that are delivered, bump `retry_count` on failure. Also refreshes the
 /// `sync_outbox` table only — engine status is updated by callers that have
 /// one. Free function so the command layer can flush without a live engine.
 pub async fn flush_outbox_with(db: &SqlitePool, mailbox: &MailboxClient) -> Result<()> {
+    prune_outbox(db).await?;
     let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
         "SELECT id, to_device_id, ciphertext, nonce, retry_count FROM sync_outbox ORDER BY created_at LIMIT 50",
     )
@@ -1073,6 +1130,7 @@ pub async fn handle_mailbox_batch(
     messages: Vec<crate::sync::types::MailboxMessage>,
 ) -> Result<()> {
     let mut ack_ids = Vec::with_capacity(messages.len());
+    let mut applied_changes: i64 = 0;
     for mb_msg in messages {
         ack_ids.push(mb_msg.id.clone());
         let envelope = match decrypt_mailbox_message(key, &mb_msg).await {
@@ -1099,6 +1157,7 @@ pub async fn handle_mailbox_batch(
                         continue;
                     }
                     apply_changes(db, &cs).await?;
+                    applied_changes += cs.changes.len() as i64;
                     let _ = crate::core::settings_service::set_device_setting(
                         db,
                         &cursor_key,
@@ -1108,6 +1167,7 @@ pub async fn handle_mailbox_batch(
                     info!(from = %mb_msg.from_device_id, to_db_version = cs.to_db_version, "applied account-level mailbox changeset");
                 } else {
                     apply_changes(db, &cs).await?;
+                    applied_changes += cs.changes.len() as i64;
                     info!(from = %mb_msg.from_device_id, "applied per-device mailbox changeset");
                 }
                 // The mailbox path carries row changes, not blob files. Ask the
@@ -1157,6 +1217,10 @@ pub async fn handle_mailbox_batch(
             },
         });
     }
+    // One notification per batch; the frontend debounces and reloads.
+    if applied_changes > 0 {
+        crate::sync::emit_remote_applied(applied_changes);
+    }
     Ok(())
 }
 
@@ -1189,6 +1253,10 @@ async fn handle_mailbox_attachment_message(
         SyncMessage::AttachmentRequest { hashes } => {
             info!(count = hashes.len(), from = %from_device_id, "received mailbox blob request");
             for (hash, ext) in hashes {
+                if !blob_fits_mailbox(app_data_dir, &hash, &ext) {
+                    warn!(hash = %hash, "blob exceeds mailbox size limit; only P2P will carry it");
+                    continue;
+                }
                 match read_blob_base64(app_data_dir, &hash, &ext) {
                     Ok(Some(data)) => {
                         let payload = SyncMessage::AttachmentPayload {
@@ -1911,6 +1979,57 @@ mod tests {
         sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
         db_a.close().await;
         db_b.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn prune_outbox_drops_expired_and_poisoned_rows() -> anyhow::Result<()> {
+        let (db, _dir) = create_test_db().await?;
+        let now = chrono::Utc::now();
+        let old = (now - chrono::Duration::days(8))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let fresh = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        // fresh row: kept
+        sqlx::query(
+            "INSERT INTO sync_outbox (id, to_device_id, ciphertext, nonce, ttl_seconds, created_at, retry_count)
+             VALUES ('fresh', 'dev', '', '', 604800, ?, 0)",
+        )
+        .bind(&fresh)
+        .execute(&db)
+        .await?;
+        // expired row: created 8 days ago with a 7-day TTL
+        sqlx::query(
+            "INSERT INTO sync_outbox (id, to_device_id, ciphertext, nonce, ttl_seconds, created_at, retry_count)
+             VALUES ('expired', 'dev', '', '', 604800, ?, 0)",
+        )
+        .bind(&old)
+        .execute(&db)
+        .await?;
+        // poisoned row: hit the retry ceiling
+        sqlx::query(
+            "INSERT INTO sync_outbox (id, to_device_id, ciphertext, nonce, ttl_seconds, created_at, retry_count)
+             VALUES ('poisoned', 'dev', '', '', 604800, ?, ?)",
+        )
+        .bind(&fresh)
+        .bind(MAX_OUTBOX_RETRIES)
+        .execute(&db)
+        .await?;
+
+        prune_outbox(&db).await?;
+
+        let remaining: Vec<(String,)> =
+            sqlx::query_as("SELECT id FROM sync_outbox ORDER BY id")
+                .fetch_all(&db)
+                .await?;
+        assert_eq!(
+            remaining,
+            vec![("fresh".to_string(),)],
+            "only the fresh row must survive pruning"
+        );
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
         Ok(())
     }
 }

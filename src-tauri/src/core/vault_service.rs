@@ -146,6 +146,12 @@ pub async fn delete_vault(db: &SqlitePool, id: &str) -> Result<(), String> {
         .execute(db)
         .await
         .map_err(|e| format!("db: {e}"))?;
+    // Managed files belong to the vault too (no checked FKs on CRR tables).
+    sqlx::query("DELETE FROM files WHERE vault_id = ?")
+        .bind(id)
+        .execute(db)
+        .await
+        .map_err(|e| format!("db: {e}"))?;
     sqlx::query("DELETE FROM vaults WHERE id = ?")
         .bind(id)
         .execute(db)

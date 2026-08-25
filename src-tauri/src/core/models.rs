@@ -129,6 +129,23 @@ pub struct Vault {
     pub updated_at: String,
 }
 
+/// A vault-managed file (PDF/Word/Excel/image/...) shown in the note tree
+/// alongside notes and folders. Content lives in the blob store; `name` is
+/// the display name and can change without touching the blob.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct FileItem {
+    pub id: String,
+    pub vault_id: String,
+    pub parent_id: Option<String>,
+    pub name: String,
+    pub blob_path: String,
+    pub size: i64,
+    pub mime_type: Option<String>,
+    pub sort_order: i32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// A snapshot of a note captured before an AI edit (version history).
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct NoteVersion {

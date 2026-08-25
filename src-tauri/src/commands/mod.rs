@@ -7,6 +7,7 @@ pub mod chat;
 pub mod collections;
 pub mod cron;
 pub mod file_browser;
+pub mod files;
 pub mod graph;
 pub mod image_cache;
 pub mod knowledge;

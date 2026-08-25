@@ -120,7 +120,7 @@ pub fn reveal_in_system(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn mime_guess(name: &str) -> Option<String> {
+pub fn mime_guess(name: &str) -> Option<String> {
     let ext = std::path::Path::new(name).extension()?.to_str()?;
     match ext.to_lowercase().as_str() {
         "pdf" => Some("application/pdf".into()),

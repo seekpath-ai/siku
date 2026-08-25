@@ -6,6 +6,7 @@ pub mod collection_service;
 pub mod cron_scheduler;
 pub mod db;
 pub mod error;
+pub mod file_item_service;
 pub mod file_service;
 pub mod graph_service;
 pub mod knowledge;

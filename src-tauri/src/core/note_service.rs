@@ -150,12 +150,14 @@ pub async fn delete_note(db: &SqlitePool, id: &str) -> Result<(), String> {
     .map_err(|e| format!("db: {e}"))?;
 
     // No ON DELETE CASCADE anymore (CRR tables may not have checked FKs) —
-    // remove links and version history explicitly so the deletions propagate
-    // via CRDT.
+    // remove links, version history and managed files explicitly so the
+    // deletions propagate via CRDT.
     for (nid,) in &ids {
         sqlx::query("DELETE FROM note_links WHERE source_id = ? OR target_id = ?")
             .bind(nid).bind(nid).execute(db).await.map_err(|e| format!("db: {e}"))?;
         sqlx::query("DELETE FROM note_versions WHERE note_id = ?")
+            .bind(nid).execute(db).await.map_err(|e| format!("db: {e}"))?;
+        sqlx::query("DELETE FROM files WHERE parent_id = ?")
             .bind(nid).execute(db).await.map_err(|e| format!("db: {e}"))?;
         sqlx::query("DELETE FROM notes WHERE id = ?")
             .bind(nid).execute(db).await.map_err(|e| format!("db: {e}"))?;

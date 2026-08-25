@@ -3,8 +3,10 @@ import {
   Plus, Folder, FileText, ChevronRight, ChevronsUpDown, ChevronsDownUp, Search, Trash2,
   MoreHorizontal, FolderPlus, FilePlus, ArrowUpToLine, X, Crosshair,
   Settings, HelpCircle, Database, Move, Bookmark,
+  File as FileIcon, Image as ImageIcon, FileSpreadsheet, ExternalLink,
 } from 'lucide-react';
-import type { Note } from '@/lib/types';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import type { Note, FileItem } from '@/lib/types';
 import { parseNoteTags } from '@/lib/types';
 import { notesSearch, type NoteSearchResult } from '@/lib/tauri';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
@@ -13,6 +15,8 @@ import { useDialog } from '@/hooks/useDialog';
 
 interface Props {
   notes: Note[];
+  /** Vault-managed files shown in the tree alongside notes and folders. */
+  files?: FileItem[];
   activeNoteId: string | null;
   onSelect: (id: string) => void;
   /** Create a new note under the given parent folder (undefined = root). */
@@ -34,6 +38,12 @@ interface Props {
   onBulkCreateFolder?: (ids: string[]) => Promise<string>;
   /** Bulk move selected notes under a folder (or to root). */
   onBulkMove?: (ids: string[], parentId: string | null) => void;
+  /** Import OS-dropped files under a folder (null = root). */
+  onFileImport?: (paths: string[], parentId: string | null) => void;
+  onFileMove?: (id: string, parentId: string | null) => void;
+  onFileRename?: (id: string, name: string) => void;
+  onFileDelete?: (id: string) => void;
+  onFileOpen?: (id: string) => void;
   onClose?: () => void;
   title?: string;
   /** Current vault name shown in the footer. */
@@ -45,8 +55,39 @@ interface Props {
 
 const ROOT_KEY = '__root__';
 
+/** A tree row: either a note/folder or a managed file. Files are leaf nodes. */
+interface TreeNode {
+  id: string;
+  parentId: string | null;
+  title: string;
+  isFolder: boolean;
+  sortOrder: number;
+  updatedAt: string;
+  note?: Note;
+  file?: FileItem;
+}
+
+/** Icon for a managed file, chosen by extension. */
+function FileTypeIcon({ name }: { name: string }) {
+  const ext = name.split('.').pop()?.toLowerCase() ?? '';
+  if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp'].includes(ext)) {
+    return <ImageIcon size={14} className="shrink-0 text-text-secondary/60" />;
+  }
+  if (['xls', 'xlsx', 'csv'].includes(ext)) {
+    return <FileSpreadsheet size={14} className="shrink-0 text-text-secondary/60" />;
+  }
+  if (ext === 'pdf') {
+    return <FileText size={14} className="shrink-0 text-red-400/80" />;
+  }
+  if (['doc', 'docx', 'md', 'txt'].includes(ext)) {
+    return <FileText size={14} className="shrink-0 text-text-secondary/60" />;
+  }
+  return <FileIcon size={14} className="shrink-0 text-text-secondary/60" />;
+}
+
 export function NoteList({
   notes,
+  files = [],
   activeNoteId,
   onSelect,
   onCreate,
@@ -61,6 +102,11 @@ export function NoteList({
   onMoveToFolder,
   onBulkCreateFolder,
   onBulkMove,
+  onFileImport,
+  onFileMove,
+  onFileRename,
+  onFileDelete,
+  onFileOpen,
   onClose,
   title = '文件列表',
   currentVaultName = 'cognitive-archive',
@@ -78,7 +124,7 @@ export function NoteList({
   const [flashIds, setFlashIds] = useState<Set<string>>(new Set());
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [lastSelectedId, setLastSelectedId] = useState<string | null>(null);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; noteId: string; bulk: boolean } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string; bulk: boolean } | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [sortEnabled, setSortEnabled] = useState(false);
@@ -109,15 +155,37 @@ export function NoteList({
   }, [notes]);
 
   const noteMap = useMemo(() => new Map(notes.map((n) => [n.id, n])), [notes]);
+  const fileMap = useMemo(() => new Map(files.map((f) => [f.id, f])), [files]);
   const folderIds = useMemo(() => notes.filter((n) => n.is_folder === 1).map((n) => n.id), [notes]);
   const allFoldersExpanded = folderIds.length > 0 && folderIds.every((id) => expanded.has(id));
 
   const childrenMap = useMemo(() => {
-    const map = new Map<string, Note[]>();
-    for (const n of notes) {
-      const pid = n.parent_id ?? ROOT_KEY;
+    const map = new Map<string, TreeNode[]>();
+    const push = (pid: string, node: TreeNode) => {
       if (!map.has(pid)) map.set(pid, []);
-      map.get(pid)!.push(n);
+      map.get(pid)!.push(node);
+    };
+    for (const n of notes) {
+      push(n.parent_id ?? ROOT_KEY, {
+        id: n.id,
+        parentId: n.parent_id,
+        title: n.title,
+        isFolder: n.is_folder === 1,
+        sortOrder: n.sort_order,
+        updatedAt: n.updated_at,
+        note: n,
+      });
+    }
+    for (const f of files) {
+      push(f.parent_id ?? ROOT_KEY, {
+        id: f.id,
+        parentId: f.parent_id,
+        title: f.name,
+        isFolder: false,
+        sortOrder: f.sort_order,
+        updatedAt: f.updated_at,
+        file: f,
+      });
     }
     for (const list of map.values()) {
       // Folders always come before files at the same level (Obsidian-style),
@@ -126,23 +194,30 @@ export function NoteList({
       list.sort((a, b) => {
         if (a.title === '我的图书馆' && b.title !== '我的图书馆') return -1;
         if (b.title === '我的图书馆' && a.title !== '我的图书馆') return 1;
-        const af = a.is_folder === 1 ? 0 : 1;
-        const bf = b.is_folder === 1 ? 0 : 1;
+        const af = a.isFolder ? 0 : 1;
+        const bf = b.isFolder ? 0 : 1;
         if (af !== bf) return af - bf;
         if (sortEnabled) {
           if (a.title === b.title) return 0;
           return a.title.localeCompare(b.title, 'zh-CN');
         }
-        if (a.sort_order !== b.sort_order) return a.sort_order - b.sort_order;
-        return b.updated_at.localeCompare(a.updated_at);
+        if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+        return b.updatedAt.localeCompare(a.updatedAt);
       });
     }
     return map;
-  }, [notes, sortEnabled]);
+  }, [notes, files, sortEnabled]);
 
   const visibleIds = useMemo(() => {
     const q = search.trim().toLowerCase();
-    const matchSelf = (n: Note) => {
+    const matchSelf = (node: TreeNode) => {
+      // Files only match a plain name search; tag/AI filters are note-only.
+      if (node.file) {
+        if (aiOnly || tagFilter) return false;
+        if (!q) return true;
+        return node.file.name.toLowerCase().includes(q);
+      }
+      const n = node.note!;
       if (aiOnly && n.agent_edit_count <= 0) return false;
       if (tagFilter && !parseNoteTags(n).includes(tagFilter)) return false;
       if (!q) return true;
@@ -152,29 +227,27 @@ export function NoteList({
     };
 
     const ids = new Set<string>();
-    const dfs = (id: string): boolean => {
-      const n = noteMap.get(id);
-      if (!n) return false;
-      let selfMatch = matchSelf(n);
-      for (const c of childrenMap.get(id) || []) {
-        if (dfs(c.id)) selfMatch = true;
+    const dfs = (node: TreeNode): boolean => {
+      let selfMatch = matchSelf(node);
+      for (const c of childrenMap.get(node.id) || []) {
+        if (dfs(c)) selfMatch = true;
       }
-      if (selfMatch) ids.add(id);
+      if (selfMatch) ids.add(node.id);
       return selfMatch;
     };
-    for (const r of childrenMap.get(ROOT_KEY) || []) dfs(r.id);
+    for (const r of childrenMap.get(ROOT_KEY) || []) dfs(r);
     return ids;
-  }, [search, tagFilter, aiOnly, noteMap, childrenMap]);
+  }, [search, tagFilter, aiOnly, childrenMap]);
 
-  // Flat list of visible note ids in tree order (for Shift+click range selection).
+  // Flat list of visible node ids in tree order (for Shift+click range selection).
   const visibleOrderedIds = useMemo(() => {
     const ids: string[] = [];
-    const dfs = (id: string) => {
-      if (!visibleIds.has(id)) return;
-      ids.push(id);
-      for (const c of childrenMap.get(id) || []) dfs(c.id);
+    const dfs = (node: TreeNode) => {
+      if (!visibleIds.has(node.id)) return;
+      ids.push(node.id);
+      for (const c of childrenMap.get(node.id) || []) dfs(c);
     };
-    for (const r of childrenMap.get(ROOT_KEY) || []) dfs(r.id);
+    for (const r of childrenMap.get(ROOT_KEY) || []) dfs(r);
     return ids;
   }, [visibleIds, childrenMap]);
 
@@ -243,9 +316,9 @@ export function NoteList({
     });
   }, [activeNoteId, noteMap]);
 
-  const startRename = useCallback((note: Note) => {
-    setRenamingId(note.id);
-    setRenameValue(note.title);
+  const startRename = useCallback((id: string, currentName: string) => {
+    setRenamingId(id);
+    setRenameValue(currentName);
   }, []);
 
   const cancelRename = useCallback(() => {
@@ -256,39 +329,42 @@ export function NoteList({
   const commitRename = useCallback(() => {
     if (renamingId) {
       const name = renameValue.trim();
-      // The system library folder name is reserved.
-      if (name === '我的图书馆') {
+      const isFile = fileMap.has(renamingId);
+      // The system library folder name is reserved (notes only — renaming a
+      // file to it is harmless since files never become folders).
+      if (!isFile && name === '我的图书馆') {
         alert('「我的图书馆」为系统保留名称，不能用于新建目录');
         cancelRename();
         return;
       }
-      const current = noteMap.get(renamingId)?.title ?? '';
+      const current = noteMap.get(renamingId)?.title ?? fileMap.get(renamingId)?.name ?? '';
       if (name && name !== current) {
-        onRename(renamingId, name);
+        if (isFile) onFileRename?.(renamingId, name);
+        else onRename(renamingId, name);
       }
     }
     setRenamingId(null);
     setRenameValue('');
-  }, [renamingId, renameValue, onRename, cancelRename, alert, noteMap]);
+  }, [renamingId, renameValue, onRename, onFileRename, cancelRename, alert, noteMap, fileMap]);
 
-  const openContextMenu = useCallback((e: MouseEvent, note: Note) => {
+  const openContextMenu = useCallback((e: MouseEvent, node: TreeNode) => {
     e.preventDefault();
     e.stopPropagation();
-    const bulk = selectedIds.size > 1 && selectedIds.has(note.id);
-    // If right-clicked note is not in the current selection, select it alone.
-    if (!selectedIds.has(note.id)) {
-      setSelectedIds(new Set([note.id]));
-      setLastSelectedId(note.id);
+    const bulk = selectedIds.size > 1 && selectedIds.has(node.id);
+    // If right-clicked node is not in the current selection, select it alone.
+    if (!selectedIds.has(node.id)) {
+      setSelectedIds(new Set([node.id]));
+      setLastSelectedId(node.id);
     }
-    setContextMenu({ x: e.clientX, y: e.clientY, noteId: note.id, bulk });
+    setContextMenu({ x: e.clientX, y: e.clientY, nodeId: node.id, bulk });
   }, [selectedIds]);
 
-  const handleNodeClick = useCallback((e: React.MouseEvent, note: Note) => {
+  const handleNodeClick = useCallback((e: React.MouseEvent, node: TreeNode) => {
     if (e.shiftKey && lastSelectedId) {
       e.preventDefault();
       e.stopPropagation();
       const idx1 = visibleOrderedIds.indexOf(lastSelectedId);
-      const idx2 = visibleOrderedIds.indexOf(note.id);
+      const idx2 = visibleOrderedIds.indexOf(node.id);
       if (idx1 !== -1 && idx2 !== -1) {
         const start = Math.min(idx1, idx2);
         const end = Math.max(idx1, idx2);
@@ -299,21 +375,22 @@ export function NoteList({
           return next;
         });
       }
-      setLastSelectedId(note.id);
+      setLastSelectedId(node.id);
     } else if (e.ctrlKey || e.metaKey) {
       e.preventDefault();
       e.stopPropagation();
       setSelectedIds((prev) => {
         const next = new Set(prev);
-        if (next.has(note.id)) next.delete(note.id);
-        else next.add(note.id);
+        if (next.has(node.id)) next.delete(node.id);
+        else next.add(node.id);
         return next;
       });
-      setLastSelectedId(note.id);
+      setLastSelectedId(node.id);
     } else {
-      setSelectedIds(new Set([note.id]));
-      setLastSelectedId(note.id);
-      onSelect(note.id);
+      setSelectedIds(new Set([node.id]));
+      setLastSelectedId(node.id);
+      // Files have no editor pane; clicking only selects them.
+      if (node.note) onSelect(node.id);
     }
   }, [lastSelectedId, visibleOrderedIds, onSelect]);
 
@@ -332,10 +409,15 @@ export function NoteList({
     [onCreateFolder, onCreateSubFolder]
   );
 
-  const contextNote = contextMenu && !contextMenu.bulk ? noteMap.get(contextMenu.noteId) : undefined;
+  const contextNote = contextMenu && !contextMenu.bulk ? noteMap.get(contextMenu.nodeId) : undefined;
+  const contextFile = contextMenu && !contextMenu.bulk ? fileMap.get(contextMenu.nodeId) : undefined;
   const selectedNotes = useMemo(
     () => notes.filter((n) => selectedIds.has(n.id)),
     [notes, selectedIds]
+  );
+  const selectedFiles = useMemo(
+    () => files.filter((f) => selectedIds.has(f.id)),
+    [files, selectedIds]
   );
 
   // True when `targetId` is inside `ancestorId`'s subtree (used to prevent
@@ -355,6 +437,13 @@ export function NoteList({
     [noteMap]
   );
 
+  // Parent folder of any node id (note or file), null when at root.
+  const parentOf = useCallback(
+    (id: string): string | null =>
+      noteMap.get(id)?.parent_id ?? fileMap.get(id)?.parent_id ?? null,
+    [noteMap, fileMap]
+  );
+
   // ── Pointer-based drag & drop (HTML5 DnD is unreliable in WebView2) ──
   const resolveDropTarget = useCallback(
     (
@@ -369,14 +458,19 @@ export function NoteList({
         if ((el as HTMLElement).dataset?.dragIndicator) continue;
         const node = el.closest('[data-note-id]') as HTMLElement | null;
         if (!node) continue;
-        const note = noteMap.get(node.dataset.noteId!);
+        const id = node.dataset.noteId!;
+        const note = noteMap.get(id);
         if (note) {
           return note.is_folder === 1 ? { kind: 'folder', id: note.id } : { kind: 'note', id: note.id };
+        }
+        // Dropping onto a managed file lands next to it (same parent).
+        if (fileMap.has(id)) {
+          return { kind: 'note', id };
         }
       }
       return { kind: 'root' };
     },
-    [noteMap]
+    [noteMap, fileMap]
   );
 
   const isValidDrop = useCallback(
@@ -384,18 +478,18 @@ export function NoteList({
       if (target.kind === 'root') return true;
       // Dropping onto itself is invalid.
       if (target.id === candId) return false;
-      // Dropping into its own subtree is invalid.
+      // Dropping into its own subtree is invalid (files have no subtree).
       if (target.kind === 'folder' && isInSubtree(target.id, candId)) return false;
       return true;
     },
     [isInSubtree]
   );
 
-  const handleNodeMouseDown = useCallback((e: React.MouseEvent, note: Note) => {
+  const handleNodeMouseDown = useCallback((e: React.MouseEvent, node: TreeNode) => {
     if (e.button !== 0) return;
     // Don't initiate drag when using multi-selection modifiers.
     if (e.shiftKey || e.ctrlKey || e.metaKey) return;
-    dragCandidateRef.current = note.id;
+    dragCandidateRef.current = node.id;
     dragStartPosRef.current = { x: e.clientX, y: e.clientY };
     dragActiveRef.current = false;
   }, []);
@@ -439,8 +533,8 @@ export function NoteList({
       const candId = dragCandidateRef.current;
       const start = dragStartPosRef.current;
       if (!candId || !start) return;
-      const note = noteMap.get(candId);
-      if (!note) return;
+      const title = noteMap.get(candId)?.title ?? fileMap.get(candId)?.name;
+      if (title == null) return;
 
       if (!dragActiveRef.current) {
         if (Math.hypot(e.clientX - start.x, e.clientY - start.y) < 6) return;
@@ -449,7 +543,7 @@ export function NoteList({
       }
 
       lastMouseYRef.current = e.clientY;
-      setDragPos({ x: e.clientX, y: e.clientY, id: note.id, title: note.title });
+      setDragPos({ x: e.clientX, y: e.clientY, id: candId, title });
       const target = resolveDropTarget(e.clientX, e.clientY);
       const valid = isValidDrop(target, candId);
       const nextTarget: typeof dropTarget =
@@ -513,16 +607,18 @@ export function NoteList({
       const target = finalTarget ?? resolveDropTarget(e.clientX, e.clientY);
       if (!target || !isValidDrop(target, candId)) return;
 
-      if (target.kind === 'folder') {
-        onMoveToFolder?.(candId, target.id);
-      } else if (target.kind === 'note') {
-        // Dropping on a regular note places the dragged note in the same
-        // directory as the target note (the target's parent folder, or root).
-        const targetNote = noteMap.get(target.id);
-        onMoveToFolder?.(candId, targetNote?.parent_id ?? null);
+      // Dropping on a folder lands inside it; dropping on a note/file lands
+      // next to it (the target's parent folder, or root); empty area = root.
+      const parentId =
+        target.kind === 'folder'
+          ? target.id
+          : target.kind === 'note'
+            ? parentOf(target.id)
+            : null;
+      if (fileMap.has(candId)) {
+        onFileMove?.(candId, parentId);
       } else {
-        // Dropping on empty area moves the note to the root level.
-        onMoveToFolder?.(candId, null);
+        onMoveToFolder?.(candId, parentId);
       }
       setJustMovedId(candId);
       window.setTimeout(() => setJustMovedId(null), 900);
@@ -547,20 +643,55 @@ export function NoteList({
       }
       stopAutoScroll();
     };
-  }, [noteMap, resolveDropTarget, isValidDrop, onMoveToFolder, expanded, draggingId]);
+  }, [noteMap, fileMap, resolveDropTarget, isValidDrop, onMoveToFolder, onFileMove, parentOf, expanded, draggingId]);
+
+  // OS file drag-in: Tauri native drag-drop events (HTML5 file drop is
+  // disabled in the webview; the payload carries absolute paths + position).
+  useEffect(() => {
+    if (!onFileImport) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    getCurrentWindow()
+      .onDragDropEvent((event) => {
+        if (event.payload.type !== 'drop') return;
+        const { paths, position } = event.payload;
+        if (!paths.length) return;
+        const target = resolveDropTarget(position.x, position.y);
+        const parentId =
+          target.kind === 'folder'
+            ? target.id
+            : target.kind === 'note'
+              ? parentOf(target.id)
+              : null;
+        onFileImport(paths, parentId);
+      })
+      .then((u) => {
+        if (cancelled) u();
+        else unlisten = u;
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [onFileImport, resolveDropTarget, parentOf]);
 
   const handleMoveDialog = useCallback(
     (parentId: string | null) => {
       if (!moveTargetIds) return;
       if (moveTargetIds.length === 1) {
-        onMoveToFolder?.(moveTargetIds[0], parentId);
-      } else if (onBulkMove) {
-        onBulkMove(moveTargetIds, parentId);
+        const id = moveTargetIds[0];
+        if (fileMap.has(id)) onFileMove?.(id, parentId);
+        else onMoveToFolder?.(id, parentId);
+      } else {
+        const noteIds = moveTargetIds.filter((id) => !fileMap.has(id));
+        const fileIds = moveTargetIds.filter((id) => fileMap.has(id));
+        if (noteIds.length > 0 && onBulkMove) onBulkMove(noteIds, parentId);
+        for (const fid of fileIds) onFileMove?.(fid, parentId);
       }
       setMoveTargetIds(null);
       setSelectedIds(new Set());
     },
-    [moveTargetIds, onMoveToFolder, onBulkMove]
+    [moveTargetIds, onMoveToFolder, onBulkMove, onFileMove, fileMap]
   );
 
   const buildContextItems = (note: Note): ContextMenuItem[] => {
@@ -582,7 +713,7 @@ export function NoteList({
         {
           label: '重命名',
           icon: <MoreHorizontal size={12} />,
-          onClick: () => startRename(note),
+          onClick: () => startRename(note.id, note.title),
         },
         {
           label: '移动到...',
@@ -614,32 +745,67 @@ export function NoteList({
     return items;
   };
 
+  const buildFileContextItems = (file: FileItem): ContextMenuItem[] => {
+    const items: ContextMenuItem[] = [
+      {
+        label: '打开',
+        icon: <ExternalLink size={12} />,
+        onClick: () => onFileOpen?.(file.id),
+      },
+      {
+        label: '重命名',
+        icon: <MoreHorizontal size={12} />,
+        onClick: () => startRename(file.id, file.name),
+      },
+      {
+        label: '移动到...',
+        icon: <Move size={12} />,
+        onClick: () => setMoveTargetIds([file.id]),
+      },
+    ];
+    if (file.parent_id && onFileMove) {
+      items.push({
+        label: '移出文件夹',
+        icon: <ArrowUpToLine size={12} />,
+        onClick: () => onFileMove(file.id, null),
+      });
+    }
+    items.push({
+      label: '删除',
+      destructive: true,
+      icon: <Trash2 size={12} />,
+      onClick: () => onFileDelete?.(file.id),
+    });
+    return items;
+  };
+
   const buildBulkContextItems = (): ContextMenuItem[] => {
     const count = selectedIds.size;
-    const ids = selectedNotes.map((n) => n.id);
-    const allFav = selectedNotes.every((n) => n.is_favorite === 1);
+    const noteIds = selectedNotes.map((n) => n.id);
+    const fileIds = selectedFiles.map((f) => f.id);
+    const allFav = selectedNotes.length > 0 && selectedNotes.every((n) => n.is_favorite === 1);
     const items: ContextMenuItem[] = [];
 
-    if (onBulkCreateFolder) {
+    if (onBulkCreateFolder && noteIds.length > 0) {
       items.push({
-        label: `使用选中的 ${count} 个对象创建新文件夹`,
+        label: `使用选中的 ${noteIds.length} 个对象创建新文件夹`,
         icon: <FolderPlus size={12} />,
         onClick: async () => {
-          await onBulkCreateFolder(ids);
+          await onBulkCreateFolder(noteIds);
           setSelectedIds(new Set());
         },
       });
     }
-    if (onBulkMove) {
+    if (onBulkMove || onFileMove) {
       items.push({
         label: `将 ${count} 个文件移动到...`,
         icon: <Move size={12} />,
-        onClick: () => setMoveTargetIds(selectedNotes.map((n) => n.id)),
+        onClick: () => setMoveTargetIds([...noteIds, ...fileIds]),
       });
     }
-    if (onToggleFavorite) {
+    if (onToggleFavorite && noteIds.length > 0) {
       items.push({
-        label: allFav ? `取消收藏 ${count} 个` : `收藏 ${count} 个`,
+        label: allFav ? `取消收藏 ${noteIds.length} 个` : `收藏 ${noteIds.length} 个`,
         icon: <Bookmark size={12} />,
         onClick: () => {
           for (const n of selectedNotes) onToggleFavorite!(n.id, !allFav);
@@ -652,47 +818,56 @@ export function NoteList({
       destructive: true,
       icon: <Trash2 size={12} />,
       onClick: () => {
-        if (onBulkDelete) {
-          // One confirmation covering the union of all subtrees.
-          onBulkDelete(ids);
-        } else {
-          for (const n of selectedNotes) onDelete(n.id);
+        if (noteIds.length > 0) {
+          if (onBulkDelete) {
+            // One confirmation covering the union of all subtrees.
+            onBulkDelete(noteIds);
+          } else {
+            for (const n of selectedNotes) onDelete(n.id);
+          }
         }
+        for (const f of selectedFiles) onFileDelete?.(f.id);
         setSelectedIds(new Set());
       },
     });
     return items;
   };
 
-  const renderNode = (note: Note, depth: number) => {
-    if (!visibleIds.has(note.id)) return null;
+  const renderNode = (node: TreeNode, depth: number) => {
+    if (!visibleIds.has(node.id)) return null;
 
-    const children = childrenMap.get(note.id) || [];
+    const children = node.file ? [] : childrenMap.get(node.id) || [];
     const hasChildren = children.length > 0;
-    const isExpanded = expanded.has(note.id);
-    const isActive = activeNoteId === note.id;
-    const isSelected = selectedIds.has(note.id);
-    const isRenaming = renamingId === note.id;
-    const isFolder = note.is_folder === 1;
-    const isSystem = note.is_system === 1;
-    const isDropTarget = dropTarget?.kind !== 'root' && dropTarget?.id === note.id;
+    const isExpanded = expanded.has(node.id);
+    const isActive = activeNoteId === node.id;
+    const isSelected = selectedIds.has(node.id);
+    const isRenaming = renamingId === node.id;
+    const isFolder = node.isFolder;
+    const note = node.note;
+    const isSystem = note?.is_system === 1;
+    const isDropTarget = dropTarget?.kind !== 'root' && dropTarget?.id === node.id;
     const dropTargetInvalid = isDropTarget && !dropTarget!.valid;
-    const isDraggingSource = draggingId === note.id;
-    const isJustMoved = justMovedId === note.id;
-    const isFlashing = flashIds.has(note.id);
+    const isDraggingSource = draggingId === node.id;
+    const isJustMoved = justMovedId === node.id;
+    const isFlashing = flashIds.has(node.id);
 
     return (
-      <div key={note.id}>
+      <div key={node.id}>
         <div
           ref={(el) => {
-            if (el) itemRefs.current.set(note.id, el);
-            else itemRefs.current.delete(note.id);
+            if (el) itemRefs.current.set(node.id, el);
+            else itemRefs.current.delete(node.id);
           }}
-          data-note-id={note.id}
-          onClick={(e) => handleNodeClick(e, note)}
-          onDoubleClick={() => !isSystem && startRename(note)}
-          onContextMenu={(e) => openContextMenu(e as unknown as MouseEvent, note)}
-          onMouseDown={(e) => !isSystem && handleNodeMouseDown(e, note)}
+          data-note-id={node.id}
+          onClick={(e) => handleNodeClick(e, node)}
+          onDoubleClick={() => {
+            if (node.file) onFileOpen?.(node.id);
+            else if (!isSystem) startRename(node.id, node.title);
+          }}
+          onContextMenu={(e) => openContextMenu(e as unknown as MouseEvent, node)}
+          onMouseDown={(e) => {
+            if (node.file || !isSystem) handleNodeMouseDown(e, node);
+          }}
           className={`flex items-center gap-1 h-7 px-3 text-[13px] cursor-pointer group select-none transition-opacity ${
             isDropTarget
               ? dropTargetInvalid
@@ -712,7 +887,7 @@ export function NoteList({
         >
           {isFolder || hasChildren ? (
             <button
-              onClick={(e) => { e.stopPropagation(); toggleExpand(note.id); }}
+              onClick={(e) => { e.stopPropagation(); toggleExpand(node.id); }}
               className="shrink-0 p-0.5 rounded hover:bg-surface-hover/60 text-text-secondary/60"
             >
               <ChevronRight
@@ -724,15 +899,19 @@ export function NoteList({
             <span className="w-[22px] shrink-0" />
           )}
 
-          {!isFolder &&
+          {node.file ? (
+            <FileTypeIcon name={node.file.name} />
+          ) : (
+            !isFolder &&
             (hasChildren ? (
               <Folder size={14} className="shrink-0 text-text-secondary/70" />
             ) : (
               <FileText
                 size={14}
-                className={`shrink-0 ${note.is_excerpt === 1 ? 'text-primary' : 'text-text-secondary/60'}`}
+                className={`shrink-0 ${note!.is_excerpt === 1 ? 'text-primary' : 'text-text-secondary/60'}`}
               />
-            ))}
+            ))
+          )}
 
           {isRenaming ? (
             <input
@@ -754,8 +933,8 @@ export function NoteList({
             />
           ) : (
             <span className="flex-1 truncate flex items-center gap-1.5">
-              {note.title || 'Untitled'}
-              {note.is_excerpt === 1 && (
+              {node.title || 'Untitled'}
+              {note?.is_excerpt === 1 && (
                 <span className="shrink-0 text-[9px] px-1 py-px rounded bg-primary/15 text-primary leading-none">
                   摘录
                 </span>
@@ -778,7 +957,6 @@ export function NoteList({
       </div>
     );
   };
-
 
 
 
@@ -817,6 +995,8 @@ export function NoteList({
       for (const id of visibleIds) {
         const n = noteMap.get(id);
         if (n?.parent_id) next.add(n.parent_id);
+        const f = fileMap.get(id);
+        if (f?.parent_id) next.add(f.parent_id);
       }
       return next;
     });
@@ -831,9 +1011,9 @@ export function NoteList({
       }
     });
     return () => window.clearTimeout(timer);
-  }, [search, tagFilter, aiOnly, visibleIds, noteMap]);
+  }, [search, tagFilter, aiOnly, visibleIds, noteMap, fileMap]);
 
-  const rootNotes = childrenMap.get(ROOT_KEY) || [];
+  const rootNodes = childrenMap.get(ROOT_KEY) || [];
 
   return (
     <div className="flex flex-col h-full bg-surface">
@@ -849,6 +1029,10 @@ export function NoteList({
                 const note = id ? noteMap.get(id) : undefined;
                 if (note) {
                   parentId = note.is_folder === 1 ? note.id : (note.parent_id ?? undefined);
+                } else {
+                  // A selected file creates the new note next to it.
+                  const file = id ? fileMap.get(id) : undefined;
+                  if (file) parentId = file.parent_id ?? undefined;
                 }
               }
               onCreate(parentId);
@@ -979,10 +1163,10 @@ export function NoteList({
               ))}
             </div>
           )
-        ) : rootNotes.length === 0 ? (
-          <p className="text-xs text-text-secondary/50 text-center py-6">暂无笔记</p>
+        ) : rootNodes.length === 0 ? (
+          <p className="text-xs text-text-secondary/50 text-center py-6">暂无笔记或文件</p>
         ) : (
-          rootNotes.map((note) => renderNode(note, 0))
+          rootNodes.map((node) => renderNode(node, 0))
         )}
       </div>
 
@@ -1023,7 +1207,15 @@ export function NoteList({
         <ContextMenu
           x={contextMenu.x}
           y={contextMenu.y}
-          items={contextMenu.bulk ? buildBulkContextItems() : contextNote ? buildContextItems(contextNote) : []}
+          items={
+            contextMenu.bulk
+              ? buildBulkContextItems()
+              : contextNote
+                ? buildContextItems(contextNote)
+                : contextFile
+                  ? buildFileContextItems(contextFile)
+                  : []
+          }
           onClose={() => setContextMenu(null)}
         />
       )}
@@ -1042,12 +1234,12 @@ export function NoteList({
         </div>
       )}
 
-      {/* Move-to-folder dialog */}
+      {/* Move-to-folder dialog (notes and managed files share the folder tree) */}
       {moveTargetIds && (
         <MoveNoteDialog
           notes={notes}
           noteIds={moveTargetIds}
-          currentParentId={noteMap.get(moveTargetIds[0])?.parent_id ?? null}
+          currentParentId={parentOf(moveTargetIds[0])}
           onMove={handleMoveDialog}
           onClose={() => setMoveTargetIds(null)}
         />

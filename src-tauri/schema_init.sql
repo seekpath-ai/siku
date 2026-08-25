@@ -178,6 +178,27 @@ CREATE TABLE IF NOT EXISTS note_links (
     PRIMARY KEY (source_id, target_id)
 );
 
+-- files: vault-level managed files (PDF/Word/Excel/images/...) shown in the
+-- note tree alongside notes and folders. No FK constraints: this is a CRR
+-- table and CRR tables may not have checked FKs — parent/vault cleanup is
+-- done explicitly in note_service::delete_note / vault_service::delete_vault.
+-- blob_path points into the content-addressed blob store (blobs/<sha256>.<ext>);
+-- renaming a file only touches `name`, never the blob.
+CREATE TABLE IF NOT EXISTS files (
+    id TEXT PRIMARY KEY NOT NULL,
+    vault_id TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001',
+    parent_id TEXT,
+    name TEXT NOT NULL DEFAULT '',
+    blob_path TEXT NOT NULL DEFAULT '',
+    size INTEGER NOT NULL DEFAULT 0,
+    mime_type TEXT,
+    sort_order INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_files_vault ON files(vault_id);
+CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent_id);
+
 -- annotations
 CREATE TABLE IF NOT EXISTS annotations (
     id TEXT PRIMARY KEY NOT NULL,

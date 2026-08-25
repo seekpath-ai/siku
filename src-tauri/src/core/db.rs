@@ -17,6 +17,7 @@ pub(crate) const CORE_SYNC_TABLES: &[&str] = &[
     "vaults",
     "note_versions",
     "note_links",
+    "files",
     // Library organization
     "tags",
     "paper_tags",

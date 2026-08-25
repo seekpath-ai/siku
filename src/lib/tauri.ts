@@ -6,7 +6,7 @@ import type {
   AgentSession, AgentStep, ChatMessage, ChatAttachment, LlmConfigBlock, ApprovalConfig, Project, CronJob,
   KnowledgeDomain, KnowledgeItem,
   ResearchTopic, ResearchSource, Note,
-  FileEntry, SystemInfo, TimelineItem,
+  FileEntry, FileItem, SystemInfo, TimelineItem,
   Collection, Tag, LlmProvider, Vault, NoteVersion, Bookmark,
 } from './types';
 
@@ -776,6 +776,31 @@ export async function vaultExport(id: string, targetDir: string): Promise<number
 }
 export async function vaultImport(id: string, sourceDir: string): Promise<{ imported: number; skipped: number }> {
   return invoke<{ imported: number; skipped: number }>('vault_import', { id, sourceDir });
+}
+
+// ============================================================
+// Vault files (managed files in the note tree)
+// ============================================================
+
+export async function filesList(vaultId: string): Promise<FileItem[]> {
+  return invoke<FileItem[]>('files_list', { vaultId });
+}
+/** Import a local file into the vault (copies content into the blob store). */
+export async function filesImport(vaultId: string, sourcePath: string, parentId?: string | null): Promise<FileItem> {
+  return invoke<FileItem>('files_import', { vaultId, sourcePath, parentId });
+}
+export async function filesMove(id: string, parentId?: string | null, sortOrder?: number): Promise<FileItem> {
+  return invoke<FileItem>('files_move', { id, parentId, sortOrder });
+}
+export async function filesRename(id: string, name: string): Promise<FileItem> {
+  return invoke<FileItem>('files_rename', { id, name });
+}
+export async function filesDelete(id: string): Promise<void> {
+  return invoke<void>('files_delete', { id });
+}
+/** Open a managed file with the system default application. */
+export async function filesOpen(id: string): Promise<void> {
+  return invoke<void>('files_open', { id });
 }
 
 // ============================================================

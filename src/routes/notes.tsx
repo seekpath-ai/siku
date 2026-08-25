@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { createRoute } from '@tanstack/react-router';
 import { Route as RootRoute } from './__root';
 import { NoteList } from '@/components/notes/NoteList';
@@ -12,7 +12,7 @@ import { useShellStore } from '@/stores/shellStore';
 import { useDialog } from '@/hooks/useDialog';
 import { usePetContextStore } from '@/stores/petContextStore';
 import { useTabStore } from '@/stores/tabStore';
-import type { Note, Vault } from '@/lib/types';
+import type { Note, Vault, FileItem } from '@/lib/types';
 import {
   notesListAll,
   notesCreate,
@@ -28,11 +28,18 @@ import {
   vaultSetCurrent,
   vaultExport,
   vaultImport,
+  filesList,
+  filesImport,
+  filesMove,
+  filesRename,
+  filesDelete,
+  filesOpen,
 } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
 
 function NotesPage() {
   const [notes, setNotes] = useState<Note[]>([]);
+  const [files, setFiles] = useState<FileItem[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [activeNote, setActiveNote] = useState<Note | null>(null);
   const [backlinks, setBacklinks] = useState<{ id: string; title: string; context: string; created_at: string }[]>([]);
@@ -162,6 +169,18 @@ function NotesPage() {
       console.error('load notes:', err);
     }
   };
+
+  const loadFiles = useCallback(async () => {
+    if (!currentVault) return;
+    try {
+      setFiles(await filesList(currentVault.id));
+    } catch (err) {
+      console.error('load files:', err);
+    }
+  }, [currentVault]);
+
+  // Reload the vault's managed files when the current vault is known/switched.
+  useEffect(() => { loadFiles(); }, [loadFiles]);
 
   useEffect(() => {
     if (activeId) {
@@ -296,7 +315,8 @@ function NotesPage() {
       // Close any open tabs for the deleted note and its descendants.
       const tabStore = useTabStore.getState();
       for (const nid of subtree) tabStore.close(`note_${nid}`);
-      await loadNotes();
+      // Deleting a folder also removes the managed files inside it.
+      await Promise.all([loadNotes(), loadFiles()]);
     } catch (err) {
       console.error('delete note:', err);
     }
@@ -322,7 +342,7 @@ function NotesPage() {
       }
       const tabStore = useTabStore.getState();
       for (const nid of all) tabStore.close(`note_${nid}`);
-      await loadNotes();
+      await Promise.all([loadNotes(), loadFiles()]);
     } catch (err) {
       console.error('bulk delete notes:', err);
     }
@@ -384,6 +404,65 @@ function NotesPage() {
     }
   };
 
+  // ── Vault-managed files ─────────────────────────────────────────────
+
+  /** Import OS-dropped files into the current vault under a folder (null = root). */
+  const handleFileImport = async (paths: string[], parentId: string | null) => {
+    if (!currentVault) return;
+    const failed: string[] = [];
+    for (const p of paths) {
+      try {
+        await filesImport(currentVault.id, p, parentId);
+      } catch (err) {
+        console.error('import file:', err);
+        failed.push(p);
+      }
+    }
+    if (failed.length > 0) {
+      await alert(`以下文件导入失败：\n${failed.join('\n')}`, '导入失败');
+    }
+    await loadFiles();
+  };
+
+  const handleFileMove = async (id: string, parentId: string | null) => {
+    try {
+      await filesMove(id, parentId);
+      await loadFiles();
+    } catch (err) {
+      console.error('move file:', err);
+    }
+  };
+
+  const handleFileRename = async (id: string, name: string) => {
+    try {
+      await filesRename(id, name);
+      await loadFiles();
+    } catch (err) {
+      console.error('rename file:', err);
+    }
+  };
+
+  const handleFileDelete = async (id: string) => {
+    const target = files.find((f) => f.id === id);
+    const ok = await confirm(`确定删除「${target?.name ?? ''}」吗？此操作不可撤销。`);
+    if (!ok) return;
+    try {
+      await filesDelete(id);
+      await loadFiles();
+    } catch (err) {
+      console.error('delete file:', err);
+    }
+  };
+
+  const handleFileOpen = async (id: string) => {
+    try {
+      await filesOpen(id);
+    } catch (err) {
+      console.error('open file:', err);
+      await alert(`打开文件失败：${err}`, '打开失败');
+    }
+  };
+
   const handleCreateLink = async (title: string) => {
     try {
       const note = await notesCreate(title, '', undefined, undefined);
@@ -423,6 +502,7 @@ function NotesPage() {
       <ListPanel width={260}>
         <NoteList
           notes={notes}
+          files={files}
           activeNoteId={activeId}
           onSelect={setActiveId}
           onCreate={handleCreate}
@@ -437,6 +517,11 @@ function NotesPage() {
           onMoveToFolder={handleMoveToFolder}
           onBulkCreateFolder={handleBulkCreateFolder}
           onBulkMove={handleBulkMove}
+          onFileImport={handleFileImport}
+          onFileMove={handleFileMove}
+          onFileRename={handleFileRename}
+          onFileDelete={handleFileDelete}
+          onFileOpen={handleFileOpen}
           onClose={() => setSidePanelCollapsed(true)}
           currentVaultName={currentVault?.name ?? 'cognitive-archive'}
           onOpenVault={() => setVaultOpen(true)}

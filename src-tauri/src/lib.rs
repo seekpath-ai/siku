@@ -795,6 +795,13 @@ pub fn run() {
             commands::notes::note_create_under_paper,
             commands::notes::note_add_excerpt,
             commands::notes::note_merge_into_excerpt,
+            // Vault files
+            commands::files::files_list,
+            commands::files::files_import,
+            commands::files::files_move,
+            commands::files::files_rename,
+            commands::files::files_delete,
+            commands::files::files_open,
             // Vaults
             commands::vault::vault_list,
             commands::vault::vault_current,

@@ -455,6 +455,20 @@ export interface Vault {
   updated_at: string;
 }
 
+/** A vault-managed file shown in the note tree (content lives in the blob store). */
+export interface FileItem {
+  id: string;
+  vault_id: string;
+  parent_id: string | null;
+  name: string;
+  blob_path: string;
+  size: number;
+  mime_type: string | null;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+}
+
 /** Parse a note's JSON tags/aliases column into an array. */
 export function parseNoteTags(note: Note): string[] {
   try {

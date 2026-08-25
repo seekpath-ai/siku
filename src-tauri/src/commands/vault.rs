@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{Emitter, State};
 use tracing::instrument;
 
 use crate::AppState;
@@ -50,11 +50,18 @@ pub async fn vault_export(state: State<'_, AppState>, id: String, target_dir: St
 }
 
 #[tauri::command]
-#[instrument(skip(state))]
+#[instrument(skip(app, state))]
 pub async fn vault_import(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     id: String,
     source_dir: String,
 ) -> Result<serde_json::Value, String> {
-    vault_service::import_vault(&state.db, &id, &source_dir).await
+    vault_service::import_vault(&state.db, &state.app_data_dir, &id, &source_dir, &|current, total, name| {
+        let _ = app.emit(
+            "vault:import_progress",
+            serde_json::json!({ "current": current, "total": total, "name": name }),
+        );
+    })
+    .await
 }

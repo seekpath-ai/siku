@@ -774,8 +774,8 @@ export async function vaultSetCurrent(id: string): Promise<Vault> {
 export async function vaultExport(id: string, targetDir: string): Promise<number> {
   return invoke<number>('vault_export', { id, targetDir });
 }
-export async function vaultImport(id: string, sourceDir: string): Promise<{ imported: number; skipped: number }> {
-  return invoke<{ imported: number; skipped: number }>('vault_import', { id, sourceDir });
+export async function vaultImport(id: string, sourceDir: string): Promise<{ imported: number; files_imported: number; unchanged: number; skipped: number }> {
+  return invoke<{ imported: number; files_imported: number; unchanged: number; skipped: number }>('vault_import', { id, sourceDir });
 }
 
 // ============================================================

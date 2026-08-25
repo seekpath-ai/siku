@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { createRoute } from '@tanstack/react-router';
+import { listen } from '@tauri-apps/api/event';
 import { Route as RootRoute } from './__root';
 import { NoteList } from '@/components/notes/NoteList';
 import { NoteEditor } from '@/components/notes/NoteEditor';
@@ -48,6 +49,8 @@ function NotesPage() {
   const [vaultOpen, setVaultOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Vault import progress (null = no import running).
+  const [importProgress, setImportProgress] = useState<{ current: number; total: number; name: string } | null>(null);
   // Bumped after a version restore so NoteEditor remounts with fresh data.
   const [editorKey, setEditorKey] = useState(0);
   const { setSidePanelCollapsed } = useShellStore();
@@ -150,15 +153,27 @@ function NotesPage() {
     if (!currentVault) return;
     const dir = await pickDirectory();
     if (!dir) return;
-    const ok = await confirm(`将把「${dir}」中的 Markdown 笔记导入当前库「${currentVault.name}」，继续吗？`);
+    const ok = await confirm(`将把「${dir}」中的笔记和文件导入当前库「${currentVault.name}」，继续吗？`);
     if (!ok) return;
+    setImportProgress({ current: 0, total: 0, name: '' });
+    const unlisten = await listen<{ current: number; total: number; name: string }>(
+      'vault:import_progress',
+      (e) => setImportProgress(e.payload)
+    );
     try {
       const r = await vaultImport(currentVault.id, dir);
-      await loadNotes();
-      await alert(`已导入 ${r.imported} 篇笔记${r.skipped ? `，跳过 ${r.skipped} 个非笔记文件` : ''}`, '导入完成');
+      await Promise.all([loadNotes(), loadFiles()]);
+      const parts = [`已导入 ${r.imported} 篇笔记`];
+      if (r.files_imported > 0) parts.push(`${r.files_imported} 个文件`);
+      if (r.unchanged > 0) parts.push(`${r.unchanged} 项内容未变化已跳过`);
+      if (r.skipped > 0) parts.push(`${r.skipped} 个文件导入失败`);
+      await alert(parts.join('，'), '导入完成');
     } catch (err) {
       console.error('import vault:', err);
       await alert(`导入失败：${err}`, '导入失败');
+    } finally {
+      unlisten();
+      setImportProgress(null);
     }
   };
 
@@ -569,6 +584,30 @@ function NotesPage() {
       )}
       {helpOpen && <HelpDialog onClose={() => setHelpOpen(false)} />}
       {settingsOpen && <NotesSettingsModal onClose={() => setSettingsOpen(false)} />}
+
+      {/* Vault import progress */}
+      {importProgress && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+          <div className="relative w-[380px] bg-surface border border-surface-hover rounded-xl shadow-2xl p-5">
+            <div className="text-sm font-medium text-text-primary mb-3">正在导入库…</div>
+            <div className="h-1.5 rounded-full bg-surface-hover overflow-hidden">
+              <div
+                className="h-full bg-primary transition-all duration-150"
+                style={{
+                  width: `${importProgress.total > 0 ? Math.round((importProgress.current / importProgress.total) * 100) : 0}%`,
+                }}
+              />
+            </div>
+            <div className="flex items-center justify-between gap-2 mt-2 text-xs text-text-secondary">
+              <span className="truncate flex-1">{importProgress.name || '扫描目录…'}</span>
+              <span className="shrink-0 tabular-nums">
+                {importProgress.current} / {importProgress.total || '…'}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

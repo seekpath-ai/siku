@@ -354,12 +354,24 @@ fn parse_frontmatter(content: &str) -> (Option<Frontmatter>, &str) {
     )
 }
 
-/// Import Markdown notes from a folder (an Obsidian-style vault) into a vault.
-/// Directories become folder notes; each `.md` file becomes a note with its
-/// frontmatter (aliases/tags/created/updated) preserved. Non-markdown files
-/// (attachments etc.) are skipped. Returns `{ imported, skipped }`.
-#[instrument(skip(db))]
-pub async fn import_vault(db: &SqlitePool, vault_id: &str, source_dir: &str) -> Result<serde_json::Value, String> {
+/// Import a folder (an Obsidian-style vault) into a vault. Directories become
+/// folder notes; each `.md` file becomes a note with its frontmatter
+/// (aliases/tags/created/updated) preserved; every other file (PDF/Word/Excel/
+/// images/...) is imported as a vault-managed file (blob store) under the
+/// folder it came from. Re-importing the same directory is idempotent:
+/// folders are reused, unchanged notes/files are skipped, changed files update
+/// their blob in place, and changed notes are imported as new copies (local
+/// edits are never overwritten). `on_progress(current, total, name)` is
+/// called as each item is processed. Returns `{ imported, files_imported,
+/// unchanged, skipped }` where `skipped` counts files that failed to import.
+#[instrument(skip(db, on_progress))]
+pub async fn import_vault(
+    db: &SqlitePool,
+    app_data_dir: &Path,
+    vault_id: &str,
+    source_dir: &str,
+    on_progress: &(dyn Fn(usize, usize, &str) + Sync),
+) -> Result<serde_json::Value, String> {
     let root = Path::new(source_dir);
     if !root.is_dir() {
         return Err("目录不存在".to_string());
@@ -387,7 +399,78 @@ pub async fn import_vault(db: &SqlitePool, vault_id: &str, source_dir: &str) -> 
     collect_dirs(root, Path::new(""), &mut dirs)?;
     dirs.sort_by_key(|p| p.components().count());
 
-    // 2. Create a folder note for each directory (rel path -> note id).
+    // 2. Walk all files, splitting markdown notes from managed-file assets.
+    let mut md_files: Vec<(PathBuf, PathBuf)> = Vec::new(); // (abs, rel)
+    let mut asset_files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    fn collect_files(dir: &Path, rel: &Path, md: &mut Vec<(PathBuf, PathBuf)>, assets: &mut Vec<(PathBuf, PathBuf)>) -> Result<(), String> {
+        for entry in std::fs::read_dir(dir).map_err(|e| format!("读取目录失败: {e}"))? {
+            let entry = entry.map_err(|e| format!("读取目录失败: {e}"))?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if SKIP_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            let path = entry.path();
+            let rel_sub = rel.join(&name);
+            if path.is_dir() {
+                collect_files(&path, &rel_sub, md, assets)?;
+            } else if name.ends_with(".md") {
+                md.push((path, rel_sub));
+            } else {
+                assets.push((path, rel_sub));
+            }
+        }
+        Ok(())
+    }
+    collect_files(root, Path::new(""), &mut md_files, &mut asset_files)?;
+
+    let total = dirs.len() + md_files.len() + asset_files.len();
+    let mut current = 0usize;
+
+    // Idempotent re-import support: index existing items by (parent, name) so
+    // re-importing the same directory reuses folders, skips unchanged notes
+    // and files, and updates changed files in place (stable ids) instead of
+    // duplicating everything.
+    let mut existing_folders: HashMap<(Option<String>, String), String> = HashMap::new();
+    {
+        let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT id, parent_id, title FROM notes WHERE vault_id = ? AND is_folder = 1",
+        )
+        .bind(vault_id)
+        .fetch_all(db)
+        .await
+        .map_err(|e| format!("db: {e}"))?;
+        for (id, pid, title) in rows {
+            existing_folders.insert((pid, title), id);
+        }
+    }
+    let mut existing_notes: HashMap<(Option<String>, String), String> = HashMap::new();
+    {
+        let rows: Vec<(Option<String>, String, String)> = sqlx::query_as(
+            "SELECT parent_id, title, content FROM notes WHERE vault_id = ? AND is_folder = 0",
+        )
+        .bind(vault_id)
+        .fetch_all(db)
+        .await
+        .map_err(|e| format!("db: {e}"))?;
+        for (pid, title, content) in rows {
+            existing_notes.insert((pid, title), content);
+        }
+    }
+    let mut existing_files: HashMap<(Option<String>, String), (String, String)> = HashMap::new();
+    {
+        let rows: Vec<(String, Option<String>, String, String)> = sqlx::query_as(
+            "SELECT id, parent_id, name, blob_path FROM files WHERE vault_id = ?",
+        )
+        .bind(vault_id)
+        .fetch_all(db)
+        .await
+        .map_err(|e| format!("db: {e}"))?;
+        for (id, pid, name, blob) in rows {
+            existing_files.insert((pid, name), (id, blob));
+        }
+    }
+
+    // 3. Create a folder note for each directory (rel path -> note id).
     let mut folder_ids: HashMap<PathBuf, String> = HashMap::new();
     for rel in &dirs {
         let parent_rel = rel.parent().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -403,37 +486,35 @@ pub async fn import_vault(db: &SqlitePool, vault_id: &str, source_dir: &str) -> 
         if name.is_empty() {
             continue;
         }
+        // Re-import: reuse an existing folder with the same name and parent.
+        if let Some(existing_id) = existing_folders.get(&(parent_id.clone(), name.clone())) {
+            folder_ids.insert(rel.clone(), existing_id.clone());
+            current += 1;
+            on_progress(current, total, &name);
+            continue;
+        }
         let folder =
             crate::core::note_service::create_note(db, &name, "", None, parent_id.as_deref(), vault_id, true).await?;
         folder_ids.insert(rel.clone(), folder.id);
+        current += 1;
+        on_progress(current, total, &name);
     }
 
-    // 3. Walk all files, importing `.md` and counting skipped attachments.
-    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new(); // (abs, rel)
-    let mut skipped = 0usize;
-    fn collect_files(dir: &Path, rel: &Path, out: &mut Vec<(PathBuf, PathBuf)>, skipped: &mut usize) -> Result<(), String> {
-        for entry in std::fs::read_dir(dir).map_err(|e| format!("读取目录失败: {e}"))? {
-            let entry = entry.map_err(|e| format!("读取目录失败: {e}"))?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            if SKIP_DIRS.contains(&name.as_str()) {
-                continue;
-            }
-            let path = entry.path();
-            let rel_sub = rel.join(&name);
-            if path.is_dir() {
-                collect_files(&path, &rel_sub, out, skipped)?;
-            } else if name.ends_with(".md") {
-                out.push((path, rel_sub));
-            } else {
-                *skipped += 1;
-            }
+    let folder_of = |rel: &Path| -> Option<String> {
+        let parent_rel = rel.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        if parent_rel.as_os_str().is_empty() {
+            None
+        } else {
+            folder_ids.get(&parent_rel).cloned()
         }
-        Ok(())
-    }
-    collect_files(root, Path::new(""), &mut files, &mut skipped)?;
+    };
 
+    // 4. Import markdown notes. Re-import: a note with the same title, parent
+    //    and identical content is skipped; changed content creates a new note
+    //    (never overwrite local edits made in Siku).
     let mut imported = 0usize;
-    for (abs, rel) in files {
+    let mut unchanged = 0usize;
+    for (abs, rel) in md_files {
         let content = std::fs::read_to_string(&abs).map_err(|e| format!("读取文件失败: {e}"))?;
         let (fm, body) = parse_frontmatter(&content);
         let stem = abs
@@ -442,12 +523,17 @@ pub async fn import_vault(db: &SqlitePool, vault_id: &str, source_dir: &str) -> 
             .unwrap_or_default();
         let title = if stem.is_empty() { "未命名".to_string() } else { stem };
 
-        let parent_rel = rel.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let parent_id = if parent_rel.as_os_str().is_empty() {
-            None
-        } else {
-            folder_ids.get(&parent_rel).cloned()
-        };
+        let parent_id = folder_of(&rel);
+        if existing_notes
+            .get(&(parent_id.clone(), title.clone()))
+            .map(|c| c.as_str() == body)
+            .unwrap_or(false)
+        {
+            unchanged += 1;
+            current += 1;
+            on_progress(current, total, &title);
+            continue;
+        }
 
         let note =
             crate::core::note_service::create_note(db, &title, body, None, parent_id.as_deref(), vault_id, false).await?;
@@ -484,7 +570,155 @@ pub async fn import_vault(db: &SqlitePool, vault_id: &str, source_dir: &str) -> 
         }
 
         imported += 1;
+        current += 1;
+        on_progress(current, total, &title);
     }
 
-    Ok(serde_json::json!({ "imported": imported, "skipped": skipped }))
+    // 5. Import every other file as a vault-managed file (blob store) under
+    //    the folder it came from. Re-import: same name + same parent compares
+    //    content hashes — identical files are skipped, changed files update
+    //    their blob in place (stable id). Failures skip the file without
+    //    aborting.
+    let mut files_imported = 0usize;
+    let mut skipped = 0usize;
+    for (abs, rel) in asset_files {
+        let name = abs
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let parent_id = folder_of(&rel);
+        // Ok(false) = unchanged (already imported with identical content).
+        let outcome: Result<bool, String> = 'blk: {
+            if let Some((fid, old_blob)) = existing_files.get(&(parent_id.clone(), name.clone())) {
+                let bytes = match std::fs::read(&abs) {
+                    Ok(b) => b,
+                    Err(e) => break 'blk Err(format!("读取文件失败: {e}")),
+                };
+                let new_hash = crate::file_store::sha256_hex(&bytes);
+                let old_hash = crate::file_store::parse_blob_path(old_blob)
+                    .map(|(h, _)| h)
+                    .unwrap_or_default();
+                if new_hash == old_hash {
+                    break 'blk Ok(false);
+                }
+                let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("bin");
+                let blob = match crate::file_store::write_blob(app_data_dir, &bytes, ext) {
+                    Ok(b) => b,
+                    Err(e) => break 'blk Err(format!("copy to blob store: {e}")),
+                };
+                if let Err(e) = sqlx::query(
+                    "UPDATE files SET blob_path = ?, size = ?, mime_type = ?, updated_at = ? WHERE id = ?",
+                )
+                .bind(&blob)
+                .bind(bytes.len() as i64)
+                .bind(crate::core::file_service::mime_guess(&name))
+                .bind(time::now_iso())
+                .bind(fid)
+                .execute(db)
+                .await
+                {
+                    break 'blk Err(format!("db: {e}"));
+                }
+                break 'blk Ok(true);
+            }
+            match crate::core::file_item_service::import_file(
+                db,
+                app_data_dir,
+                vault_id,
+                parent_id.as_deref(),
+                &abs.to_string_lossy(),
+            )
+            .await
+            {
+                Ok(_) => Ok(true),
+                Err(e) => Err(e),
+            }
+        };
+        match outcome {
+            Ok(true) => files_imported += 1,
+            Ok(false) => unchanged += 1,
+            Err(e) => {
+                skipped += 1;
+                tracing::warn!(file = %abs.display(), error = %e, "vault import: skipping file");
+            }
+        }
+        current += 1;
+        on_progress(current, total, &name);
+    }
+
+    Ok(serde_json::json!({
+        "imported": imported,
+        "files_imported": files_imported,
+        "unchanged": unchanged,
+        "skipped": skipped,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Re-importing the same directory must not duplicate folders, notes or
+    /// files: unchanged items are skipped and changed files update in place.
+    #[tokio::test]
+    async fn import_vault_is_idempotent() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("siku-import-test-{}", uuid::Uuid::new_v4()));
+        let src = dir.join("src");
+        let data = dir.join("data");
+        std::fs::create_dir_all(src.join("sub"))?;
+        std::fs::create_dir_all(&data)?;
+        std::fs::write(src.join("a.md"), "---\ntags:\n  - t1\n---\n\nhello [[a]]")?;
+        std::fs::write(src.join("sub").join("b.md"), "world")?;
+        std::fs::write(src.join("sub").join("doc.pdf"), b"%PDF-fake")?;
+
+        let db = crate::core::db::tests::connect_with_crsqlite(&dir.join("t.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db).await?;
+        let vault = create_vault(&db, "test").await.map_err(|e| anyhow::anyhow!(e))?;
+
+        let noop = |_: usize, _: usize, _: &str| {};
+        let src_str = src.to_string_lossy().to_string();
+
+        // First import: everything is new.
+        let r1 = import_vault(&db, &data, &vault.id, &src_str, &noop)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(r1["imported"], 2);
+        assert_eq!(r1["files_imported"], 1);
+        assert_eq!(r1["unchanged"], 0);
+
+        // Second import of the unchanged directory: nothing new, nothing duplicated.
+        let r2 = import_vault(&db, &data, &vault.id, &src_str, &noop)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(r2["imported"], 0);
+        assert_eq!(r2["files_imported"], 0);
+        assert_eq!(r2["unchanged"], 3); // 2 notes + 1 file
+
+        let note_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notes WHERE vault_id = ?")
+            .bind(&vault.id)
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(note_count, 3); // 1 folder + 2 notes
+        let file_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE vault_id = ?")
+            .bind(&vault.id)
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(file_count, 1);
+
+        // Changed file content updates the blob in place (stable file id).
+        std::fs::write(src.join("sub").join("doc.pdf"), b"%PDF-v2")?;
+        let r3 = import_vault(&db, &data, &vault.id, &src_str, &noop)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(r3["files_imported"], 1);
+        assert_eq!(r3["unchanged"], 2); // 2 notes unchanged
+        let file_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE vault_id = ?")
+            .bind(&vault.id)
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(file_count, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 }

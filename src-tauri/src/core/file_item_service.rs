@@ -169,7 +169,7 @@ pub async fn read_file_text(
     use std::io::Read;
 
     let path = resolve_file_path(db, app_data_dir, id).await?;
-    let mut file = std::fs::File::open(&path).map_err(|e| format!("read failed: {e}"))?;
+    let file = std::fs::File::open(&path).map_err(|e| format!("read failed: {e}"))?;
     const MAX: u64 = 2 * 1024 * 1024;
     let mut buf = Vec::new();
     file.take(MAX + 1)

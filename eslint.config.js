@@ -19,6 +19,13 @@ export default tseslint.config(
     },
     rules: {
       ...reactHooks.configs.recommended.rules,
+      // `_`-prefixed names mark intentionally unused values (override
+      // parameters, stripped props) — a convention already used in the code.
+      '@typescript-eslint/no-unused-vars': ['error', {
+        argsIgnorePattern: '^_',
+        varsIgnorePattern: '^_',
+        caughtErrorsIgnorePattern: '^_',
+      }],
       'react-refresh/only-export-components': [
         'warn',
         { allowConstantExport: true },

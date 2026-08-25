@@ -131,6 +131,56 @@ function resolveWikiTarget(raw: string, notes: Note[]): { targetId: string | nul
   return { targetId: target?.id ?? null, display: display || title };
 }
 
+// Images: remote URLs are cached by the Rust backend; local/attachment paths
+// are resolved against attachmentsDir and loaded through the asset protocol.
+// A real component (not an inline callback) so hooks are legal.
+function MdImage({
+  attachmentsDir,
+  src,
+  alt,
+  ...rest
+}: React.ImgHTMLAttributes<HTMLImageElement> & { attachmentsDir?: string }) {
+  const [resolvedSrc, setResolvedSrc] = useState<string | undefined>(src);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (!src) {
+      setResolvedSrc(undefined);
+      return;
+    }
+    let active = true;
+    setFailed(false);
+    resolveImageUrl(src, { attachmentsDir })
+      .then((url) => {
+        if (active) setResolvedSrc(url);
+      })
+      .catch(() => {
+        if (active) setFailed(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, [src, attachmentsDir]);
+
+  if (failed || !resolvedSrc) {
+    return (
+      <span className="inline-block px-2 py-1 rounded bg-surface-hover text-text-secondary/60 text-xs">
+        {failed ? '[图片加载失败]' : '[图片]'}
+      </span>
+    );
+  }
+
+  return (
+    <img
+      src={resolvedSrc}
+      alt={alt}
+      {...rest}
+      onError={() => setFailed(true)}
+      className={`max-w-full rounded ${rest.className ?? ''}`}
+    />
+  );
+}
+
 export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, className, attachmentsDir }: Props) {
   const navigate = useNavigate();
   const processed = useMemo(() => {
@@ -252,51 +302,12 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
     [onNavigate, onCreateLink, notes, navigate]
   );
 
-  // Images: remote URLs are cached by the Rust backend; local/attachment paths
-  // are resolved against attachmentsDir and loaded through the asset protocol.
+  // Images are rendered by the MdImage component (remote caching + asset
+  // protocol resolution); this wrapper just injects attachmentsDir.
   const ImageComponent = useCallback(
-    (props: React.ImgHTMLAttributes<HTMLImageElement>) => {
-      const { src, alt, ...rest } = props;
-      const [resolvedSrc, setResolvedSrc] = useState<string | undefined>(src);
-      const [failed, setFailed] = useState(false);
-
-      useEffect(() => {
-        if (!src) {
-          setResolvedSrc(undefined);
-          return;
-        }
-        let active = true;
-        setFailed(false);
-        resolveImageUrl(src, { attachmentsDir })
-          .then((url) => {
-            if (active) setResolvedSrc(url);
-          })
-          .catch(() => {
-            if (active) setFailed(true);
-          });
-        return () => {
-          active = false;
-        };
-      }, [src, attachmentsDir]);
-
-      if (failed || !resolvedSrc) {
-        return (
-          <span className="inline-block px-2 py-1 rounded bg-surface-hover text-text-secondary/60 text-xs">
-            {failed ? '[图片加载失败]' : '[图片]'}
-          </span>
-        );
-      }
-
-      return (
-        <img
-          src={resolvedSrc}
-          alt={alt}
-          {...rest}
-          onError={() => setFailed(true)}
-          className={`max-w-full rounded ${props.className ?? ''}`}
-        />
-      );
-    },
+    (props: React.ImgHTMLAttributes<HTMLImageElement>) => (
+      <MdImage {...props} attachmentsDir={attachmentsDir} />
+    ),
     [attachmentsDir]
   );
 

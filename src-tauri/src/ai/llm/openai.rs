@@ -289,11 +289,13 @@ impl LlmClient for OpenAiClient {
             // chunk boundaries is never converted to lossy text.
             while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
                 let line_bytes = line_buf.split_to(pos + 1);
-                // Drop the trailing newline and any \r for robust CRLF handling.
-                let line = line_bytes
-                    .trim_ascii_end()
-                    .strip_suffix(b"\r")
-                    .unwrap_or(line_bytes.trim_ascii_end());
+                // Drop trailing ASCII whitespace (newline and any \r for CRLF).
+                // trim_ascii_end() is only stable since Rust 1.80 (MSRV 1.78).
+                let line = &line_bytes[..line_bytes
+                    .iter()
+                    .rposition(|b| !b.is_ascii_whitespace())
+                    .map(|i| i + 1)
+                    .unwrap_or(0)];
                 let line = String::from_utf8_lossy(line).trim().to_string();
 
                 if line.is_empty() || line == "data: [DONE]" {

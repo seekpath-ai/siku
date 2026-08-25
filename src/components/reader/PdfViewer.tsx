@@ -265,7 +265,7 @@ class SimpleReaderLinkService extends SimpleLinkService {
 
 /** Simple URL regex for turning plain-text URLs in the text layer into
  *  clickable links. Matches http://, https:// and www. links. */
-const URL_REGEX = /https?:\/\/[^\s<>"{}|\\^`\[\]]+|www\.[^\s<>"{}|\\^`\[\]]+/g;
+const URL_REGEX = /https?:\/\/[^\s<>"{}|\\^`[\]]+|www\.[^\s<>"{}|\\^`[\]]+/g;
 
 /** Create clickable <a> overlays for plain URLs found in the text layer.
  *  PDFs often don't embed link annotations for bibliography URLs, so this

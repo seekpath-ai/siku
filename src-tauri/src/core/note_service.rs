@@ -721,6 +721,8 @@ mod tests {
             .execute(&db).await.unwrap();
         sqlx::query("CREATE TABLE note_versions (note_id TEXT)")
             .execute(&db).await.unwrap();
+        sqlx::query("CREATE TABLE files (id TEXT PRIMARY KEY, parent_id TEXT)")
+            .execute(&db).await.unwrap();
 
         // Tree: folder → child → grandchild; sibling stays at the root level.
         sqlx::query("INSERT INTO notes (id, parent_id) VALUES ('folder', NULL), ('child', 'folder'), ('grandchild', 'child'), ('sibling', NULL)")

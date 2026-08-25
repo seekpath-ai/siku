@@ -120,7 +120,7 @@ export function AccountSettings({ onLoggedIn }: Props) {
     try {
       // Default device name is suggested as hostname + id suffix so two
       // devices don't both show up as "我的设备".
-      let name = deviceName.trim() || suggestedName || '我的设备';
+      const name = deviceName.trim() || suggestedName || '我的设备';
       const info = await authLogin(httpBase, email, password, name);
       setAuth(info);
       onLoggedIn(info);
@@ -137,7 +137,7 @@ export function AccountSettings({ onLoggedIn }: Props) {
     setError('');
     try {
       await authRegister(httpBase, email, password);
-      let name = deviceName.trim() || suggestedName || '我的设备';
+      const name = deviceName.trim() || suggestedName || '我的设备';
       const info = await authLogin(httpBase, email, password, name);
       setAuth(info);
       onLoggedIn(info);

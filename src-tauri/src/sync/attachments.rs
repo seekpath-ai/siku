@@ -64,11 +64,13 @@ fn extract_blob_refs(text: &str) -> Vec<String> {
     out
 }
 
-/// Collect blob hashes referenced by synced papers/attachments **and note
-/// Markdown content** that are not present locally. Notes embed pasted/dropped
-/// images as `![...](blobs/<sha256>.png)`; without scanning note content the
-/// image files would never be requested from the peer and show as broken
-/// images on synced devices.
+/// Collect blob hashes referenced by synced papers/attachments/files **and
+/// note Markdown content** that are not present locally. Notes embed
+/// pasted/dropped images as `![...](blobs/<sha256>.png)`; without scanning
+/// note content the image files would never be requested from the peer and
+/// show as broken images on synced devices. Same for the vault `files` table:
+/// its rows sync via CRR, but without scanning `blob_path` the actual
+/// PDF/image/text content would never arrive.
 pub async fn collect_missing_blob_hashes(
     db: &SqlitePool,
     app_data_dir: &std::path::Path,
@@ -76,7 +78,9 @@ pub async fn collect_missing_blob_hashes(
     let rows: Vec<(String,)> = sqlx::query_as::<_, (String,)>(
         "SELECT file_path FROM papers WHERE file_path LIKE 'blobs/%' \
          UNION \
-         SELECT file_path FROM attachments WHERE file_path LIKE 'blobs/%'",
+         SELECT file_path FROM attachments WHERE file_path LIKE 'blobs/%' \
+         UNION \
+         SELECT blob_path FROM files WHERE blob_path LIKE 'blobs/%'",
     )
     .fetch_all(db)
     .await
@@ -210,6 +214,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query("CREATE TABLE files (id TEXT PRIMARY KEY, blob_path TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let h1 = "a".repeat(64);
         let h2 = "b".repeat(64);
@@ -229,6 +237,55 @@ mod tests {
         assert!(
             missing.contains(&(h1.clone(), "png".to_string())),
             "note-referenced blob must be reported missing: {missing:?}"
+        );
+        assert!(
+            !missing.iter().any(|(h, _)| *h == h2),
+            "present blob must not be requested: {missing:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_missing_finds_vault_file_blobs() {
+        let dir = temp_dir("vault-file");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE notes (id TEXT PRIMARY KEY, content TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE papers (id TEXT PRIMARY KEY, file_path TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE attachments (id TEXT PRIMARY KEY, file_path TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE files (id TEXT PRIMARY KEY, blob_path TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let h1 = "d".repeat(64);
+        let h2 = "e".repeat(64);
+        // h2 already exists locally, h1 does not.
+        std::fs::create_dir_all(file_store::blob_dir(&dir)).unwrap();
+        std::fs::write(file_store::blob_path(&dir, &h2, "pdf"), b"present").unwrap();
+
+        sqlx::query("INSERT INTO files (id, blob_path) VALUES ('f1', ?), ('f2', ?), ('f3', '')")
+            .bind(blob_ref(&h1, "pdf"))
+            .bind(blob_ref(&h2, "pdf"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let missing = collect_missing_blob_hashes(&pool, &dir).await.unwrap();
+        assert!(
+            missing.contains(&(h1.clone(), "pdf".to_string())),
+            "files.blob_path must be reported missing: {missing:?}"
         );
         assert!(
             !missing.iter().any(|(h, _)| *h == h2),

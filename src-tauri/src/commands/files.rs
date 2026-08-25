@@ -63,3 +63,30 @@ pub async fn files_open(state: State<'_, AppState>, id: String) -> Result<(), St
     let path = crate::core::file_item_service::resolve_file_path(&state.db, &state.app_data_dir, &id).await?;
     crate::core::file_service::open_in_system(&path.to_string_lossy())
 }
+
+/// Get a managed file record.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn files_get(state: State<'_, AppState>, id: String) -> Result<FileItem, String> {
+    crate::core::file_item_service::get_file(&state.db, &id).await
+}
+
+/// Resolve a managed file's absolute path (for in-app preview via the asset
+/// protocol, e.g. the built-in PDF/image viewer).
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn files_resolve_path(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    let path = crate::core::file_item_service::resolve_file_path(&state.db, &state.app_data_dir, &id).await?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Preview a managed file as text (content-sniffed; binary files error out so
+/// the frontend can fall back to the system application).
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn files_read_text(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<crate::core::models::TextPreview, String> {
+    crate::core::file_item_service::read_file_text(&state.db, &state.app_data_dir, &id).await
+}

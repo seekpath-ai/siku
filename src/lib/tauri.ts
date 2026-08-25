@@ -6,7 +6,7 @@ import type {
   AgentSession, AgentStep, ChatMessage, ChatAttachment, LlmConfigBlock, ApprovalConfig, Project, CronJob,
   KnowledgeDomain, KnowledgeItem,
   ResearchTopic, ResearchSource, Note,
-  FileEntry, FileItem, SystemInfo, TimelineItem,
+  FileEntry, FileItem, TextPreview, SystemInfo, TimelineItem,
   Collection, Tag, LlmProvider, Vault, NoteVersion, Bookmark,
 } from './types';
 
@@ -801,6 +801,20 @@ export async function filesDelete(id: string): Promise<void> {
 /** Open a managed file with the system default application. */
 export async function filesOpen(id: string): Promise<void> {
   return invoke<void>('files_open', { id });
+}
+/** Get a managed file record. */
+export async function filesGet(id: string): Promise<FileItem> {
+  return invoke<FileItem>('files_get', { id });
+}
+/** Resolve a managed file to an asset-protocol URL for in-app preview
+ *  (built-in PDF/image viewer). */
+export async function filesResolveUrl(id: string): Promise<string> {
+  const path = await invoke<string>('files_resolve_path', { id });
+  return convertFileSrc(path);
+}
+/** Preview a managed file as text (content-sniffed; rejects binary files). */
+export async function filesReadText(id: string): Promise<TextPreview> {
+  return invoke<TextPreview>('files_read_text', { id });
 }
 
 // ============================================================

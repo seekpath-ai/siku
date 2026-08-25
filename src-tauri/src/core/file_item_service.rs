@@ -154,3 +154,74 @@ pub async fn resolve_file_path(
     }
     Ok(path)
 }
+
+/// Preview a managed file as text. Whether a file is previewable is decided
+/// by CONTENT, not extension: a NUL byte in the first 8 KB marks it binary
+/// (git-style detection), so misnamed binaries are rejected and unknown
+/// text formats just work. Text is decoded lossily (GBK and friends degrade
+/// to replacement chars instead of failing) and capped at 2 MB.
+#[instrument(skip(db))]
+pub async fn read_file_text(
+    db: &SqlitePool,
+    app_data_dir: &Path,
+    id: &str,
+) -> Result<crate::core::models::TextPreview, String> {
+    use std::io::Read;
+
+    let path = resolve_file_path(db, app_data_dir, id).await?;
+    let mut file = std::fs::File::open(&path).map_err(|e| format!("read failed: {e}"))?;
+    const MAX: u64 = 2 * 1024 * 1024;
+    let mut buf = Vec::new();
+    file.take(MAX + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read failed: {e}"))?;
+    let truncated = buf.len() as u64 > MAX;
+    if truncated {
+        buf.truncate(MAX as usize);
+    }
+    let probe = &buf[..buf.len().min(8192)];
+    if probe.contains(&0) {
+        return Err("binary file".to_string());
+    }
+    Ok(crate::core::models::TextPreview {
+        content: String::from_utf8_lossy(&buf).into_owned(),
+        truncated,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Text preview decodes plain text and rejects binary files by content
+    /// (NUL-byte sniffing), regardless of extension.
+    #[tokio::test]
+    async fn read_file_text_sniffs_binary() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("siku-filetext-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let db = crate::core::db::tests::connect_with_crsqlite(&dir.join("t.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db).await?;
+
+        let txt = dir.join("a.conf");
+        std::fs::write(&txt, "key=value\n")?;
+        let bin = dir.join("b.txt"); // binary content behind a text extension
+        std::fs::write(&bin, [0u8, 1, 2, 3])?;
+
+        let f1 = import_file(&db, &dir, "vault-x", None, &txt.to_string_lossy())
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let preview = read_file_text(&db, &dir, &f1.id)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(preview.content.trim(), "key=value");
+        assert!(!preview.truncated);
+
+        let f2 = import_file(&db, &dir, "vault-x", None, &bin.to_string_lossy())
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert!(read_file_text(&db, &dir, &f2.id).await.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+}

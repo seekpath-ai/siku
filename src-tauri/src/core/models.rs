@@ -146,10 +146,17 @@ pub struct FileItem {
     pub updated_at: String,
 }
 
+/// Text preview of a managed file (`files_read_text`). `truncated` is true
+/// when the file exceeded the preview size cap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextPreview {
+    pub content: String,
+    pub truncated: bool,
+}
+
 /// A snapshot of a note captured before an AI edit (version history).
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct NoteVersion {
-    pub id: String,
+pub struct NoteVersion {    pub id: String,
     pub note_id: String,
     pub title: String,
     pub content: String,

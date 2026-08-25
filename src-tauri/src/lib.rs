@@ -802,6 +802,9 @@ pub fn run() {
             commands::files::files_rename,
             commands::files::files_delete,
             commands::files::files_open,
+            commands::files::files_get,
+            commands::files::files_resolve_path,
+            commands::files::files_read_text,
             // Vaults
             commands::vault::vault_list,
             commands::vault::vault_current,

@@ -2,6 +2,7 @@ import { Route as RootRoute } from './__root';
 import { Route as IndexRoute } from './index';
 import { Route as LibraryRoute } from './library';
 import { Route as ReaderRoute } from './reader.$paperId';
+import { Route as FileViewRoute } from './file.$fileId';
 import { Route as ChatRoute } from './chat';
 import { Route as NotesRoute } from './notes';
 import { Route as GraphRoute } from './graph';
@@ -18,6 +19,7 @@ export const routeTree = RootRoute.addChildren([
   IndexRoute,
   LibraryRoute,
   ReaderRoute,
+  FileViewRoute,
   ChatRoute,
   NotesRoute,
   GraphRoute,

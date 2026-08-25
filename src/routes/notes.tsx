@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { createRoute } from '@tanstack/react-router';
+import { createRoute, useNavigate } from '@tanstack/react-router';
 import { listen } from '@tauri-apps/api/event';
 import { Route as RootRoute } from './__root';
 import { NoteList } from '@/components/notes/NoteList';
@@ -55,6 +55,7 @@ function NotesPage() {
   const [editorKey, setEditorKey] = useState(0);
   const { setSidePanelCollapsed } = useShellStore();
   const { alert, confirm } = useDialog();
+  const navigate = useNavigate();
   const { note: noteParam } = Route.useSearch();
 
   useEffect(() => { loadNotes(); }, []);
@@ -470,6 +471,16 @@ function NotesPage() {
   };
 
   const handleFileOpen = async (id: string) => {
+    // Known binary formats go straight to the system application; everything
+    // else opens the in-app preview (PDF/image viewers, or a text preview —
+    // the backend sniffs content and binaries fall back gracefully).
+    const f = files.find((x) => x.id === id);
+    const name = f?.name.toLowerCase() ?? '';
+    const isKnownBinary = /\.(docx?|xlsx?|pptx?|odt|ods|odp|zip|gz|7z|rar|tar|mp3|mp4|mov|avi|mkv|exe|dll|so|dylib|sqlite3?|db)$/.test(name);
+    if (f && !isKnownBinary) {
+      navigate({ to: '/file/$fileId', params: { fileId: id } });
+      return;
+    }
     try {
       await filesOpen(id);
     } catch (err) {

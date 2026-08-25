@@ -469,6 +469,12 @@ export interface FileItem {
   updated_at: string;
 }
 
+/** Text preview of a managed file (files_read_text). */
+export interface TextPreview {
+  content: string;
+  truncated: boolean;
+}
+
 /** Parse a note's JSON tags/aliases column into an array. */
 export function parseNoteTags(note: Note): string[] {
   try {

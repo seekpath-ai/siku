@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event';
 import { Route as RootRoute } from './__root';
 import { NoteList } from '@/components/notes/NoteList';
 import { NoteEditor } from '@/components/notes/NoteEditor';
+import { FilePreview } from '@/components/files/FilePreview';
 import { VaultSwitcher } from '@/components/notes/VaultSwitcher';
 import { HelpDialog } from '@/components/notes/HelpDialog';
 import { NotesSettingsModal } from '@/components/notes/NotesSettingsModal';
@@ -41,6 +42,7 @@ import { pickDirectory } from '@/lib/pickDirectory';
 function NotesPage() {
   const [notes, setNotes] = useState<Note[]>([]);
   const [files, setFiles] = useState<FileItem[]>([]);
+  const [activeFileId, setActiveFileId] = useState<string | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [activeNote, setActiveNote] = useState<Note | null>(null);
   const [backlinks, setBacklinks] = useState<{ id: string; title: string; context: string; created_at: string }[]>([]);
@@ -89,6 +91,7 @@ function NotesPage() {
       const v = await vaultSetCurrent(id);
       setCurrentVault(v);
       setActiveId(null);
+      setActiveFileId(null);
       setActiveNote(null);
       setBacklinks([]);
       await loadNotes();
@@ -104,6 +107,7 @@ function NotesPage() {
       setCurrentVault(v);
       await Promise.all([loadNotes(), loadVaults()]);
       setActiveId(null);
+      setActiveFileId(null);
       setActiveNote(null);
       setBacklinks([]);
     } catch (err) {
@@ -126,6 +130,7 @@ function NotesPage() {
       await vaultDelete(id);
       if (currentVault?.id === id) {
         setActiveId(null);
+        setActiveFileId(null);
         setActiveNote(null);
         setBacklinks([]);
         await Promise.all([loadNotes(), loadVaults()]);
@@ -420,6 +425,14 @@ function NotesPage() {
     }
   };
 
+  // Drop the inline preview when the previewed file disappears (deleted
+  // directly or via a parent folder delete / vault switch).
+  useEffect(() => {
+    if (activeFileId && !files.some((f) => f.id === activeFileId)) {
+      setActiveFileId(null);
+    }
+  }, [files, activeFileId]);
+
   // ── Vault-managed files ─────────────────────────────────────────────
 
   /** Import OS-dropped files into the current vault under a folder (null = root). */
@@ -452,6 +465,8 @@ function NotesPage() {
   const handleFileRename = async (id: string, name: string) => {
     try {
       await filesRename(id, name);
+      // Keep an open preview tab's title in sync.
+      useTabStore.getState().updateTab(`file-${id}`, { title: name });
       await loadFiles();
     } catch (err) {
       console.error('rename file:', err);
@@ -464,6 +479,8 @@ function NotesPage() {
     if (!ok) return;
     try {
       await filesDelete(id);
+      if (activeFileId === id) setActiveFileId(null);
+      useTabStore.getState().close(`file-${id}`);
       await loadFiles();
     } catch (err) {
       console.error('delete file:', err);
@@ -471,13 +488,19 @@ function NotesPage() {
   };
 
   const handleFileOpen = async (id: string) => {
-    // Known binary formats go straight to the system application; everything
-    // else opens the in-app preview (PDF/image viewers, or a text preview —
-    // the backend sniffs content and binaries fall back gracefully).
+    // Double-click: previewable files open in a dedicated tab (like papers in
+    // the reader); known binary formats go straight to the system application.
     const f = files.find((x) => x.id === id);
     const name = f?.name.toLowerCase() ?? '';
     const isKnownBinary = /\.(docx?|xlsx?|pptx?|odt|ods|odp|zip|gz|7z|rar|tar|mp3|mp4|mov|avi|mkv|exe|dll|so|dylib|sqlite3?|db)$/.test(name);
     if (f && !isKnownBinary) {
+      useTabStore.getState().open({
+        id: `file-${id}`,
+        title: f.name,
+        icon: 'pdf',
+        route: '/file/$fileId',
+        params: { fileId: id },
+      });
       navigate({ to: '/file/$fileId', params: { fileId: id } });
       return;
     }
@@ -487,6 +510,12 @@ function NotesPage() {
       console.error('open file:', err);
       await alert(`打开文件失败：${err}`, '打开失败');
     }
+  };
+
+  /** Single-click a file: inline preview in the right pane (tree stays put). */
+  const handleFileSelect = (id: string) => {
+    setActiveFileId(id);
+    setActiveId(null);
   };
 
   const handleCreateLink = async (title: string) => {
@@ -530,7 +559,11 @@ function NotesPage() {
           notes={notes}
           files={files}
           activeNoteId={activeId}
-          onSelect={setActiveId}
+          vaultId={currentVault?.id}
+          onSelect={(id) => {
+            setActiveId(id);
+            setActiveFileId(null);
+          }}
           onCreate={handleCreate}
           onCreateFolder={handleCreateFolder}
           onCreateSubNote={handleCreateSubNote}
@@ -544,6 +577,7 @@ function NotesPage() {
           onBulkCreateFolder={handleBulkCreateFolder}
           onBulkMove={handleBulkMove}
           onFileImport={handleFileImport}
+          onFileSelect={handleFileSelect}
           onFileMove={handleFileMove}
           onFileRename={handleFileRename}
           onFileDelete={handleFileDelete}
@@ -556,7 +590,9 @@ function NotesPage() {
         />
       </ListPanel>
       <div className="flex-1 flex min-w-0 bg-background">
-        {activeNote ? (
+        {activeFileId ? (
+          <FilePreview fileId={activeFileId} />
+        ) : activeNote ? (
           <NoteEditor
             key={editorKey}
             note={activeNote}

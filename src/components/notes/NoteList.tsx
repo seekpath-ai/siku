@@ -12,6 +12,7 @@ import { notesSearch, type NoteSearchResult } from '@/lib/tauri';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
 import { MoveNoteDialog } from '@/components/notes/MoveNoteDialog';
 import { useDialog } from '@/hooks/useDialog';
+import { useNoteListStore } from '@/stores/noteListStore';
 
 interface Props {
   notes: Note[];
@@ -40,10 +41,14 @@ interface Props {
   onBulkMove?: (ids: string[], parentId: string | null) => void;
   /** Import OS-dropped files under a folder (null = root). */
   onFileImport?: (paths: string[], parentId: string | null) => void;
+  /** Single-click a file: inline preview in the notes page pane. */
+  onFileSelect?: (id: string) => void;
   onFileMove?: (id: string, parentId: string | null) => void;
   onFileRename?: (id: string, name: string) => void;
   onFileDelete?: (id: string) => void;
   onFileOpen?: (id: string) => void;
+  /** Current vault id — tree UI state (expanded/scroll) is persisted per vault. */
+  vaultId?: string;
   onClose?: () => void;
   title?: string;
   /** Current vault name shown in the footer. */
@@ -103,10 +108,12 @@ export function NoteList({
   onBulkCreateFolder,
   onBulkMove,
   onFileImport,
+  onFileSelect,
   onFileMove,
   onFileRename,
   onFileDelete,
   onFileOpen,
+  vaultId,
   onClose,
   title = '文件列表',
   currentVaultName = 'cognitive-archive',
@@ -120,7 +127,11 @@ export function NoteList({
   const [aiOnly, setAiOnly] = useState(false);
   const [searchResults, setSearchResults] = useState<NoteSearchResult[] | null>(null);
   const [searching, setSearching] = useState(false);
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [expanded, setExpanded] = useState<Set<string>>(
+    () => new Set(vaultId ? useNoteListStore.getState().expandedByVault[vaultId] ?? [] : [])
+  );
+  const scrollRestoredRef = useRef(false);
+  const prevVaultRef = useRef(vaultId);
   const [flashIds, setFlashIds] = useState<Set<string>>(new Set());
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [lastSelectedId, setLastSelectedId] = useState<string | null>(null);
@@ -207,6 +218,36 @@ export function NoteList({
     }
     return map;
   }, [notes, files, sortEnabled]);
+
+  // Tree UI state persistence per vault (tab switches remount this component):
+  // restore on vault change, write through on expand/collapse.
+  useEffect(() => {
+    if (prevVaultRef.current === vaultId) return;
+    prevVaultRef.current = vaultId;
+    scrollRestoredRef.current = false;
+    setExpanded(new Set(vaultId ? useNoteListStore.getState().expandedByVault[vaultId] ?? [] : []));
+  }, [vaultId]);
+  useEffect(() => {
+    if (vaultId) useNoteListStore.getState().setExpanded(vaultId, [...expanded]);
+  }, [expanded, vaultId]);
+
+  // Scroll position: save on scroll, restore once the tree has content again
+  // (notes load asynchronously after remount).
+  useEffect(() => {
+    const el = treeRef.current;
+    if (!el || !vaultId) return;
+    const onScroll = () => useNoteListStore.getState().setScroll(vaultId, el.scrollTop);
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [vaultId]);
+  useEffect(() => {
+    if (scrollRestoredRef.current || !vaultId) return;
+    const el = treeRef.current;
+    if (!el || (childrenMap.get(ROOT_KEY) || []).length === 0) return;
+    const top = useNoteListStore.getState().scrollByVault[vaultId];
+    if (top) el.scrollTop = top;
+    scrollRestoredRef.current = true;
+  }, [childrenMap, vaultId]);
 
   const visibleIds = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -389,10 +430,11 @@ export function NoteList({
     } else {
       setSelectedIds(new Set([node.id]));
       setLastSelectedId(node.id);
-      // Files have no editor pane; clicking only selects them.
+      // Files have no editor pane; clicking selects + triggers inline preview.
       if (node.note) onSelect(node.id);
+      else onFileSelect?.(node.id);
     }
-  }, [lastSelectedId, visibleOrderedIds, onSelect]);
+  }, [lastSelectedId, visibleOrderedIds, onSelect, onFileSelect]);
 
   // Create a folder and immediately start renaming it (Obsidian-style):
   // the new "未命名文件夹" appears with its > chevron and an inline editor.

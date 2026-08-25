@@ -818,6 +818,7 @@ pub fn run() {
             commands::attachments::save_clipboard_image,
             commands::attachments::save_attachment_bytes,
             commands::attachments::vault_attachments_dir,
+            commands::attachments::read_image_file,
             // System
             commands::system::system_info,
             commands::system::log_startup_metrics,

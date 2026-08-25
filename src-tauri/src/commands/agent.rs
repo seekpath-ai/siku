@@ -501,6 +501,7 @@ pub(crate) async fn run_agent_turn(
     app_handle: &AppHandle,
     session_id: String,
     content: String,
+    attachments: Option<Vec<crate::ai::llm::ImageAttachment>>,
 ) -> Result<(), String> {
     let session = sqlx::query_as::<_, ChatSession>(
         "SELECT id, title, mode, project_id, working_dir, vision_provider_id, web_proxy, agent_mode, tools_enabled, system_prompt,
@@ -515,7 +516,7 @@ pub(crate) async fn run_agent_turn(
     .ok_or_else(|| "session not found".to_string())?;
 
     let config = build_agent_config(&state, &session).await?;
-    let app_settings = settings_service::load_app_settings(&state.db).await?;
+    let _app_settings = settings_service::load_app_settings(&state.db).await?;
     let device_settings = settings_service::load_device_settings(&state.db).await?;
 
     // Resolve the session's project directory (Codex-style project context).
@@ -533,14 +534,29 @@ pub(crate) async fn run_agent_turn(
     }
 
     // Build per-agent LLM client from active block
-    let llm_config = config.active_llm().to_llm_config();
+    let mut llm_config = config.active_llm().to_llm_config();
+
+    // If the user sent image attachments, route to a vision-capable model.
+    let has_attachments = attachments.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+    if has_attachments && !llm_config.is_vision {
+        llm_config = match &session.vision_provider_id {
+            Some(pid) => crate::core::llm_provider_service::resolve_block(&state.db, pid)
+                .await
+                .map(|b| b.to_llm_config())
+                .map_err(|e| format!("无法解析视觉模型配置: {e}"))?,
+            None => {
+                return Err("当前消息包含图片，但默认模型不支持视觉且未配置视觉模型。请在会话设置中选择视觉模型。".to_string());
+            }
+        };
+    }
+
     if llm_config.api_key.is_empty() && llm_config.provider != llm::LlmProvider::Ollama {
         return Err("API key not configured. Please set it in Settings.".to_string());
     }
     let llm_client = llm::client::create_llm_client(&llm_config)
         .map_err(|e| format!("failed to create LLM client: {e}"))?;
 
-    // Resolve the agent's vision (multimodal) model config.
+    // Resolve the agent's vision (multimodal) model config for the read_media_file tool.
     let vision_llm = match &session.vision_provider_id {
         Some(pid) => crate::core::llm_provider_service::resolve_block(&state.db, pid)
             .await
@@ -583,7 +599,8 @@ pub(crate) async fn run_agent_turn(
     let memory = MemoryStore::new(memory_path.clone());
 
     // Save user message to DB
-    chat::save_chat_message(&state.db, &session_id, "user", &content, None, None, None, None, None, None, None, None, None).await?;
+    let attachments_json = attachments.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()).filter(|s| !s.is_empty());
+    chat::save_chat_message(&state.db, &session_id, "user", &content, None, None, None, None, None, None, None, None, None, attachments_json.as_deref()).await?;
 
     // Load history BEFORE appending current user message, then append it.
     // The engine itself will prepend the current user message to the prompt.
@@ -596,13 +613,14 @@ pub(crate) async fn run_agent_turn(
         .map(|r| ChatMessage {
             role: r.role,
             content: r.content,
+            attachments: r.attachments,
             tool_calls: None,
             tool_call_id: None,
             name: None,
         })
         .collect();
 
-    memory.append("user", &content, None, None, None);
+    memory.append("user", &content, None, None, None, attachments_json.as_deref());
 
     // Pet domain sessions: build a context hint for the system prompt so the
     // agent knows which object (note/paper/...) the user is talking about.
@@ -670,7 +688,7 @@ pub(crate) async fn run_agent_turn(
     crate::spawn_tracked(&tracked, async move {
         let engine_ref = Arc::new(engine);
         let result = engine_ref
-            .process_message(&content, &history, event_tx, &mut approval_rx, &mut ask_rx)
+            .process_message(&content, attachments_json.as_deref(), &history, event_tx, &mut approval_rx, &mut ask_rx)
             .await;
 
         {
@@ -703,7 +721,7 @@ pub(crate) async fn run_agent_turn(
                 let tokens_in_hit = if total_tokens.tokens_in_hit > 0 { Some(total_tokens.tokens_in_hit as i32) } else { None };
                 let tokens_out = if total_tokens.tokens_out > 0 { Some(total_tokens.tokens_out as i32) } else { None };
                 let message_id = match chat::save_chat_message(
-                    &db, &sid, "assistant", &display_content, None, tokens_used, tokens_in, tokens_in_hit, tokens_out, None, None, None, None,
+                    &db, &sid, "assistant", &display_content, None, tokens_used, tokens_in, tokens_in_hit, tokens_out, None, None, None, None, None,
                 ).await {
                     Ok(id) => Some(id),
                     Err(e) => {
@@ -735,7 +753,7 @@ pub(crate) async fn run_agent_turn(
                     }
                 }
 
-                mem.append("assistant", &display_content, None, None, None);
+                mem.append("assistant", &display_content, None, None, None, None);
 
                 // Terminal event goes last: the frontend reloads the session
                 // history on done/cancelled, so it must observe committed rows.
@@ -787,8 +805,9 @@ pub async fn agent_send_message(
     app_handle: AppHandle,
     session_id: String,
     content: String,
+    attachments: Option<Vec<crate::ai::llm::ImageAttachment>>,
 ) -> Result<(), String> {
-    run_agent_turn(&state, &app_handle, session_id, content).await
+    run_agent_turn(&state, &app_handle, session_id, content, attachments).await
 }
 
 /// Answer a pending AskUserQuestion dialog for a session.
@@ -1185,6 +1204,7 @@ pub async fn settings_validate_llm(
         proxy,
         max_tokens: 100,
         temperature: 0.0,
+        is_vision: false,
     };
 
     settings_service::validate_llm_config(&config).await

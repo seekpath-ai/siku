@@ -188,6 +188,7 @@ pub struct ChatMessage {
     pub tokens_in: Option<i32>,
     pub tokens_in_hit: Option<i32>,
     pub tokens_out: Option<i32>,
+    pub attachments: Option<String>,
     pub created_at: String,
 }
 

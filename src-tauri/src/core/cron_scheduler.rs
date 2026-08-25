@@ -144,7 +144,7 @@ pub async fn run(
                 let state = app2.state::<crate::AppState>();
                 let msg = format!("⏰ 定时任务：{prompt}");
                 if let Err(e) =
-                    crate::commands::agent::run_agent_turn(&state, &app2, sid.clone(), msg).await
+                    crate::commands::agent::run_agent_turn(&state, &app2, sid.clone(), msg, None).await
                 {
                     tracing::error!(session_id = %sid, error = %e, "cron fire failed");
                 }

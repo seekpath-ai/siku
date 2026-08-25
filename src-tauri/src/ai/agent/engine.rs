@@ -199,6 +199,7 @@ impl AgentEngine {
     pub async fn process_message(
         &self,
         user_message: &str,
+        attachments: Option<&str>,
         history: &[ChatMessage],
         event_tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
         approval_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ApprovalResponse>,
@@ -227,10 +228,10 @@ impl AgentEngine {
             if let Some(ctx) = &self.context_prompt {
                 content.push_str(&format!("\n\n{ctx}"));
             }
-            messages.push(ChatMessage { role: "system".into(), content, tool_calls: None, tool_call_id: None, name: None });
+            messages.push(ChatMessage { role: "system".into(), content, attachments: None, tool_calls: None, tool_call_id: None, name: None });
         }
         messages.extend(history.iter().cloned());
-        messages.push(ChatMessage { role: "user".into(), content: user_message.to_string(), tool_calls: None, tool_call_id: None, name: None });
+        messages.push(ChatMessage { role: "user".into(), content: user_message.to_string(), attachments: attachments.map(|s| s.to_string()), tool_calls: None, tool_call_id: None, name: None });
 
         info!(message_count=%messages.len(), messages_summary=%messages.iter().map(|m| {
             let tc = m.tool_calls.as_ref().map(|v| v.len()).unwrap_or(0);
@@ -271,7 +272,7 @@ impl AgentEngine {
             if max_loops > 0 && round >= max_loops {
                 messages.push(ChatMessage { role: "system".into(),
                     content: "Max tool calls reached. Provide your final answer now based on gathered information.".into(),
-                    tool_calls: None, tool_call_id: None, name: None });
+                    attachments: None, tool_calls: None, tool_call_id: None, name: None });
                 let resp = self.llm.chat_completion(&messages, &[]).await.map_err(|e| format!("LLM: {e}"))?;
                 final_content = resp.content;
                 if !final_content.trim().is_empty() {
@@ -475,7 +476,7 @@ impl AgentEngine {
                     tc2
                 })
                 .collect();
-            messages.push(ChatMessage { role: "assistant".into(), content: stream_text.clone(), tool_calls: Some(normalized_calls), tool_call_id: None, name: None });
+            messages.push(ChatMessage { role: "assistant".into(), content: stream_text.clone(), attachments: None, tool_calls: Some(normalized_calls), tool_call_id: None, name: None });
 
             // Execute each tool call and collect records for this step.
             let mut step_tool_records: Vec<ToolCallRecord> = Vec::new();
@@ -509,7 +510,7 @@ impl AgentEngine {
                     });
                     messages.push(ChatMessage {
                         role: "tool".into(), content: answers,
-                        tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some("ask_user".into()),
+                        attachments: None, tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some("ask_user".into()),
                     });
                     continue;
                 }
@@ -571,7 +572,7 @@ impl AgentEngine {
                     });
                     messages.push(ChatMessage {
                         role: "tool".into(), content: tool_result.clone(),
-                        tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some(tc.function.name.clone()),
+                        attachments: None, tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some(tc.function.name.clone()),
                     });
                     continue;
                 }
@@ -629,7 +630,7 @@ impl AgentEngine {
 
                 messages.push(ChatMessage {
                     role: "tool".into(), content: tool_result.clone(),
-                    tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some(tc.function.name.clone()),
+                    attachments: None, tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some(tc.function.name.clone()),
                 });
             }
 

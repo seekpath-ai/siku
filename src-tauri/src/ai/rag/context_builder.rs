@@ -60,12 +60,12 @@ pub fn build_rag_messages(
             content: system_prompt.unwrap_or(
                 "You are a research assistant. Answer questions based on the provided literature excerpts. Always cite sources using [n] notation."
             ).to_string(),
-            tool_calls: None, tool_call_id: None, name: None,
+            attachments: None, tool_calls: None, tool_call_id: None, name: None,
         },
         crate::ai::llm::ChatMessage {
             role: "user".to_string(),
             content: context,
-            tool_calls: None, tool_call_id: None, name: None,
+            attachments: None, tool_calls: None, tool_call_id: None, name: None,
         },
     ]
 }

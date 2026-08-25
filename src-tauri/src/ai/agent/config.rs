@@ -19,6 +19,8 @@ pub struct LlmConfigBlock {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_body: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_vision: Option<bool>,
 }
 
 impl std::fmt::Debug for LlmConfigBlock {
@@ -32,6 +34,7 @@ impl std::fmt::Debug for LlmConfigBlock {
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
             .field("extra_body", &self.extra_body)
+            .field("is_vision", &self.is_vision)
             .finish()
     }
 }
@@ -47,6 +50,7 @@ impl Default for LlmConfigBlock {
             max_tokens: None,
             temperature: None,
             extra_body: None,
+            is_vision: None,
         }
     }
 }
@@ -75,6 +79,7 @@ impl LlmConfigBlock {
             proxy: self.proxy.clone(),
             max_tokens: self.max_tokens.unwrap_or(4096) as u32,
             temperature: self.temperature.unwrap_or(0.7),
+            is_vision: self.is_vision.unwrap_or(false),
         }
     }
 }

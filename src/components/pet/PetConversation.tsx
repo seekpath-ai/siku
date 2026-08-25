@@ -500,6 +500,7 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
                         tokens_in: null,
                         tokens_in_hit: null,
                         tokens_out: null,
+                        attachments: null,
                         created_at: new Date().toISOString(),
                       };
                       usePetStore.setState((s) => ({ messages: [...s.messages, localMsg], streamContent: '' }));

@@ -115,7 +115,7 @@ pub async fn get_chat_messages(
     session_id: String,
 ) -> Result<Vec<ChatMessage>, String> {
     let messages = sqlx::query_as::<_, ChatMessage>(
-        "SELECT id, session_id, role, content, reasoning_content, tool_calls, tool_call_id, tool_name, citations, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, created_at
+        "SELECT id, session_id, role, content, reasoning_content, tool_calls, tool_call_id, tool_name, citations, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, attachments, created_at
          FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC"
     )
     .bind(&session_id)
@@ -142,13 +142,14 @@ pub async fn save_chat_message(
     tool_call_id: Option<&str>,
     tool_name: Option<&str>,
     reasoning_content: Option<&str>,
+    attachments: Option<&str>,
 ) -> Result<String, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = time::now_iso();
 
     sqlx::query(
-        "INSERT INTO chat_messages (id, session_id, role, content, reasoning_content, tool_calls, tool_call_id, tool_name, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO chat_messages (id, session_id, role, content, reasoning_content, tool_calls, tool_call_id, tool_name, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, attachments, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&id)
     .bind(session_id)
@@ -163,6 +164,7 @@ pub async fn save_chat_message(
     .bind(tokens_in)
     .bind(tokens_in_hit)
     .bind(tokens_out)
+    .bind(attachments)
     .bind(&now)
     .execute(db)
     .await

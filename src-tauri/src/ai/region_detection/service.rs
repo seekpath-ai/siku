@@ -276,6 +276,7 @@ pub async fn detect_regions(
         ChatMessage {
             role: "system".to_string(),
             content: SYSTEM_PROMPT.to_string(),
+            attachments: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -283,6 +284,7 @@ pub async fn detect_regions(
         ChatMessage {
             role: "user".to_string(),
             content: layout_desc,
+            attachments: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,

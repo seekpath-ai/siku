@@ -294,6 +294,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     tokens_in INTEGER,
     tokens_in_hit INTEGER,
     tokens_out INTEGER,
+    attachments TEXT,
     created_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);

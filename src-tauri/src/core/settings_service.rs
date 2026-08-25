@@ -217,6 +217,7 @@ pub async fn validate_llm_config(config: &crate::ai::llm::LlmConfig) -> Result<b
     let test_messages = vec![crate::ai::llm::ChatMessage {
         role: "user".to_string(),
         content: "Hello, respond with just 'ok'.".to_string(),
+        attachments: None,
         tool_calls: None,
         tool_call_id: None,
         name: None,

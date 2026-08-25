@@ -1,35 +1,72 @@
-import { useState, useRef, useEffect } from 'react';
-import { Send, Paperclip, BookOpen, Square, X, FileText } from 'lucide-react';
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { Send, Paperclip, ImagePlus, BookOpen, Square, X, FileText } from 'lucide-react';
 import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
-import { agentSendMessage, agentCancel, readTextFile } from '@/lib/tauri';
+import { agentSendMessage, agentCancel, readTextFile, readImageFile } from '@/lib/tauri';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
+import type { ChatAttachment } from '@/lib/types';
 
 interface Props {
   disabled?: boolean;
 }
 
-interface Attachment {
+interface TextAttachment {
+  kind: 'text';
+  id: string;
   path: string;
   name: string;
   content: string;
+}
+
+interface ImageAttachmentLocal {
+  kind: 'image';
+  id: string;
+  name: string;
+  mime: string;
+  base64: string;
+  previewUrl: string;
+}
+
+type Attachment = TextAttachment | ImageAttachmentLocal;
+
+function attachmentKey(a: Attachment): string {
+  return `${a.kind}:${a.id}`;
 }
 
 const TEXT_FILTERS = [
   { name: '文本文件', extensions: ['txt', 'md', 'json', 'ts', 'tsx', 'js', 'rs', 'py', 'css', 'html', 'yml', 'yaml', 'toml', 'csv', 'xml'] },
 ];
 
+const IMAGE_FILTERS = [
+  { name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] },
+];
+
+function fileToBase64(file: File): Promise<{ base64: string; mime: string; previewUrl: string }> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      const [header, base64] = result.split(',');
+      const mime = header.match(/data:(.+);base64/)?.[1] || file.type || 'image/png';
+      resolve({ base64, mime, previewUrl: result });
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
 export function MessageInput({ disabled }: Props) {
   const agentName = useActiveAgentName();
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { activeSessionId, addMessage, setLoading, isStreaming } = useChatStore();
   const activeProject = useProjectStore((s) =>
     s.projects.find((p) => p.id === s.activeProjectId)
   );
 
-  const handleAttach = async () => {
+  const handleAttachText = async () => {
     try {
       const { open } = await import('@tauri-apps/plugin-dialog');
       const selected = await open({
@@ -41,12 +78,111 @@ export function MessageInput({ disabled }: Props) {
       if (selected && typeof selected === 'string') {
         const content = await readTextFile(selected);
         const name = selected.split(/[\\/]/).pop() || selected;
-        setAttachments((prev) => (prev.some((a) => a.path === selected) ? prev : [...prev, { path: selected, name, content }]));
+        setAttachments((prev) =>
+          prev.some((a) => a.kind === 'text' && a.path === selected)
+            ? prev
+            : [...prev, { kind: 'text', id: `txt_${Date.now()}`, path: selected, name, content }]
+        );
       }
     } catch (err) {
       console.error('Attach failed:', err);
     }
   };
+
+  const handleAttachImage = async () => {
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const selected = await open({
+        multiple: true,
+        directory: false,
+        defaultPath: activeProject?.path,
+        filters: IMAGE_FILTERS,
+      });
+      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+      for (const path of paths) {
+        if (typeof path !== 'string') continue;
+        const name = path.split(/[\\/]/).pop() || path;
+        const att = await readImageFile(path);
+        setAttachments((prev) =>
+          prev.some((a) => a.kind === 'image' && a.name === name)
+            ? prev
+            : [
+                ...prev,
+                {
+                  kind: 'image',
+                  id: `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                  name: att.name || name,
+                  mime: att.mime,
+                  base64: att.base64,
+                  previewUrl: `data:${att.mime};base64,${att.base64}`,
+                },
+              ]
+        );
+      }
+    } catch (err) {
+      console.error('Image attach failed:', err);
+    }
+  };
+
+  const addImageAttachment = useCallback(async (file: File) => {
+    try {
+      const { base64, mime, previewUrl } = await fileToBase64(file);
+      setAttachments((prev) => [
+        ...prev,
+        {
+          kind: 'image',
+          id: `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          name: file.name,
+          mime,
+          base64,
+          previewUrl,
+        },
+      ]);
+    } catch (err) {
+      console.error('Failed to read pasted image:', err);
+    }
+  }, []);
+
+  const handlePaste = useCallback(
+    async (e: React.ClipboardEvent) => {
+      const files = e.clipboardData?.files;
+      if (!files) return;
+      let handled = false;
+      for (const file of Array.from(files)) {
+        if (file.type.startsWith('image/')) {
+          e.preventDefault();
+          handled = true;
+          await addImageAttachment(file);
+        }
+      }
+      if (handled) return;
+      // Let default paste handle text.
+    },
+    [addImageAttachment]
+  );
+
+  const handleDrop = useCallback(
+    async (e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsDragging(false);
+      const files = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith('image/'));
+      for (const file of files) {
+        await addImageAttachment(file);
+      }
+    },
+    [addImageAttachment]
+  );
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+  }, []);
 
   const handleStop = () => {
     if (activeSessionId) agentCancel(activeSessionId).catch(() => {});
@@ -54,12 +190,20 @@ export function MessageInput({ disabled }: Props) {
 
   const handleSend = async () => {
     const text = input.trim();
+    const imageAttachments = attachments.filter((a): a is ImageAttachmentLocal => a.kind === 'image');
+    const textAttachments = attachments.filter((a): a is TextAttachment => a.kind === 'text');
+
     if ((!text && attachments.length === 0) || !activeSessionId || isStreaming) return;
 
-    const attachBlock = attachments
+    const attachBlock = textAttachments
       .map((a) => `<file name="${a.name}" path="${a.path}">\n${a.content}\n</file>`)
       .join('\n');
     const content = [attachBlock, text].filter(Boolean).join('\n\n');
+
+    const chatAttachments: ChatAttachment[] | undefined =
+      imageAttachments.length > 0
+        ? imageAttachments.map((a) => ({ mime: a.mime, base64: a.base64, name: a.name }))
+        : undefined;
 
     setInput('');
     setAttachments([]);
@@ -79,11 +223,12 @@ export function MessageInput({ disabled }: Props) {
       tokens_in: null,
       tokens_in_hit: null,
       tokens_out: null,
+      attachments: chatAttachments ? JSON.stringify(chatAttachments) : null,
       created_at: new Date().toISOString(),
     });
 
     try {
-      await agentSendMessage(activeSessionId, content);
+      await agentSendMessage(activeSessionId, content, chatAttachments);
     } catch (err) {
       setLoading(false);
       addMessage({
@@ -99,6 +244,7 @@ export function MessageInput({ disabled }: Props) {
         tokens_in: null,
         tokens_in_hit: null,
         tokens_out: null,
+        attachments: null,
         created_at: new Date().toISOString(),
       });
     }
@@ -129,34 +275,67 @@ export function MessageInput({ disabled }: Props) {
     }
   }, [activeSessionId]);
 
+  const removeAttachment = (target: Attachment) => {
+    const key = attachmentKey(target);
+    setAttachments((prev) => prev.filter((a) => attachmentKey(a) !== key));
+  };
+
   const canSend = !disabled && (!!input.trim() || attachments.length > 0);
 
   return (
     <div className="px-5 pb-5 pt-2 bg-background">
       <div className="max-w-[800px] mx-auto">
-        <div className="rounded-xl border border-surface-hover p-1 transition-colors focus-within:bg-surface">
+        <div
+          className={`rounded-xl border p-1 transition-colors focus-within:bg-surface ${
+            isDragging ? 'border-primary bg-primary/5' : 'border-surface-hover'
+          }`}
+          onDrop={handleDrop}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+        >
           {attachments.length > 0 && (
             <div className="flex flex-wrap gap-1.5 px-2 pt-2">
-              {attachments.map((a) => (
-                <span
-                  key={a.path}
-                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-primary/10 text-primary text-[11px] max-w-[220px]"
-                  title={a.path}
-                >
-                  <FileText size={11} className="shrink-0" />
-                  <span className="truncate">{a.name}</span>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setAttachments((prev) => prev.filter((x) => x.path !== a.path))
-                    }
-                    className="hover:text-red-400 shrink-0"
-                    aria-label="移除附件"
+              {attachments.map((a) =>
+                a.kind === 'text' ? (
+                  <span
+                    key={a.id}
+                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-primary/10 text-primary text-[11px] max-w-[220px]"
+                    title={a.path}
                   >
-                    <X size={11} />
-                  </button>
-                </span>
-              ))}
+                    <FileText size={11} className="shrink-0" />
+                    <span className="truncate">{a.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => removeAttachment(a)}
+                      className="hover:text-red-400 shrink-0"
+                      aria-label="移除附件"
+                    >
+                      <X size={11} />
+                    </button>
+                  </span>
+                ) : (
+                  <span
+                    key={a.id}
+                    className="inline-flex items-center gap-1 px-1.5 py-1 rounded-md bg-primary/10 text-primary text-[11px] max-w-[220px]"
+                    title={a.name}
+                  >
+                    <img
+                      src={a.previewUrl}
+                      alt={a.name}
+                      className="w-6 h-6 object-cover rounded"
+                    />
+                    <span className="truncate">{a.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => removeAttachment(a)}
+                      className="hover:text-red-400 shrink-0"
+                      aria-label="移除图片"
+                    >
+                      <X size={11} />
+                    </button>
+                  </span>
+                )
+              )}
             </div>
           )}
           <textarea
@@ -165,6 +344,7 @@ export function MessageInput({ disabled }: Props) {
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             onInput={handleInput}
+            onPaste={handlePaste}
             placeholder={isStreaming ? 'AI 正在回复…' : `给 ${agentName} 发送指令…`}
             disabled={disabled}
             rows={1}
@@ -175,11 +355,20 @@ export function MessageInput({ disabled }: Props) {
               <button
                 type="button"
                 disabled={disabled}
-                onClick={handleAttach}
+                onClick={handleAttachText}
                 className="w-7 h-7 rounded-md border-0 bg-transparent text-text-secondary/70 flex items-center justify-center hover:bg-surface-hover hover:text-text-primary transition-colors disabled:opacity-50"
-                title="附加文件（作为上下文发送）"
+                title="附加文本文件"
               >
                 <Paperclip size={15} />
+              </button>
+              <button
+                type="button"
+                disabled={disabled}
+                onClick={handleAttachImage}
+                className="w-7 h-7 rounded-md border-0 bg-transparent text-text-secondary/70 flex items-center justify-center hover:bg-surface-hover hover:text-text-primary transition-colors disabled:opacity-50"
+                title="附加图片"
+              >
+                <ImagePlus size={15} />
               </button>
               <button
                 type="button"
@@ -211,7 +400,7 @@ export function MessageInput({ disabled }: Props) {
           </div>
         </div>
         <div className="text-center text-[12px] text-text-secondary/60 mt-2">
-          Enter 发送 · Shift + Enter 换行 · 工具调用前会请求确认
+          Enter 发送 · Shift + Enter 换行 · 拖拽/粘贴图片也可发送
         </div>
       </div>
     </div>

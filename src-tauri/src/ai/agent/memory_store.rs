@@ -15,6 +15,8 @@ pub struct MemoryRecord {
     pub role: String,
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -84,6 +86,7 @@ impl MemoryStore {
         tool_calls: Option<&str>,
         tool_call_id: Option<&str>,
         tool_name: Option<&str>,
+        attachments: Option<&str>,
     ) {
         let now = Utc::now();
         let record = MemoryRecord {
@@ -91,6 +94,7 @@ impl MemoryStore {
             time: now,
             role: role.to_string(),
             content: content.to_string(),
+            attachments: attachments.map(|s| s.to_string()),
             tool_calls: tool_calls.map(|s| s.to_string()),
             tool_call_id: tool_call_id.map(|s| s.to_string()),
             tool_name: tool_name.map(|s| s.to_string()),

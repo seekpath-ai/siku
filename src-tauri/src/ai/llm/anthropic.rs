@@ -55,7 +55,7 @@ impl AnthropicClient {
                 continue;
             }
 
-            // Build Anthropic content as a mixed array of text + tool_use blocks
+            // Build Anthropic content as a mixed array of text + image + tool_use blocks
             let mut content_blocks: Vec<serde_json::Value> = Vec::new();
 
             // Preserve text content if present
@@ -64,6 +64,22 @@ impl AnthropicClient {
                     "type": "text",
                     "text": msg.content,
                 }));
+            }
+
+            // Add image blocks from attachments
+            if let Some(attachments_json) = &msg.attachments {
+                if let Ok(attachments) = serde_json::from_str::<Vec<crate::ai::llm::ImageAttachment>>(attachments_json) {
+                    for att in attachments {
+                        content_blocks.push(serde_json::json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": att.mime,
+                                "data": att.base64,
+                            },
+                        }));
+                    }
+                }
             }
 
             // Add tool_use blocks
@@ -79,7 +95,7 @@ impl AnthropicClient {
             }
 
             // Tool result message
-            let mut entry = if let Some(ref tool_call_id) = msg.tool_call_id {
+            let entry = if let Some(ref tool_call_id) = msg.tool_call_id {
                 serde_json::json!({
                     "role": msg.role,
                     "content": [{

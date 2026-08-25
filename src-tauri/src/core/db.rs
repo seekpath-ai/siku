@@ -362,6 +362,11 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_messages.tokens_out: {}", e))?;
 
+    // Migration: image attachments on chat messages (added 2026-08-25)
+    add_column_if_missing(&db, "chat_messages", "attachments", "TEXT")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chat_messages.attachments: {}", e))?;
+
     // Migration: sync chat_sessions columns added for agent features
     add_column_if_missing(&db, "chat_sessions", "llm_models", "TEXT")
         .await

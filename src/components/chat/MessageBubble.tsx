@@ -4,7 +4,7 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import { User, Copy, Check } from 'lucide-react';
 import { useState } from 'react';
-import type { AgentPhase, AgentStep, ChatMessage, ToolCallInfo } from '@/lib/types';
+import type { AgentPhase, AgentStep, ChatAttachment, ChatMessage, ToolCallInfo } from '@/lib/types';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
 import { CodeBlock } from './CodeBlock';
 import { ToolCallCard } from './ToolCallCard';
@@ -36,6 +36,16 @@ function formatTokenUsage(message: ChatMessage): string {
     return `${message.tokens_used} tokens`;
   }
   return '';
+}
+
+function parseAttachments(json: string | null): ChatAttachment[] {
+  if (!json) return [];
+  try {
+    const parsed = JSON.parse(json);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 function parseToolCalls(json: string | null): ToolCallInfo[] {
@@ -150,7 +160,28 @@ export function MessageBubble({ message, agentSteps = [] }: Props) {
           <span className="absolute -right-[7px] top-3 h-0 w-0 border-y-[6px] border-l-[8px] border-y-transparent border-l-codex-surface" />
         )}
         {isUser ? (
-          <p className="whitespace-pre-wrap">{message.content}</p>
+          <>
+            <p className="whitespace-pre-wrap">{message.content}</p>
+            {message.attachments && (
+              <div className="flex flex-wrap gap-2 mt-2">
+                {parseAttachments(message.attachments).map((att, idx) => (
+                  <a
+                    key={idx}
+                    href={`data:${att.mime};base64,${att.base64}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="block"
+                  >
+                    <img
+                      src={`data:${att.mime};base64,${att.base64}`}
+                      alt={att.name || `图片 ${idx + 1}`}
+                      className="max-w-[120px] max-h-[120px] object-cover rounded-lg border border-codex-border/50"
+                    />
+                  </a>
+                ))}
+              </div>
+            )}
+          </>
         ) : (
           <div className="prose prose-sm prose-invert max-w-none [&>*:first-child]:mt-0">
             <ReactMarkdown

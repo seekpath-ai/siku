@@ -23,6 +23,42 @@ impl OllamaClient {
     }
 }
 
+/// Convert a ChatMessage to the JSON shape expected by OpenAI-compatible APIs.
+fn message_to_openai_json(msg: &ChatMessage) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("role".to_string(), serde_json::Value::String(msg.role.clone()));
+
+    if let Some(attachments_json) = &msg.attachments {
+        let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+        if !msg.content.is_empty() {
+            content_blocks.push(serde_json::json!({"type": "text", "text": msg.content}));
+        }
+        if let Ok(attachments) = serde_json::from_str::<Vec<crate::ai::llm::ImageAttachment>>(attachments_json) {
+            for att in attachments {
+                content_blocks.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{};base64,{}", att.mime, att.base64) },
+                }));
+            }
+        }
+        obj.insert("content".to_string(), serde_json::Value::Array(content_blocks));
+    } else {
+        obj.insert("content".to_string(), serde_json::Value::String(msg.content.clone()));
+    }
+
+    if let Some(ref tool_calls) = msg.tool_calls {
+        obj.insert("tool_calls".to_string(), serde_json::to_value(tool_calls).unwrap_or_default());
+    }
+    if let Some(ref tool_call_id) = msg.tool_call_id {
+        obj.insert("tool_call_id".to_string(), serde_json::Value::String(tool_call_id.clone()));
+    }
+    if let Some(ref name) = msg.name {
+        obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
+    }
+
+    serde_json::Value::Object(obj)
+}
+
 #[async_trait]
 impl LlmClient for OllamaClient {
     #[instrument(skip(self, messages, tools))]
@@ -34,7 +70,7 @@ impl LlmClient for OllamaClient {
         // Ollama supports OpenAI-compatible API since v0.5.0
         let body = serde_json::json!({
             "model": self.config.model,
-            "messages": messages,
+            "messages": messages.iter().map(message_to_openai_json).collect::<Vec<_>>(),
             "tools": tools,
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
@@ -157,7 +193,7 @@ impl LlmClient for OllamaClient {
     ) -> Result<(), String> {
         let body = serde_json::json!({
             "model": self.config.model,
-            "messages": messages,
+            "messages": messages.iter().map(message_to_openai_json).collect::<Vec<_>>(),
             "tools": tools,
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,

@@ -256,6 +256,12 @@ export interface ApprovalConfig {
   whitelist?: string[];
 }
 
+export interface ChatAttachment {
+  mime: string;
+  base64: string;
+  name?: string | null;
+}
+
 export interface ChatMessage {
   id: string;
   session_id: string;
@@ -269,6 +275,7 @@ export interface ChatMessage {
   tokens_in: number | null;
   tokens_in_hit: number | null;
   tokens_out: number | null;
+  attachments: string | null; // JSON ChatAttachment[]
   created_at: string;
 }
 

@@ -28,6 +28,7 @@ fn build_translation_messages(text: &str, source: &str, target: &str) -> Vec<Cha
         ChatMessage {
             role: "system".to_string(),
             content: TRANSLATION_SYSTEM_PROMPT.to_string(),
+            attachments: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -35,6 +36,7 @@ fn build_translation_messages(text: &str, source: &str, target: &str) -> Vec<Cha
         ChatMessage {
             role: "user".to_string(),
             content: user_prompt,
+            attachments: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,

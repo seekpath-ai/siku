@@ -3,7 +3,6 @@ pub mod openai;
 pub mod anthropic;
 pub mod ollama;
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// Supported LLM providers (all OpenAI-compatible except Anthropic/Ollama)
@@ -47,6 +46,7 @@ pub struct LlmConfig {
     pub proxy: Option<String>,
     pub max_tokens: u32,
     pub temperature: f32,
+    pub is_vision: bool,
 }
 
 impl std::fmt::Debug for LlmConfig {
@@ -59,6 +59,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("proxy", &self.proxy)
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
+            .field("is_vision", &self.is_vision)
             .finish()
     }
 }
@@ -76,6 +77,7 @@ impl Default for LlmConfig {
             proxy: None,
             max_tokens: 4096,
             temperature: 0.7,
+            is_vision: false,
         }
     }
 }
@@ -85,6 +87,9 @@ impl Default for LlmConfig {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// JSON array of ImageAttachment; only user messages should carry images.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,6 +103,15 @@ pub struct ChatMessage {
 pub struct ImagePart {
     pub mime: String,
     pub base64: String,
+}
+
+/// An image attachment carried on a chat message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    pub mime: String,
+    pub base64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// A tool call from the LLM

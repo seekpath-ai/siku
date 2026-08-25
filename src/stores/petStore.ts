@@ -138,6 +138,7 @@ export const usePetStore = create<PetState>((set, get) => ({
       tokens_in: null,
       tokens_in_hit: null,
       tokens_out: null,
+      attachments: null,
       created_at: new Date().toISOString(),
     };
     set((s) => ({

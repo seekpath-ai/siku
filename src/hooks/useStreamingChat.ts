@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useChatStore } from '@/stores/chatStore';
 import type { AgentStep, AgentStreamEvent, ToolCallInfo } from '@/lib/types';
@@ -7,7 +7,7 @@ export function useStreamingChat() {
   const unlistenRef = useRef<UnlistenFn | null>(null);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
 
-  const finalizeStep = (stepIndex: number) => {
+  const finalizeStep = useCallback((stepIndex: number) => {
     const state = useChatStore.getState();
     const step = state.currentStreamingStep;
     if (!step || step.step_index !== stepIndex) return;
@@ -46,7 +46,7 @@ export function useStreamingChat() {
       state.clearStreamContent();
     }
     */
-  };
+  }, [activeSessionId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -148,6 +148,7 @@ export function useStreamingChat() {
                 tokens_in: e.tokens_in ?? null,
                 tokens_in_hit: e.tokens_in_hit ?? null,
                 tokens_out: e.tokens_out ?? null,
+                attachments: null,
                 created_at: new Date().toISOString(),
               });
               state.linkAgentSteps(messageId, e.session_id);
@@ -196,6 +197,7 @@ export function useStreamingChat() {
                 tokens_in: e.tokens_in ?? null,
                 tokens_in_hit: e.tokens_in_hit ?? null,
                 tokens_out: e.tokens_out ?? null,
+                attachments: null,
                 created_at: new Date().toISOString(),
               });
               state.linkAgentSteps(messageId, e.session_id);
@@ -227,6 +229,7 @@ export function useStreamingChat() {
               tokens_in: null,
               tokens_in_hit: null,
               tokens_out: null,
+              attachments: null,
               created_at: new Date().toISOString(),
             });
             state.clearStreamContent();
@@ -251,5 +254,5 @@ export function useStreamingChat() {
         unlistenRef.current = null;
       }
     };
-  }, [activeSessionId]);
+  }, [activeSessionId, finalizeStep]);
 }

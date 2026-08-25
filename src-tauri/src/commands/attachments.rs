@@ -2,6 +2,8 @@ use std::path::Path;
 use tauri::State;
 use tracing::instrument;
 
+use base64::Engine;
+use crate::ai::llm::ImageAttachment;
 use crate::file_store;
 use crate::AppState;
 
@@ -123,4 +125,42 @@ pub async fn vault_attachments_dir(state: State<'_, AppState>) -> Result<String,
     Ok(file_store::blob_dir(&state.app_data_dir)
         .to_string_lossy()
         .to_string())
+}
+
+fn guess_image_mime(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "image/png",
+    }
+}
+
+/// Read a local image file and return it as a base64-encoded ImageAttachment.
+#[tauri::command]
+#[instrument]
+pub async fn read_image_file(path: String) -> Result<ImageAttachment, String> {
+    let resolved = std::path::Path::new(&path)
+        .canonicalize()
+        .map_err(|e| format!("invalid path: {e}"))?;
+    if !resolved.is_file() {
+        return Err(format!("not a file: {path}"));
+    }
+    let bytes = tokio::fs::read(&resolved)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    let mime = guess_image_mime(&resolved.to_string_lossy());
+    let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let name = resolved
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_string());
+    Ok(ImageAttachment { mime: mime.to_string(), base64, name })
 }

@@ -12,7 +12,7 @@ export const LLM_PRESETS: LlmPreset[] = [
   {
     label: 'DeepSeek',
     provider: 'deepseek',
-    models: ['deepseek-v4-pro', 'deepseek-v4-flash'],
+    models: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp'],
     baseURL: 'https://api.deepseek.com/v1',
     apiKeyEnv: 'DEEPSEEK_API_KEY',
   },

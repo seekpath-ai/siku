@@ -58,6 +58,7 @@ impl ConversationMemory {
             result.push(crate::ai::llm::ChatMessage {
                 role: "system".to_string(),
                 content: sys.clone(),
+                attachments: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -141,6 +142,7 @@ mod tests {
             .map(|i| crate::ai::llm::ChatMessage {
                 role: "user".to_string(),
                 content: format!("message {}", i),
+                attachments: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,

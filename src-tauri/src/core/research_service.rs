@@ -276,12 +276,12 @@ async fn expand_query(db: &SqlitePool, topic_name: &str, keywords: &[String]) ->
         crate::ai::llm::ChatMessage {
             role: "system".into(),
             content: "你是文献检索助手，只输出检索关键词。".into(),
-            tool_calls: None, tool_call_id: None, name: None,
+            attachments: None, tool_calls: None, tool_call_id: None, name: None,
         },
         crate::ai::llm::ChatMessage {
             role: "user".into(),
             content: prompt,
-            tool_calls: None, tool_call_id: None, name: None,
+            attachments: None, tool_calls: None, tool_call_id: None, name: None,
         },
     ];
     let resp = tokio::time::timeout(

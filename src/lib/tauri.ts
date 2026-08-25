@@ -3,7 +3,7 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   Paper, PaperInput, PaperLinkMetadata, PaperImportResult, LinkImportError, ListPapersParams,
-  AgentSession, AgentStep, ChatMessage, LlmConfigBlock, ApprovalConfig, Project, CronJob,
+  AgentSession, AgentStep, ChatMessage, ChatAttachment, LlmConfigBlock, ApprovalConfig, Project, CronJob,
   KnowledgeDomain, KnowledgeItem,
   ResearchTopic, ResearchSource, Note,
   FileEntry, SystemInfo, TimelineItem,
@@ -225,8 +225,9 @@ export async function petDomains(): Promise<PetDomainInfo[]> {
 export async function agentSendMessage(
   sessionId: string,
   content: string,
+  attachments?: ChatAttachment[],
 ): Promise<void> {
-  return invoke<void>('agent_send_message', { sessionId, content });
+  return invoke<void>('agent_send_message', { sessionId, content, attachments });
 }
 
 export async function agentApproveTool(
@@ -960,6 +961,11 @@ export async function saveAttachmentBytes(input: SaveAttachmentBytesInput): Prom
       vault_id: input.vaultId,
     },
   });
+}
+
+/** Read a local image file and return it as a base64-encoded attachment. */
+export async function readImageFile(path: string): Promise<ChatAttachment> {
+  return invoke<ChatAttachment>('read_image_file', { path });
 }
 
 // ============================================================

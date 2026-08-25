@@ -859,7 +859,7 @@ pub fn run() {
             commands::account::auth_logout,
             commands::account::auth_status,
             commands::account::device_list,
-            commands::account::device_revoke,
+            commands::account::device_remove,
             commands::account::device_rename,
             commands::account::suggest_device_name,
             // Sync

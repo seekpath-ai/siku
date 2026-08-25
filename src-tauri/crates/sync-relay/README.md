@@ -5,9 +5,9 @@ Siku 多端同步的官方中继服务。职责三块：**WebRTC 信令转发**�
 ## 功能
 
 - WebSocket 接入：`/v1/signaling?token=<jwt>`
-- 账户 API：`/api/register`、`/api/login`、`/api/devices`（列表/改名/吊销）
+- 账户 API：`/api/register`、`/api/login`、`/api/devices`（列表/改名/移除）
 - JWT（HS256）认证：token 由 `/api/login` 服务端签发（有效期 7 天，claims 含 `jti`）
-- 设备吊销检查：已吊销设备的连接在 WS 握手阶段直接拒绝
+- 设备校验：已移除或未知设备的连接在 WS 握手阶段直接拒绝
 - 房间（room）管理：同一 room（= 用户 id）内的设备互相可见；一个设备的多条连接（发现/会话/邮箱）互不影响在线状态
 - `PeerOnline` / `PeerOffline` / `Presence` 状态广播
 - `signal` 消息转发（offer / answer / ICE candidate）
@@ -225,7 +225,7 @@ curl -X POST http://127.0.0.1:8080/api/login \
 TOKEN=<上一步的 access_token>
 # 列出本账号设备
 curl http://127.0.0.1:8080/api/devices -H "Authorization: Bearer $TOKEN"
-# 改名 / 吊销（吊销后该设备无法再连接）
+# 改名 / 移除（移除后该设备无法再连接）
 curl -X PATCH http://127.0.0.1:8080/api/devices/<device_id> \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"name":"新名字"}'
 curl -X DELETE http://127.0.0.1:8080/api/devices/<device_id> -H "Authorization: Bearer $TOKEN"
@@ -286,7 +286,7 @@ websocat "ws://127.0.0.1:8080/v1/signaling?token=$TOKEN"
 
 - **明文不落盘**：邮箱只存 E2E 加密后的密文（`ciphertext` + `nonce`），密钥（`sync_key`）只由客户端持有、在 `/api/login` 响应中下发。
 - **账户凭据**：密码以迭代 SHA-256（10 万轮 + 随机盐，PBKDF2 风格）存储，见 `auth.rs`。
-- **设备吊销**：`/api/devices/:id` DELETE 后，该设备后续 WS 连接在握手阶段即被拒绝。
+- **设备移除**：`/api/devices/:id` DELETE 直接删除设备记录，其 refresh token 同步失效，后续 WS 连接在握手阶段即被拒绝；重新登录会注册为全新设备。
 - **生产注意事项**：
   - 替换默认 `JWT_SECRET`（固定密钥仅用于本地/内部测试）；
   - 挂载持久化卷并设置 `RELAY_DB_PATH`；

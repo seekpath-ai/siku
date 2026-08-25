@@ -124,8 +124,8 @@ impl Db {
     /// Register a device under a user. Returns Ok(false) when the device is
     /// already registered (idempotent re-login).
     ///
-    /// A previously **revoked** device is reactivated: logging in again with
-    /// valid credentials re-authorizes the device (revoked_at cleared).
+    /// Legacy rows may still carry `revoked_at` (from before device removal
+    /// replaced revocation): re-login clears it and re-authorizes the device.
     pub fn register_device(
         &self,
         user_id: &str,
@@ -181,7 +181,9 @@ impl Db {
         let mut list: Vec<Device> = snap
             .devices
             .values()
-            .filter(|d| d.user_id == user_id)
+            // Legacy rows may still carry revoked_at; keep them hidden so the
+            // device list only ever shows live devices.
+            .filter(|d| d.user_id == user_id && d.revoked_at.is_none())
             .cloned()
             .collect();
         list.sort_by(|a, b| a.created_at.cmp(&b.created_at));
@@ -210,15 +212,19 @@ impl Db {
             .cloned()
     }
 
-    pub fn revoke_device(&self, user_id: &str, device_id: &str) -> bool {
+    /// Remove a device entirely. The row disappears from the list and its
+    /// tokens die with it: refresh-token lookup finds nothing and the WS
+    /// handshake rejects unknown device ids. Logging in again with the same
+    /// device id simply registers a fresh row.
+    pub fn delete_device(&self, user_id: &str, device_id: &str) -> bool {
         let mut snap = self.inner.lock().unwrap();
-        let Some(dev) = snap.devices.get_mut(device_id) else {
+        let Some(dev) = snap.devices.get(device_id) else {
             return false;
         };
         if dev.user_id != user_id {
             return false;
         }
-        dev.revoked_at = Some(crate::now_iso());
+        snap.devices.remove(device_id);
         self.persist(&snap);
         true
     }

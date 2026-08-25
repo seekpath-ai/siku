@@ -7,7 +7,7 @@ import {
   authStatus,
   deviceList,
   deviceRename,
-  deviceRevoke,
+  deviceRemove,
   suggestDeviceName,
   type AccountDeviceRow,
   type AuthInfo,
@@ -180,11 +180,11 @@ export function AccountSettings({ onLoggedIn }: Props) {
     setDevices([]);
   };
 
-  const handleRevoke = async (deviceId: string) => {
+  const handleRemove = async (deviceId: string) => {
     if (!auth) return;
     setBusy(true);
     try {
-      await deviceRevoke(httpBase, deviceId);
+      await deviceRemove(httpBase, deviceId);
       await refreshDevices();
     } catch (e) {
       if (isAuthError(e)) {
@@ -193,7 +193,7 @@ export function AccountSettings({ onLoggedIn }: Props) {
         setDevices([]);
         setError('登录已过期，请重新登录');
       } else {
-        setError(`吊销失败: ${e}`);
+        setError(`移除失败: ${e}`);
       }
     } finally {
       setBusy(false);
@@ -304,44 +304,36 @@ export function AccountSettings({ onLoggedIn }: Props) {
                       {isSelf && (
                         <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/20 text-primary shrink-0">本机</span>
                       )}
-                      {!d.revoked && (
-                        <span
-                          className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
-                            d.online
-                              ? 'bg-emerald-500/15 text-emerald-400'
-                              : 'bg-surface-hover text-text-secondary/50'
-                          }`}
-                        >
-                          {d.online ? '在线' : '离线'}
-                        </span>
-                      )}
+                      <span
+                        className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
+                          d.online
+                            ? 'bg-emerald-500/15 text-emerald-400'
+                            : 'bg-surface-hover text-text-secondary/50'
+                        }`}
+                      >
+                        {d.online ? '在线' : '离线'}
+                      </span>
                     </div>
                     <div className="text-[10px] text-text-secondary/60 font-mono truncate">{d.device_id}</div>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
-                    {d.revoked ? (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-400">已吊销</span>
-                    ) : (
-                      <>
-                        <button
-                          onClick={() => handleRename(d.device_id, d.name)}
-                          disabled={busy}
-                          title="重命名设备"
-                          className="flex items-center gap-1 text-[10px] text-text-secondary hover:text-primary disabled:opacity-30 transition-colors"
-                        >
-                          <RefreshCw size={11} /> 改名
-                        </button>
-                        {!isSelf && (
-                          <button
-                            onClick={() => handleRevoke(d.device_id)}
-                            disabled={busy}
-                            title="吊销该设备的登录"
-                            className="flex items-center gap-1 text-[10px] text-text-secondary hover:text-red-400 disabled:opacity-30 transition-colors"
-                          >
-                            <Trash2 size={11} /> 吊销
-                          </button>
-                        )}
-                      </>
+                    <button
+                      onClick={() => handleRename(d.device_id, d.name)}
+                      disabled={busy}
+                      title="重命名设备"
+                      className="flex items-center gap-1 text-[10px] text-text-secondary hover:text-primary disabled:opacity-30 transition-colors"
+                    >
+                      <RefreshCw size={11} /> 改名
+                    </button>
+                    {!isSelf && (
+                      <button
+                        onClick={() => handleRemove(d.device_id)}
+                        disabled={busy}
+                        title="移除该设备，其登录立即失效"
+                        className="flex items-center gap-1 text-[10px] text-text-secondary hover:text-red-400 disabled:opacity-30 transition-colors"
+                      >
+                        <Trash2 size={11} /> 移除
+                      </button>
                     )}
                   </div>
                 </div>

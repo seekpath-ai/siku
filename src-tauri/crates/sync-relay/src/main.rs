@@ -350,7 +350,10 @@ async fn signaling_handler(
             return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
         }
     };
-    // Revoked devices must not connect, even with a still-valid JWT.
+    // Only registered, non-revoked devices may connect, even with a
+    // still-valid JWT. `revoked_at` only exists on legacy rows (device
+    // removal replaced revocation); unknown devices are rejected outright —
+    // otherwise a removed device could keep syncing until its JWT expired.
     match state.db.get_device(&claims.device_id) {
         Some(d) if d.revoked_at.is_none() => {
             state.db.touch_device(&claims.device_id);
@@ -360,8 +363,8 @@ async fn signaling_handler(
             return (StatusCode::UNAUTHORIZED, "device revoked").into_response();
         }
         None => {
-            // PoC fallback: a valid token without a device row still works.
-            warn!(device_id = %claims.device_id, "device not registered, allowing PoC connection");
+            warn!(device_id = %claims.device_id, "connection rejected: unknown device");
+            return (StatusCode::UNAUTHORIZED, "unknown device").into_response();
         }
     }
     info!(device_id = %claims.device_id, room = %claims.sub, "websocket connected");
@@ -713,7 +716,7 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/api/login", post(api_login))
         .route("/api/refresh", post(api_refresh))
         .route("/api/devices", get(api_list_devices))
-        .route("/api/devices/:id", patch(api_rename_device).delete(api_revoke_device))
+        .route("/api/devices/:id", patch(api_rename_device).delete(api_remove_device))
         .with_state(state)
 }
 
@@ -851,7 +854,6 @@ fn bearer_claims(
 struct DeviceRow {
     device_id: String,
     name: String,
-    revoked: bool,
     online: bool,
     last_seen_at: Option<String>,
 }
@@ -868,7 +870,6 @@ async fn api_list_devices(
             .map(|d| DeviceRow {
                 device_id: d.id.clone(),
                 name: d.name,
-                revoked: d.revoked_at.is_some(),
                 online: state.is_online(&d.id),
                 last_seen_at: None,
             })
@@ -892,17 +893,17 @@ async fn api_rename_device(
     Ok(StatusCode::OK)
 }
 
-async fn api_revoke_device(
+async fn api_remove_device(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let claims = bearer_claims(&state, &headers)?;
-    let ok = state.db.revoke_device(&claims.sub, &id);
+    let ok = state.db.delete_device(&claims.sub, &id);
     if !ok {
         return Err((StatusCode::NOT_FOUND, "device not found".to_string()));
     }
-    info!(device_id = %id, "device revoked");
+    info!(device_id = %id, "device removed");
     Ok(StatusCode::OK)
 }
 

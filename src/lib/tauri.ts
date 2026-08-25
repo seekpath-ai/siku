@@ -1261,7 +1261,6 @@ export interface AuthInfo {
 export interface AccountDeviceRow {
   device_id: string;
   name: string;
-  revoked: boolean;
   online?: boolean;
 }
 
@@ -1289,8 +1288,8 @@ export async function deviceList(relayUrl: string): Promise<AccountDeviceRow[]> 
   return invoke<AccountDeviceRow[]>('device_list', { relayUrl });
 }
 
-export async function deviceRevoke(relayUrl: string, deviceId: string): Promise<void> {
-  return invoke<void>('device_revoke', { relayUrl, deviceId });
+export async function deviceRemove(relayUrl: string, deviceId: string): Promise<void> {
+  return invoke<void>('device_remove', { relayUrl, deviceId });
 }
 
 export async function deviceRename(relayUrl: string, deviceId: string, name: string): Promise<void> {

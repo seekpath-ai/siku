@@ -26,7 +26,6 @@ pub struct AuthInfo {
 pub struct DeviceRow {
     pub device_id: String,
     pub name: String,
-    pub revoked: bool,
     /// Live presence from the relay room membership (added in device_list).
     #[serde(default)]
     pub online: bool,
@@ -386,15 +385,16 @@ pub async fn device_list(
         .map(|r| DeviceRow {
             device_id: r.get("device_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             name: r.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            revoked: r.get("revoked").and_then(|v| v.as_bool()).unwrap_or(false),
             online: r.get("online").and_then(|v| v.as_bool()).unwrap_or(false),
         })
         .collect())
 }
 
-/// Revoke a device (kills its token on next use).
+/// Remove a device: its row is deleted on the relay, so its tokens die
+/// immediately and it disappears from the device list. Re-login on that
+/// device simply registers it again.
 #[tauri::command]
-pub async fn device_revoke(
+pub async fn device_remove(
     state: State<'_, AppState>,
     relay_url: String,
     device_id: String,

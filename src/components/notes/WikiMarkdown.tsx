@@ -7,7 +7,7 @@ import { Check, Copy } from 'lucide-react';
 import { useNavigate } from '@tanstack/react-router';
 import { emit } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { CodeBlock } from '@/components/chat/CodeBlock';
+import { MarkdownCode, MarkdownPre } from '@/components/chat/CodeBlock';
 import { open } from '@tauri-apps/plugin-shell';
 import { resolveImageUrl } from '@/lib/imageCache';
 import { parseReaderUrl } from '@/lib/evidence';
@@ -300,33 +300,15 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
     [attachmentsDir]
   );
 
-  // Code blocks: rendered with a language label + copy button (same as chat).
-  // The outer <pre> is unwrapped — CodeBlock provides its own container.
-  const CodeComponent = useCallback(
-    ({ className, children }: { className?: string; children?: React.ReactNode }) => {
-      const match = /language-(\w+)/.exec(className || '');
-      const language = match ? match[1] : '';
-      const code = String(children).replace(/\n$/, '');
-      const isInline = !match && !code.includes('\n');
-      return (
-        <CodeBlock code={code} language={language || 'text'} inline={isInline}>
-          {children}
-        </CodeBlock>
-      );
-    },
-    []
-  );
-
-  const UnwrappedPre = useCallback(
-    ({ children }: { children?: React.ReactNode }) => <>{children}</>,
-    []
-  );
+  // Code blocks: shared react-markdown wiring from CodeBlock — block vs
+  // inline is decided by structure (pre > code vs bare code), so a
+  // language-less single-line fence is never mistaken for inline code.
 
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm, remarkMath, remarkStrictLineBreaks]}
       rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
-      components={{ a: LinkComponent, code: CodeComponent, pre: UnwrappedPre, img: ImageComponent, td: TdComponent, th: ThComponent }}
+      components={{ a: LinkComponent, code: MarkdownCode, pre: MarkdownPre, img: ImageComponent, td: TdComponent, th: ThComponent }}
       urlTransform={allowCustomProtocols}
       className={className}
     >

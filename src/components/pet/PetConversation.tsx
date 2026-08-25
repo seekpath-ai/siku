@@ -13,7 +13,7 @@ import { useDialogStore } from '@/stores/dialogStore';
 import { getChatMessages, getAgentSteps, agentApproveTool, notesCreate, noteCreateUnderPaper } from '@/lib/tauri';
 import { parseEvidence, buildNoteMarkdown } from '@/lib/evidence';
 import type { EvidenceEntry } from '@/lib/evidence';
-import { CodeBlock } from '@/components/chat/CodeBlock';
+import { MarkdownCode, MarkdownPre } from '@/components/chat/CodeBlock';
 import { ReasoningProcessCard } from '@/components/chat/ReasoningProcessCard';
 import { ExternalLink } from '@/components/ui/ExternalLink';
 import type { AgentStreamEvent, AgentPhase, AgentStep, ChatMessage, StreamingStep, ToolCallInfo } from '@/lib/types';
@@ -140,18 +140,8 @@ export function PetMarkdown({ content, onCitation }: { content: string; onCitati
           }
           return <ExternalLink href={href}>{children}</ExternalLink>;
         },
-        pre: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
-        code({ className, children }: { className?: string; children?: React.ReactNode }) {
-          const match = /language-(\w+)/.exec(className || '');
-          const language = match ? match[1] : '';
-          const code = String(children).replace(/\n$/, '');
-          const isInline = !match && !code.includes('\n');
-          return (
-            <CodeBlock code={code} language={language || 'text'} inline={isInline}>
-              {children}
-            </CodeBlock>
-          );
-        },
+        code: MarkdownCode,
+        pre: MarkdownPre,
       }}
     >
       {clean}

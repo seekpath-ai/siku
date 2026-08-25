@@ -6,7 +6,7 @@ import { User, Copy, Check } from 'lucide-react';
 import { useState } from 'react';
 import type { AgentPhase, AgentStep, ChatAttachment, ChatMessage, ToolCallInfo } from '@/lib/types';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
-import { CodeBlock } from './CodeBlock';
+import { MarkdownCode, MarkdownPre } from './CodeBlock';
 import { ToolCallCard } from './ToolCallCard';
 import { ReasoningProcessCard } from './ReasoningProcessCard';
 import { ReasoningBlock } from './ReasoningBlock';
@@ -189,22 +189,8 @@ export function MessageBubble({ message, agentSteps = [] }: Props) {
               rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
               components={{
                 a: ExternalLink,
-                code({ className, children }) {
-                  const match = /language-(\w+)/.exec(className || '');
-                  const language = match ? match[1] : '';
-                  const code = String(children).replace(/\n$/, '');
-                  const isInline = !match && !code.includes('\n');
-
-                  return (
-                    <CodeBlock
-                      code={code}
-                      language={language || 'text'}
-                      inline={isInline}
-                    >
-                      {children}
-                    </CodeBlock>
-                  );
-                },
+                code: MarkdownCode,
+                pre: MarkdownPre,
               }}
             >
               {message.content}

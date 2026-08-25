@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, type ReactElement, type ReactNode } from 'react';
 import { Check, Copy } from 'lucide-react';
 
 interface CodeBlockProps {
@@ -119,4 +119,32 @@ export function CodeBlock({ code, language = 'text', inline }: CodeBlockProps) {
       </div>
     </div>
   );
+}
+
+// ── react-markdown wiring ────────────────────────────────────────────────
+// Block vs inline code is decided by STRUCTURE, not content: fenced blocks
+// are always <pre><code> while inline code is a bare <code>. Do not infer
+// from language tag / line count — a language-less single-line fence is
+// still a block.
+
+/** react-markdown `code` component: inline code only (block code is handled
+ *  by MarkdownPre, so this only ever fires for bare <code>). */
+export function MarkdownCode({ children }: { className?: string; children?: ReactNode }) {
+  return (
+    <CodeBlock code={String(children)} language="text" inline>
+      {children}
+    </CodeBlock>
+  );
+}
+
+/** react-markdown `pre` component: receives the not-yet-rendered <code>
+ *  element, reads its props and renders the block CodeBlock itself. */
+export function MarkdownPre({ children }: { children?: ReactNode }) {
+  const el = (Array.isArray(children) ? children[0] : children) as
+    | ReactElement<{ className?: string; children?: ReactNode }>
+    | undefined;
+  const className = el?.props?.className ?? '';
+  const match = /language-(\w+)/.exec(className);
+  const code = String(el?.props?.children ?? '').replace(/\n$/, '');
+  return <CodeBlock code={code} language={match ? match[1] : 'text'} />;
 }

@@ -4,7 +4,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
-import { CodeBlock } from '@/components/chat/CodeBlock';
+import { MarkdownCode, MarkdownPre } from '@/components/chat/CodeBlock';
 import { HELP_MARKDOWN } from './helpContent';
 
 interface Props {
@@ -40,21 +40,8 @@ export function HelpDialog({ onClose }: Props) {
             remarkPlugins={[remarkGfm, remarkMath]}
             rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
             components={{
-              // Code blocks keep their own container; unwrap react-markdown's <pre>.
-              pre({ children }: { children?: React.ReactNode }) {
-                return <>{children}</>;
-              },
-              code({ className, children }: { className?: string; children?: React.ReactNode }) {
-                const match = /language-(\w+)/.exec(className || '');
-                const language = match ? match[1] : '';
-                const code = String(children).replace(/\n$/, '');
-                const isInline = !match && !code.includes('\n');
-                return (
-                  <CodeBlock code={code} language={language || 'text'} inline={isInline}>
-                    {children}
-                  </CodeBlock>
-                );
-              },
+              code: MarkdownCode,
+              pre: MarkdownPre,
             }}
           >
             {HELP_MARKDOWN}

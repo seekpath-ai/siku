@@ -2,7 +2,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
-import { CodeBlock } from './CodeBlock';
+import { MarkdownCode, MarkdownPre } from './CodeBlock';
 import { ExternalLink } from '@/components/ui/ExternalLink';
 
 interface Props {
@@ -17,18 +17,8 @@ export function StreamingContent({ content }: Props) {
         rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
         components={{
           a: ExternalLink,
-          code({ className, children }) {
-            const match = /language-(\w+)/.exec(className || '');
-            const language = match ? match[1] : '';
-            const code = String(children).replace(/\n$/, '');
-            const isInline = !match && !code.includes('\n');
-
-            return (
-              <CodeBlock code={code} language={language || 'text'} inline={isInline}>
-                {children}
-              </CodeBlock>
-            );
-          },
+          code: MarkdownCode,
+          pre: MarkdownPre,
         }}
       >
         {content}

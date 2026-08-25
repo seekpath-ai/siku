@@ -1,7 +1,7 @@
 {
   "name": "siku",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "license": "Apache-2.0 with Commons Clause",
   "type": "module",
   "packageManager": "pnpm@9.15.0",

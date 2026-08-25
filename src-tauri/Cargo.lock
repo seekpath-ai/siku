@@ -5958,7 +5958,7 @@ dependencies = [
 
 [[package]]
 name = "siku"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "aes-gcm",
  "anyhow",

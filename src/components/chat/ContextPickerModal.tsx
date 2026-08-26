@@ -92,13 +92,12 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
     [files, q]
   );
 
-  /** Display path per file: vault name + folder chain (file parents are
-   *  notes-tree folders), always shown under the file name. */
-  const filePaths = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const f of files ?? []) {
+  /** Display path per item (notes and files): vault name + folder chain
+   *  (parents are notes-tree folders), shown above the title/name. */
+  const paths = useMemo(() => {
+    const chain = (parentId: string | null): string[] => {
       const parts: string[] = [];
-      let pid = f.parent_id;
+      let pid = parentId;
       let guard = 0; // cycle protection
       while (pid && guard++ < 32) {
         const folder = folders.get(pid);
@@ -106,11 +105,17 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
         parts.unshift(folder.title || '未命名');
         pid = folder.parent_id;
       }
-      const vault = vaultNames.get(f.vault_id);
-      map.set(f.id, [vault, ...parts].filter(Boolean).join(' / '));
+      return parts;
+    };
+    const map = new Map<string, string>();
+    for (const n of notes ?? []) {
+      map.set(n.id, [vaultNames.get(n.vault_id), ...chain(n.parent_id)].filter(Boolean).join(' / '));
+    }
+    for (const f of files ?? []) {
+      map.set(f.id, [vaultNames.get(f.vault_id), ...chain(f.parent_id)].filter(Boolean).join(' / '));
     }
     return map;
-  }, [files, folders, vaultNames]);
+  }, [notes, files, folders, vaultNames]);
 
   const toggle = (key: string) => {
     setSelected((prev) => {
@@ -187,6 +192,7 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
                   <div className="px-1.5 py-1 text-[11px] text-text-secondary/50">笔记</div>
                   {filteredNotes.map((n) => {
                     const key = contextKey('note', n.id);
+                    const path = paths.get(n.id) || '';
                     const snippet = q
                       ? contentExcerpt(n.content_plain || n.content || '', q)
                       : null;
@@ -203,6 +209,14 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
                         />
                         <FileText size={13} className="text-text-secondary/60 shrink-0" />
                         <span className="flex-1 min-w-0">
+                          {path && (
+                            <span
+                              className="block truncate text-[11px] text-text-secondary/60"
+                              title={path}
+                            >
+                              {path}
+                            </span>
+                          )}
                           <span className="block truncate text-[13px] text-text-primary">
                             {n.title || '未命名笔记'}
                           </span>
@@ -222,7 +236,7 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
                   <div className="px-1.5 py-1 mt-1 text-[11px] text-text-secondary/50">文件</div>
                   {filteredFiles.map((f) => {
                     const key = contextKey('file', f.id);
-                    const path = filePaths.get(f.id) || '';
+                    const path = paths.get(f.id) || '';
                     return (
                       <label
                         key={key}

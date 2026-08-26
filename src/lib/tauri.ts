@@ -454,6 +454,10 @@ export async function agentMemorySetActive(sessionId: string, active: boolean): 
   return invoke<void>('agent_memory_set_active', { sessionId, active });
 }
 
+export async function agentMemoryRestore(sessionId: string, versionId: string): Promise<void> {
+  return invoke<void>('agent_memory_restore', { sessionId, versionId });
+}
+
 // ============================================================
 // Projects (Codex-style project folders)
 // ============================================================

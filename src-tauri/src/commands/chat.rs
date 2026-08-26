@@ -139,6 +139,21 @@ pub async fn agent_memory_set(
         .map_err(|e| format!("db error: {e}"))
 }
 
+/// Restore an agent's long-term memory from a version snapshot (snapshots
+/// reuse the note_versions table, keyed by session id). The current content
+/// is snapshotted first so the restore can be undone.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn agent_memory_restore(
+    state: State<'_, AppState>,
+    session_id: String,
+    version_id: String,
+) -> Result<(), String> {
+    crate::core::agent_memory_service::restore(&state.db, &session_id, &version_id)
+        .await
+        .map_err(|e| format!("db error: {e}"))
+}
+
 /// Activate or "forget" an agent's long-term memory. Forgotten memories are
 /// kept but not injected into the system prompt.
 #[tauri::command]

@@ -7,12 +7,15 @@ import { oneDark } from '@codemirror/theme-one-dark';
 import { useDialog } from '@/hooks/useDialog';
 import { noteVersionsList } from '@/lib/tauri';
 import { diffLines } from '@/lib/diff';
-import type { Note, NoteVersion } from '@/lib/types';
+import type { NoteVersion } from '@/lib/types';
 
 interface Props {
-  note: Note;
+  /** Current document identity/content. A Note satisfies this shape; the
+   * agent long-term memory passes { id: sessionId, title: '长期记忆', ... },
+   * its snapshots reuse note_versions keyed by session id. */
+  current: { id: string; title: string; content: string };
   /** Restores the given version, then refreshes the editor (caller's job). */
-  onRestore: (versionId: string) => Promise<void>;
+  onRestore: (version: NoteVersion) => Promise<void>;
   onClose: () => void;
 }
 
@@ -39,7 +42,7 @@ const READONLY = [
 
 /** VSCode-style version history: narrow version list + CodeMirror merge diff
  *  (synchronized scrolling, character-level highlight, fold, gutter markers). */
-export function VersionHistoryDialog({ note, onRestore, onClose }: Props) {
+export function VersionHistoryDialog({ current, onRestore, onClose }: Props) {
   const { confirm } = useDialog();
   const [versions, setVersions] = useState<NoteVersion[] | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -48,10 +51,10 @@ export function VersionHistoryDialog({ note, onRestore, onClose }: Props) {
   const mvRef = useRef<MergeView | null>(null);
 
   useEffect(() => {
-    noteVersionsList(note.id)
+    noteVersionsList(current.id)
       .then(setVersions)
       .catch(() => setVersions([]));
-  }, [note.id]);
+  }, [current.id]);
 
   useEffect(() => {
     const onDown = (e: KeyboardEvent) => {
@@ -66,9 +69,9 @@ export function VersionHistoryDialog({ note, onRestore, onClose }: Props) {
   // Line-count summary (independent of the merge view's own diff).
   const summary = useMemo(() => {
     if (!selected) return null;
-    const d = diffLines(note.content, selected.content);
+    const d = diffLines(current.content, selected.content);
     return { added: d.added, removed: d.removed };
-  }, [selected, note.content]);
+  }, [selected, current.content]);
 
   // Build the CodeMirror merge view (left = current, right = selected version).
   useEffect(() => {
@@ -79,7 +82,7 @@ export function VersionHistoryDialog({ note, onRestore, onClose }: Props) {
     if (!selected || !mergeRef.current) return;
 
     const mv = new MergeView({
-      a: { doc: note.content, extensions: READONLY },
+      a: { doc: current.content, extensions: READONLY },
       b: { doc: selected.content, extensions: READONLY },
       parent: mergeRef.current,
     });
@@ -89,15 +92,15 @@ export function VersionHistoryDialog({ note, onRestore, onClose }: Props) {
       mv.destroy();
       mvRef.current = null;
     };
-  }, [selected, note.content]);
+  }, [selected, current.content]);
 
   const handleRestore = async () => {
     if (!selected || restoring) return;
-    const ok = await confirm('将把笔记恢复到该版本（覆盖当前内容）。当前内容会自动保存为新版本，可随时回滚。');
+    const ok = await confirm('将把内容恢复到该版本（覆盖当前内容）。当前内容会自动保存为新版本，可随时回滚。');
     if (!ok) return;
     setRestoring(true);
     try {
-      await onRestore(selected.id);
+      await onRestore(selected);
     } finally {
       setRestoring(false);
     }

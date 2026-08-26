@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Brain, X, Loader2, Check, BookOpen, Pen, MoreVertical, Code, Columns2, Rows2 } from 'lucide-react';
+import { Brain, X, Loader2, Check, BookOpen, Pen, MoreVertical, Code, Columns2, Rows2, History } from 'lucide-react';
 import { MarkdownEditor } from '@/components/editor/MarkdownEditor';
 import { WikiMarkdown } from '@/components/notes/WikiMarkdown';
-import { agentMemoryGet, agentMemorySet, agentMemorySetActive } from '@/lib/tauri';
+import { VersionHistoryDialog } from '@/components/notes/VersionHistoryDialog';
+import { agentMemoryGet, agentMemorySet, agentMemorySetActive, agentMemoryRestore } from '@/lib/tauri';
+import type { NoteVersion } from '@/lib/types';
 
 interface Props {
   sessionId: string;
@@ -28,6 +30,7 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
   const [loaded, setLoaded] = useState(false);
   const [mode, setMode] = useState<ViewMode>('edit');
   const [menuOpen, setMenuOpen] = useState(false);
+  const [versionOpen, setVersionOpen] = useState(false);
   const [saved, setSaved] = useState<'idle' | 'saving' | 'saved'>('idle');
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -55,11 +58,12 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
 
   useEffect(() => {
     const onDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      // Let the version-history dialog consume Escape first.
+      if (e.key === 'Escape' && !versionOpen) onClose();
     };
     window.addEventListener('keydown', onDown);
     return () => window.removeEventListener('keydown', onDown);
-  }, [onClose]);
+  }, [onClose, versionOpen]);
 
   // Close the overflow menu on outside click.
   useEffect(() => {
@@ -103,6 +107,24 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
   const pickMode = (m: ViewMode) => {
     setMenuOpen(false);
     setMode(m);
+  };
+
+  /** Restore a version: cancel any pending autosave first so it cannot
+   * overwrite the restored content, then apply and show it. The backend
+   * snapshots the pre-restore content itself. */
+  const handleVersionRestore = async (version: NoteVersion) => {
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    try {
+      await agentMemoryRestore(sessionId, version.id);
+      setContent(version.content);
+      latest.current = version.content;
+      setSaved('saved');
+    } catch {
+      setSaved('idle');
+    }
   };
 
   // Save pending edits when the modal closes.
@@ -198,6 +220,17 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
                   <span className="flex-1">上下分屏</span>
                   {mode === 'split-v' && <Check size={13} className="text-primary" />}
                 </button>
+                <div className="my-1 h-px bg-surface-hover" />
+                <button
+                  className="flex items-center gap-2 px-3 py-1.5 text-[12px] text-text-secondary hover:bg-surface-hover hover:text-text-primary w-full text-left"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    setVersionOpen(true);
+                  }}
+                >
+                  <History size={13} />
+                  <span className="flex-1">版本历史</span>
+                </button>
               </div>
             )}
           </div>
@@ -237,6 +270,16 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
           </span>
         </div>
       </div>
+
+      {/* Version history reuses the note dialog; snapshots are stored in
+          note_versions keyed by session id. */}
+      {versionOpen && (
+        <VersionHistoryDialog
+          current={{ id: sessionId, title: '长期记忆', content }}
+          onRestore={handleVersionRestore}
+          onClose={() => setVersionOpen(false)}
+        />
+      )}
     </div>
   );
 }

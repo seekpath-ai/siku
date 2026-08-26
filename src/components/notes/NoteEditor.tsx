@@ -25,7 +25,7 @@ import { VersionHistoryDialog } from './VersionHistoryDialog';
 import { saveTextFile, fileBrowserRevealInSystem, noteVersionRestore, vaultAttachmentsDir } from '@/lib/tauri';
 import { EditorView } from '@codemirror/view';
 import { MarkdownEditor } from '@/components/editor/MarkdownEditor';
-import type { Note } from '@/lib/types';
+import type { Note, NoteVersion } from '@/lib/types';
 import { parseNoteTags, parseNoteAliases } from '@/lib/types';
 
 interface Props {
@@ -200,9 +200,9 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   // "导出为 PDF" — currently exports the note as Markdown (.md).
   // Restore a note from a version snapshot, then let the parent refresh.
   const handleVersionRestore = useCallback(
-    async (versionId: string) => {
+    async (version: NoteVersion) => {
       try {
-        await noteVersionRestore(versionId);
+        await noteVersionRestore(version.id);
         onVersionRestored?.();
       } catch (err) {
         console.error('restore version:', err);
@@ -649,7 +649,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
 
       {versionOpen && (
         <VersionHistoryDialog
-          note={note}
+          current={note}
           onRestore={handleVersionRestore}
           onClose={() => setVersionOpen(false)}
         />

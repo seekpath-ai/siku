@@ -52,6 +52,47 @@ impl OpenAiClient {
     }
 }
 
+/// Parse a streaming `usage` object into (tokens_in, tokens_in_hit, tokens_out).
+///
+/// NOTE: `usage` is a serde_json Map, whose [] indexing PANICS on a missing
+/// key ("no entry found for key"). Providers differ in which fields they send
+/// (Kimi k3 omits the cache fields DeepSeek has), so lookups must use .get().
+fn parse_stream_usage(usage: &serde_json::Map<String, serde_json::Value>) -> (u32, u32, u32) {
+    let get_u64 = |key: &str| usage.get(key).and_then(|v| v.as_u64());
+    let tokens_in = get_u64("prompt_tokens").unwrap_or(0) as u32;
+    let tokens_out = get_u64("completion_tokens").unwrap_or(0) as u32;
+    // Some providers (e.g. DeepSeek) split prompt tokens into cache hit/miss.
+    let tokens_in_hit = get_u64("prompt_cache_hit_tokens")
+        .or_else(|| get_u64("cache_read_input_tokens"))
+        .unwrap_or(0) as u32;
+    (tokens_in, tokens_in_hit, tokens_out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_stream_usage;
+
+    #[test]
+    fn usage_with_deepseek_cache_fields() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "prompt_cache_hit_tokens": 64,
+            "prompt_cache_miss_tokens": 36,
+        });
+        let (i, hit, o) = parse_stream_usage(usage.as_object().unwrap());
+        assert_eq!((i, hit, o), (100, 64, 20));
+    }
+
+    #[test]
+    fn usage_without_cache_fields_does_not_panic() {
+        // Kimi k3 sends no cache fields; indexing the Map with [] would panic.
+        let usage = serde_json::json!({ "prompt_tokens": 42, "completion_tokens": 7 });
+        let (i, hit, o) = parse_stream_usage(usage.as_object().unwrap());
+        assert_eq!((i, hit, o), (42, 0, 7));
+    }
+}
+
 /// Convert a ChatMessage to the JSON shape expected by OpenAI-compatible APIs.
 /// When attachments are present, content becomes a block array with a leading
 /// text block followed by image_url blocks.
@@ -316,14 +357,7 @@ impl LlmClient for OpenAiClient {
                     // OpenAI sends a final chunk with empty choices and usage info
                     // when stream_options.include_usage is true.
                     if let Some(usage) = json["usage"].as_object() {
-                        let tokens_in = usage["prompt_tokens"].as_u64().unwrap_or(0) as u32;
-                        let tokens_out = usage["completion_tokens"].as_u64().unwrap_or(0) as u32;
-                        // Some providers (e.g. DeepSeek) split prompt tokens into
-                        // cache hit / miss. Fall back to zero when absent.
-                        let tokens_in_hit = usage["prompt_cache_hit_tokens"]
-                            .as_u64()
-                            .or_else(|| usage["cache_read_input_tokens"].as_u64())
-                            .unwrap_or(0) as u32;
+                        let (tokens_in, tokens_in_hit, tokens_out) = parse_stream_usage(usage);
                         if tokens_in > 0 || tokens_out > 0 {
                             let _ = sender.send(StreamEvent {
                                 event_type: "usage".to_string(),

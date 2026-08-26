@@ -1,9 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
-import { useNavigate } from '@tanstack/react-router';
 import {
   Save,
   FileText,
-  ExternalLink,
   Tag,
   StickyNote,
   Plus,
@@ -13,7 +11,6 @@ import {
   ArrowLeft,
   Loader2,
   RefreshCw,
-  Copy,
   Link2,
   X,
   Paperclip,
@@ -25,7 +22,7 @@ import { usePaper, useUpdatePaper, usePaperNotes, usePaperTags, useTags, useAddT
 import { useDialog } from '@/hooks/useDialog';
 import { useTabStore } from '@/stores/tabStore';
 import { parseJsonArray } from '@/lib/types';
-import { openPaperInSystem, paperFindDuplicates, paperMerge, paperListRelated, paperAddRelated, paperRemoveRelated, listPapers, paperGetCollections, paperEnrichMetadata, paperGetCreators, paperSetCreators, paperListAttachments, paperAddAttachment, paperRemoveAttachment, paperOpenAttachment, paperExportAnnotations, notesListAll, notesUpdate, notesDelete, notesGetBacklinks, noteCreateUnderPaper, noteMergeIntoExcerpt, type Creator } from '@/lib/tauri';
+import { paperListRelated, paperAddRelated, paperRemoveRelated, listPapers, paperGetCollections, paperEnrichMetadata, paperGetCreators, paperSetCreators, paperListAttachments, paperAddAttachment, paperRemoveAttachment, paperOpenAttachment, paperExportAnnotations, notesListAll, notesUpdate, notesDelete, notesGetBacklinks, noteCreateUnderPaper, noteMergeIntoExcerpt, type Creator } from '@/lib/tauri';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { NoteEditor } from '@/components/notes/NoteEditor';
 import type { Paper, Note } from '@/lib/types';
@@ -222,7 +219,6 @@ function formatDate(iso: string): string {
 
 function InfoTab({ paper }: { paper: Paper }) {
   const updateMutation = useUpdatePaper();
-  const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { alert, select } = useDialog();
   const [enriching, setEnriching] = useState(false);
@@ -303,37 +299,6 @@ function InfoTab({ paper }: { paper: Paper }) {
     }
   };
 
-  // Duplicate detection + merge: find papers matching by DOI / normalized
-  // title, let the user pick one to merge into the current entry.
-  const handleFindDuplicates = async () => {
-    try {
-      const dups = await paperFindDuplicates(paper.id);
-      if (dups.length === 0) {
-        await alert('未发现重复项', '查重');
-        return;
-      }
-      const reasons = [...new Set(dups.map((d) => (d.match_reason === 'doi' ? 'DOI' : '标题')))].join('、');
-      const choice = await select(
-        `发现 ${dups.length} 个疑似重复条目（${reasons}匹配），选择要合并到当前条目的：`,
-        {
-          title: '合并重复项',
-          options: dups.map((d) => ({
-            label: `${d.title}${d.year ? ` (${d.year})` : ''}${d.doi ? ` · ${d.doi}` : ''}`,
-            value: d.id,
-          })),
-        }
-      );
-      if (!choice) return;
-      await paperMerge(paper.id, choice);
-      await alert('已合并到当前条目', '合并重复项');
-      queryClient.invalidateQueries({ queryKey: ['paper', paper.id] });
-      queryClient.invalidateQueries({ queryKey: ['papers'] });
-    } catch (err) {
-      console.error('查重失败:', err);
-      await alert(`查重失败: ${err}`, '查重');
-    }
-  };
-
   // Zotero-style: resolve DOI / title via CrossRef and fill blank metadata.
   const handleEnrich = async () => {
     if (enriching) return;
@@ -375,7 +340,7 @@ function InfoTab({ paper }: { paper: Paper }) {
     isbn: paper.isbn ?? '',
     issn: paper.issn ?? '',
     language: paper.language ?? '',
-    numPages: paper.num_pages?.toString() ?? '',
+    numPages: paper.num_pages?.toString() ?? paper.page_count?.toString() ?? '',
     archiveLocation: paper.archive_location ?? '',
     callNumber: paper.call_number ?? '',
     rights: paper.rights ?? '',
@@ -405,7 +370,7 @@ function InfoTab({ paper }: { paper: Paper }) {
       isbn: paper.isbn ?? '',
       issn: paper.issn ?? '',
       language: paper.language ?? '',
-      numPages: paper.num_pages?.toString() ?? '',
+      numPages: paper.num_pages?.toString() ?? paper.page_count?.toString() ?? '',
       archiveLocation: paper.archive_location ?? '',
       callNumber: paper.call_number ?? '',
       rights: paper.rights ?? '',
@@ -481,7 +446,7 @@ function InfoTab({ paper }: { paper: Paper }) {
       form.isbn !== (paper.isbn ?? '') ||
       form.issn !== (paper.issn ?? '') ||
       form.language !== (paper.language ?? '') ||
-      form.numPages !== (paper.num_pages?.toString() ?? '') ||
+      form.numPages !== (paper.num_pages?.toString() ?? paper.page_count?.toString() ?? '') ||
       form.archiveLocation !== (paper.archive_location ?? '') ||
       form.callNumber !== (paper.call_number ?? '') ||
       form.rights !== (paper.rights ?? '')
@@ -489,6 +454,15 @@ function InfoTab({ paper }: { paper: Paper }) {
   }, [form, paper]);
 
   const handleSave = () => {
+    // The 页数 field falls back to the physical PDF page count for display;
+    // that fallback must not be persisted into num_pages (it would block
+    // CrossRef from filling the true bibliographic value later).
+    const numPagesToSave =
+      paper.num_pages == null && form.numPages === (paper.page_count?.toString() ?? '')
+        ? null
+        : form.numPages
+          ? parseInt(form.numPages, 10) || null
+          : null;
     // Persist structured creators (also regenerates authors/editor columns).
     paperSetCreators(paper.id, creators).catch((err) =>
       console.error('保存创作者失败:', err)
@@ -517,7 +491,7 @@ function InfoTab({ paper }: { paper: Paper }) {
         isbn: form.isbn || null,
         issn: form.issn || null,
         language: form.language || null,
-        num_pages: form.numPages ? parseInt(form.numPages, 10) || null : null,
+        num_pages: numPagesToSave,
         archive_location: form.archiveLocation || null,
         call_number: form.callNumber || null,
         rights: form.rights || null,
@@ -624,51 +598,6 @@ function InfoTab({ paper }: { paper: Paper }) {
         <div className="text-[10px] text-text-secondary/40">
           创建于 {formatDate(paper.created_at)} · 更新于 {formatDate(paper.updated_at)}
         </div>
-
-        {/* File (merged from the former Attachments tab) */}
-        {paper.file_path && (
-          <div className="pt-2 border-t border-surface-hover space-y-2">
-            <div className="flex items-center gap-3 p-3 rounded-lg bg-surface border border-surface-hover">
-              <FileText size={20} className="text-primary/80 shrink-0" />
-              <div className="flex-1 min-w-0">
-                <div className="text-xs font-medium text-text-primary truncate">
-                  {paper.file_path.split('/').pop() || 'PDF'}
-                </div>
-                <div className="text-[11px] text-text-secondary/60 truncate">{paper.file_path}</div>
-              </div>
-            </div>
-            <div className="flex gap-2">
-              <button
-                onClick={() => {
-                  useTabStore.getState().open({
-                    id: `reader-${paper.id}`,
-                    title: paper.title || '未命名',
-                    icon: 'pdf',
-                    route: '/reader/$paperId',
-                    params: { paperId: paper.id },
-                  });
-                  navigate({ to: '/reader/$paperId', params: { paperId: paper.id } });
-                }}
-                className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-primary/10 text-primary text-xs font-medium hover:bg-primary/20 transition-colors"
-              >
-                <FileText size={13} /> 打开 PDF
-              </button>
-              <button
-                onClick={() => openPaperInSystem(paper.id).catch((err) => console.error('打开失败:', err))}
-                className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-surface border border-surface-hover text-text-secondary text-xs hover:bg-surface-hover transition-colors"
-              >
-                <ExternalLink size={13} /> 系统打开
-              </button>
-              <button
-                onClick={handleFindDuplicates}
-                className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-surface border border-surface-hover text-text-secondary text-xs hover:bg-surface-hover transition-colors"
-                title="按 DOI / 标题查找重复条目并合并"
-              >
-                <Copy size={13} /> 查重
-              </button>
-            </div>
-          </div>
-        )}
 
         {/* Attachments (the main PDF is the first row) */}
         <div className="pt-2 border-t border-surface-hover space-y-2">
@@ -793,7 +722,7 @@ function InfoTab({ paper }: { paper: Paper }) {
                 isbn: paper.isbn ?? '',
                 issn: paper.issn ?? '',
                 language: paper.language ?? '',
-                numPages: paper.num_pages?.toString() ?? '',
+                numPages: paper.num_pages?.toString() ?? paper.page_count?.toString() ?? '',
                 archiveLocation: paper.archive_location ?? '',
                 callNumber: paper.call_number ?? '',
                 rights: paper.rights ?? '',

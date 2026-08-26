@@ -62,6 +62,8 @@ import {
   notesList,
   paperImportBibtex,
   paperReprocessIndex,
+  paperFindDuplicates,
+  paperMerge,
 } from '@/lib/tauri';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
 import { PaperCard } from './PaperCard';
@@ -318,6 +320,37 @@ function PaperRow({
     }
   };
 
+  // Duplicate detection + merge: find papers matching by DOI / normalized
+  // title, let the user pick one to merge into the current entry.
+  const handleFindDuplicates = async () => {
+    try {
+      const dups = await paperFindDuplicates(paper.id);
+      if (dups.length === 0) {
+        await alert('未发现重复项', '查重');
+        return;
+      }
+      const reasons = [...new Set(dups.map((d) => (d.match_reason === 'doi' ? 'DOI' : '标题')))].join('、');
+      const choice = await select(
+        `发现 ${dups.length} 个疑似重复条目（${reasons}匹配），选择要合并到当前条目的：`,
+        {
+          title: '合并重复项',
+          options: dups.map((d) => ({
+            label: `${d.title}${d.year ? ` (${d.year})` : ''}${d.doi ? ` · ${d.doi}` : ''}`,
+            value: d.id,
+          })),
+        }
+      );
+      if (!choice) return;
+      await paperMerge(paper.id, choice);
+      await alert('已合并到当前条目', '合并重复项');
+      queryClient.invalidateQueries({ queryKey: ['paper', paper.id] });
+      queryClient.invalidateQueries({ queryKey: ['papers'] });
+    } catch (err) {
+      console.error('查重失败:', err);
+      await alert(`查重失败: ${err}`, '查重');
+    }
+  };
+
   const [reprocessing, setReprocessing] = useState(false);
 
   const handleReprocessIndex = async () => {
@@ -495,6 +528,11 @@ function PaperRow({
       label: '导入 BibTeX 元数据',
       icon: <BookMarked size={14} />,
       onClick: handleImportBibtex,
+    },
+    {
+      label: '查重（合并重复项）',
+      icon: <Copy size={14} />,
+      onClick: handleFindDuplicates,
     },
     {
       label: '导出笔记',

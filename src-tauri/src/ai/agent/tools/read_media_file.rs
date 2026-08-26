@@ -39,7 +39,7 @@ impl Tool for ReadMediaFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read an image file and analyze it with the agent's vision (multimodal) model, returning a text description. Requires a vision-capable model configured for this agent."
+        "Read an image file from disk and analyze it with the agent's vision (multimodal) model, returning a text description. Requires a vision-capable model configured for this agent. Use this ONLY for image files on disk referenced by a path; images attached directly in the conversation are already visible to you — never call this tool for those."
     }
 
     fn readonly(&self) -> bool {

@@ -641,6 +641,13 @@ pub(crate) async fn run_agent_turn(
         format!("当前上下文：你在「{name}」场景中，当前对象：{title}（id: {oid}）{extra}。用户的请求针对该对象，请直接处理它。")
     });
 
+    // Long-term memory: injected into the system prompt when the user has
+    // activated it for this agent (brain button in the chat input).
+    let long_term_memory = crate::core::agent_memory_service::active_content(&state.db, &session_id)
+        .await
+        .ok()
+        .flatten();
+
     let engine = AgentEngine::new(
         llm_client,
         registry,
@@ -651,6 +658,7 @@ pub(crate) async fn run_agent_turn(
         cancel_token.clone(),
         project_dir,
         context_prompt,
+        long_term_memory,
     );
 
     // Create event channel
@@ -1049,6 +1057,9 @@ pub async fn agent_delete_session(
     sqlx::query("DELETE FROM chat_messages WHERE session_id = ?")
         .bind(&session_id)
         .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
+    // CRR tables declare no checked FKs: cascade explicitly.
+    crate::core::agent_memory_service::delete_for_session(&state.db, &session_id)
+        .await.map_err(|e| format!("db: {e}"))?;
     sqlx::query("DELETE FROM chat_sessions WHERE id = ?")
         .bind(&session_id)
         .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;

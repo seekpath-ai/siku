@@ -98,6 +98,11 @@ pub async fn delete_chat_session(
         .await
         .map_err(|e| format!("db error: {e}"))?;
 
+    // CRR tables declare no checked FKs: cascade explicitly.
+    crate::core::agent_memory_service::delete_for_session(&state.db, &session_id)
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
+
     sqlx::query("DELETE FROM chat_sessions WHERE id = ?")
         .bind(&session_id)
         .execute(&state.db)
@@ -105,6 +110,47 @@ pub async fn delete_chat_session(
         .map_err(|e| format!("db error: {e}"))?;
 
     Ok(())
+}
+
+/// Get the long-term memory for an agent (session). Returns None when the
+/// user has never written one.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn agent_memory_get(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<crate::core::agent_memory_service::AgentMemory>, String> {
+    crate::core::agent_memory_service::get(&state.db, &session_id)
+        .await
+        .map_err(|e| format!("db error: {e}"))
+}
+
+/// Save the long-term memory content for an agent (upsert, keeps the
+/// active flag).
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn agent_memory_set(
+    state: State<'_, AppState>,
+    session_id: String,
+    content: String,
+) -> Result<(), String> {
+    crate::core::agent_memory_service::set_content(&state.db, &session_id, &content)
+        .await
+        .map_err(|e| format!("db error: {e}"))
+}
+
+/// Activate or "forget" an agent's long-term memory. Forgotten memories are
+/// kept but not injected into the system prompt.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn agent_memory_set_active(
+    state: State<'_, AppState>,
+    session_id: String,
+    active: bool,
+) -> Result<(), String> {
+    crate::core::agent_memory_service::set_active(&state.db, &session_id, active)
+        .await
+        .map_err(|e| format!("db error: {e}"))
 }
 
 /// Get messages for a session

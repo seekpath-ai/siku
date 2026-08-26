@@ -29,6 +29,10 @@ pub(crate) const CORE_SYNC_TABLES: &[&str] = &[
     "saved_searches",
     "saved_items",
     "imports",
+    // Per-agent long-term memory (1:1 with chat_sessions, which is optional:
+    // memory rows may arrive before/regardless of their session — harmless,
+    // they apply once the session exists).
+    "agent_memories",
     // NOTE: `creators` is intentionally NOT synced — it is a device-local
     // overlay rebuilt from the papers.authors/editor JSON columns (which do
     // sync via the papers table). See paper_service::rebuild_creators_for_papers.

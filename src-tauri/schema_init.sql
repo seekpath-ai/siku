@@ -279,6 +279,18 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     updated_at TEXT NOT NULL DEFAULT ''
 );
 
+-- agent_memories: per-agent long-term memory (1:1 with chat_sessions).
+-- Manually curated by the user via the brain button in the chat input;
+-- injected into the system prompt when active. No FK per CRR rules —
+-- session deletion cascades explicitly in commands/chat.rs.
+CREATE TABLE IF NOT EXISTS agent_memories (
+    id TEXT PRIMARY KEY NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
 -- llm_providers: unified LLM configuration pool
 CREATE TABLE IF NOT EXISTS llm_providers (
     id TEXT PRIMARY KEY,

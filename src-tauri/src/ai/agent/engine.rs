@@ -59,6 +59,8 @@ pub struct AgentEngine {
     project_dir: Option<String>,
     /// Extra context injected into the system prompt (pet domain agents).
     context_prompt: Option<String>,
+    /// Active long-term memory for this agent, appended to the system prompt.
+    long_term_memory: Option<String>,
 }
 
 impl AgentEngine {
@@ -72,6 +74,7 @@ impl AgentEngine {
         cancel_token: tokio_util::sync::CancellationToken,
         project_dir: Option<String>,
         context_prompt: Option<String>,
+        long_term_memory: Option<String>,
     ) -> Self {
         let system_prompt = Some(config.effective_system_prompt());
         let max_tokens = config.effective_max_tokens();
@@ -87,6 +90,7 @@ impl AgentEngine {
             cancel_token,
             project_dir,
             context_prompt,
+            long_term_memory,
         }
     }
 
@@ -227,6 +231,9 @@ impl AgentEngine {
             }
             if let Some(ctx) = &self.context_prompt {
                 content.push_str(&format!("\n\n{ctx}"));
+            }
+            if let Some(ltm) = &self.long_term_memory {
+                content.push_str(&format!("\n\n# 长期记忆\n{ltm}"));
             }
             messages.push(ChatMessage { role: "system".into(), content, attachments: None, tool_calls: None, tool_call_id: None, name: None });
         }

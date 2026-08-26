@@ -434,6 +434,26 @@ export async function getChatMessages(sessionId: string): Promise<ChatMessage[]>
   return invoke<ChatMessage[]>('get_chat_messages', { sessionId });
 }
 
+// Agent long-term memory (per chat session, brain button in the input area)
+export interface AgentMemory {
+  id: string;
+  content: string;
+  active: boolean;
+  updated_at: string;
+}
+
+export async function agentMemoryGet(sessionId: string): Promise<AgentMemory | null> {
+  return invoke<AgentMemory | null>('agent_memory_get', { sessionId });
+}
+
+export async function agentMemorySet(sessionId: string, content: string): Promise<void> {
+  return invoke<void>('agent_memory_set', { sessionId, content });
+}
+
+export async function agentMemorySetActive(sessionId: string, active: boolean): Promise<void> {
+  return invoke<void>('agent_memory_set_active', { sessionId, active });
+}
+
 // ============================================================
 // Projects (Codex-style project folders)
 // ============================================================

@@ -741,6 +741,9 @@ pub fn run() {
             commands::chat::create_chat_session,
             commands::chat::delete_chat_session,
             commands::chat::get_chat_messages,
+            commands::chat::agent_memory_get,
+            commands::chat::agent_memory_set,
+            commands::chat::agent_memory_set_active,
             // Projects
             commands::projects::projects_list,
             commands::projects::project_create,

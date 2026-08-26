@@ -1,9 +1,10 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Send, Paperclip, ImagePlus, BookOpen, Square, X, FileText } from 'lucide-react';
+import { Send, Paperclip, ImagePlus, BookOpen, Brain, Square, X, FileText } from 'lucide-react';
 import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
-import { agentSendMessage, agentCancel, readTextFile, readImageFile } from '@/lib/tauri';
+import { agentSendMessage, agentCancel, readTextFile, readImageFile, agentMemoryGet } from '@/lib/tauri';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
+import { AgentMemoryModal } from './AgentMemoryModal';
 import type { ChatAttachment } from '@/lib/types';
 
 interface Props {
@@ -65,6 +66,17 @@ export function MessageInput({ disabled }: Props) {
   const activeProject = useProjectStore((s) =>
     s.projects.find((p) => p.id === s.activeProjectId)
   );
+  // Long-term memory button state (per agent, persisted server-side).
+  const [memoryActive, setMemoryActive] = useState(false);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+
+  useEffect(() => {
+    setMemoryActive(false);
+    if (!activeSessionId) return;
+    agentMemoryGet(activeSessionId)
+      .then((m) => setMemoryActive(m?.active ?? false))
+      .catch(() => {});
+  }, [activeSessionId]);
 
   const handleAttachText = async () => {
     try {
@@ -378,6 +390,19 @@ export function MessageInput({ disabled }: Props) {
               >
                 <BookOpen size={15} />
               </button>
+              <button
+                type="button"
+                disabled={disabled || !activeSessionId}
+                onClick={() => setMemoryOpen(true)}
+                className={`w-7 h-7 rounded-md border-0 bg-transparent flex items-center justify-center hover:bg-surface-hover transition-colors disabled:opacity-50 ${
+                  memoryActive
+                    ? 'text-primary hover:text-primary'
+                    : 'text-text-secondary/50 hover:text-text-primary'
+                }`}
+                title={memoryActive ? '长期记忆 · 已激活' : '长期记忆 · 已遗忘'}
+              >
+                <Brain size={15} fill={memoryActive ? 'currentColor' : 'none'} />
+              </button>
             </div>
             {isStreaming ? (
               <button
@@ -403,6 +428,13 @@ export function MessageInput({ disabled }: Props) {
           Enter 发送 · Shift + Enter 换行 · 拖拽/粘贴图片也可发送
         </div>
       </div>
+      {memoryOpen && activeSessionId && (
+        <AgentMemoryModal
+          sessionId={activeSessionId}
+          onClose={() => setMemoryOpen(false)}
+          onActiveChange={setMemoryActive}
+        />
+      )}
     </div>
   );
 }

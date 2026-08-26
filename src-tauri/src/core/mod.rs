@@ -1,3 +1,4 @@
+pub mod agent_memory_service;
 pub mod annotation_service;
 pub mod bibtex;
 pub mod bookmark_service;

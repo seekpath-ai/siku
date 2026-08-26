@@ -5,6 +5,8 @@ import { useProjectStore } from '@/stores/projectStore';
 import { agentSendMessage, agentCancel, readTextFile, readImageFile, agentMemoryGet } from '@/lib/tauri';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
 import { AgentMemoryModal } from './AgentMemoryModal';
+import { ContextPickerModal } from './ContextPickerModal';
+import { contextKey, type ContextItem } from './contextItem';
 import type { ChatAttachment } from '@/lib/types';
 
 interface Props {
@@ -69,6 +71,9 @@ export function MessageInput({ disabled }: Props) {
   // Long-term memory button state (per agent, persisted server-side).
   const [memoryActive, setMemoryActive] = useState(false);
   const [memoryOpen, setMemoryOpen] = useState(false);
+  // Picked note/file contexts attached to the next message (one-shot).
+  const [contexts, setContexts] = useState<ContextItem[]>([]);
+  const [contextOpen, setContextOpen] = useState(false);
 
   useEffect(() => {
     setMemoryActive(false);
@@ -205,12 +210,22 @@ export function MessageInput({ disabled }: Props) {
     const imageAttachments = attachments.filter((a): a is ImageAttachmentLocal => a.kind === 'image');
     const textAttachments = attachments.filter((a): a is TextAttachment => a.kind === 'text');
 
-    if ((!text && attachments.length === 0) || !activeSessionId || isStreaming) return;
+    if ((!text && attachments.length === 0 && contexts.length === 0) || !activeSessionId || isStreaming) return;
 
+    // Picked notes/files travel as a plain user-message context block
+    // (unlike the long-term memory, which lives in the system prompt).
+    const contextBlock = contexts.length
+      ? `<context>\n${contexts
+          .map(
+            (c) =>
+              `# ${c.kind === 'note' ? '笔记' : '文件'}「${c.name}」\n${c.content ?? '[二进制文件，未附加内容]'}`
+          )
+          .join('\n\n')}\n</context>`
+      : '';
     const attachBlock = textAttachments
       .map((a) => `<file name="${a.name}" path="${a.path}">\n${a.content}\n</file>`)
       .join('\n');
-    const content = [attachBlock, text].filter(Boolean).join('\n\n');
+    const content = [contextBlock, attachBlock, text].filter(Boolean).join('\n\n');
 
     const chatAttachments: ChatAttachment[] | undefined =
       imageAttachments.length > 0
@@ -219,6 +234,7 @@ export function MessageInput({ disabled }: Props) {
 
     setInput('');
     setAttachments([]);
+    setContexts([]);
     setLoading(true);
     resetHeight();
 
@@ -292,7 +308,7 @@ export function MessageInput({ disabled }: Props) {
     setAttachments((prev) => prev.filter((a) => attachmentKey(a) !== key));
   };
 
-  const canSend = !disabled && (!!input.trim() || attachments.length > 0);
+  const canSend = !disabled && (!!input.trim() || attachments.length > 0 || contexts.length > 0);
 
   return (
     <div className="px-5 pb-5 pt-2 bg-background">
@@ -305,8 +321,30 @@ export function MessageInput({ disabled }: Props) {
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
         >
-          {attachments.length > 0 && (
+          {(attachments.length > 0 || contexts.length > 0) && (
             <div className="flex flex-wrap gap-1.5 px-2 pt-2">
+              {contexts.map((c) => (
+                <span
+                  key={contextKey(c.kind, c.id)}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-emerald-500/10 text-emerald-400 text-[11px] max-w-[220px]"
+                  title={c.kind === 'note' ? '笔记上下文' : '文件上下文'}
+                >
+                  <BookOpen size={11} className="shrink-0" />
+                  <span className="truncate">{c.name}</span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setContexts((prev) =>
+                        prev.filter((x) => contextKey(x.kind, x.id) !== contextKey(c.kind, c.id))
+                      )
+                    }
+                    className="hover:text-red-400 shrink-0"
+                    aria-label="移除上下文"
+                  >
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
               {attachments.map((a) =>
                 a.kind === 'text' ? (
                   <span
@@ -385,6 +423,7 @@ export function MessageInput({ disabled }: Props) {
               <button
                 type="button"
                 disabled={disabled}
+                onClick={() => setContextOpen(true)}
                 className="w-7 h-7 rounded-md border-0 bg-transparent text-text-secondary/70 flex items-center justify-center hover:bg-surface-hover hover:text-text-primary transition-colors disabled:opacity-50"
                 title="选择上下文"
               >
@@ -433,6 +472,19 @@ export function MessageInput({ disabled }: Props) {
           sessionId={activeSessionId}
           onClose={() => setMemoryOpen(false)}
           onActiveChange={setMemoryActive}
+        />
+      )}
+      {contextOpen && (
+        <ContextPickerModal
+          initialSelected={new Set(contexts.map((c) => contextKey(c.kind, c.id)))}
+          onClose={() => setContextOpen(false)}
+          onConfirm={(items) => {
+            setContexts((prev) => {
+              const existing = new Set(prev.map((c) => contextKey(c.kind, c.id)));
+              return [...prev, ...items.filter((c) => !existing.has(contextKey(c.kind, c.id)))];
+            });
+            setContextOpen(false);
+          }}
         />
       )}
     </div>

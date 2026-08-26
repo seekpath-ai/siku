@@ -2,8 +2,8 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
-import { User, Copy, Check } from 'lucide-react';
-import { useState } from 'react';
+import { User, Copy, Check, Paperclip, ChevronDown, ChevronUp } from 'lucide-react';
+import { useMemo, useState } from 'react';
 import type { AgentPhase, AgentStep, ChatAttachment, ChatMessage, ToolCallInfo } from '@/lib/types';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
 import { MarkdownCode, MarkdownPre } from './CodeBlock';
@@ -56,6 +56,67 @@ function parseToolCalls(json: string | null): ToolCallInfo[] {
   } catch {
     return [];
   }
+}
+
+interface ContentBlock {
+  label: string;
+  text: string;
+}
+
+/** Split a user message into its machine-generated blocks (context picker
+ * output, attached text files) and the text the user actually typed. */
+function extractBlocks(content: string): { blocks: ContentBlock[]; rest: string } {
+  const blocks: ContentBlock[] = [];
+  let rest = content;
+
+  const ctx = rest.match(/<context>[\s\S]*?<\/context>/);
+  if (ctx) {
+    const names = [...ctx[0].matchAll(/# (?:笔记|文件)「([^」]*)」/g)].map((m) => m[1]);
+    blocks.push({
+      label: names.length > 0 ? `上下文：${names.join('、')}` : '上下文',
+      text: ctx[0],
+    });
+    rest = rest.replace(ctx[0], '');
+  }
+
+  const fileRe = /<file name="([^"]*)"[^>]*>[\s\S]*?<\/file>/g;
+  let m: RegExpExecArray | null;
+  while ((m = fileRe.exec(content)) !== null) {
+    blocks.push({ label: `附件「${m[1]}」`, text: m[0] });
+  }
+  rest = rest.replace(fileRe, '');
+
+  return { blocks, rest: rest.trim() };
+}
+
+/** User message text: attachment/context blocks are collapsed into a
+ * summary chip (click to expand); the typed text stays visible. */
+function UserText({ content }: { content: string }) {
+  const { blocks, rest } = useMemo(() => extractBlocks(content), [content]);
+  const [expanded, setExpanded] = useState(false);
+
+  if (blocks.length === 0) {
+    return <p className="whitespace-pre-wrap">{content}</p>;
+  }
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="inline-flex items-center gap-1.5 max-w-full px-2 py-1 mb-1.5 rounded-md bg-codex-hover/60 text-codex-muted text-[11px] hover:text-codex-primary transition-colors"
+      >
+        <Paperclip size={11} className="shrink-0" />
+        <span className="truncate">{blocks.map((b) => b.label).join(' · ')}</span>
+        {expanded ? <ChevronUp size={11} className="shrink-0" /> : <ChevronDown size={11} className="shrink-0" />}
+      </button>
+      {expanded && (
+        <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-codex-muted bg-codex-bg/60 border border-codex-border/50 rounded-md p-2.5 mb-1.5 max-h-[320px] overflow-y-auto">
+          {blocks.map((b) => b.text).join('\n\n')}
+        </pre>
+      )}
+      {rest && <p className="whitespace-pre-wrap">{rest}</p>}
+    </>
+  );
 }
 
 function stepsToPhases(steps: AgentStep[]): AgentPhase[] {
@@ -161,7 +222,7 @@ export function MessageBubble({ message, agentSteps = [] }: Props) {
         )}
         {isUser ? (
           <>
-            <p className="whitespace-pre-wrap">{message.content}</p>
+            <UserText content={message.content} />
             {message.attachments && (
               <div className="flex flex-wrap gap-2 mt-2">
                 {parseAttachments(message.attachments).map((att, idx) => (

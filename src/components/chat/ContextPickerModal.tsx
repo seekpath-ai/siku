@@ -1,8 +1,28 @@
 import { useState, useEffect, useMemo } from 'react';
-import { BookOpen, FileText, X, Search, Loader2 } from 'lucide-react';
+import { BookOpen, Eye, FileText, X, Search, Loader2 } from 'lucide-react';
 import { notesListAll, vaultList, filesList, filesReadText } from '@/lib/tauri';
+import { FilePreview } from '@/components/files/FilePreview';
 import { contextKey, type ContextItem } from './contextItem';
 import type { Note, FileItem } from '@/lib/types';
+
+function isPdf(f: FileItem): boolean {
+  return f.mime_type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf');
+}
+
+function isImage(f: FileItem): boolean {
+  return (f.mime_type ?? '').startsWith('image/') || /\.(png|jpe?g|gif|svg|webp|bmp)$/i.test(f.name);
+}
+
+/** One-line excerpt around the first query hit, shown under a note title so
+ *  content matches explain why the note appeared in the results. */
+function contentExcerpt(content: string, q: string): string | null {
+  const idx = content.toLowerCase().indexOf(q);
+  if (idx < 0) return null;
+  const start = Math.max(0, idx - 24);
+  const end = Math.min(content.length, idx + q.length + 56);
+  const text = content.slice(start, end).replace(/\s+/g, ' ').trim();
+  return (start > 0 ? '…' : '') + text + (end < content.length ? '…' : '');
+}
 
 interface Props {
   /** Keys ("kind:id") already attached, so re-opening keeps them checked. */
@@ -17,16 +37,25 @@ interface Props {
 export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Props) {
   const [notes, setNotes] = useState<Note[] | null>(null);
   const [files, setFiles] = useState<FileItem[] | null>(null);
+  /** Folder notes (id → note) and vault names, used to build file path labels. */
+  const [folders, setFolders] = useState<Map<string, Note>>(new Map());
+  const [vaultNames, setVaultNames] = useState<Map<string, string>>(new Map());
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set(initialSelected ?? []));
   const [resolving, setResolving] = useState(false);
+  /** File shown in the stacked preview overlay (PDF/image only). */
+  const [previewId, setPreviewId] = useState<string | null>(null);
 
   useEffect(() => {
     notesListAll()
-      .then((ns) => setNotes(ns.filter((n) => !n.is_folder)))
+      .then((ns) => {
+        setNotes(ns.filter((n) => !n.is_folder));
+        setFolders(new Map(ns.filter((n) => n.is_folder).map((n) => [n.id, n])));
+      })
       .catch(() => setNotes([]));
     vaultList()
       .then(async (vs) => {
+        setVaultNames(new Map(vs.map((v) => [v.id, v.name])));
         const all: FileItem[] = [];
         for (const v of vs) {
           all.push(...(await filesList(v.id).catch(() => [] as FileItem[])));
@@ -38,11 +67,14 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
 
   useEffect(() => {
     const onDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key !== 'Escape') return;
+      // Escape closes the stacked preview first, then the picker itself.
+      if (previewId) setPreviewId(null);
+      else onClose();
     };
     window.addEventListener('keydown', onDown);
     return () => window.removeEventListener('keydown', onDown);
-  }, [onClose]);
+  }, [onClose, previewId]);
 
   const q = query.trim().toLowerCase();
   const filteredNotes = useMemo(
@@ -59,6 +91,26 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
     () => (files ?? []).filter((f) => !q || f.name.toLowerCase().includes(q)),
     [files, q]
   );
+
+  /** Display path per file: vault name + folder chain (file parents are
+   *  notes-tree folders), always shown under the file name. */
+  const filePaths = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const f of files ?? []) {
+      const parts: string[] = [];
+      let pid = f.parent_id;
+      let guard = 0; // cycle protection
+      while (pid && guard++ < 32) {
+        const folder = folders.get(pid);
+        if (!folder) break;
+        parts.unshift(folder.title || '未命名');
+        pid = folder.parent_id;
+      }
+      const vault = vaultNames.get(f.vault_id);
+      map.set(f.id, [vault, ...parts].filter(Boolean).join(' / '));
+    }
+    return map;
+  }, [files, folders, vaultNames]);
 
   const toggle = (key: string) => {
     setSelected((prev) => {
@@ -135,6 +187,9 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
                   <div className="px-1.5 py-1 text-[11px] text-text-secondary/50">笔记</div>
                   {filteredNotes.map((n) => {
                     const key = contextKey('note', n.id);
+                    const snippet = q
+                      ? contentExcerpt(n.content_plain || n.content || '', q)
+                      : null;
                     return (
                       <label
                         key={key}
@@ -147,7 +202,16 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
                           className="accent-primary shrink-0"
                         />
                         <FileText size={13} className="text-text-secondary/60 shrink-0" />
-                        <span className="text-[13px] text-text-primary truncate">{n.title || '未命名笔记'}</span>
+                        <span className="flex-1 min-w-0">
+                          <span className="block truncate text-[13px] text-text-primary">
+                            {n.title || '未命名笔记'}
+                          </span>
+                          {snippet && (
+                            <span className="block truncate text-[11px] text-text-secondary/60">
+                              {snippet}
+                            </span>
+                          )}
+                        </span>
                       </label>
                     );
                   })}
@@ -158,10 +222,11 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
                   <div className="px-1.5 py-1 mt-1 text-[11px] text-text-secondary/50">文件</div>
                   {filteredFiles.map((f) => {
                     const key = contextKey('file', f.id);
+                    const path = filePaths.get(f.id) || '';
                     return (
                       <label
                         key={key}
-                        className="flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg hover:bg-surface-hover cursor-pointer"
+                        className="group flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg hover:bg-surface-hover cursor-pointer"
                       >
                         <input
                           type="checkbox"
@@ -170,7 +235,32 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
                           className="accent-primary shrink-0"
                         />
                         <FileText size={13} className="text-text-secondary/60 shrink-0" />
-                        <span className="text-[13px] text-text-primary truncate">{f.name}</span>
+                        <span className="flex-1 min-w-0">
+                          {path && (
+                            <span
+                              className="block truncate text-[11px] text-text-secondary/60"
+                              title={path}
+                            >
+                              {path}
+                            </span>
+                          )}
+                          <span className="block truncate text-[13px] text-text-primary">{f.name}</span>
+                        </span>
+                        {(isPdf(f) || isImage(f)) && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              // Keep the label from toggling the checkbox.
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setPreviewId(f.id);
+                            }}
+                            className="opacity-0 group-hover:opacity-100 p-1 rounded text-text-secondary/60 hover:text-text-primary hover:bg-background transition-opacity shrink-0"
+                            title="预览"
+                          >
+                            <Eye size={13} />
+                          </button>
+                        )}
                       </label>
                     );
                   })}
@@ -204,6 +294,20 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
           </div>
         </div>
       </div>
+
+      {/* Stacked preview overlay for PDF/image files; sits above the picker so
+          the selection state underneath is preserved. */}
+      {previewId && (
+        <div className="fixed inset-0 z-[300] flex items-center justify-center">
+          <div
+            className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+            onClick={() => setPreviewId(null)}
+          />
+          <div className="relative w-[860px] max-w-[94vw] h-[82vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
+            <FilePreview fileId={previewId} onBack={() => setPreviewId(null)} />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

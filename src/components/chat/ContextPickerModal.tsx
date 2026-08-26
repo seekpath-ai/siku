@@ -46,7 +46,13 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
 
   const q = query.trim().toLowerCase();
   const filteredNotes = useMemo(
-    () => (notes ?? []).filter((n) => !q || (n.title || '').toLowerCase().includes(q)),
+    () =>
+      (notes ?? []).filter(
+        (n) =>
+          !q ||
+          (n.title || '').toLowerCase().includes(q) ||
+          (n.content_plain || n.content || '').toLowerCase().includes(q)
+      ),
     [notes, q]
   );
   const filteredFiles = useMemo(
@@ -110,7 +116,7 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="搜索笔记或文件…"
+              placeholder="搜索笔记标题、正文或文件名…"
               className="flex-1 bg-transparent border-0 outline-0 text-[13px] text-text-primary placeholder:text-text-secondary/50"
               autoFocus
             />

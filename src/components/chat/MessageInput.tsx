@@ -440,7 +440,7 @@ export function MessageInput({ disabled }: Props) {
                 }`}
                 title={memoryActive ? '长期记忆 · 已激活' : '长期记忆 · 已遗忘'}
               >
-                <Brain size={15} fill={memoryActive ? 'currentColor' : 'none'} />
+                <Brain size={15} />
               </button>
             </div>
             {isStreaming ? (

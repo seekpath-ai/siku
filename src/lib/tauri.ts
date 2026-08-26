@@ -256,6 +256,14 @@ export async function agentCancel(sessionId: string): Promise<void> {
   return invoke<void>('agent_cancel', { sessionId });
 }
 
+/** Update only the session's approval config (chat-input quick switch). */
+export async function agentSetApprovalConfig(
+  sessionId: string,
+  approvalConfig: ApprovalConfig,
+): Promise<void> {
+  return invoke<void>('agent_set_approval_config', { sessionId, approvalConfig });
+}
+
 /** Rename a session (title only). */
 export async function agentRenameSession(sessionId: string, title: string): Promise<void> {
   return invoke<void>('agent_rename_session', { sessionId, title });

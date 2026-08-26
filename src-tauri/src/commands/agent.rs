@@ -1101,6 +1101,27 @@ pub async fn agent_approve_tool(
     Ok(())
 }
 
+/// Update only the approval config of a session — the quick switch in the
+/// chat input. Takes effect on the next turn (the running turn's engine
+/// already holds its config).
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn agent_set_approval_config(
+    state: State<'_, AppState>,
+    session_id: String,
+    approval_config: crate::ai::agent::config::ApprovalConfig,
+) -> Result<(), String> {
+    let json = serde_json::to_string(&approval_config).map_err(|e| format!("json: {e}"))?;
+    sqlx::query("UPDATE chat_sessions SET approval_config = ?, updated_at = ? WHERE id = ?")
+        .bind(&json)
+        .bind(now_iso())
+        .bind(&session_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| format!("db: {e}"))?;
+    Ok(())
+}
+
 // ── Settings ──
 
 #[tauri::command]

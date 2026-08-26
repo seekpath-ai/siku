@@ -718,6 +718,7 @@ pub fn run() {
             commands::agent::agent_list_sessions,
             commands::agent::agent_delete_session,
             commands::agent::agent_approve_tool,
+            commands::agent::agent_set_approval_config,
             commands::agent::agent_pin_session,
             commands::agent::agent_cancel,
             commands::agent::agent_rename_session,

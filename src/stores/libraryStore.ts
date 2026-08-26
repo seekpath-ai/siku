@@ -33,6 +33,9 @@ interface LibraryState {
   // View
   viewMode: ViewMode;
 
+  /** Paper-list columns hidden via the header context menu (title exempt). */
+  hiddenColumns: string[];
+
   // Panel widths (px)
   leftPanelWidth: number;
   rightPanelWidth: number;
@@ -63,6 +66,7 @@ interface LibraryState {
   setSortOrder: (order: SortOrder) => void;
   toggleSort: (field: SortField) => void;
   setViewMode: (mode: ViewMode) => void;
+  toggleHiddenColumn: (key: string) => void;
   selectPaper: (id: string, multi?: boolean, range?: boolean) => void;
   clearSelection: () => void;
   setLeftPanelWidth: (width: number) => void;
@@ -95,6 +99,7 @@ export const useLibraryStore = create<LibraryState>()(
       selectedPaperIds: [],
       lastSelectedId: null,
       viewMode: 'table',
+      hiddenColumns: [],
       leftPanelWidth: 256,
       rightPanelWidth: 320,
       rightPanelCollapsed: false,
@@ -187,6 +192,12 @@ export const useLibraryStore = create<LibraryState>()(
         }
       },
       setViewMode: (mode) => set({ viewMode: mode }),
+      toggleHiddenColumn: (key) =>
+        set((state) => ({
+          hiddenColumns: state.hiddenColumns.includes(key)
+            ? state.hiddenColumns.filter((k) => k !== key)
+            : [...state.hiddenColumns, key],
+        })),
       selectPaper: (id, multi, range) => {
         const { selectedPaperIds, lastSelectedId } = get();
         if (multi) {
@@ -224,6 +235,7 @@ export const useLibraryStore = create<LibraryState>()(
         rightPanelWidth: state.rightPanelWidth,
         rightPanelCollapsed: state.rightPanelCollapsed,
         viewMode: state.viewMode,
+        hiddenColumns: state.hiddenColumns,
         sortBy: state.sortBy,
         sortOrder: state.sortOrder,
         expandedCollectionIds: state.expandedCollectionIds,

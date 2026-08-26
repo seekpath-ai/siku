@@ -34,6 +34,7 @@ import {
   FolderPlus,
   FolderMinus,
   RefreshCw,
+  Check,
 } from 'lucide-react';
 import {
   usePapers,
@@ -67,6 +68,36 @@ import { PaperCard } from './PaperCard';
 import type { Paper, ListPapersParams, Note, Collection } from '@/lib/types';
 
 type SortField = 'title' | 'year' | 'imported_at';
+
+/** Toggleable paper-list columns (the title column is always visible).
+ *  Order matches the row layout. */
+type ColumnKey = 'authors' | 'year' | 'journal' | 'pages' | 'date';
+
+const COLUMN_DEFS: { key: ColumnKey; label: string }[] = [
+  { key: 'authors', label: '作者' },
+  { key: 'year', label: '年份' },
+  { key: 'journal', label: '期刊' },
+  { key: 'pages', label: '页数' },
+  { key: 'date', label: '日期' },
+];
+
+/** Container-width thresholds: below `below` px the listed columns
+ * auto-hide (least valuable first), so the title column is squeezed last.
+ * Applied cumulatively — the first matching (narrowest) band wins. */
+const AUTO_HIDE_BANDS: { below: number; keys: ColumnKey[] }[] = [
+  { below: 520, keys: ['pages', 'journal', 'date', 'authors'] },
+  { below: 680, keys: ['pages', 'journal', 'date'] },
+  { below: 800, keys: ['pages', 'journal'] },
+  { below: 900, keys: ['pages'] },
+];
+
+function autoHiddenColumns(width: number): Set<ColumnKey> {
+  if (width <= 0) return new Set(); // not measured yet — show everything
+  for (const band of AUTO_HIDE_BANDS) {
+    if (width < band.below) return new Set(band.keys);
+  }
+  return new Set();
+}
 
 function SortIcon({ field, current, order }: { field: SortField; current: SortField; order: 'asc' | 'desc' }) {
   if (field !== current) return <span className="w-3.5" />;
@@ -207,6 +238,7 @@ function PaperRow({
   onSetReadStatus,
   activeFilter,
   collections,
+  visibleColumns,
 }: {
   paper: Paper;
   isSelected: boolean;
@@ -221,6 +253,8 @@ function PaperRow({
   onSetReadStatus: (id: string, status: string) => void;
   activeFilter: ActiveFilter;
   collections: Collection[] | undefined;
+  /** Columns currently visible (manual hide ∪ container-width auto-hide). */
+  visibleColumns: Set<ColumnKey>;
 }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -537,7 +571,7 @@ function PaperRow({
           {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         </button>
 
-        <div className="flex-1 min-w-0">
+        <div className="flex-1 min-w-24">
           <div className="flex items-center gap-2">
             {paper.read_status === 'unread' && (
               <span className="w-1.5 h-1.5 rounded-full bg-primary shrink-0" title="未读" />
@@ -559,25 +593,38 @@ function PaperRow({
           </div>
         </div>
 
-        <div className="w-32 shrink-0 hidden md:block">
-          <span className="block truncate text-xs text-text-secondary">{displayAuthors}</span>
-        </div>
+        {/* Secondary columns: authors/journal shrink (with truncation) before
+            the title does; year/pages/date stay fixed since their content is
+            short. Visibility is container-width driven, not viewport. */}
+        {visibleColumns.has('authors') && (
+          <div className="w-32 shrink min-w-12">
+            <span className="block truncate text-xs text-text-secondary">{displayAuthors}</span>
+          </div>
+        )}
 
-        <div className="w-16 shrink-0 hidden sm:block text-xs text-text-secondary text-center">
-          {paper.year || '—'}
-        </div>
+        {visibleColumns.has('year') && (
+          <div className="w-16 shrink-0 text-xs text-text-secondary text-center">
+            {paper.year || '—'}
+          </div>
+        )}
 
-        <div className="w-36 shrink-0 hidden lg:block">
-          <span className="block truncate text-xs text-text-secondary">{paper.journal || '—'}</span>
-        </div>
+        {visibleColumns.has('journal') && (
+          <div className="w-36 shrink min-w-12">
+            <span className="block truncate text-xs text-text-secondary">{paper.journal || '—'}</span>
+          </div>
+        )}
 
-        <div className="w-14 shrink-0 hidden lg:block text-xs text-text-secondary text-center">
-          {paper.page_count || '—'}
-        </div>
+        {visibleColumns.has('pages') && (
+          <div className="w-14 shrink-0 text-xs text-text-secondary text-center">
+            {paper.page_count || '—'}
+          </div>
+        )}
 
-        <div className="w-24 shrink-0 hidden sm:block text-xs text-text-secondary/60 text-right">
-          {isoToDisplay(paper.imported_at).split(' ')[0]}
-        </div>
+        {visibleColumns.has('date') && (
+          <div className="w-24 shrink-0 text-xs text-text-secondary/60 text-right">
+            {isoToDisplay(paper.imported_at).split(' ')[0]}
+          </div>
+        )}
       </div>
 
       {expanded && <PaperChildren paper={paper} />}
@@ -611,6 +658,10 @@ export function PaperList() {
   const listRef = useRef<HTMLDivElement>(null);
   const [focusedIndex, setFocusedIndex] = useState<number>(-1);
   const [showFilters, setShowFilters] = useState(false);
+  const hiddenColumns = useLibraryStore((s) => s.hiddenColumns);
+  const toggleHiddenColumn = useLibraryStore((s) => s.toggleHiddenColumn);
+  const [listWidth, setListWidth] = useState(0);
+  const [colMenu, setColMenu] = useState<{ x: number; y: number } | null>(null);
 
   const yearFrom = useLibraryStore((s) => s.yearFrom);
   const yearTo = useLibraryStore((s) => s.yearTo);
@@ -685,6 +736,37 @@ export function PaperList() {
   useEffect(() => {
     setFocusedIndex(-1);
   }, [paperIds.join(',')]);
+
+  // Measure the list container: column auto-hide reacts to the LIST width,
+  // not the viewport — side panels resize independently of the window.
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      setListWidth(entries[0].contentRect.width);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [viewMode, papers?.length]);
+
+  /** Columns actually rendered: manually hidden columns and columns
+   * auto-hidden because the list got too narrow are both excluded. */
+  const visibleColumns = useMemo<Set<ColumnKey>>(() => {
+    const auto = autoHiddenColumns(listWidth);
+    return new Set(
+      COLUMN_DEFS.map((c) => c.key).filter((k) => !auto.has(k) && !hiddenColumns.includes(k))
+    );
+  }, [listWidth, hiddenColumns]);
+
+  const columnMenuItems: ContextMenuItem[] = COLUMN_DEFS.map((col) => ({
+    label: col.label,
+    icon: hiddenColumns.includes(col.key) ? (
+      <span className="w-3.5" />
+    ) : (
+      <Check size={14} className="text-primary" />
+    ),
+    onClick: () => toggleHiddenColumn(col.key),
+  }));
 
   // Focus the list only when view mode changes, not when papers data changes,
   // so that typing in the search box is not interrupted.
@@ -1011,54 +1093,62 @@ export function PaperList() {
           onClick={clearSelection}
           className="flex-1 overflow-y-auto outline-none focus:bg-surface-hover/10"
         >
-          {/* Column headers */}
+          {/* Column headers (right-click to show/hide columns) */}
           <div
             className="sticky top-0 z-10 flex items-center gap-2 px-3 py-2 border-b border-surface-hover bg-surface/80 backdrop-blur text-xs text-text-secondary/70"
             onClick={(e) => e.stopPropagation()}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setColMenu({ x: e.clientX, y: e.clientY });
+            }}
           >
             <div className="w-5 shrink-0" />
             {activeFilter.type === 'recent' ? (
-              <>
-                <div className="flex-1 min-w-0 flex items-center gap-1">
-                  <FileText size={12} /> 标题
-                </div>
-                <div className="w-32 shrink-0 hidden md:flex items-center gap-1">
-                  <User size={12} /> 作者
-                </div>
-                <div className="w-16 shrink-0 hidden sm:flex items-center justify-center gap-1">
+              <div className="flex-1 min-w-24 flex items-center gap-1">
+                <FileText size={12} /> 标题
+              </div>
+            ) : (
+              <button onClick={() => toggleSort('title')} className="flex-1 min-w-24 flex items-center gap-1 text-left hover:text-text-secondary">
+                <FileText size={12} /> 标题 <SortIcon field="title" current={sortBy} order={sortOrder} />
+              </button>
+            )}
+            {visibleColumns.has('authors') && (
+              <div className="w-32 shrink min-w-12 flex items-center gap-1">
+                <User size={12} /> 作者
+              </div>
+            )}
+            {visibleColumns.has('year') && (
+              activeFilter.type === 'recent' ? (
+                <div className="w-16 shrink-0 flex items-center justify-center gap-1">
                   <Calendar size={12} /> 年份
                 </div>
-                <div className="w-36 shrink-0 hidden lg:flex items-center gap-1">
-                  <BookOpen size={12} /> 期刊
-                </div>
-                <div className="w-14 shrink-0 hidden lg:flex items-center justify-center gap-1">
-                  <FileText size={12} /> 页数
-                </div>
-                <div className="w-24 shrink-0 hidden sm:flex items-center justify-end gap-1">
-                  最近阅读
-                </div>
-              </>
-            ) : (
-              <>
-                <button onClick={() => toggleSort('title')} className="flex-1 min-w-0 flex items-center gap-1 text-left hover:text-text-secondary">
-                  <FileText size={12} /> 标题 <SortIcon field="title" current={sortBy} order={sortOrder} />
-                </button>
-                <div className="w-32 shrink-0 hidden md:flex items-center gap-1">
-                  <User size={12} /> 作者
-                </div>
-                <button onClick={() => toggleSort('year')} className="w-16 shrink-0 hidden sm:flex items-center justify-center gap-1 hover:text-text-secondary">
+              ) : (
+                <button onClick={() => toggleSort('year')} className="w-16 shrink-0 flex items-center justify-center gap-1 hover:text-text-secondary">
                   <Calendar size={12} /> 年份 <SortIcon field="year" current={sortBy} order={sortOrder} />
                 </button>
-                <div className="w-36 shrink-0 hidden lg:flex items-center gap-1">
-                  <BookOpen size={12} /> 期刊
+              )
+            )}
+            {visibleColumns.has('journal') && (
+              <div className="w-36 shrink min-w-12 flex items-center gap-1">
+                <BookOpen size={12} /> 期刊
+              </div>
+            )}
+            {visibleColumns.has('pages') && (
+              <div className="w-14 shrink-0 flex items-center justify-center gap-1">
+                <FileText size={12} /> 页数
+              </div>
+            )}
+            {visibleColumns.has('date') && (
+              activeFilter.type === 'recent' ? (
+                <div className="w-24 shrink-0 flex items-center justify-end gap-1">
+                  最近阅读
                 </div>
-                <div className="w-14 shrink-0 hidden lg:flex items-center justify-center gap-1">
-                  <FileText size={12} /> 页数
-                </div>
-                <button onClick={() => toggleSort('imported_at')} className="w-24 shrink-0 hidden sm:flex items-center justify-end gap-1 hover:text-text-secondary">
+              ) : (
+                <button onClick={() => toggleSort('imported_at')} className="w-24 shrink-0 flex items-center justify-end gap-1 hover:text-text-secondary">
                   导入日期 <SortIcon field="imported_at" current={sortBy} order={sortOrder} />
                 </button>
-              </>
+              )
             )}
           </div>
 
@@ -1087,6 +1177,7 @@ export function PaperList() {
                 onSetReadStatus={handleSetReadStatus}
                 activeFilter={activeFilter}
                 collections={collections}
+                visibleColumns={visibleColumns}
               />
             </div>
           ))}
@@ -1113,6 +1204,10 @@ export function PaperList() {
             ))}
           </div>
         </div>
+      )}
+
+      {colMenu && (
+        <ContextMenu x={colMenu.x} y={colMenu.y} items={columnMenuItems} onClose={() => setColMenu(null)} />
       )}
     </div>
   );

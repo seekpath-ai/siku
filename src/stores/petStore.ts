@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { AgentSession, AgentStep, ChatMessage, StreamingStep, ToolCallInfo } from '@/lib/types';
+import type { AgentSession, AgentStep, ChatAttachment, ChatMessage, StreamingStep, ToolCallInfo } from '@/lib/types';
 import { petCreateSession, getChatMessages, getAgentSteps, agentGetSession, agentSendMessage } from '@/lib/tauri';
 import type { PetContext } from './petContextStore';
 
@@ -43,7 +43,7 @@ interface PetState {
   start: (ctx: PetContext) => Promise<void>;
   /** Attach to an EXISTING session (detached chat window) and load history. */
   attach: (sessionId: string) => Promise<void>;
-  send: (text: string) => Promise<void>;
+  send: (text: string, attachments?: ChatAttachment[]) => Promise<void>;
   appendDelta: (t: string) => void;
   setStreaming: (s: boolean) => void;
   setPendingApproval: (a: PetApproval | null) => void;
@@ -122,7 +122,7 @@ export const usePetStore = create<PetState>((set, get) => ({
     }
   },
 
-  send: async (text) => {
+  send: async (text, attachments) => {
     const { session } = get();
     if (!session || get().streaming) return;
     const userMsg: ChatMessage = {
@@ -138,7 +138,7 @@ export const usePetStore = create<PetState>((set, get) => ({
       tokens_in: null,
       tokens_in_hit: null,
       tokens_out: null,
-      attachments: null,
+      attachments: attachments?.length ? JSON.stringify(attachments) : null,
       created_at: new Date().toISOString(),
     };
     set((s) => ({
@@ -146,7 +146,7 @@ export const usePetStore = create<PetState>((set, get) => ({
       pendingApproval: null, streamingSteps: [], currentStreamingStep: null, error: null,
     }));
     try {
-      await agentSendMessage(session.id, text);
+      await agentSendMessage(session.id, text, attachments);
     } catch (err) {
       console.error('pet send:', err);
       set({ streaming: false, error: err instanceof Error ? err.message : String(err) });

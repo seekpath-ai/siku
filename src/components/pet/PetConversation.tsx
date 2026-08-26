@@ -5,18 +5,20 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import { listen, emit } from '@tauri-apps/api/event';
 import { useNavigate } from '@tanstack/react-router';
-import { Send, Loader2, ShieldAlert, Check, NotebookPen, Quote, ChevronDown, ChevronRight } from 'lucide-react';
+import { Send, Loader2, ShieldAlert, Check, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus } from 'lucide-react';
 import { usePetStore } from '@/stores/petStore';
 import type { PetContext } from '@/stores/petContextStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
 import { useDialogStore } from '@/stores/dialogStore';
-import { getChatMessages, getAgentSteps, agentApproveTool, notesCreate, noteCreateUnderPaper } from '@/lib/tauri';
+import { getChatMessages, getAgentSteps, agentApproveTool, notesCreate, noteCreateUnderPaper, readImageFile } from '@/lib/tauri';
 import { parseEvidence, buildNoteMarkdown } from '@/lib/evidence';
 import type { EvidenceEntry } from '@/lib/evidence';
 import { MarkdownCode, MarkdownPre } from '@/components/chat/CodeBlock';
+import { parseAttachments } from '@/lib/attachments';
 import { ReasoningProcessCard } from '@/components/chat/ReasoningProcessCard';
 import { ExternalLink } from '@/components/ui/ExternalLink';
-import type { AgentStreamEvent, AgentPhase, AgentStep, ChatMessage, StreamingStep, ToolCallInfo } from '@/lib/types';
+import { useImageAttachments } from '@/hooks/useImageAttachments';
+import type { AgentStreamEvent, AgentPhase, AgentStep, ChatAttachment, ChatMessage, StreamingStep, ToolCallInfo } from '@/lib/types';
 
 // Flatten streaming steps into reasoning / tool-call phases (same as chat).
 function streamingToPhases(steps: StreamingStep[], current: StreamingStep | null): AgentPhase[] {
@@ -220,10 +222,30 @@ function PetMessage({ msg, onCitation, onSaveNote, saving }: {
   // the citation badges (cheap: one regex + one JSON.parse per render).
   const evidence = useMemo(() => parseEvidence(msg.content).evidence, [msg.content]);
   if (msg.role === 'user') {
+    const images = parseAttachments(msg.attachments);
     return (
       <div className="flex justify-end">
         <div className="max-w-[82%] bg-surface px-3 py-2 rounded-xl rounded-tr-sm text-[13px] text-text-primary whitespace-pre-wrap">
           {msg.content}
+          {images.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mt-1.5">
+              {images.map((att, idx) => (
+                <a
+                  key={idx}
+                  href={`data:${att.mime};base64,${att.base64}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="block"
+                >
+                  <img
+                    src={`data:${att.mime};base64,${att.base64}`}
+                    alt={att.name || `图片 ${idx + 1}`}
+                    className="max-w-[96px] max-h-[96px] object-cover rounded-lg border border-surface-hover"
+                  />
+                </a>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     );
@@ -274,6 +296,10 @@ export const DOMAIN_NAMES: Record<string, string> = {
   chat: '对话总结',
 };
 
+const IMAGE_FILTERS = [
+  { name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] },
+];
+
 const QUICK_COMMANDS: Record<string, string[]> = {
   notes: ['整理这篇笔记', '提炼要点', '补充标签', '检查错别字'],
   library: ['总结这篇文献', '提炼要点', '翻译摘要', '保存总结到笔记'],
@@ -303,6 +329,46 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
   const store = usePetStore();
   const [input, setInput] = useState('');
   const navigate = useNavigate();
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Image attachments (upload + paste + OS screenshot, max 3). No global
+  // Ctrl+Shift+S here — that shortcut belongs to the main chat input.
+  const {
+    images,
+    addImageData,
+    removeImage,
+    clearImages,
+    shotArmed,
+    startScreenshot,
+    handlePaste,
+  } = useImageAttachments({
+    max: 3,
+    onAttached: () => inputRef.current?.focus(),
+    onError: (msg, title) => useDialogStore.getState().alert(msg, title ?? '图片附件'),
+  });
+
+  // Image upload via the OS file picker (same pipeline as the main chat).
+  const handleAttachImage = async () => {
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const selected = await open({ multiple: true, directory: false, filters: IMAGE_FILTERS });
+      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+      for (const path of paths) {
+        if (typeof path !== 'string') continue;
+        const name = path.split(/[\\/]/).pop() || path;
+        if (images.some((a) => a.name === name)) continue;
+        const att = await readImageFile(path);
+        addImageData({
+          name: att.name || name,
+          mime: att.mime,
+          base64: att.base64,
+          previewUrl: `data:${att.mime};base64,${att.base64}`,
+        });
+      }
+    } catch (err) {
+      console.error('Image attach failed:', err);
+    }
+  };
 
   // Citation badge click: highlight the quoted evidence in the reader. The
   // paper id comes from the session context (reader/library pages); in a
@@ -588,9 +654,14 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
 
   const handleSend = async () => {
     const text = input.trim();
-    if (!text || store.streaming) return;
+    if ((!text && images.length === 0) || store.streaming) return;
+    const attachments: ChatAttachment[] | undefined = images.length
+      ? images.map((a) => ({ mime: a.mime, base64: a.base64, name: a.name }))
+      : undefined;
     setInput('');
-    await store.send(text);
+    clearImages();
+    if (inputRef.current) inputRef.current.style.height = 'auto';
+    await store.send(text, attachments);
   };
 
   const handleQuick = (cmd: string) => {
@@ -767,25 +838,92 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
           </div>
         )}
 
-      {/* Input */}
-      <div className="px-3 py-2.5 border-t border-surface-hover flex items-center gap-2 shrink-0">
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') handleSend();
-          }}
-          placeholder="告诉我要做什么…"
-          className="flex-1 min-w-0 h-9 bg-background text-text-primary text-[13px] px-3 rounded-lg border border-surface-hover focus:border-primary/40 focus:outline-none placeholder:text-text-secondary/40"
-        />
-        <button
-          onClick={handleSend}
-          disabled={!input.trim() || store.streaming}
-          className="w-9 h-9 rounded-lg bg-primary/15 text-primary flex items-center justify-center hover:bg-primary/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
-          aria-label="发送"
-        >
-          {store.streaming ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
-        </button>
+      {/* Input — same structure as the main chat MessageInput, trimmed to
+          image upload + screenshot (paste comes with the shared hook). */}
+      <div className="px-3 py-2.5 border-t border-surface-hover shrink-0 space-y-2">
+        {shotArmed && (
+          <div className="text-[11px] text-primary/80">
+            正在等待截图：请在屏幕上框选区域，完成后自动附加（也可直接 Ctrl+V 粘贴图片）
+          </div>
+        )}
+        <div className="rounded-lg border border-surface-hover bg-background transition-colors focus-within:border-primary/40">
+          {images.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 px-2 pt-2">
+              {images.map((a) => (
+                <span
+                  key={a.id}
+                  className="inline-flex items-center gap-1 px-1.5 py-1 rounded-md bg-primary/10 text-primary text-[11px] max-w-[160px]"
+                  title={a.name}
+                >
+                  <img src={a.previewUrl} alt={a.name} className="w-6 h-6 object-cover rounded" />
+                  <span className="truncate">{a.name}</span>
+                  <button
+                    type="button"
+                    onClick={() => removeImage(a.id)}
+                    className="hover:text-red-400 shrink-0"
+                    aria-label="移除图片"
+                  >
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                handleSend();
+              }
+            }}
+            onInput={(e) => {
+              const el = e.currentTarget;
+              el.style.height = 'auto';
+              el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
+            }}
+            onPaste={handlePaste}
+            placeholder="告诉我要做什么…"
+            rows={1}
+            className="w-full min-h-[36px] max-h-[120px] bg-transparent border-0 outline-0 focus:outline-none text-text-primary text-[13px] leading-relaxed px-3 py-2 resize-none placeholder:text-text-secondary/40"
+          />
+          <div className="flex items-center justify-between px-2 pb-1.5">
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={handleAttachImage}
+                disabled={store.streaming}
+                className="w-7 h-7 rounded-md border-0 bg-transparent text-text-secondary/70 flex items-center justify-center hover:bg-surface-hover hover:text-text-primary transition-colors disabled:opacity-40"
+                title="附加图片"
+              >
+                <ImagePlus size={15} />
+              </button>
+              <button
+                type="button"
+                onClick={startScreenshot}
+                disabled={store.streaming}
+                className={`w-7 h-7 rounded-md border-0 bg-transparent flex items-center justify-center hover:bg-surface-hover transition-colors disabled:opacity-40 ${
+                  shotArmed
+                    ? 'text-primary hover:text-primary'
+                    : 'text-text-secondary/70 hover:text-text-primary'
+                }`}
+                title={shotArmed ? '等待截图…（截完自动附加）' : '截图（调用系统截图工具，截完自动附加；也可直接粘贴图片）'}
+              >
+                <Scissors size={15} />
+              </button>
+            </div>
+            <button
+              onClick={handleSend}
+              disabled={(!input.trim() && images.length === 0) || store.streaming}
+              className="w-8 h-8 rounded-lg bg-primary/15 text-primary flex items-center justify-center hover:bg-primary/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+              aria-label="发送"
+            >
+              {store.streaming ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );

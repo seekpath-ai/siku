@@ -4,7 +4,8 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import { User, Copy, Check, Paperclip, ChevronDown, ChevronUp } from 'lucide-react';
 import { useMemo, useState } from 'react';
-import type { AgentPhase, AgentStep, ChatAttachment, ChatMessage, ToolCallInfo } from '@/lib/types';
+import type { AgentPhase, AgentStep, ChatMessage, ToolCallInfo } from '@/lib/types';
+import { parseAttachments } from '@/lib/attachments';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
 import { MarkdownCode, MarkdownPre } from './CodeBlock';
 import { ToolCallCard } from './ToolCallCard';
@@ -36,16 +37,6 @@ function formatTokenUsage(message: ChatMessage): string {
     return `${message.tokens_used} tokens`;
   }
   return '';
-}
-
-function parseAttachments(json: string | null): ChatAttachment[] {
-  if (!json) return [];
-  try {
-    const parsed = JSON.parse(json);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
 }
 
 function parseToolCalls(json: string | null): ToolCallInfo[] {

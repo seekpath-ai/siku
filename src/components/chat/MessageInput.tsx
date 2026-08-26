@@ -1,11 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Send, Paperclip, ImagePlus, BookOpen, Brain, Square, X, FileText, ShieldCheck, Check, Scissors } from 'lucide-react';
-import { readImage } from '@tauri-apps/plugin-clipboard-manager';
 import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
-import { agentSendMessage, agentCancel, readTextFile, readImageFile, agentMemoryGet, agentGetSession, agentSetApprovalConfig, screenshotStart } from '@/lib/tauri';
+import { agentSendMessage, agentCancel, readTextFile, readImageFile, agentMemoryGet, agentGetSession, agentSetApprovalConfig } from '@/lib/tauri';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
 import { useDialog } from '@/hooks/useDialog';
+import { useImageAttachments } from '@/hooks/useImageAttachments';
 import { AgentMemoryModal } from './AgentMemoryModal';
 import { ContextPickerModal } from './ContextPickerModal';
 import { contextKey, type ContextItem } from './contextItem';
@@ -32,21 +32,6 @@ interface TextAttachment {
   content: string;
 }
 
-interface ImageAttachmentLocal {
-  kind: 'image';
-  id: string;
-  name: string;
-  mime: string;
-  base64: string;
-  previewUrl: string;
-}
-
-type Attachment = TextAttachment | ImageAttachmentLocal;
-
-function attachmentKey(a: Attachment): string {
-  return `${a.kind}:${a.id}`;
-}
-
 const TEXT_FILTERS = [
   { name: '文本文件', extensions: ['txt', 'md', 'json', 'ts', 'tsx', 'js', 'rs', 'py', 'css', 'html', 'yml', 'yaml', 'toml', 'csv', 'xml'] },
 ];
@@ -55,58 +40,11 @@ const IMAGE_FILTERS = [
   { name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] },
 ];
 
-function fileToBase64(file: File): Promise<{ base64: string; mime: string; previewUrl: string }> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      const [header, base64] = result.split(',');
-      const mime = header.match(/data:(.+);base64/)?.[1] || file.type || 'image/png';
-      resolve({ base64, mime, previewUrl: result });
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-}
-
-interface ClipboardShot {
-  /** Cheap content fingerprint, to tell a fresh screenshot from stale clipboard content. */
-  sig: string;
-  dataUrl: string;
-  base64: string;
-}
-
-/** Read the clipboard image (if any) and convert it to a PNG data URL. */
-async function readClipboardShot(): Promise<ClipboardShot | null> {
-  try {
-    const img = await readImage();
-    const { width, height } = await img.size();
-    const rgba = await img.rgba();
-    if (!width || !height || rgba.length === 0) return null;
-    let sum = 0;
-    for (let i = 0; i < rgba.length; i += 997) sum = (sum + rgba[i]) & 0xffffff;
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return null;
-    ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0);
-    const dataUrl = canvas.toDataURL('image/png');
-    return { sig: `${width}x${height}:${rgba.length}:${sum}`, dataUrl, base64: dataUrl.split(',')[1] ?? '' };
-  } catch {
-    return null; // clipboard holds no image
-  }
-}
-
-/** Window during which a fresh clipboard image is treated as the screenshot
- * the user was asked to take (avoids attaching unrelated clipboard images). */
-const SCREENSHOT_TIMEOUT_MS = 120_000;
-
 export function MessageInput({ disabled }: Props) {
   const agentName = useActiveAgentName();
   const { alert } = useDialog();
   const [input, setInput] = useState('');
-  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [textAttachments, setTextAttachments] = useState<TextAttachment[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { activeSessionId, addMessage, setLoading, isStreaming } = useChatStore();
@@ -157,73 +95,23 @@ export function MessageInput({ disabled }: Props) {
     );
   };
 
-  // Screenshot flow: the scissors button launches the OS snipping tool; a
-  // fresh clipboard image within SCREENSHOT_TIMEOUT_MS is attached
-  // automatically. Checked on window focus AND by polling, because some
-  // tools (e.g. spectacle -rb) never steal window focus.
-  const shotPending = useRef<{ since: number; prevSig: string | null } | null>(null);
-  const [shotArmed, setShotArmed] = useState(false);
-
-  const checkClipboardShot = useCallback(async () => {
-    const pending = shotPending.current;
-    if (!pending) return;
-    if (Date.now() - pending.since > SCREENSHOT_TIMEOUT_MS) {
-      shotPending.current = null;
-      setShotArmed(false);
-      return;
-    }
-    const shot = await readClipboardShot();
-    if (!shot || shot.sig === pending.prevSig) return;
-    shotPending.current = null;
-    setShotArmed(false);
-    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
-    setAttachments((prev) => [
-      ...prev,
-      {
-        kind: 'image',
-        id: `shot_${Date.now()}`,
-        name: `截图-${stamp}.png`,
-        mime: 'image/png',
-        base64: shot.base64,
-        previewUrl: shot.dataUrl,
-      },
-    ]);
-    textareaRef.current?.focus();
-  }, []);
-
-  useEffect(() => {
-    if (!shotArmed) return;
-    window.addEventListener('focus', checkClipboardShot);
-    const timer = setInterval(checkClipboardShot, 2000);
-    return () => {
-      window.removeEventListener('focus', checkClipboardShot);
-      clearInterval(timer);
-    };
-  }, [shotArmed, checkClipboardShot]);
-
-  const handleScreenshot = useCallback(async () => {
-    // Remember the current clipboard content so only a NEW image attaches.
-    const prev = await readClipboardShot();
-    try {
-      await screenshotStart();
-      shotPending.current = { since: Date.now(), prevSig: prev?.sig ?? null };
-      setShotArmed(true);
-    } catch (err) {
-      alert(String(err), '截图');
-    }
-  }, [alert]);
-
-  // In-app shortcut: Ctrl+Shift+S triggers the screenshot flow.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 's') {
-        e.preventDefault();
-        if (!disabled) handleScreenshot();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [disabled, handleScreenshot]);
+  // Image attachments (staging, paste, OS-screenshot flow) come from the
+  // shared hook; this input owns the global Ctrl+Shift+S shortcut.
+  const {
+    images,
+    addImageData,
+    addImageFile,
+    removeImage,
+    clearImages,
+    shotArmed,
+    startScreenshot,
+    handlePaste,
+  } = useImageAttachments({
+    disabled,
+    enableShortcut: true,
+    onAttached: () => textareaRef.current?.focus(),
+    onError: (msg, title) => alert(msg, title ?? '图片附件'),
+  });
 
   const handleAttachText = async () => {
     try {
@@ -237,8 +125,8 @@ export function MessageInput({ disabled }: Props) {
       if (selected && typeof selected === 'string') {
         const content = await readTextFile(selected);
         const name = selected.split(/[\\/]/).pop() || selected;
-        setAttachments((prev) =>
-          prev.some((a) => a.kind === 'text' && a.path === selected)
+        setTextAttachments((prev) =>
+          prev.some((a) => a.path === selected)
             ? prev
             : [...prev, { kind: 'text', id: `txt_${Date.now()}`, path: selected, name, content }]
         );
@@ -261,64 +149,19 @@ export function MessageInput({ disabled }: Props) {
       for (const path of paths) {
         if (typeof path !== 'string') continue;
         const name = path.split(/[\\/]/).pop() || path;
+        if (images.some((a) => a.name === name)) continue;
         const att = await readImageFile(path);
-        setAttachments((prev) =>
-          prev.some((a) => a.kind === 'image' && a.name === name)
-            ? prev
-            : [
-                ...prev,
-                {
-                  kind: 'image',
-                  id: `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-                  name: att.name || name,
-                  mime: att.mime,
-                  base64: att.base64,
-                  previewUrl: `data:${att.mime};base64,${att.base64}`,
-                },
-              ]
-        );
+        addImageData({
+          name: att.name || name,
+          mime: att.mime,
+          base64: att.base64,
+          previewUrl: `data:${att.mime};base64,${att.base64}`,
+        });
       }
     } catch (err) {
       console.error('Image attach failed:', err);
     }
   };
-
-  const addImageAttachment = useCallback(async (file: File) => {
-    try {
-      const { base64, mime, previewUrl } = await fileToBase64(file);
-      setAttachments((prev) => [
-        ...prev,
-        {
-          kind: 'image',
-          id: `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-          name: file.name,
-          mime,
-          base64,
-          previewUrl,
-        },
-      ]);
-    } catch (err) {
-      console.error('Failed to read pasted image:', err);
-    }
-  }, []);
-
-  const handlePaste = useCallback(
-    async (e: React.ClipboardEvent) => {
-      const files = e.clipboardData?.files;
-      if (!files) return;
-      let handled = false;
-      for (const file of Array.from(files)) {
-        if (file.type.startsWith('image/')) {
-          e.preventDefault();
-          handled = true;
-          await addImageAttachment(file);
-        }
-      }
-      if (handled) return;
-      // Let default paste handle text.
-    },
-    [addImageAttachment]
-  );
 
   const handleDrop = useCallback(
     async (e: React.DragEvent) => {
@@ -327,10 +170,10 @@ export function MessageInput({ disabled }: Props) {
       setIsDragging(false);
       const files = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith('image/'));
       for (const file of files) {
-        await addImageAttachment(file);
+        await addImageFile(file);
       }
     },
-    [addImageAttachment]
+    [addImageFile]
   );
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -349,10 +192,8 @@ export function MessageInput({ disabled }: Props) {
 
   const handleSend = async () => {
     const text = input.trim();
-    const imageAttachments = attachments.filter((a): a is ImageAttachmentLocal => a.kind === 'image');
-    const textAttachments = attachments.filter((a): a is TextAttachment => a.kind === 'text');
 
-    if ((!text && attachments.length === 0 && contexts.length === 0) || !activeSessionId || isStreaming) return;
+    if ((!text && textAttachments.length === 0 && images.length === 0 && contexts.length === 0) || !activeSessionId || isStreaming) return;
 
     // Picked notes/files travel as a plain user-message context block
     // (unlike the long-term memory, which lives in the system prompt).
@@ -370,12 +211,13 @@ export function MessageInput({ disabled }: Props) {
     const content = [contextBlock, attachBlock, text].filter(Boolean).join('\n\n');
 
     const chatAttachments: ChatAttachment[] | undefined =
-      imageAttachments.length > 0
-        ? imageAttachments.map((a) => ({ mime: a.mime, base64: a.base64, name: a.name }))
+      images.length > 0
+        ? images.map((a) => ({ mime: a.mime, base64: a.base64, name: a.name }))
         : undefined;
 
     setInput('');
-    setAttachments([]);
+    setTextAttachments([]);
+    clearImages();
     setContexts([]);
     setLoading(true);
     resetHeight();
@@ -445,12 +287,9 @@ export function MessageInput({ disabled }: Props) {
     }
   }, [activeSessionId]);
 
-  const removeAttachment = (target: Attachment) => {
-    const key = attachmentKey(target);
-    setAttachments((prev) => prev.filter((a) => attachmentKey(a) !== key));
-  };
-
-  const canSend = !disabled && (!!input.trim() || attachments.length > 0 || contexts.length > 0);
+  const canSend =
+    !disabled &&
+    (!!input.trim() || textAttachments.length > 0 || images.length > 0 || contexts.length > 0);
 
   return (
     <div className="px-5 pb-5 pt-2 bg-background">
@@ -463,7 +302,7 @@ export function MessageInput({ disabled }: Props) {
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
         >
-          {(attachments.length > 0 || contexts.length > 0) && (
+          {(textAttachments.length > 0 || images.length > 0 || contexts.length > 0) && (
             <div className="flex flex-wrap gap-1.5 px-2 pt-2">
               {contexts.map((c) => (
                 <span
@@ -487,47 +326,46 @@ export function MessageInput({ disabled }: Props) {
                   </button>
                 </span>
               ))}
-              {attachments.map((a) =>
-                a.kind === 'text' ? (
-                  <span
-                    key={a.id}
-                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-primary/10 text-primary text-[11px] max-w-[220px]"
-                    title={a.path}
+              {textAttachments.map((a) => (
+                <span
+                  key={a.id}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-primary/10 text-primary text-[11px] max-w-[220px]"
+                  title={a.path}
+                >
+                  <FileText size={11} className="shrink-0" />
+                  <span className="truncate">{a.name}</span>
+                  <button
+                    type="button"
+                    onClick={() => setTextAttachments((prev) => prev.filter((x) => x.id !== a.id))}
+                    className="hover:text-red-400 shrink-0"
+                    aria-label="移除附件"
                   >
-                    <FileText size={11} className="shrink-0" />
-                    <span className="truncate">{a.name}</span>
-                    <button
-                      type="button"
-                      onClick={() => removeAttachment(a)}
-                      className="hover:text-red-400 shrink-0"
-                      aria-label="移除附件"
-                    >
-                      <X size={11} />
-                    </button>
-                  </span>
-                ) : (
-                  <span
-                    key={a.id}
-                    className="inline-flex items-center gap-1 px-1.5 py-1 rounded-md bg-primary/10 text-primary text-[11px] max-w-[220px]"
-                    title={a.name}
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
+              {images.map((a) => (
+                <span
+                  key={a.id}
+                  className="inline-flex items-center gap-1 px-1.5 py-1 rounded-md bg-primary/10 text-primary text-[11px] max-w-[220px]"
+                  title={a.name}
+                >
+                  <img
+                    src={a.previewUrl}
+                    alt={a.name}
+                    className="w-6 h-6 object-cover rounded"
+                  />
+                  <span className="truncate">{a.name}</span>
+                  <button
+                    type="button"
+                    onClick={() => removeImage(a.id)}
+                    className="hover:text-red-400 shrink-0"
+                    aria-label="移除图片"
                   >
-                    <img
-                      src={a.previewUrl}
-                      alt={a.name}
-                      className="w-6 h-6 object-cover rounded"
-                    />
-                    <span className="truncate">{a.name}</span>
-                    <button
-                      type="button"
-                      onClick={() => removeAttachment(a)}
-                      className="hover:text-red-400 shrink-0"
-                      aria-label="移除图片"
-                    >
-                      <X size={11} />
-                    </button>
-                  </span>
-                )
-              )}
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
             </div>
           )}
           <textarea
@@ -565,7 +403,7 @@ export function MessageInput({ disabled }: Props) {
               <button
                 type="button"
                 disabled={disabled}
-                onClick={handleScreenshot}
+                onClick={startScreenshot}
                 className={`w-7 h-7 rounded-md border-0 bg-transparent flex items-center justify-center hover:bg-surface-hover transition-colors disabled:opacity-50 ${
                   shotArmed
                     ? 'text-primary hover:text-primary'

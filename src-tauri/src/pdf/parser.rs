@@ -50,12 +50,66 @@ fn get_info_entry(doc: &lopdf::Document, key: &[u8]) -> Option<String> {
 
     let value = info_dict.get(key).ok()?;
     match value {
-        lopdf::Object::String(s, _) => {
-            String::from_utf8(s.clone()).ok()
-                .or_else(|| Some(String::from_utf8_lossy(s).into_owned()))
-        }
+        lopdf::Object::String(s, _) => decode_pdf_text_string(s),
         _ => None,
     }
+}
+
+/// Decode a PDF text string (Info dictionary values). The spec allows only
+/// PDFDocEncoding or UTF-16BE (0xFEFF BOM), but real-world files also carry
+/// plain UTF-8, BOM-less UTF-16, and — from Chinese producers — GBK bytes.
+/// Decoding these as UTF-8-lossy produced the "tofu" replacement boxes.
+fn decode_pdf_text_string(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    // UTF-16 with BOM (spec mandates BE; tolerate LE).
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return decode_utf16(&bytes[2..], false);
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return decode_utf16(&bytes[2..], true);
+    }
+    // Plain UTF-8 (modern producers, and pure ASCII which is a subset).
+    // Embedded NULs mean this was never UTF-8 — likely BOM-less UTF-16.
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        if !s.contains('\0') {
+            return Some(s.to_string());
+        }
+    }
+    // BOM-less UTF-16BE heuristic: even length and many NUL high bytes
+    // (Latin-script text). CJK without a BOM is left to the GBK path below.
+    if bytes.len() % 2 == 0 && !bytes.is_empty() {
+        let nul_high = bytes.iter().step_by(2).filter(|&&b| b == 0).count();
+        if nul_high * 3 >= bytes.len() / 2 && nul_high > 0 {
+            if let Some(s) = decode_utf16(bytes, false) {
+                return Some(s);
+            }
+        }
+    }
+    // Non-spec GBK (common in Chinese-produced PDFs): accept only when it
+    // decodes cleanly and actually yields CJK text.
+    let (gbk, _, had_errors) = encoding_rs::GBK.decode(bytes);
+    if !had_errors && gbk.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) {
+        return Some(gbk.into_owned());
+    }
+    // PDFDocEncoding, approximated as Latin-1 — the differences live in the
+    // 0x80–0x9F control range and rarely matter for titles/authors.
+    Some(bytes.iter().map(|&b| b as char).collect())
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> Option<String> {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| {
+            if little_endian {
+                u16::from_le_bytes([c[0], c[1]])
+            } else {
+                u16::from_be_bytes([c[0], c[1]])
+            }
+        })
+        .collect();
+    String::from_utf16(&units).ok()
 }
 
 /// Best-effort DOI extraction: PDF Info dictionary, XMP metadata, then
@@ -192,5 +246,52 @@ mod tests {
     fn test_extract_metadata_invalid_file() {
         let result = extract_metadata(Path::new("/nonexistent/file.pdf"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_utf16be_with_bom() {
+        // "标题" (U+6807 U+9898) in UTF-16BE with BOM — how Chinese titles
+        // are usually stored.
+        let bytes = [0xFE, 0xFF, 0x68, 0x07, 0x98, 0x98];
+        assert_eq!(decode_pdf_text_string(&bytes).as_deref(), Some("标题"));
+    }
+
+    #[test]
+    fn test_decode_utf16le_with_bom() {
+        let bytes = [0xFF, 0xFE, 0x07, 0x68, 0x98, 0x98];
+        assert_eq!(decode_pdf_text_string(&bytes).as_deref(), Some("标题"));
+    }
+
+    #[test]
+    fn test_decode_plain_utf8_and_ascii() {
+        assert_eq!(
+            decode_pdf_text_string("A study of cafés".as_bytes()).as_deref(),
+            Some("A study of cafés")
+        );
+        assert_eq!(
+            decode_pdf_text_string(b"Plain ASCII title").as_deref(),
+            Some("Plain ASCII title")
+        );
+    }
+
+    #[test]
+    fn test_decode_bomless_utf16be_latin() {
+        // "AB" as BOM-less UTF-16BE.
+        let bytes = [0x00, 0x41, 0x00, 0x42];
+        assert_eq!(decode_pdf_text_string(&bytes).as_deref(), Some("AB"));
+    }
+
+    #[test]
+    fn test_decode_gbk_chinese() {
+        // "中文" in GBK (non-spec, emitted by some Chinese producers).
+        let bytes = [0xD6, 0xD0, 0xCE, 0xC4];
+        assert_eq!(decode_pdf_text_string(&bytes).as_deref(), Some("中文"));
+    }
+
+    #[test]
+    fn test_decode_pdfdocencoding_latin1_fallback() {
+        // "café" with a Latin-1 é (0xE9): not valid UTF-8, not valid GBK.
+        let bytes = [0x63, 0x61, 0x66, 0xE9];
+        assert_eq!(decode_pdf_text_string(&bytes).as_deref(), Some("café"));
     }
 }

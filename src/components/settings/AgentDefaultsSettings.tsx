@@ -11,6 +11,7 @@ const APPROVAL_OPTIONS: { value: ApprovalConfig['mode']; label: string }[] = [
   { value: 'auto_expire_time', label: '时间窗口内自动批准' },
   { value: 'auto_by_rules', label: '白名单自动批准' },
   { value: 'manual', label: '手动（始终询问）' },
+  { value: 'manual_all', label: '严格（读写均询问）' },
 ];
 
 export function AgentDefaultsSettings() {

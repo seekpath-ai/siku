@@ -615,7 +615,7 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
     const a = store.pendingApproval;
     if (!a || !store.session) return;
     try {
-      await agentApproveTool(store.session.id, a.toolCallId, approved);
+      await agentApproveTool(store.session.id, a.toolCallId, approved ? 'approve' : 'decline');
       // Only dismiss the approval on success — on failure keep it open so the
       // user can retry, and surface the error instead of hanging silently.
       store.setPendingApproval(null);

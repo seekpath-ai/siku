@@ -33,6 +33,11 @@ pub struct AgentEvent {
 pub enum ApprovalResponse {
     Approved,
     Declined,
+    /// Declined, with user feedback handed to the agent so it can adjust
+    /// course instead of retrying blindly; the turn continues.
+    DeclinedWithGuidance(String),
+    /// Declined and the whole turn ends (agent was on the wrong track).
+    DeclinedStop,
     ModifiedArgs(serde_json::Value),
 }
 
@@ -522,13 +527,19 @@ impl AgentEngine {
                     continue;
                 }
 
-                // Approval logic: read-only tools are always auto-approved;
-                // write/execute tools follow the configured policy (Auto mode
-                // bypasses approval entirely).
+                // Approval logic: Auto bypasses approval entirely; ManualAll
+                // gates every tool (read-only included, to throttle runaway
+                // exploration); the other modes gate write/execute tools only.
+                // (`ask_user` bypasses approval — it IS the user interaction.)
                 let readonly_tool = self.tool_registry.is_readonly(&tc.function.name);
-                let requires_approval = !readonly_tool
-                    && !matches!(self.config.approval.mode, crate::ai::agent::config::ApprovalMode::Auto);
+                let requires_approval = match self.config.approval.mode {
+                    crate::ai::agent::config::ApprovalMode::Auto => false,
+                    crate::ai::agent::config::ApprovalMode::ManualAll => true,
+                    _ => !readonly_tool,
+                };
                 info!(tool_name=%tc.function.name, readonly_tool, requires_approval, approval_mode=?self.config.approval.mode, "checking tool approval");
+                let mut decline_guidance: Option<String> = None;
+                let mut decline_stop = false;
                 let approved = if requires_approval {
                     let elapsed = last_approval_at.map(|t| t.elapsed().as_secs());
                     let auto_approved = self.config.approval.is_auto_approved(&tc.function.name, elapsed);
@@ -555,6 +566,14 @@ impl AgentEngine {
                                 last_approval_at = Some(std::time::Instant::now());
                                 true
                             }
+                            Some(Ok(Some(ApprovalResponse::DeclinedWithGuidance(g)))) => {
+                                decline_guidance = Some(g);
+                                false
+                            }
+                            Some(Ok(Some(ApprovalResponse::DeclinedStop))) => {
+                                decline_stop = true;
+                                false
+                            }
                             Some(Ok(Some(ApprovalResponse::Declined))) | Some(Ok(None)) | None => false,
                             Some(Err(_)) => {
                                 self.emit(&event_tx, "tool_result", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), None, Some("Error: approval timeout".into()), Some("timeout".into()), None);
@@ -567,7 +586,12 @@ impl AgentEngine {
                 };
 
                 if !approved {
-                    let tool_result = "User declined the operation".to_string();
+                    let tool_result = match &decline_guidance {
+                        Some(g) if !g.trim().is_empty() => {
+                            format!("User declined the operation. User feedback: {g}")
+                        }
+                        _ => "User declined the operation".to_string(),
+                    };
                     self.emit(&event_tx, "tool_result", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), None, Some(tool_result.clone()), Some("error".into()), Some(0));
                     step_tool_records.push(ToolCallRecord {
                         id: tool_id.clone(),
@@ -581,6 +605,11 @@ impl AgentEngine {
                         role: "tool".into(), content: tool_result.clone(),
                         attachments: None, tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some(tc.function.name.clone()),
                     });
+                    if decline_stop {
+                        info!(tool_name=%tc.function.name, "user declined with stop; ending turn");
+                        cancelled = true;
+                        break;
+                    }
                     continue;
                 }
 
@@ -657,6 +686,12 @@ impl AgentEngine {
 
             // Notify frontend that a full step is complete.
             self.emit(&event_tx, "step_complete", Some(step_index), None, None, None, None, None, None, None);
+
+            // Decline-and-stop (or a cancel that arrived mid-step) ends the
+            // turn here; token cancels are also caught at the loop head.
+            if cancelled {
+                break;
+            }
 
             info!(round, step_index, "tool round completed");
         }

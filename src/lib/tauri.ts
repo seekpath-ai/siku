@@ -230,17 +230,24 @@ export async function agentSendMessage(
   return invoke<void>('agent_send_message', { sessionId, content, attachments });
 }
 
+/** Tool-approval decision. "approve" accepts optional modifiedArgs (the tool
+ * runs with replaced arguments); "decline" continues the turn;
+ * "decline_guide" continues with feedback handed to the agent;
+ * "decline_stop" ends the whole turn. */
+export type ApprovalDecision = 'approve' | 'decline' | 'decline_guide' | 'decline_stop';
+
 export async function agentApproveTool(
   sessionId: string,
   toolCallId: string,
-  approved: boolean,
-  modifiedArgs?: Record<string, unknown>,
+  decision: ApprovalDecision,
+  opts?: { guidance?: string; modifiedArgs?: Record<string, unknown> },
 ): Promise<void> {
   return invoke<void>('agent_approve_tool', {
     sessionId,
     toolCallId,
-    approved,
-    modifiedArgs,
+    decision,
+    guidance: opts?.guidance ?? null,
+    modifiedArgs: opts?.modifiedArgs ?? null,
   });
 }
 

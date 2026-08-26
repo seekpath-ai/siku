@@ -1066,14 +1066,19 @@ pub async fn agent_delete_session(
     Ok(())
 }
 
-/// Approve or decline a pending tool execution.
+/// Respond to a pending tool approval.
+/// decision: "approve" (modified_args, when present, replaces the tool
+/// arguments), "decline" (turn continues), "decline_guide" (turn continues,
+/// guidance text is handed to the agent as feedback), "decline_stop"
+/// (ends the whole turn).
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn agent_approve_tool(
     state: State<'_, AppState>,
     session_id: String,
     _tool_call_id: String,
-    approved: bool,
+    decision: String,
+    guidance: Option<String>,
     modified_args: Option<serde_json::Value>,
 ) -> Result<(), String> {
     let senders = state.approval_senders.lock().await;
@@ -1081,13 +1086,14 @@ pub async fn agent_approve_tool(
         .get(&session_id)
         .ok_or_else(|| "no pending approval for this session".to_string())?;
 
-    let response = if approved {
-        match modified_args {
+    let response = match decision.as_str() {
+        "approve" => match modified_args {
             Some(args) => ApprovalResponse::ModifiedArgs(args),
             None => ApprovalResponse::Approved,
-        }
-    } else {
-        ApprovalResponse::Declined
+        },
+        "decline_guide" => ApprovalResponse::DeclinedWithGuidance(guidance.unwrap_or_default()),
+        "decline_stop" => ApprovalResponse::DeclinedStop,
+        _ => ApprovalResponse::Declined,
     };
 
     tx.send(response)

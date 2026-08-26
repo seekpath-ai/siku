@@ -248,7 +248,7 @@ export interface LlmProvider {
   updated_at: string;
 }
 
-export type ApprovalMode = 'auto' | 'auto_expire_time' | 'auto_by_rules' | 'manual';
+export type ApprovalMode = 'auto' | 'auto_expire_time' | 'auto_by_rules' | 'manual' | 'manual_all';
 
 export interface ApprovalConfig {
   mode: ApprovalMode;

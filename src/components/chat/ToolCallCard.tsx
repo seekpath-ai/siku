@@ -38,7 +38,7 @@ export function ToolCallCard({ toolCall }: Props) {
           <div className="flex items-center gap-2 mb-1">
             <span className="text-[13px] font-semibold text-codex-primary">{agentName}</span>
           </div>
-          <ApprovalCard toolCallId={toolCall.id} command={command} />
+          <ApprovalCard toolCallId={toolCall.id} toolName={toolCall.name} command={command} args={toolCall.arguments} />
         </div>
       </div>
     );

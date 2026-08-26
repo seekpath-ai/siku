@@ -92,6 +92,9 @@ pub enum ApprovalMode {
     AutoExpireTime,
     AutoByRules,
     Manual,
+    /// Like Manual but read-only tools also require approval — a strict
+    /// mode to throttle runaway LLM exploration (every call is confirmed).
+    ManualAll,
 }
 
 impl Default for ApprovalMode {
@@ -114,7 +117,7 @@ impl ApprovalConfig {
     pub fn is_auto_approved(&self, tool_name: &str, last_approval_elapsed_sec: Option<u64>) -> bool {
         match self.mode {
             ApprovalMode::Auto => true,
-            ApprovalMode::Manual => false,
+            ApprovalMode::Manual | ApprovalMode::ManualAll => false,
             ApprovalMode::AutoByRules => {
                 let list = self.whitelist.as_deref().unwrap_or_default();
                 list.iter().any(|w| tool_name == w || tool_name.starts_with(w.trim_end_matches('*')))

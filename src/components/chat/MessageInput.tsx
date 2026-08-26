@@ -1,9 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Send, Paperclip, ImagePlus, BookOpen, Brain, Square, X, FileText, ShieldCheck, Check } from 'lucide-react';
+import { Send, Paperclip, ImagePlus, BookOpen, Brain, Square, X, FileText, ShieldCheck, Check, Scissors } from 'lucide-react';
+import { readImage } from '@tauri-apps/plugin-clipboard-manager';
 import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
-import { agentSendMessage, agentCancel, readTextFile, readImageFile, agentMemoryGet, agentGetSession, agentSetApprovalConfig } from '@/lib/tauri';
+import { agentSendMessage, agentCancel, readTextFile, readImageFile, agentMemoryGet, agentGetSession, agentSetApprovalConfig, screenshotStart } from '@/lib/tauri';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
+import { useDialog } from '@/hooks/useDialog';
 import { AgentMemoryModal } from './AgentMemoryModal';
 import { ContextPickerModal } from './ContextPickerModal';
 import { contextKey, type ContextItem } from './contextItem';
@@ -67,8 +69,42 @@ function fileToBase64(file: File): Promise<{ base64: string; mime: string; previ
   });
 }
 
+interface ClipboardShot {
+  /** Cheap content fingerprint, to tell a fresh screenshot from stale clipboard content. */
+  sig: string;
+  dataUrl: string;
+  base64: string;
+}
+
+/** Read the clipboard image (if any) and convert it to a PNG data URL. */
+async function readClipboardShot(): Promise<ClipboardShot | null> {
+  try {
+    const img = await readImage();
+    const { width, height } = await img.size();
+    const rgba = await img.rgba();
+    if (!width || !height || rgba.length === 0) return null;
+    let sum = 0;
+    for (let i = 0; i < rgba.length; i += 997) sum = (sum + rgba[i]) & 0xffffff;
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0);
+    const dataUrl = canvas.toDataURL('image/png');
+    return { sig: `${width}x${height}:${rgba.length}:${sum}`, dataUrl, base64: dataUrl.split(',')[1] ?? '' };
+  } catch {
+    return null; // clipboard holds no image
+  }
+}
+
+/** Window during which a fresh clipboard image is treated as the screenshot
+ * the user was asked to take (avoids attaching unrelated clipboard images). */
+const SCREENSHOT_TIMEOUT_MS = 120_000;
+
 export function MessageInput({ disabled }: Props) {
   const agentName = useActiveAgentName();
+  const { alert } = useDialog();
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [isDragging, setIsDragging] = useState(false);
@@ -120,6 +156,74 @@ export function MessageInput({ disabled }: Props) {
       console.error('set approval config:', err)
     );
   };
+
+  // Screenshot flow: the scissors button launches the OS snipping tool; a
+  // fresh clipboard image within SCREENSHOT_TIMEOUT_MS is attached
+  // automatically. Checked on window focus AND by polling, because some
+  // tools (e.g. spectacle -rb) never steal window focus.
+  const shotPending = useRef<{ since: number; prevSig: string | null } | null>(null);
+  const [shotArmed, setShotArmed] = useState(false);
+
+  const checkClipboardShot = useCallback(async () => {
+    const pending = shotPending.current;
+    if (!pending) return;
+    if (Date.now() - pending.since > SCREENSHOT_TIMEOUT_MS) {
+      shotPending.current = null;
+      setShotArmed(false);
+      return;
+    }
+    const shot = await readClipboardShot();
+    if (!shot || shot.sig === pending.prevSig) return;
+    shotPending.current = null;
+    setShotArmed(false);
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+    setAttachments((prev) => [
+      ...prev,
+      {
+        kind: 'image',
+        id: `shot_${Date.now()}`,
+        name: `截图-${stamp}.png`,
+        mime: 'image/png',
+        base64: shot.base64,
+        previewUrl: shot.dataUrl,
+      },
+    ]);
+    textareaRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    if (!shotArmed) return;
+    window.addEventListener('focus', checkClipboardShot);
+    const timer = setInterval(checkClipboardShot, 2000);
+    return () => {
+      window.removeEventListener('focus', checkClipboardShot);
+      clearInterval(timer);
+    };
+  }, [shotArmed, checkClipboardShot]);
+
+  const handleScreenshot = useCallback(async () => {
+    // Remember the current clipboard content so only a NEW image attaches.
+    const prev = await readClipboardShot();
+    try {
+      await screenshotStart();
+      shotPending.current = { since: Date.now(), prevSig: prev?.sig ?? null };
+      setShotArmed(true);
+    } catch (err) {
+      alert(String(err), '截图');
+    }
+  }, [alert]);
+
+  // In-app shortcut: Ctrl+Shift+S triggers the screenshot flow.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        if (!disabled) handleScreenshot();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [disabled, handleScreenshot]);
 
   const handleAttachText = async () => {
     try {
@@ -461,6 +565,19 @@ export function MessageInput({ disabled }: Props) {
               <button
                 type="button"
                 disabled={disabled}
+                onClick={handleScreenshot}
+                className={`w-7 h-7 rounded-md border-0 bg-transparent flex items-center justify-center hover:bg-surface-hover transition-colors disabled:opacity-50 ${
+                  shotArmed
+                    ? 'text-primary hover:text-primary'
+                    : 'text-text-secondary/70 hover:text-text-primary'
+                }`}
+                title={shotArmed ? '等待截图…（截完自动附加）' : '截图（Ctrl+Shift+S，调用系统截图工具，截完自动附加）'}
+              >
+                <Scissors size={15} />
+              </button>
+              <button
+                type="button"
+                disabled={disabled}
                 onClick={() => setContextOpen(true)}
                 className="w-7 h-7 rounded-md border-0 bg-transparent text-text-secondary/70 flex items-center justify-center hover:bg-surface-hover hover:text-text-primary transition-colors disabled:opacity-50"
                 title="选择上下文"
@@ -541,7 +658,7 @@ export function MessageInput({ disabled }: Props) {
           </div>
         </div>
         <div className="text-center text-[12px] text-text-secondary/60 mt-2">
-          Enter 发送 · Shift + Enter 换行 · 拖拽/粘贴图片也可发送
+          Enter 发送 · Shift + Enter 换行 · Ctrl+Shift+S 截图 · 拖拽/粘贴图片也可发送
         </div>
       </div>
       {memoryOpen && activeSessionId && (

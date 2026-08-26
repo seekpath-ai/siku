@@ -264,6 +264,12 @@ export async function agentSetApprovalConfig(
   return invoke<void>('agent_set_approval_config', { sessionId, approvalConfig });
 }
 
+/** Launch the OS-native region screenshot tool; the captured image lands in
+ * the clipboard and is attached automatically on window refocus. */
+export async function screenshotStart(): Promise<string> {
+  return invoke<string>('screenshot_start');
+}
+
 /** Rename a session (title only). */
 export async function agentRenameSession(sessionId: string, title: string): Promise<void> {
   return invoke<void>('agent_rename_session', { sessionId, title });

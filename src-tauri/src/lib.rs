@@ -840,6 +840,7 @@ pub fn run() {
             // System
             commands::system::system_info,
             commands::system::log_startup_metrics,
+            commands::system::screenshot_start,
             // Annotations
             commands::annotation::annotation_list,
             commands::annotation::annotation_create,

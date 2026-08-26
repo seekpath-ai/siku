@@ -39,6 +39,45 @@ pub async fn log_startup_metrics(
     Ok(())
 }
 
+/// Launch the OS-native region screenshot tool; the captured image lands in
+/// the clipboard and the frontend picks it up on window refocus. Returns the
+/// launched tool's name. Errors when no known tool is available (Linux
+/// without flameshot/spectacle/gnome-screenshot).
+#[tauri::command]
+#[instrument]
+pub fn screenshot_start() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg("ms-screenclip:")
+            .spawn()
+            .map_err(|e| format!("launch ms-screenclip: {e}"))?;
+        return Ok("ms-screenclip".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("screencapture")
+            .args(["-i", "-c"])
+            .spawn()
+            .map_err(|e| format!("launch screencapture: {e}"))?;
+        return Ok("screencapture".into());
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let candidates: [(&str, &[&str]); 3] = [
+            ("flameshot", &["gui", "-c"]),
+            ("spectacle", &["-rbc"]),
+            ("gnome-screenshot", &["-i", "-c"]),
+        ];
+        for (bin, args) in candidates {
+            if std::process::Command::new(bin).args(args).spawn().is_ok() {
+                return Ok(bin.to_string());
+            }
+        }
+        Err("未找到可用的截图工具（尝试过 flameshot / spectacle / gnome-screenshot），请使用系统截图后 Ctrl+V 粘贴".to_string())
+    }
+}
+
 #[tauri::command]
 #[instrument]
 pub async fn system_info() -> Result<SystemInfo, String> {

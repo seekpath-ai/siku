@@ -220,6 +220,19 @@ function NotesPage() {
     };
   }, [loadFiles]);
 
+  // Reload the open note when the AI (note_write via the pet agent) edits it.
+  // The list reload also refreshes activeNote through the [activeId, notes]
+  // effect; NoteEditor decides whether to adopt the new content (it skips
+  // while the user has unsaved edits).
+  useEffect(() => {
+    const unlisten = listen<{ id: string }>('note:changed', () => {
+      loadNotes();
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   useEffect(() => {
     if (activeId) {
       const n = notes.find((note) => note.id === activeId);

@@ -134,6 +134,18 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [note.id]);
 
+  // Adopt external content changes (AI 笔记整理的 note_write、同步落盘) while
+  // the same note stays open — but only when there are no unsaved local edits.
+  // A dirty editor keeps its text: its next autosave wins, and the external
+  // version is preserved in the version history.
+  useEffect(() => {
+    const clean = saveVersionRef.current === savedVersionRef.current;
+    if (!clean) return;
+    if (note.content !== content) setContent(note.content);
+    if (note.title !== titleInput && !editingTitle) setTitleInput(note.title);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [note.content, note.title]);
+
   // Resolve the vault attachments directory for image rendering and paste/drop.
   useEffect(() => {
     let active = true;

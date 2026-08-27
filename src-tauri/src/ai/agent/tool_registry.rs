@@ -149,6 +149,7 @@ impl ToolRegistry {
     /// `working_dir` is the sandbox root for file tools (None = full access);
     /// `tasks` is the app-wide background task store (for bash);
     /// `session_id` 归属会话 id，写入 bash 后台任务的 TaskInfo，方便任务中心按会话过滤；
+    /// `app_handle` 用于工具向前端广播变更事件（目前仅 note_write 的 `note:changed`）；
     /// `vision_llm` is the agent's multimodal model config (for read_media_file);
     /// `web_proxy` is the per-agent proxy for web tools (None = global).
     pub fn default_registry(
@@ -157,6 +158,7 @@ impl ToolRegistry {
         working_dir: Option<String>,
         tasks: crate::core::tasks::TaskStore,
         session_id: Option<String>,
+        app_handle: Option<tauri::AppHandle>,
         vision_llm: Option<crate::ai::llm::LlmConfig>,
         web_proxy: Option<String>,
     ) -> Self {
@@ -170,7 +172,7 @@ impl ToolRegistry {
 
         // Note tools
         registry.register(crate::ai::agent::tools::note_read::NoteReadTool::new(db.clone()));
-        registry.register(crate::ai::agent::tools::note_write::NoteWriteTool::new(db.clone()));
+        registry.register(crate::ai::agent::tools::note_write::NoteWriteTool::new(db.clone(), app_handle));
 
         // Web tools
         registry.register(crate::ai::agent::tools::web_fetch::WebFetchTool::new(db.clone(), web_proxy.clone()));

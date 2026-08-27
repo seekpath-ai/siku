@@ -589,6 +589,7 @@ pub(crate) async fn run_agent_turn(
         session.working_dir.clone(),
         state.tasks.clone(),
         Some(session.id.clone()),
+        Some(app_handle.clone()),
         vision_llm,
         session.web_proxy.clone(),
     );

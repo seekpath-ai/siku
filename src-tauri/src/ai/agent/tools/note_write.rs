@@ -1,14 +1,23 @@
 use async_trait::async_trait;
 use sqlx::SqlitePool;
+use tauri::Emitter;
 use crate::ai::agent::tool_registry::{Tool, ToolParameter};
 use crate::core::time;
 
 pub struct NoteWriteTool {
     db: SqlitePool,
+    /// 写入成功后向前端广播 `note:changed`,让打开的笔记编辑器即时刷新。
+    app: Option<tauri::AppHandle>,
 }
 
 impl NoteWriteTool {
-    pub fn new(db: SqlitePool) -> Self { Self { db } }
+    pub fn new(db: SqlitePool, app: Option<tauri::AppHandle>) -> Self { Self { db, app } }
+
+    fn emit_changed(&self, note_id: &str) {
+        if let Some(app) = &self.app {
+            let _ = app.emit("note:changed", serde_json::json!({ "id": note_id }));
+        }
+    }
 }
 
 #[async_trait]
@@ -63,6 +72,7 @@ impl Tool for NoteWriteTool {
                  agent_edited_at = ?, agent_edit_count = agent_edit_count + 1 WHERE id = ?"
             ).bind(title).bind(content).bind(content).bind(&now).bind(&now).bind(note_id)
                 .execute(&self.db).await.map_err(|e| format!("db error: {e}"))?;
+            self.emit_changed(note_id);
             Ok(format!("Note '{}' updated (id: {})", title, note_id))
         } else {
             // Create new, marked as AI-created/edited. Go through the
@@ -86,6 +96,7 @@ impl Tool for NoteWriteTool {
                 "UPDATE notes SET agent_edited_at = ?, agent_edit_count = 1, updated_at = ? WHERE id = ?"
             ).bind(&now).bind(&now).bind(&note.id)
                 .execute(&self.db).await.map_err(|e| format!("db error: {e}"))?;
+            self.emit_changed(&note.id);
             Ok(format!("Note '{}' created (id: {})", title, note.id))
         }
     }

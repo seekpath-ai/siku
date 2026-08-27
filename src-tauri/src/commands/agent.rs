@@ -132,11 +132,27 @@ async fn build_agent_config(
             .unwrap_or_default();
     }
 
-    let approval: ApprovalConfig = session
+    let approval: ApprovalConfig = match session
         .approval_config
         .as_ref()
         .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| app_settings.default_approval.clone());
+    {
+        Some(a) => a,
+        None => {
+            // Pet/domain sessions fall back to the pet-level `pet.approval`
+            // setting (pet panel shield) before the global default, so the
+            // shield never clobbers the new-agent template default.
+            let pet = match session.domain.as_deref() {
+                Some(_) => settings_service::get_setting(&state.db, "pet.approval")
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str(&s).ok()),
+                None => None,
+            };
+            pet.unwrap_or_else(|| app_settings.default_approval.clone())
+        }
+    };
 
     let mut config = AgentConfig {
         display_name: session.title.clone(),

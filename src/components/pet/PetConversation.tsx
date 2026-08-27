@@ -10,7 +10,7 @@ import { usePetStore } from '@/stores/petStore';
 import type { PetContext } from '@/stores/petContextStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
 import { useDialogStore } from '@/stores/dialogStore';
-import { getChatMessages, getAgentSteps, notesCreate, noteCreateUnderPaper, readImageFile, settingsAppGet, settingsAppSave } from '@/lib/tauri';
+import { getChatMessages, getAgentSteps, notesCreate, noteCreateUnderPaper, readImageFile, settingsAppGet, settingsGet, settingsSet } from '@/lib/tauri';
 import { parseEvidence, buildNoteMarkdown } from '@/lib/evidence';
 import type { EvidenceEntry } from '@/lib/evidence';
 import { MarkdownCode, MarkdownPre } from '@/components/chat/CodeBlock';
@@ -333,27 +333,34 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
   const navigate = useNavigate();
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
-  // Approval policy quick switch: bound to the GLOBAL default approval, so
-  // one switch governs every agent (pet domain sessions and main-chat
-  // sessions alike fall back to it unless they carry an explicit override).
+  // Approval policy quick switch: bound to the pet-level `pet.approval`
+  // setting (governs all domain/pet sessions), NOT the global
+  // default_approval — that one doubles as the new-agent template default
+  // and stays untouched. Unset → display (and fall back to) the global
+  // default.
   const [approval, setApproval] = useState<ApprovalConfig>({ mode: 'auto' });
   useEffect(() => {
-    settingsAppGet()
-      .then((s) => setApproval(s.default_approval))
-      .catch(() => {});
+    (async () => {
+      try {
+        const raw = await settingsGet('pet.approval');
+        if (raw) {
+          setApproval(JSON.parse(raw) as ApprovalConfig);
+          return;
+        }
+      } catch { /* fall through to the global default */ }
+      try {
+        const s = await settingsAppGet();
+        setApproval(s.default_approval);
+      } catch { /* keep the local default */ }
+    })();
   }, []);
   const pickApprovalMode = (mode: ApprovalConfig['mode']) => {
     if (mode === approval.mode) return;
     const next = { ...approval, mode };
     setApproval(next);
-    (async () => {
-      try {
-        const current = await settingsAppGet();
-        await settingsAppSave({ ...current, default_approval: next });
-      } catch (err) {
-        console.error('save default approval:', err);
-      }
-    })();
+    settingsSet('pet.approval', JSON.stringify(next)).catch((err) =>
+      console.error('save pet approval:', err)
+    );
   };
 
   // Image attachments (upload + paste + OS screenshot, max 3). No global
@@ -937,7 +944,7 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
               <ApprovalPolicySwitch
                 mode={approval.mode}
                 onPick={pickApprovalMode}
-                titleSuffix="（全局默认，对所有智能体生效）"
+                titleSuffix="（对所有宠物智能体生效）"
               />
             </div>
             <button

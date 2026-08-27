@@ -7,8 +7,27 @@ const MAX_FILES: usize = 2000;
 const MAX_DEPTH: usize = 16;
 
 /// Minimal glob matcher supporting `*` (any chars except `/`), `**` (any
-/// chars including `/`), and `?` (single char).
+/// chars including `/`), and `?` (single char). A leading or inner `**/`
+/// also matches zero directories (standard glob semantics), so `**/*.rs`
+/// matches both `a.rs` and `x/b.rs`.
 fn glob_match(pattern: &str, text: &str) -> bool {
+    if glob_match_dp(pattern, text) {
+        return true;
+    }
+    // `**/` matches zero or more path components: also try the pattern with
+    // the first `**/` removed (recursively, for multiple occurrences).
+    if let Some(pos) = pattern.find("**/") {
+        let mut reduced = String::with_capacity(pattern.len() - 3);
+        reduced.push_str(&pattern[..pos]);
+        reduced.push_str(&pattern[pos + 3..]);
+        return glob_match(&reduced, text);
+    }
+    false
+}
+
+/// DP matcher for `*` / `**` / `?` (no `**/` zero-directory handling — that
+/// is layered on top by `glob_match`).
+fn glob_match_dp(pattern: &str, text: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let txt: Vec<char> = text.chars().collect();
     let (n, m) = (pat.len(), txt.len());
@@ -131,4 +150,28 @@ fn walk(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glob_match;
+
+    #[test]
+    fn double_star_slash_matches_zero_directories() {
+        // Standard glob semantics: `**/` also matches no directory at all.
+        assert!(glob_match("**/*.rs", "a.rs"));
+        assert!(glob_match("**/*.rs", "x/b.rs"));
+        assert!(glob_match("**/*.rs", "x/y/b.rs"));
+        assert!(glob_match("src/**/*.ts", "src/a.ts"));
+        assert!(glob_match("src/**/*.ts", "src/x/a.ts"));
+        assert!(!glob_match("src/**/*.ts", "other/a.ts"));
+    }
+
+    #[test]
+    fn single_star_does_not_cross_slash() {
+        assert!(glob_match("*.rs", "a.rs"));
+        assert!(!glob_match("*.rs", "x/b.rs"));
+        assert!(glob_match("x/*.rs", "x/b.rs"));
+        assert!(!glob_match("x/*.rs", "x/y/b.rs"));
+    }
 }

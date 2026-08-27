@@ -64,3 +64,48 @@ pub fn working_dir_from_args(args: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_path;
+
+    /// Sandboxed resolution must reject every `..` escape shape — whether the
+    /// target exists, only the parent exists, or nothing exists.
+    #[test]
+    fn rejects_dotdot_escape_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("sandbox");
+        std::fs::create_dir_all(base.join("a")).unwrap();
+        let base_s = base.to_str().unwrap();
+
+        // Missing tail with .. that climbs out of the sandbox.
+        assert!(resolve_path(Some(base_s), "a/../../b").is_err());
+        assert!(resolve_path(Some(base_s), "nonexist/../../outside.txt").is_err());
+        assert!(resolve_path(Some(base_s), "../escape.txt").is_err());
+        // Existing file reached via ...
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, b"x").unwrap();
+        assert!(resolve_path(Some(base_s), "a/../../secret.txt").is_err());
+        // Absolute path outside the sandbox.
+        assert!(resolve_path(Some(base_s), outside.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn allows_legitimate_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("sandbox");
+        std::fs::create_dir_all(base.join("a")).unwrap();
+        std::fs::write(base.join("a/f.txt"), b"x").unwrap();
+        let base_s = base.to_str().unwrap();
+
+        // Existing file, plain and via an internal `a/../` detour.
+        assert!(resolve_path(Some(base_s), "a/f.txt").is_ok());
+        assert!(resolve_path(Some(base_s), "a/../a/f.txt").is_ok());
+        // New file to create inside the sandbox.
+        let new_file = resolve_path(Some(base_s), "a/new.txt").unwrap();
+        assert!(new_file.starts_with(base.canonicalize().unwrap()));
+        // Deeply nested new file.
+        assert!(resolve_path(Some(base_s), "x/y/z.txt").is_ok());
+    }
+}
+

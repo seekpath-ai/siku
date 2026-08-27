@@ -26,6 +26,9 @@ pub struct ReadMediaFileTool {
     vision_llm: Option<llm::LlmConfig>,
 }
 
+/// Maximum image size accepted by read_media_file (20 MB).
+const MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
+
 impl ReadMediaFileTool {
     pub fn new(vision_llm: Option<llm::LlmConfig>) -> Self {
         Self { vision_llm }
@@ -73,6 +76,16 @@ impl Tool for ReadMediaFileTool {
 
         if !resolved.is_file() {
             return Ok(format!("Not a file: {path}"));
+        }
+        // Refuse oversized files before reading them into memory + base64.
+        if let Ok(meta) = std::fs::metadata(&resolved) {
+            if meta.len() > MAX_FILE_BYTES {
+                return Err(format!(
+                    "file too large: {} bytes (max {} MB); compress or downscale the image first",
+                    meta.len(),
+                    MAX_FILE_BYTES / 1024 / 1024
+                ));
+            }
         }
         let bytes = std::fs::read(&resolved).map_err(|e| format!("read failed: {e}"))?;
         let mime = guess_mime(&resolved.to_string_lossy());

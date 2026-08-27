@@ -26,7 +26,7 @@ impl Tool for FileGrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search text files within the working directory for a substring, returning matching lines with file and line numbers. Read-only, auto-approved."
+        "Search text files within the working directory for a substring, returning matching lines with file and line numbers. Matching is a case-sensitive substring search (not regex). Read-only, auto-approved."
     }
 
     fn parameters(&self) -> Vec<ToolParameter> {
@@ -65,14 +65,15 @@ impl Tool for FileGrepTool {
         if files.is_empty() {
             return Ok("No files found.".to_string());
         }
+        // collect_files caps at MAX_FILES, so a full vec means more files may
+        // exist on disk that were never scanned.
+        let files_truncated = files.len() >= MAX_FILES;
 
         let mut results: Vec<String> = Vec::new();
-        let mut scanned = 0usize;
         for file in files {
-            if scanned >= MAX_FILES || results.len() >= max_results {
+            if results.len() >= max_results {
                 break;
             }
-            scanned += 1;
             let Ok(meta) = std::fs::metadata(&file) else { continue };
             if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
                 continue;
@@ -90,10 +91,22 @@ impl Tool for FileGrepTool {
         }
 
         if results.is_empty() {
-            Ok(format!("No matches for '{pattern}'."))
-        } else {
-            Ok(results.join("\n"))
+            return Ok(format!("No matches for '{pattern}'."));
         }
+        let mut out = results.join("\n");
+        // State both truncation causes explicitly so the model narrows the
+        // pattern/path instead of assuming the listing is complete.
+        if results.len() >= max_results {
+            out.push_str(&format!(
+                "\n…(已截断:结果已达上限 {max_results} 条,请缩小 pattern 或指定更精确的 path)"
+            ));
+        }
+        if files_truncated {
+            out.push_str(&format!(
+                "\n…(已截断:仅扫描了前 {MAX_FILES} 个文件,请缩小 pattern 或指定更精确的 path)"
+            ));
+        }
+        Ok(out)
     }
 }
 

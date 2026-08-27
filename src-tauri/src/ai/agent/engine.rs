@@ -500,8 +500,32 @@ impl AgentEngine {
                     break;
                 }
                 let tool_id = format!("tool_{}", uuid::Uuid::new_v4());
-                let mut args: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
-                args = Self::normalize_args(args);
+                // 参数 JSON 本身非法时不能拿 Value::Null 硬跑——工具只会报
+                // "path required" 之类的错,模型误以为参数缺失而原样重发。
+                // 标记该调用失败,把解析错误和原始参数前缀回给模型,让它修正
+                // JSON 后重试;引擎循环不中断。
+                let mut args: serde_json::Value = match serde_json::from_str(&tc.function.arguments) {
+                    Ok(v) => Self::normalize_args(v),
+                    Err(e) => {
+                        let prefix: String = tc.function.arguments.chars().take(200).collect();
+                        let tool_result = format!("参数 JSON 解析失败:{e};原始参数前缀:{prefix}");
+                        self.emit(&event_tx, "tool_call", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), Some(serde_json::Value::Null), None, None, None);
+                        self.emit(&event_tx, "tool_result", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), None, Some(tool_result.clone()), Some("error".into()), Some(0));
+                        step_tool_records.push(ToolCallRecord {
+                            id: tool_id.clone(),
+                            name: tc.function.name.clone(),
+                            arguments: serde_json::Value::Null,
+                            result: tool_result.clone(),
+                            status: "error".into(),
+                            duration_ms: 0,
+                        });
+                        messages.push(ChatMessage {
+                            role: "tool".into(), content: tool_result,
+                            attachments: None, tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some(tc.function.name.clone()),
+                        });
+                        continue;
+                    }
+                };
 
                 self.emit(&event_tx, "tool_call", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), Some(args.clone()), None, None, None);
 

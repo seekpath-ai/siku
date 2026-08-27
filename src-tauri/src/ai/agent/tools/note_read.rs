@@ -49,7 +49,20 @@ impl Tool for NoteReadTool {
                 .map_err(|e| format!("db error: {e}"))?
                 .ok_or("note not found")?;
 
-            return Ok(format!("**{}**\n\n{}", note.title, note.content));
+            // Reading by id returns the note body itself, not a search
+            // preview — floor the cap at 8000 chars so the (small) search
+            // preview setting can't cut off legitimate full-content reads.
+            let limit = (crate::core::settings_service::cached_settings()
+                .tool_note_read_max_chars
+                .max(1) as usize)
+                .max(8000);
+            let total = note.content.chars().count();
+            let body: String = note.content.chars().take(limit).collect();
+            let mut out = format!("**{}**\n\n{}", note.title, body);
+            if total > limit {
+                out.push_str(&format!("\n(truncated, {total} chars total)"));
+            }
+            return Ok(out);
         }
 
         // Search (full-text, LIKE fallback)
@@ -88,8 +101,16 @@ impl Tool for NoteReadTool {
         let preview_limit = crate::core::settings_service::cached_settings()
             .tool_note_read_max_chars
             .max(1) as usize;
-        Ok(notes.iter().map(|(id, title, content)| {
+        let from = offset + 1;
+        let to = offset + notes.len() as i64;
+        let mut out = notes.iter().map(|(id, title, content)| {
             format!("- **{}** (id: {})\n  {}", title, id, content.chars().take(preview_limit).collect::<String>())
-        }).collect::<Vec<_>>().join("\n\n"))
+        }).collect::<Vec<_>>().join("\n\n");
+        // 总量需要额外的 COUNT 查询,这里只给低成本的页信息;满页时提示翻页。
+        out.push_str(&format!("\n\n共返回 {} 条(第 {from}–{to} 条)", notes.len()));
+        if notes.len() as i64 == limit {
+            out.push_str(",可能还有更多,请用 offset 翻页");
+        }
+        Ok(out)
     }
 }

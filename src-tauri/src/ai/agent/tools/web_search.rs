@@ -171,8 +171,10 @@ impl Tool for WebSearchTool {
             return Ok(format!("No results found for '{query}'."));
         }
 
-        let shown = results.into_iter().take(max);
+        let parsed = results.len();
+        let shown: Vec<_> = results.into_iter().take(max).collect();
         let lines: Vec<String> = shown
+            .iter()
             .map(|(title, url, snippet)| {
                 let mut line = format!("- **{title}**\n  {url}");
                 if !snippet.is_empty() {
@@ -181,7 +183,12 @@ impl Tool for WebSearchTool {
                 line
             })
             .collect();
-        Ok(lines.join("\n\n"))
+        let mut out = lines.join("\n\n");
+        out.push_str(&format!("\n\n共返回 {} 条", shown.len()));
+        if parsed > shown.len() {
+            out.push_str(&format!("(已按 max_results={max} 截断,共解析到 {parsed} 条)"));
+        }
+        Ok(out)
     }
 }
 

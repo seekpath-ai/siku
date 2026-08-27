@@ -119,7 +119,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command. Windows defaults to PowerShell; Unix-like systems default to sh. Use shell=bash|powershell|cmd|sh to override. Requires approval. run_in_background=true returns a task id immediately; otherwise waits for completion (timeout default 60s, max 5min)."
+        "Execute a shell command. Windows defaults to PowerShell; Unix-like systems default to sh. Use shell=bash|powershell|cmd|sh to override. Requires approval. Commands run in the working directory by default when one is set (otherwise the process cwd). run_in_background=true returns a task id immediately; otherwise waits for completion. The timeout (default 60s, max 5min) applies to background tasks too."
     }
 
     fn parameters(&self) -> Vec<ToolParameter> {
@@ -133,7 +133,7 @@ impl Tool for BashTool {
             ToolParameter {
                 name: "cwd".into(),
                 param_type: "string".into(),
-                description: "Working directory for the command (relative to the working directory)".into(),
+                description: "Working directory for the command (relative to the working directory). Defaults to the working directory itself when one is set; otherwise the process cwd.".into(),
                 required: false,
             },
             ToolParameter {
@@ -176,10 +176,16 @@ impl Tool for BashTool {
         cmd.arg(command);
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        if let Some(cwd) = args["cwd"].as_str() {
-            if !cwd.trim().is_empty() {
+        match args["cwd"].as_str().filter(|c| !c.trim().is_empty()) {
+            Some(cwd) => {
                 cmd.current_dir(resolve_path(wd.as_deref(), cwd)?);
             }
+            // No explicit cwd: default to the sandbox root when a working
+            // directory is set, instead of inheriting the process cwd.
+            None if wd.is_some() => {
+                cmd.current_dir(resolve_path(wd.as_deref(), ".")?);
+            }
+            None => {}
         }
 
         if background {
@@ -273,10 +279,20 @@ impl BashTool {
         let cancel2 = cancel.clone();
         let log_path2 = log_path.clone();
         let task_id = id.clone();
+        // Background tasks honor the same timeout as foreground ones
+        // (default 60s, max 5min): kill the process and mark the log.
+        let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1_000, MAX_TIMEOUT_MS);
         tokio::spawn(async move {
-            // Watch for cancellation or completion.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+            let mut timed_out = false;
+            // Watch for cancellation, timeout, or completion.
             loop {
                 if cancel2.load(Ordering::Relaxed) {
+                    let _ = child.kill().await;
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    timed_out = true;
                     let _ = child.kill().await;
                     break;
                 }
@@ -287,6 +303,13 @@ impl BashTool {
             }
             let status = child.wait().await.ok();
             let stopped = cancel2.load(Ordering::Relaxed);
+            if timed_out {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_path2) {
+                    let _ = writeln!(f, "\n[...task timed out after {timeout_ms}ms]");
+                }
+                tracing::warn!(task_id = %task_id, timeout_ms, "background task timed out");
+            }
             let status_str = if stopped {
                 "stopped"
             } else if status.map(|s| s.success()).unwrap_or(false) {

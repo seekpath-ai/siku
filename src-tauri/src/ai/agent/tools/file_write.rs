@@ -17,7 +17,7 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Create, overwrite, or append a text file within the working directory. mode: overwrite (default) or append. Creates parent directories automatically. Requires approval."
+        "Create, overwrite, or append a text file within the working directory. mode: overwrite (default) or append. Creates parent directories automatically. To modify an existing file, prefer file_edit (targeted replacement) over overwriting the whole file. Requires approval."
     }
 
     fn parameters(&self) -> Vec<ToolParameter> {
@@ -45,8 +45,11 @@ impl Tool for FileWriteTool {
 
     async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
         let path = args["path"].as_str().ok_or("path required")?;
-        let content = args["content"].as_str().unwrap_or("");
-        let mode = args["mode"].as_str().unwrap_or("overwrite");
+        // content is required: silently defaulting to "" would TRUNCATE an
+        // existing file when the model omits the argument.
+        let content = args["content"]
+            .as_str()
+            .ok_or("content required (refusing to write an empty file by default)")?;
         let wd = working_dir_from_args(&args);
 
         let resolved = resolve_path(wd.as_deref(), path)?;
@@ -54,7 +57,9 @@ impl Tool for FileWriteTool {
             std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
         }
 
-        match mode {
+        // Reject unknown modes explicitly — a typo like "Append" must not
+        // fall through to a silent overwrite.
+        match args["mode"].as_str().unwrap_or("overwrite") {
             "append" => {
                 use std::io::Write;
                 let mut f = std::fs::OpenOptions::new()
@@ -65,7 +70,10 @@ impl Tool for FileWriteTool {
                 f.write_all(content.as_bytes())
                     .map_err(|e| format!("write failed: {e}"))?;
             }
-            _ => std::fs::write(&resolved, content).map_err(|e| format!("write failed: {e}"))?,
+            "overwrite" => {
+                std::fs::write(&resolved, content).map_err(|e| format!("write failed: {e}"))?
+            }
+            other => return Err(format!("unknown mode '{other}' (expected overwrite or append)")),
         }
 
         Ok(format!(

@@ -5,15 +5,16 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import { listen, emit } from '@tauri-apps/api/event';
 import { useNavigate } from '@tanstack/react-router';
-import { Send, Loader2, ShieldAlert, Check, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus } from 'lucide-react';
+import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus } from 'lucide-react';
 import { usePetStore } from '@/stores/petStore';
 import type { PetContext } from '@/stores/petContextStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
 import { useDialogStore } from '@/stores/dialogStore';
-import { getChatMessages, getAgentSteps, agentApproveTool, notesCreate, noteCreateUnderPaper, readImageFile } from '@/lib/tauri';
+import { getChatMessages, getAgentSteps, notesCreate, noteCreateUnderPaper, readImageFile } from '@/lib/tauri';
 import { parseEvidence, buildNoteMarkdown } from '@/lib/evidence';
 import type { EvidenceEntry } from '@/lib/evidence';
 import { MarkdownCode, MarkdownPre } from '@/components/chat/CodeBlock';
+import { ApprovalCard } from '@/components/chat/ApprovalCard';
 import { parseAttachments } from '@/lib/attachments';
 import { ReasoningProcessCard } from '@/components/chat/ReasoningProcessCard';
 import { ExternalLink } from '@/components/ui/ExternalLink';
@@ -682,20 +683,6 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
     store.send(cmd);
   };
 
-  const handleApprove = async (approved: boolean) => {
-    const a = store.pendingApproval;
-    if (!a || !store.session) return;
-    try {
-      await agentApproveTool(store.session.id, a.toolCallId, approved ? 'approve' : 'decline');
-      // Only dismiss the approval on success — on failure keep it open so the
-      // user can retry, and surface the error instead of hanging silently.
-      store.setPendingApproval(null);
-    } catch (err) {
-      console.error('pet approve:', err);
-      store.setError(err instanceof Error ? err.message : String(err));
-    }
-  };
-
   const quickCommands = (context ? QUICK_COMMANDS[context.page] ?? [] : [])
     .filter((cmd) => liveSelection || cmd !== SELECTION_COMMAND);
 
@@ -773,32 +760,41 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
         <div ref={bottomRef} />
       </div>
 
-      {/* Approval */}
-      {store.pendingApproval && (
-        <div className="px-3 py-2 border-t border-surface-hover shrink-0">
-          <div className="rounded-lg bg-background/60 border border-primary/30 p-2">
-            <div className="flex items-center gap-1.5 text-[11px] text-primary mb-1">
-              <ShieldAlert size={12} />
-              <span className="font-medium">需要批准：{store.pendingApproval.toolName}</span>
-            </div>
-            <pre className="text-[10px] text-text-secondary/80 whitespace-pre-wrap max-h-20 overflow-y-auto mb-1.5">
-              {store.pendingApproval.args}
-            </pre>
-            <div className="flex gap-1.5">
-              <button
-                onClick={() => handleApprove(true)}
-                className="flex items-center gap-1 px-2.5 py-1 rounded bg-primary/15 text-primary text-[11px] hover:bg-primary/25 transition-colors"
-              >
-                <Check size={11} /> 批准
-              </button>
-              <button
-                onClick={() => handleApprove(false)}
-                className="px-2.5 py-1 rounded text-text-secondary text-[11px] hover:bg-surface-hover transition-colors"
-              >
-                拒绝
-              </button>
-            </div>
-          </div>
+      {/* Approval — same four-decision card as the main chat. */}
+      {store.pendingApproval && store.session && (
+        <div className="px-3 border-t border-surface-hover shrink-0">
+          <ApprovalCard
+            toolCallId={store.pendingApproval.toolCallId}
+            toolName={store.pendingApproval.toolName}
+            command={store.pendingApproval.args}
+            args={(() => {
+              try {
+                return JSON.parse(store.pendingApproval.args) as Record<string, unknown>;
+              } catch {
+                return {};
+              }
+            })()}
+            sessionId={store.session.id}
+            onDecision={(decision, localResult) => {
+              const a = store.pendingApproval;
+              if (!a || a.stepIndex === undefined) return;
+              if (decision === 'approve') {
+                store.updateStreamingToolCall(a.stepIndex, a.toolCallId, { status: 'running' });
+              } else {
+                store.updateStreamingToolCall(a.stepIndex, a.toolCallId, {
+                  status: 'error',
+                  result: localResult ?? '用户拒绝了该操作',
+                });
+              }
+            }}
+            onSubmitFailed={(decision) => {
+              const a = store.pendingApproval;
+              if (decision === 'approve' && a?.stepIndex !== undefined) {
+                store.updateStreamingToolCall(a.stepIndex, a.toolCallId, { status: 'pending' });
+              }
+            }}
+            onSubmitted={() => store.setPendingApproval(null)}
+          />
         </div>
       )}
 

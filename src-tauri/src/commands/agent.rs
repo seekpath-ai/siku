@@ -909,8 +909,8 @@ pub async fn pet_create_session(
     let llm_models_json = serde_json::to_string(&llm_models).map_err(|e| format!("json: {e}"))?;
 
     sqlx::query(
-        "INSERT INTO chat_sessions (id, title, mode, paper_ids, agent_mode, tools_enabled, system_prompt, domain, context, llm_provider_ids, llm_models, created_at, updated_at) \
-         VALUES (?, ?, 'qa', '[]', 'chat', ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO chat_sessions (id, title, mode, paper_ids, agent_mode, tools_enabled, system_prompt, domain, context, llm_provider_ids, llm_models, approval_config, created_at, updated_at) \
+         VALUES (?, ?, 'qa', '[]', 'chat', ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&id)
     .bind(&title)
@@ -920,6 +920,10 @@ pub async fn pet_create_session(
     .bind(context.to_string())
     .bind(&provider_ids_json)
     .bind(&llm_models_json)
+    // Domain agents write to user data (notes / knowledge items); their
+    // prompts promise that writes need approval, so pin `manual` instead of
+    // inheriting the global default (auto).
+    .bind(r#"{"mode":"manual"}"#)
     .bind(&now)
     .bind(&now)
     .execute(&state.db)

@@ -10,13 +10,23 @@ interface ApprovalCardProps {
   command: string;
   /** Raw tool arguments, edited by the "修改参数" panel. */
   args: Record<string, unknown>;
+  /** Session the approval belongs to; defaults to the main chat's active
+   * session. The pet panel passes its own session id here. */
+  sessionId?: string;
+  /** Optimistic status update for the caller's streaming tool-call card;
+   * defaults to the main chat store. */
+  onDecision?: (decision: ApprovalDecision, localResult?: string) => void;
+  /** Revert the optimistic update when the submit fails. */
+  onSubmitFailed?: (decision: ApprovalDecision) => void;
+  /** Called after a successful submit (e.g. clear the caller's pending state). */
+  onSubmitted?: () => void;
 }
 
 type Panel = 'none' | 'modify' | 'guide';
 
 /** Tool approval card: approve (optionally with edited arguments), decline &
  * continue, decline with guidance for the agent, or decline & end the turn. */
-export function ApprovalCard({ toolCallId, toolName, command, args }: ApprovalCardProps) {
+export function ApprovalCard({ toolCallId, toolName, command, args, sessionId, onDecision, onSubmitFailed, onSubmitted }: ApprovalCardProps) {
   const { activeSessionId, updateStreamingToolCallById } = useChatStore();
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [declineOpen, setDeclineOpen] = useState(false);
@@ -30,9 +40,12 @@ export function ApprovalCard({ toolCallId, toolName, command, args }: ApprovalCa
     opts?: { guidance?: string; modifiedArgs?: Record<string, unknown> },
     localResult?: string
   ) => {
-    if (!activeSessionId || isSubmitting) return;
+    const sid = sessionId ?? activeSessionId;
+    if (!sid || isSubmitting) return;
     setIsSubmitting(true);
-    if (decision === 'approve') {
+    if (onDecision) {
+      onDecision(decision, localResult);
+    } else if (decision === 'approve') {
       updateStreamingToolCallById(toolCallId, { status: 'running' });
     } else {
       updateStreamingToolCallById(toolCallId, {
@@ -41,11 +54,14 @@ export function ApprovalCard({ toolCallId, toolName, command, args }: ApprovalCa
       });
     }
     try {
-      await agentApproveTool(activeSessionId, toolCallId, decision, opts);
+      await agentApproveTool(sid, toolCallId, decision, opts);
+      onSubmitted?.();
     } catch (err) {
       setIsSubmitting(false);
       // Only the approve path optimistically flipped the status; revert it.
-      if (decision === 'approve') {
+      if (onSubmitFailed) {
+        onSubmitFailed(decision);
+      } else if (decision === 'approve') {
         updateStreamingToolCallById(toolCallId, { status: 'pending' });
       }
       console.error('approval submit failed:', err);

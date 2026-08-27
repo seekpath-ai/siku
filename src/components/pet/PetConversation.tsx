@@ -10,16 +10,17 @@ import { usePetStore } from '@/stores/petStore';
 import type { PetContext } from '@/stores/petContextStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
 import { useDialogStore } from '@/stores/dialogStore';
-import { getChatMessages, getAgentSteps, notesCreate, noteCreateUnderPaper, readImageFile } from '@/lib/tauri';
+import { getChatMessages, getAgentSteps, notesCreate, noteCreateUnderPaper, readImageFile, settingsAppGet, settingsAppSave } from '@/lib/tauri';
 import { parseEvidence, buildNoteMarkdown } from '@/lib/evidence';
 import type { EvidenceEntry } from '@/lib/evidence';
 import { MarkdownCode, MarkdownPre } from '@/components/chat/CodeBlock';
 import { ApprovalCard } from '@/components/chat/ApprovalCard';
+import { ApprovalPolicySwitch } from '@/components/chat/ApprovalPolicySwitch';
 import { parseAttachments } from '@/lib/attachments';
 import { ReasoningProcessCard } from '@/components/chat/ReasoningProcessCard';
 import { ExternalLink } from '@/components/ui/ExternalLink';
 import { useImageAttachments } from '@/hooks/useImageAttachments';
-import type { AgentStreamEvent, AgentPhase, AgentStep, ChatAttachment, ChatMessage, StreamingStep, ToolCallInfo } from '@/lib/types';
+import type { AgentStreamEvent, AgentPhase, AgentStep, ApprovalConfig, ChatAttachment, ChatMessage, StreamingStep, ToolCallInfo } from '@/lib/types';
 
 // Flatten streaming steps into reasoning / tool-call phases (same as chat).
 function streamingToPhases(steps: StreamingStep[], current: StreamingStep | null): AgentPhase[] {
@@ -331,6 +332,29 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
   const [input, setInput] = useState('');
   const navigate = useNavigate();
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Approval policy quick switch: bound to the GLOBAL default approval, so
+  // one switch governs every agent (pet domain sessions and main-chat
+  // sessions alike fall back to it unless they carry an explicit override).
+  const [approval, setApproval] = useState<ApprovalConfig>({ mode: 'auto' });
+  useEffect(() => {
+    settingsAppGet()
+      .then((s) => setApproval(s.default_approval))
+      .catch(() => {});
+  }, []);
+  const pickApprovalMode = (mode: ApprovalConfig['mode']) => {
+    if (mode === approval.mode) return;
+    const next = { ...approval, mode };
+    setApproval(next);
+    (async () => {
+      try {
+        const current = await settingsAppGet();
+        await settingsAppSave({ ...current, default_approval: next });
+      } catch (err) {
+        console.error('save default approval:', err);
+      }
+    })();
+  };
 
   // Image attachments (upload + paste + OS screenshot, max 3). No global
   // Ctrl+Shift+S here — that shortcut belongs to the main chat input.
@@ -767,6 +791,7 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
             toolCallId={store.pendingApproval.toolCallId}
             toolName={store.pendingApproval.toolName}
             command={store.pendingApproval.args}
+            compact
             args={(() => {
               try {
                 return JSON.parse(store.pendingApproval.args) as Record<string, unknown>;
@@ -909,6 +934,11 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
               >
                 <Scissors size={15} />
               </button>
+              <ApprovalPolicySwitch
+                mode={approval.mode}
+                onPick={pickApprovalMode}
+                titleSuffix="（全局默认，对所有智能体生效）"
+              />
             </div>
             <button
               onClick={handleSend}

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Send, Paperclip, ImagePlus, BookOpen, Brain, Square, X, FileText, ShieldCheck, Check, Scissors } from 'lucide-react';
+import { Send, Paperclip, ImagePlus, BookOpen, Brain, Square, X, FileText, Scissors } from 'lucide-react';
 import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
 import { agentSendMessage, agentCancel, readTextFile, readImageFile, agentMemoryGet, agentGetSession, agentSetApprovalConfig } from '@/lib/tauri';
@@ -7,18 +7,10 @@ import { useActiveAgentName } from '@/hooks/useActiveAgentName';
 import { useDialog } from '@/hooks/useDialog';
 import { useImageAttachments } from '@/hooks/useImageAttachments';
 import { AgentMemoryModal } from './AgentMemoryModal';
+import { ApprovalPolicySwitch } from './ApprovalPolicySwitch';
 import { ContextPickerModal } from './ContextPickerModal';
 import { contextKey, type ContextItem } from './contextItem';
 import type { ApprovalConfig, ChatAttachment } from '@/lib/types';
-
-/** Approval policy options for the input-area quick switch. */
-const APPROVAL_OPTIONS: { value: ApprovalConfig['mode']; label: string; hint: string }[] = [
-  { value: 'auto', label: '自动批准', hint: '所有工具调用直接执行' },
-  { value: 'auto_expire_time', label: '时间窗口内自动', hint: '批准后一段时间内同类调用免确认' },
-  { value: 'auto_by_rules', label: '白名单自动', hint: '仅白名单工具免确认' },
-  { value: 'manual', label: '手动审批', hint: '写操作逐条确认，只读免确认' },
-  { value: 'manual_all', label: '严格审批', hint: '读写所有调用逐条确认' },
-];
 
 interface Props {
   disabled?: boolean;
@@ -57,10 +49,8 @@ export function MessageInput({ disabled }: Props) {
   // Picked note/file contexts attached to the next message (one-shot).
   const [contexts, setContexts] = useState<ContextItem[]>([]);
   const [contextOpen, setContextOpen] = useState(false);
-  // Approval policy quick switch (per agent, persisted; next-turn effect).
+  // Approval policy quick switch (per session, persisted; next-turn effect).
   const [approvalConfig, setApprovalConfig] = useState<ApprovalConfig>({ mode: 'auto' });
-  const [approvalOpen, setApprovalOpen] = useState(false);
-  const approvalRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setMemoryActive(false);
@@ -73,20 +63,7 @@ export function MessageInput({ disabled }: Props) {
       .catch(() => {});
   }, [activeSessionId]);
 
-  // Close the approval dropdown on outside click.
-  useEffect(() => {
-    if (!approvalOpen) return;
-    const onDown = (e: MouseEvent) => {
-      if (approvalRef.current && !approvalRef.current.contains(e.target as Node)) {
-        setApprovalOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', onDown);
-    return () => document.removeEventListener('mousedown', onDown);
-  }, [approvalOpen]);
-
   const pickApprovalMode = (mode: ApprovalConfig['mode']) => {
-    setApprovalOpen(false);
     if (!activeSessionId || mode === approvalConfig.mode) return;
     const next = { ...approvalConfig, mode };
     setApprovalConfig(next);
@@ -435,45 +412,12 @@ export function MessageInput({ disabled }: Props) {
               >
                 <Brain size={15} />
               </button>
-              <div className="relative" ref={approvalRef}>
-                <button
-                  type="button"
-                  disabled={disabled || !activeSessionId}
-                  onClick={() => setApprovalOpen((o) => !o)}
-                  className={`w-7 h-7 rounded-md border-0 bg-transparent flex items-center justify-center hover:bg-surface-hover transition-colors disabled:opacity-50 ${
-                    approvalConfig.mode === 'auto'
-                      ? 'text-text-secondary/50 hover:text-text-primary'
-                      : approvalConfig.mode === 'manual_all'
-                        ? 'text-amber-400'
-                        : 'text-primary'
-                  }`}
-                  title={`审批策略 · ${APPROVAL_OPTIONS.find((o) => o.value === approvalConfig.mode)?.label ?? ''}（下一条消息生效）`}
-                >
-                  <ShieldCheck size={15} />
-                </button>
-                {approvalOpen && (
-                  <div className="absolute left-0 bottom-full z-50 mb-1 w-60 bg-surface border border-surface-hover rounded-lg shadow-xl py-1">
-                    {APPROVAL_OPTIONS.map((opt) => (
-                      <button
-                        key={opt.value}
-                        onClick={() => pickApprovalMode(opt.value)}
-                        className="w-full flex items-start gap-2 px-3 py-1.5 text-left hover:bg-surface-hover"
-                      >
-                        <span className="flex-1 min-w-0">
-                          <span className="block text-[12px] text-text-primary">{opt.label}</span>
-                          <span className="block text-[10px] text-text-secondary/60">{opt.hint}</span>
-                        </span>
-                        {approvalConfig.mode === opt.value && (
-                          <Check size={13} className="text-primary mt-0.5 shrink-0" />
-                        )}
-                      </button>
-                    ))}
-                    <div className="px-3 py-1.5 text-[10px] text-text-secondary/50 border-t border-surface-hover mt-1">
-                      切换从下一条消息开始生效
-                    </div>
-                  </div>
-                )}
-              </div>
+              <ApprovalPolicySwitch
+                mode={approvalConfig.mode}
+                onPick={pickApprovalMode}
+                disabled={disabled || !activeSessionId}
+                titleSuffix="（仅当前会话，下一条消息生效）"
+              />
             </div>
             {isStreaming ? (
               <button

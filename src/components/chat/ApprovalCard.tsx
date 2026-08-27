@@ -18,15 +18,22 @@ interface ApprovalCardProps {
   onDecision?: (decision: ApprovalDecision, localResult?: string) => void;
   /** Revert the optimistic update when the submit fails. */
   onSubmitFailed?: (decision: ApprovalDecision) => void;
+  /** Compact spacing for narrow containers (pet panel). */
+  compact?: boolean;
   /** Called after a successful submit (e.g. clear the caller's pending state). */
   onSubmitted?: () => void;
 }
 
 type Panel = 'none' | 'modify' | 'guide';
 
+/** Long command displays collapse to a preview so the action buttons stay
+ * visible without scrolling past a wall of JSON (e.g. note_write content). */
+const COMMAND_COLLAPSE_CHARS = 500;
+const COMMAND_PREVIEW_CHARS = 300;
+
 /** Tool approval card: approve (optionally with edited arguments), decline &
  * continue, decline with guidance for the agent, or decline & end the turn. */
-export function ApprovalCard({ toolCallId, toolName, command, args, sessionId, onDecision, onSubmitFailed, onSubmitted }: ApprovalCardProps) {
+export function ApprovalCard({ toolCallId, toolName, command, args, sessionId, compact, onDecision, onSubmitFailed, onSubmitted }: ApprovalCardProps) {
   const { activeSessionId, updateStreamingToolCallById } = useChatStore();
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [declineOpen, setDeclineOpen] = useState(false);
@@ -34,6 +41,11 @@ export function ApprovalCard({ toolCallId, toolName, command, args, sessionId, o
   const [argsText, setArgsText] = useState(() => JSON.stringify(args, null, 2));
   const [argsError, setArgsError] = useState<string | null>(null);
   const [guidance, setGuidance] = useState('');
+  const [cmdExpanded, setCmdExpanded] = useState(false);
+  // Code-point-safe preview (surrogate pairs must not be split).
+  const cmdChars = [...command];
+  const cmdLong = cmdChars.length > COMMAND_COLLAPSE_CHARS;
+  const cmdPreview = cmdLong ? `${cmdChars.slice(0, COMMAND_PREVIEW_CHARS).join('')}…` : command;
 
   const submit = async (
     decision: ApprovalDecision,
@@ -92,14 +104,23 @@ export function ApprovalCard({ toolCallId, toolName, command, args, sessionId, o
   };
 
   return (
-    <div className="my-3.5 rounded-lg border border-codex-border bg-codex-surface p-3.5">
+    <div className={`rounded-lg border border-codex-border bg-codex-surface ${compact ? 'my-2 p-2.5' : 'my-3.5 p-3.5'}`}>
       <div className="flex items-center gap-2 text-[13px] font-semibold text-codex-primary mb-2">
         <Terminal size={14} className="text-codex-accent" />
         请求执行 · {toolName}
       </div>
-      <div className="rounded-md bg-codex-code border border-codex-border p-2.5 font-mono text-[12px] text-codex-secondary break-all mb-3 whitespace-pre-wrap">
-        {command}
+      <div className={`rounded-md bg-codex-code border border-codex-border p-2.5 font-mono text-[12px] text-codex-secondary break-all whitespace-pre-wrap max-h-40 overflow-y-auto ${cmdLong ? 'mb-1' : 'mb-3'}`}>
+        {cmdExpanded ? command : cmdPreview}
       </div>
+      {cmdLong && (
+        <button
+          type="button"
+          onClick={() => setCmdExpanded((v) => !v)}
+          className="mb-2 text-[11px] text-codex-accent hover:underline"
+        >
+          {cmdExpanded ? '收起' : `展开全部(共 ${cmdChars.length} 字符)`}
+        </button>
+      )}
 
       {panel === 'modify' && (
         <div className="mb-3">

@@ -920,10 +920,9 @@ pub async fn pet_create_session(
     .bind(context.to_string())
     .bind(&provider_ids_json)
     .bind(&llm_models_json)
-    // Domain agents write to user data (notes / knowledge items); their
-    // prompts promise that writes need approval, so pin `manual` instead of
-    // inheriting the global default (auto).
-    .bind(r#"{"mode":"manual"}"#)
+    // No pinned approval policy: NULL falls back to the user's global
+    // default_approval at runtime (controlled from the pet panel shield).
+    .bind(Option::<&str>::None)
     .bind(&now)
     .bind(&now)
     .execute(&state.db)

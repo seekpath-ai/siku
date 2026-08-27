@@ -404,6 +404,18 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.color: {}", e))?;
 
+    // Migration: domain (pet) sessions used to pin {"mode":"manual"} at
+    // creation. Approval is now governed by the user's global
+    // default_approval (pet panel shield), so clear that pin — NULL falls
+    // back to the global default at runtime. Idempotent.
+    sqlx::query(
+        "UPDATE chat_sessions SET approval_config = NULL \
+         WHERE domain IS NOT NULL AND approval_config = '{\"mode\":\"manual\"}'"
+    )
+    .execute(&db)
+    .await
+    .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.domain approval unpin: {}", e))?;
+
     // Migration: LLM provider pool (replaces scattered llm.* settings and app_settings.default_llm)
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS llm_providers (

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import type { PDFDocumentProxy } from 'pdfjs-dist';
 
 interface PdfThumbnailsProps {
-  doc: any;
+  doc: PDFDocumentProxy;
   currentPage: number;
   rotation?: number;
   onSelect: (page: number) => void;
@@ -34,7 +35,7 @@ export function PdfThumbnails({ doc, currentPage, rotation = 0, onSelect }: PdfT
       canvas.height = Math.floor(viewport.height);
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
-      await page.render({ canvasContext: ctx, viewport }).promise;
+      await page.render({ canvas, canvasContext: ctx, viewport }).promise;
       canvasMapRef.current.set(pageNum, canvas);
       if (mountedRef.current) {
         setRenderedPages((prev) => {

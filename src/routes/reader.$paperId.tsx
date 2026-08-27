@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { PdfViewer } from '@/components/reader/PdfViewer';
 import type { PdfViewerHandle, TextSelection, PdfViewerProps, SnippetRect } from '@/components/reader/PdfViewer';
+import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { PdfOutline } from '@/components/reader/PdfOutline';
 import { PdfThumbnails } from '@/components/reader/PdfThumbnails';
 import { ExportLayoutDialog } from '@/components/reader/ExportLayoutDialog';
@@ -139,7 +140,7 @@ function ReaderPage() {
   };
 
   // Loaded PDF document (for sidebars)
-  const [pdfDoc, setPdfDoc] = useState<any>(null);
+  const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
 
   // Patch the pet context with the current page / selected text so the
   // literature agent can act on a specific paragraph.
@@ -641,22 +642,6 @@ function ReaderPage() {
           )}
         </div>
 
-        {/* Rotation */}
-        <button
-          onClick={() => pdfViewerRef.current?.rotateCcw()}
-          className="p-0.5 rounded hover:bg-surface-hover text-text-secondary transition-colors"
-          title="向左旋转"
-        >
-          <RotateCcw size={14} />
-        </button>
-        <button
-          onClick={() => pdfViewerRef.current?.rotateCw()}
-          className="p-0.5 rounded hover:bg-surface-hover text-text-secondary transition-colors"
-          title="向右旋转"
-        >
-          <RotateCw size={14} />
-        </button>
-
         {/* Page theme picker */}
         <ThemePicker
           themeId={themeId}
@@ -758,6 +743,20 @@ function ReaderPage() {
               >
                 {regionDetecting ? <Loader2 size={13} className="animate-spin" /> : <ScanSearch size={13} />}
                 结构
+              </button>
+              <button
+                onClick={() => { setMoreOpen(false); pdfViewerRef.current?.rotateCcw(); }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-text-secondary hover:bg-surface-hover hover:text-text-primary transition-colors"
+              >
+                <RotateCcw size={13} />
+                向左旋转
+              </button>
+              <button
+                onClick={() => { setMoreOpen(false); pdfViewerRef.current?.rotateCw(); }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-text-secondary hover:bg-surface-hover hover:text-text-primary transition-colors"
+              >
+                <RotateCw size={13} />
+                向右旋转
               </button>
               <button
                 onClick={handleDownload}

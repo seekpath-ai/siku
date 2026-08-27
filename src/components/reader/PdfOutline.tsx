@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ChevronRight, ChevronDown } from 'lucide-react';
+import type { PDFDocumentProxy } from 'pdfjs-dist';
 
 interface OutlineItem {
   title: string;
@@ -15,21 +16,21 @@ interface OutlineItem {
 }
 
 interface PdfOutlineProps {
-  doc: any;
+  doc: PDFDocumentProxy;
   onJumpToPage: (page: number) => void;
 }
 
-async function resolveOutlinePage(doc: any, dest: string | Array<unknown> | null): Promise<number | null> {
+async function resolveOutlinePage(doc: PDFDocumentProxy, dest: string | Array<unknown> | null): Promise<number | null> {
   if (!dest) return null;
   try {
-    let explicit: Array<unknown>;
+    let explicit: Array<unknown> | null;
     if (typeof dest === 'string') {
       explicit = await doc.getDestination(dest);
     } else {
       explicit = dest;
     }
     if (!Array.isArray(explicit) || explicit.length === 0) return null;
-    const ref = explicit[0];
+    const ref = explicit[0] as Parameters<PDFDocumentProxy['getPageIndex']>[0];
     const idx = await doc.getPageIndex(ref);
     return typeof idx === 'number' ? idx + 1 : null;
   } catch {
@@ -91,9 +92,9 @@ export function PdfOutline({ doc, onJumpToPage }: PdfOutlineProps) {
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    doc.getOutline().then((items: OutlineItem[] | null) => {
+    doc.getOutline().then((items) => {
       if (!cancelled) {
-        setOutline(items || []);
+        setOutline((items as OutlineItem[] | null) || []);
         setLoading(false);
       }
     }).catch(() => {

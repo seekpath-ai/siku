@@ -89,6 +89,17 @@ impl Tool for FileReadTool {
         if shown >= MAX_LINES && end < total {
             note.push_str(" (truncated — use line_offset to page further)");
         }
+        // Bound the total output by the file-read tool char limit.
+        let max_chars = crate::core::settings_service::cached_settings()
+            .tool_file_read_max_chars
+            .max(1) as usize;
+        let char_count = out.chars().count();
+        if char_count > max_chars {
+            out = out.chars().take(max_chars).collect();
+            note.push_str(&format!(
+                " (output truncated at {max_chars} chars, original length: {char_count} — use line_offset to page further)"
+            ));
+        }
         Ok(format!("{note}\n{out}"))
     }
 }

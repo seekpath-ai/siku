@@ -139,7 +139,8 @@ pub struct AgentConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
     pub llm_models: Vec<LlmConfigBlock>,
-    pub tools: Vec<String>,
+    /// `None` = all built-in tools (unset/legacy); `Some([])` = explicitly none.
+    pub tools: Option<Vec<String>>,
     pub approval: ApprovalConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_loops: Option<i32>,

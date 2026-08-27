@@ -109,7 +109,8 @@ async fn build_agent_config(
 ) -> Result<AgentConfig, String> {
     let app_settings = settings_service::load_app_settings(&state.db).await?;
 
-    let tools: Vec<String> = serde_json::from_str(&session.tools_enabled).unwrap_or_default();
+    // NULL/unparsable → None → all tools (legacy default); "[]" → explicitly none.
+    let tools: Option<Vec<String>> = serde_json::from_str(&session.tools_enabled).unwrap_or(None);
 
     // Prefer provider pool references; fallback to legacy embedded llm_models.
     let mut llm_models: Vec<LlmConfigBlock> = Vec::new();
@@ -168,7 +169,7 @@ pub async fn agent_create_session(
         persona: input.system_prompt.clone(),
         system_prompt: input.system_prompt.clone(),
         llm_models: input.llm_models,
-        tools: input.tools_enabled.clone(),
+        tools: Some(input.tools_enabled.clone()),
         approval: input.approval_config.unwrap_or_else(|| app_settings.default_approval.clone()),
         max_loops: input.max_loops.or(Some(app_settings.default_max_loops)),
         max_tokens: input.max_tokens.or(Some(app_settings.default_max_tokens)),
@@ -272,7 +273,7 @@ pub async fn agent_update_session(
         persona: input.system_prompt.clone(),
         system_prompt: input.system_prompt.clone(),
         llm_models: input.llm_models,
-        tools: input.tools_enabled.clone(),
+        tools: Some(input.tools_enabled.clone()),
         approval: input.approval_config.unwrap_or_else(|| app_settings.default_approval.clone()),
         max_loops: input.max_loops.or(Some(app_settings.default_max_loops)),
         max_tokens: input.max_tokens.or(Some(app_settings.default_max_tokens)),
@@ -574,7 +575,7 @@ pub(crate) async fn run_agent_turn(
         vision_llm,
         session.web_proxy.clone(),
     );
-    registry.retain(&config.tools);
+    registry.retain(config.tools.as_deref());
 
     let data_dir_path = device_settings.data_dir.as_deref().map(std::path::PathBuf::from);
 
@@ -886,9 +887,9 @@ pub async fn pet_create_session(
     // Per-domain tool sets: only the tools each agent actually needs.
     let tools = match domain.as_str() {
         "note_organizer" => r#"["note_read","note_write"]"#,
-        "literature_analyzer" => r#"["paper_search","paper_read","translation","note_read","note_write"]"#,
+        "literature_analyzer" => r#"["paper_search","paper_read","translate","note_read","note_write"]"#,
         "research_tracker" => r#"["paper_search","paper_read","note_read","note_write"]"#,
-        "knowledge_curator" => r#"["knowledge_query","knowledge_write","note_read","note_write"]"#,
+        "knowledge_curator" => r#"["knowledge_query","knowledge_create","note_read","note_write"]"#,
         "chat_summarizer" => "[]",
         _ => "[]",
     };

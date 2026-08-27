@@ -92,18 +92,6 @@ impl WebFetchTool {
     pub fn new(db: SqlitePool, web_proxy: Option<String>) -> Self {
         Self { db, web_proxy }
     }
-
-    async fn proxy_for(&self) -> Option<String> {
-        // Per-agent proxy wins; otherwise fall back to the global (default provider).
-        if let Some(p) = self.web_proxy.clone().filter(|p| !p.is_empty()) {
-            return Some(p);
-        }
-        crate::core::settings_service::load_llm_config(&self.db)
-            .await
-            .ok()
-            .and_then(|c| c.proxy)
-            .filter(|p| !p.is_empty())
-    }
 }
 
 #[async_trait]
@@ -134,8 +122,8 @@ impl Tool for WebFetchTool {
 
         let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .user_agent("Siku/0.1");
-        if let Some(proxy) = self.proxy_for().await {
+            .user_agent(format!("Siku/{}", env!("CARGO_PKG_VERSION")));
+        if let Some(proxy) = super::resolve_web_proxy(&self.db, self.web_proxy.as_deref()).await {
             if let Ok(p) = reqwest::Proxy::all(&proxy) {
                 builder = builder.proxy(p);
             }

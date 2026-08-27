@@ -111,14 +111,24 @@ impl ToolRegistry {
             .unwrap_or(false)
     }
 
-    /// Keep only tools whose names are in `allowed`.
-    pub fn retain(&mut self, allowed: &[String]) {
-        if allowed.is_empty() {
-            // If no tools explicitly enabled, keep all (backward compatible).
-            return;
+    /// Keep only tools whose names are in `allowed`. `None` (the column was
+    /// NULL or unparsable) keeps every tool — the backward-compatible default.
+    /// `Some([])` keeps NOTHING: an explicitly empty list means "no tools".
+    /// Unknown names are logged, not silently dropped — a stale name here used
+    /// to silently strip capabilities from the built-in domain agents.
+    pub fn retain(&mut self, allowed: Option<&[String]>) {
+        let allowed = match allowed {
+            None => return,
+            Some(a) => a,
+        };
+        let allowed_set: std::collections::HashSet<&str> =
+            allowed.iter().map(|s| s.as_str()).collect();
+        for name in &allowed_set {
+            if !self.tools.contains_key(*name) {
+                tracing::warn!(tool = %name, "retain: unknown tool name ignored");
+            }
         }
-        let allowed_set: std::collections::HashSet<String> = allowed.iter().cloned().collect();
-        self.tools.retain(|name, _| allowed_set.contains(name));
+        self.tools.retain(|name, _| allowed_set.contains(name.as_str()));
     }
 
     /// Register inline skills from a skills directory as `skill_<name>` tools.
@@ -190,9 +200,6 @@ impl ToolRegistry {
 
         // Vision (multimodal) — uses the agent's vision model
         registry.register(crate::ai::agent::tools::read_media_file::ReadMediaFileTool::new(vision_llm));
-
-        // System
-        registry.register(crate::ai::agent::tools::system::SystemInfoTool::new());
 
         registry
     }

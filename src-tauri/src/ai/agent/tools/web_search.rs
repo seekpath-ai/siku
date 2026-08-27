@@ -106,18 +106,6 @@ impl WebSearchTool {
     pub fn new(db: SqlitePool, web_proxy: Option<String>) -> Self {
         Self { db, web_proxy }
     }
-
-    async fn proxy_for(&self) -> Option<String> {
-        // Per-agent proxy wins; otherwise fall back to the global (default provider).
-        if let Some(p) = self.web_proxy.clone().filter(|p| !p.is_empty()) {
-            return Some(p);
-        }
-        crate::core::settings_service::load_llm_config(&self.db)
-            .await
-            .ok()
-            .and_then(|c| c.proxy)
-            .filter(|p| !p.is_empty())
-    }
 }
 
 #[async_trait]
@@ -161,7 +149,7 @@ impl Tool for WebSearchTool {
         let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36");
-        if let Some(proxy) = self.proxy_for().await {
+        if let Some(proxy) = super::resolve_web_proxy(&self.db, self.web_proxy.as_deref()).await {
             if let Ok(p) = reqwest::Proxy::all(&proxy) {
                 builder = builder.proxy(p);
             }

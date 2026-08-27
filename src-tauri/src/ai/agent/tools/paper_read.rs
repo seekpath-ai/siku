@@ -6,10 +6,18 @@ use crate::ai::agent::tool_registry::{Tool, ToolParameter};
 
 pub struct PaperReadTool {
     db: SqlitePool,
+    /// paper_id → cached body-end boundary (chunk index); avoids rescanning
+    /// every chunk on repeat reads of the same paper.
+    body_end_cache: std::sync::Mutex<std::collections::HashMap<String, Option<usize>>>,
 }
 
 impl PaperReadTool {
-    pub fn new(db: SqlitePool) -> Self { Self { db } }
+    pub fn new(db: SqlitePool) -> Self {
+        Self {
+            db,
+            body_end_cache: Default::default(),
+        }
+    }
 }
 
 /// Find the chunk where the references/appendix tail begins.
@@ -143,23 +151,52 @@ impl Tool for PaperReadTool {
             return Ok(result);
         }
 
-        // Scan chunk contents once for the body-end boundary.
-        let all_chunks: Vec<(i32, Option<i32>, String)> = sqlx::query_as(
-            "SELECT chunk_index, page_start, content FROM chunks WHERE paper_id = ? ORDER BY chunk_index"
-        )
-        .bind(paper_id)
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| format!("db error: {e}"))?;
-        let body_end = detect_body_end(&all_chunks);
+        // Scan chunk contents once for the body-end boundary. The result is
+        // cached per paper; the lock is never held across an await.
+        let cached = self.body_end_cache.lock().unwrap().get(paper_id).copied();
+        let (body_end, end_page) = match cached {
+            Some(cached_end) => {
+                let end_page = match cached_end {
+                    Some(end) => sqlx::query_as::<_, (Option<i32>,)>(
+                        "SELECT page_start FROM chunks WHERE paper_id = ? AND chunk_index = ?",
+                    )
+                    .bind(paper_id)
+                    .bind(end as i32)
+                    .fetch_optional(&self.db)
+                    .await
+                    .map_err(|e| format!("db error: {e}"))?
+                    .and_then(|(ps,)| ps),
+                    None => None,
+                };
+                (cached_end.map(|e| e as i32), end_page)
+            }
+            None => {
+                let all_chunks: Vec<(i32, Option<i32>, String)> = sqlx::query_as(
+                    "SELECT chunk_index, page_start, content FROM chunks WHERE paper_id = ? ORDER BY chunk_index"
+                )
+                .bind(paper_id)
+                .fetch_all(&self.db)
+                .await
+                .map_err(|e| format!("db error: {e}"))?;
+                let detected = detect_body_end(&all_chunks);
+                let end_page = detected.and_then(|end| {
+                    all_chunks
+                        .iter()
+                        .find(|(idx, _, _)| *idx == end)
+                        .and_then(|(_, ps, _)| *ps)
+                });
+                self.body_end_cache
+                    .lock()
+                    .unwrap()
+                    .insert(paper_id.to_string(), detected.map(|e| e as usize));
+                (detected, end_page)
+            }
+        };
 
         // Reading boundary: the model navigates by this instead of fetching
         // everything.
         result.push_str(&format!("\n\nChunks: {total} (paginate with offset/limit)"));
         if let Some(end) = body_end {
-            let end_page = all_chunks.iter()
-                .find(|(idx, _, _)| *idx == end)
-                .and_then(|(_, ps, _)| *ps);
             result.push_str(&format!(
                 "\nBody ends at chunk {end}{}. Chunks {end}-{total_minus_1} are references/appendix — excluded from reads by default; pass include_tail=true if you really need them.",
                 end_page.map(|p| format!(" (p.{p})")).unwrap_or_default(),

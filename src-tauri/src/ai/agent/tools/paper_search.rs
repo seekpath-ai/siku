@@ -230,7 +230,7 @@ impl Tool for PaperSearchTool {
         };
 
         if papers.is_empty() {
-            return Ok("No papers found matching your query.".to_string());
+            return Ok("没有找到匹配的论文。".to_string());
         }
 
         let from = offset + 1;
@@ -242,7 +242,7 @@ impl Tool for PaperSearchTool {
                 p.title,
                 p.year.map(|y| y.to_string()).unwrap_or_else(|| "N/A".into()),
                 super::format_author_list(&p.authors),
-                p.abstract_text.as_deref().unwrap_or("No abstract"),
+                p.abstract_text.as_deref().unwrap_or("无摘要"),
                 p.id,
             )
         }));
@@ -338,7 +338,7 @@ mod tests {
             .execute(serde_json::json!({"query": "BERT", "collection": "ML"}))
             .await
             .unwrap();
-        assert!(out.contains("No papers") || out.contains("没有匹配"), "query+filter mismatch: {out}");
+        assert!(out.contains("没有找到匹配") || out.contains("没有匹配"), "query+filter mismatch: {out}");
 
         // Unknown collection short-circuits.
         let out = tool.execute(serde_json::json!({"collection": "不存在"})).await.unwrap();

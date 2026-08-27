@@ -47,7 +47,7 @@ impl Tool for PaperImportTool {
                     paper.page_count.unwrap_or(0),
                 ))
             }
-            Err(e) => Ok(format!("Failed to import paper: {e}")),
+            Err(e) => Err(format!("Failed to import paper: {e}")),
         }
     }
 }

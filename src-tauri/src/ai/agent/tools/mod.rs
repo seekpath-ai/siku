@@ -19,7 +19,22 @@ pub mod ask_user;
 pub mod skill;
 pub mod read_media_file;
 pub mod path;
-pub mod system;
+
+/// Resolve the proxy for web tools: the per-agent proxy wins; otherwise fall
+/// back to the global (default provider) proxy.
+pub(crate) async fn resolve_web_proxy(
+    db: &sqlx::SqlitePool,
+    web_proxy: Option<&str>,
+) -> Option<String> {
+    if let Some(p) = web_proxy.filter(|p| !p.is_empty()) {
+        return Some(p.to_string());
+    }
+    crate::core::settings_service::load_llm_config(db)
+        .await
+        .ok()
+        .and_then(|c| c.proxy)
+        .filter(|p| !p.is_empty())
+}
 
 /// Format the papers.authors / editor JSON-array column for display:
 /// `["A","B"]` becomes "A, B". Falls back to the raw string when the

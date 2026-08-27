@@ -72,7 +72,6 @@ export const TOOL_CATEGORIES: AgentToolCategory[] = [
     tools: [
       { key: 'ask_user', label: 'ask_user — 向用户提问' },
       { key: 'read_media_file', label: 'read_media_file — 图片理解（需多模态模型）' },
-      { key: 'system_info', label: 'system_info — 系统信息' },
     ],
   },
 ];

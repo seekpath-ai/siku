@@ -26,6 +26,7 @@ import { ConfirmButton } from '@/components/ui/ConfirmButton';
 import { AgentAvatar } from './AgentAvatar';
 import { AgentCreateDialog } from './AgentCreateDialog';
 import { AgentConfigPanel } from './AgentConfigPanel';
+import { TaskCenterDialog } from './TaskCenterDialog';
 import { DEFAULT_TOOLS } from '@/lib/agent-tools';
 import type { AgentSession, LlmConfigBlock, ApprovalConfig } from '@/lib/types';
 
@@ -97,6 +98,7 @@ export function AgentList() {
   const { alert } = useDialog();
 
   const [showCreate, setShowCreate] = useState(false);
+  const [showTaskCenter, setShowTaskCenter] = useState(false);
   const [configAgent, setConfigAgent] = useState<AgentSession | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>({
     visible: false,
@@ -376,7 +378,15 @@ export function AgentList() {
         <MenuRow
           icon={<CalendarClock size={16} />}
           label="计划任务"
-          onClick={() => handlePlaceholder('计划任务')}
+          onClick={() => {
+            // Scheduled prompts are per-session; without an active session
+            // the cron tab has nothing to bind to.
+            if (!activeSessionId) {
+              void alert('请先在左侧选择一个会话', '计划任务');
+              return;
+            }
+            setShowTaskCenter(true);
+          }}
         />
         <MenuRow
           icon={<Puzzle size={16} />}
@@ -589,6 +599,10 @@ export function AgentList() {
 
       {configAgent && (
         <AgentConfigPanel agent={configAgent} onClose={() => setConfigAgent(null)} onSave={handleUpdateAgent} />
+      )}
+
+      {showTaskCenter && activeSessionId && (
+        <TaskCenterDialog sessionId={activeSessionId} onClose={() => setShowTaskCenter(false)} />
       )}
     </aside>
   );

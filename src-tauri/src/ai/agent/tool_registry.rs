@@ -148,6 +148,7 @@ impl ToolRegistry {
     ///
     /// `working_dir` is the sandbox root for file tools (None = full access);
     /// `tasks` is the app-wide background task store (for bash);
+    /// `session_id` 归属会话 id，写入 bash 后台任务的 TaskInfo，方便任务中心按会话过滤；
     /// `vision_llm` is the agent's multimodal model config (for read_media_file);
     /// `web_proxy` is the per-agent proxy for web tools (None = global).
     pub fn default_registry(
@@ -155,6 +156,7 @@ impl ToolRegistry {
         app_data_dir: &std::path::Path,
         working_dir: Option<String>,
         tasks: crate::core::tasks::TaskStore,
+        session_id: Option<String>,
         vision_llm: Option<crate::ai::llm::LlmConfig>,
         web_proxy: Option<String>,
     ) -> Self {
@@ -190,7 +192,7 @@ impl ToolRegistry {
         registry.register(crate::ai::agent::tools::file_glob::FileGlobTool::new());
 
         // Shell + background tasks
-        registry.register(crate::ai::agent::tools::bash::BashTool::new(tasks.clone(), app_data_dir.to_path_buf()));
+        registry.register(crate::ai::agent::tools::bash::BashTool::new(tasks.clone(), app_data_dir.to_path_buf(), session_id));
         registry.register(crate::ai::agent::tools::tasks::TaskListTool::new(tasks.clone()));
         registry.register(crate::ai::agent::tools::tasks::TaskOutputTool::new(tasks.clone()));
         registry.register(crate::ai::agent::tools::tasks::TaskStopTool::new(tasks.clone()));

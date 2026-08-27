@@ -3,7 +3,7 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
   Paper, PaperInput, PaperLinkMetadata, PaperImportResult, LinkImportError, ListPapersParams,
-  AgentSession, AgentStep, ChatMessage, ChatAttachment, LlmConfigBlock, ApprovalConfig, Project, CronJob,
+  AgentSession, AgentStep, ChatMessage, ChatAttachment, LlmConfigBlock, ApprovalConfig, Project, CronJob, TaskInfo,
   KnowledgeDomain, KnowledgeItem,
   ResearchTopic, ResearchSource, Note,
   FileEntry, FileItem, TextPreview, SystemInfo, TimelineItem,
@@ -302,6 +302,34 @@ export async function cronList(): Promise<CronJob[]> {
 
 export async function cronDelete(id: string): Promise<void> {
   return invoke<void>('cron_delete', { id });
+}
+
+/** Enable/disable a cron job without deleting it. */
+export async function cronSetEnabled(id: string, enabled: boolean): Promise<void> {
+  return invoke<void>('cron_set_enabled', { id, enabled });
+}
+
+// ============================================================
+// Background tasks (long-running shell commands)
+// ============================================================
+
+export interface TaskOutput {
+  status: string;
+  exit_code: number | null;
+  content: string;
+  truncated: boolean;
+}
+
+export async function taskSnapshot(): Promise<TaskInfo[]> {
+  return invoke<TaskInfo[]>('task_snapshot');
+}
+
+export async function taskOutput(id: string): Promise<TaskOutput> {
+  return invoke<TaskOutput>('task_output', { id });
+}
+
+export async function taskStop(id: string): Promise<void> {
+  return invoke<void>('task_stop', { id });
 }
 
 export async function agentListSessions(projectId?: string): Promise<AgentSession[]> {

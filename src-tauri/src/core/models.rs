@@ -241,12 +241,17 @@ pub struct CronJob {
     pub cron: String,
     pub prompt: String,
     pub recurring: bool,
+    /// 是否启用（sqlite INTEGER 0/1 映射为 bool）
+    pub enabled: bool,
+    /// 最近一次触发时间（ISO），未触发过为 NULL
+    pub last_fired: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 /// Input for creating a cron job.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CronJobInput {
     pub session_id: String,
     pub cron: String,

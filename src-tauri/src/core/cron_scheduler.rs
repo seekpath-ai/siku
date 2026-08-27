@@ -112,9 +112,11 @@ pub async fn run(
             }
         }
 
-        let jobs: Vec<CronJob> = match sqlx::query_as::<_, CronJob>(
-            "SELECT id, session_id, cron, prompt, recurring, created_at, updated_at FROM cron_jobs",
-        )
+        // 只拉取启用中的任务；JOB_COLS 与命令层共用，保证列清单一致
+        let jobs: Vec<CronJob> = match sqlx::query_as::<_, CronJob>(&format!(
+            "SELECT {} FROM cron_jobs WHERE enabled = 1",
+            crate::commands::cron::JOB_COLS
+        ))
         .fetch_all(&db)
         .await
         {
@@ -137,16 +139,47 @@ pub async fn run(
             }
             fired.insert(job.id.clone(), minute_key.clone());
 
+            // 记录最近触发时间（内存 fired 去重是双保险，持久化一份方便前端展示）
+            let _ = sqlx::query("UPDATE cron_jobs SET last_fired = ? WHERE id = ?")
+                .bind(crate::core::time::now_iso())
+                .bind(&job.id)
+                .execute(&db)
+                .await;
+
             let app2 = app.clone();
             let sid = job.session_id.clone();
             let prompt = job.prompt.clone();
             tokio::spawn(async move {
                 let state = app2.state::<crate::AppState>();
                 let msg = format!("⏰ 定时任务：{prompt}");
-                if let Err(e) =
-                    crate::commands::agent::run_agent_turn(&state, &app2, sid.clone(), msg, None).await
-                {
-                    tracing::error!(session_id = %sid, error = %e, "cron fire failed");
+                let result =
+                    crate::commands::agent::run_agent_turn(&state, &app2, sid.clone(), msg, None)
+                        .await;
+
+                // 触发完成后发系统通知：标题区分成功/失败，正文带会话标题 + prompt 摘要
+                use tauri_plugin_notification::NotificationExt;
+                let session_title: Option<String> =
+                    sqlx::query_scalar("SELECT title FROM chat_sessions WHERE id = ?")
+                        .bind(&sid)
+                        .fetch_optional(&state.db)
+                        .await
+                        .ok()
+                        .flatten();
+                // prompt 摘要截 50 个字符（按字符截，避免切坏 UTF-8）
+                let summary: String = prompt.chars().take(50).collect();
+                let body = match session_title.filter(|t| !t.is_empty()) {
+                    Some(t) => format!("[{t}] {summary}"),
+                    None => summary,
+                };
+                let (title, body) = match &result {
+                    Ok(()) => ("定时任务完成".to_string(), body),
+                    Err(e) => {
+                        tracing::error!(session_id = %sid, error = %e, "cron fire failed");
+                        ("定时任务失败".to_string(), format!("{body}\n{e}"))
+                    }
+                };
+                if let Err(e) = app2.notification().builder().title(title).body(body).show() {
+                    tracing::warn!(error = %e, "cron notification failed");
                 }
             });
 

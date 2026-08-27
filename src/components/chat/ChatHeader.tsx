@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
-import { Pencil, FolderOpen, Bot } from 'lucide-react';
+import { Pencil, FolderOpen, Bot, CalendarClock } from 'lucide-react';
 import type { AgentSession } from '@/lib/types';
 import { AgentAvatar } from './AgentAvatar';
+import { TaskCenterDialog } from './TaskCenterDialog';
 
 interface Props {
   session: AgentSession;
@@ -14,6 +15,7 @@ interface Props {
 export function ChatHeader({ session, projectName, projectPath, onRename }: Props) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(session.title);
+  const [taskCenterOpen, setTaskCenterOpen] = useState(false);
 
   useEffect(() => {
     setTitle(session.title);
@@ -93,6 +95,18 @@ export function ChatHeader({ session, projectName, projectPath, onRename }: Prop
       </div>
 
       <div className="flex-1" />
+
+      <button
+        onClick={() => setTaskCenterOpen(true)}
+        title="任务中心"
+        className="p-1.5 rounded hover:bg-surface-hover text-text-secondary hover:text-text-primary"
+      >
+        <CalendarClock size={14} />
+      </button>
+
+      {taskCenterOpen && (
+        <TaskCenterDialog sessionId={session.id} onClose={() => setTaskCenterOpen(false)} />
+      )}
     </div>
   );
 }

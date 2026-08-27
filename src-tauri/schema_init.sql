@@ -579,6 +579,8 @@ CREATE TABLE IF NOT EXISTS cron_jobs (
     cron TEXT NOT NULL,
     prompt TEXT NOT NULL,
     recurring INTEGER DEFAULT 1,
+    enabled INTEGER DEFAULT 1,
+    last_fired TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );

@@ -495,6 +495,14 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     add_column_if_missing(&db, "llm_providers", "is_vision", "INTEGER DEFAULT 0")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for llm_providers.is_vision: {}", e))?;
+
+    // Migration: cron_jobs 支持启用/禁用开关并记录最近触发时间 (added 2026-08-27)
+    add_column_if_missing(&db, "cron_jobs", "enabled", "INTEGER DEFAULT 1")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for cron_jobs.enabled: {}", e))?;
+    add_column_if_missing(&db, "cron_jobs", "last_fired", "TEXT")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for cron_jobs.last_fired: {}", e))?;
     add_column_if_missing(&db, "notes", "tags", "TEXT DEFAULT '[]'")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for notes.tags: {}", e))?;

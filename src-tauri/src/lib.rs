@@ -755,6 +755,11 @@ pub fn run() {
             commands::cron::cron_create,
             commands::cron::cron_list,
             commands::cron::cron_delete,
+            commands::cron::cron_set_enabled,
+            // 任务中心（后台任务）
+            commands::tasks::task_snapshot,
+            commands::tasks::task_output,
+            commands::tasks::task_stop,
             // Translation
             commands::translation::translate_text,
             commands::translation::translate_text_stream,

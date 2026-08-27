@@ -22,6 +22,7 @@ pub mod search;
 pub mod sync;
 pub mod system;
 pub mod tags;
+pub mod tasks;
 pub mod timeline;
 pub mod translation;
 pub mod vault;

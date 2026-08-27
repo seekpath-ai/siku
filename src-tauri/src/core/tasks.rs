@@ -13,6 +13,9 @@ pub struct TaskInfo {
     pub status: String,
     pub exit_code: Option<i32>,
     pub output_path: Option<String>,
+    /// 归属的会话 id（哪个 agent 会话启动了它），未知/旧数据为 None
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub created_at: String,
 }
 

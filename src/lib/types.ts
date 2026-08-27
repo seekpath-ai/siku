@@ -212,8 +212,21 @@ export interface CronJob {
   cron: string;
   prompt: string;
   recurring: boolean;
+  enabled: boolean;
+  last_fired: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** A background task (long-running shell command) tracked by the backend. */
+export interface TaskInfo {
+  id: string;
+  description: string;
+  status: 'running' | 'completed' | 'failed' | 'stopped' | 'timed_out';
+  exit_code: number | null;
+  output_path: string | null;
+  created_at: string;
+  session_id: string | null;
 }
 
 /** A structured question the agent asks the user (AskUserQuestion). */

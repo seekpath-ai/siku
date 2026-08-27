@@ -104,11 +104,13 @@ fn find_bash() -> Option<std::path::PathBuf> {
 pub struct BashTool {
     tasks: TaskStore,
     output_dir: PathBuf,
+    /// 归属会话 id：run_background 产生的 TaskInfo 会带上它
+    session_id: Option<String>,
 }
 
 impl BashTool {
-    pub fn new(tasks: TaskStore, output_dir: PathBuf) -> Self {
-        Self { tasks, output_dir }
+    pub fn new(tasks: TaskStore, output_dir: PathBuf, session_id: Option<String>) -> Self {
+        Self { tasks, output_dir, session_id }
     }
 }
 
@@ -265,6 +267,7 @@ impl BashTool {
             status: "running".to_string(),
             exit_code: None,
             output_path: Some(log_path.to_string_lossy().to_string()),
+            session_id: self.session_id.clone(),
             created_at: crate::core::time::now_iso(),
         };
         self.tasks.lock().await.insert(

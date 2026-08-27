@@ -160,6 +160,9 @@ pub async fn resolve_file_path(
 /// (git-style detection), so misnamed binaries are rejected and unknown
 /// text formats just work. Text is decoded lossily (GBK and friends degrade
 /// to replacement chars instead of failing) and capped at 2 MB.
+///
+/// OOXML office documents (.docx/.xlsx/.pptx) are binary zips, so they are
+/// dispatched by name to text extraction BEFORE the NUL sniff.
 #[instrument(skip(db))]
 pub async fn read_file_text(
     db: &SqlitePool,
@@ -168,7 +171,19 @@ pub async fn read_file_text(
 ) -> Result<crate::core::models::TextPreview, String> {
     use std::io::Read;
 
-    let path = resolve_file_path(db, app_data_dir, id).await?;
+    let file = get_file(db, id).await?;
+    let path = crate::file_store::resolve_blob_path(app_data_dir, &file.blob_path);
+    if !path.exists() {
+        return Err(format!("file blob missing on disk: {}", path.display()));
+    }
+
+    // Office documents: zip+XML, extract text instead of sniffing.
+    if crate::core::office_text::is_office_name(&file.name) {
+        let bytes = std::fs::read(&path).map_err(|e| format!("read failed: {e}"))?;
+        let (content, truncated) = crate::core::office_text::extract_text(&bytes, &file.name)?;
+        return Ok(crate::core::models::TextPreview { content, truncated });
+    }
+
     let file = std::fs::File::open(&path).map_err(|e| format!("read failed: {e}"))?;
     const MAX: u64 = 2 * 1024 * 1024;
     let mut buf = Vec::new();

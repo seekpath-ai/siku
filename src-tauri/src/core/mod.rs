@@ -16,6 +16,7 @@ pub mod llm_provider_service;
 pub mod logger;
 pub mod models;
 pub mod note_service;
+pub mod office_text;
 pub mod paper_service;
 pub mod project_service;
 pub mod redact;

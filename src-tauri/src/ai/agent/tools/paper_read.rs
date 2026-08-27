@@ -269,7 +269,8 @@ impl Tool for PaperReadTool {
             let text_len = text.chars().count();
             if emitted > 0 && spent + text_len > total_budget {
                 result.push_str(&format!(
-                    "(output budget exhausted — {} more chunk(s) in this range; call again with offset {idx})\n",
+                    "(output budget exhausted — spent {spent} of {total_budget} chars this call; \
+                     {} more chunk(s) in this range; call again with offset {idx})\n",
                     chunks.len() - emitted,
                 ));
                 break;

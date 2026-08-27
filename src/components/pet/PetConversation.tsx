@@ -5,11 +5,10 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import { listen, emit } from '@tauri-apps/api/event';
 import { useNavigate } from '@tanstack/react-router';
-import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus } from 'lucide-react';
+import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus, CheckCircle2, AlertCircle } from 'lucide-react';
 import { usePetStore } from '@/stores/petStore';
 import type { PetContext } from '@/stores/petContextStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
-import { useDialogStore } from '@/stores/dialogStore';
 import { getChatMessages, getAgentSteps, notesCreate, noteCreateUnderPaper, readImageFile, settingsAppGet, settingsGet, settingsSet } from '@/lib/tauri';
 import { parseEvidence, buildNoteMarkdown } from '@/lib/evidence';
 import type { EvidenceEntry } from '@/lib/evidence';
@@ -333,6 +332,21 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
   const navigate = useNavigate();
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
+  // Inline toast for transient feedback (save success/failure, hints). The
+  // global <Dialog /> lives only in the main window's AppShell, so modal
+  // alerts from here are hidden behind a maximized panel and NEVER render in
+  // the detached pet window — an inline toast works in both.
+  const [toast, setToast] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback((kind: 'success' | 'error', text: string) => {
+    setToast({ kind, text });
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 3200);
+  }, []);
+  useEffect(() => () => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+  }, []);
+
   // Approval policy quick switch: bound to the pet-level `pet.approval`
   // setting (governs all domain/pet sessions), NOT the global
   // default_approval — that one doubles as the new-agent template default
@@ -376,7 +390,7 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
   } = useImageAttachments({
     max: 3,
     onAttached: () => inputRef.current?.focus(),
-    onError: (msg, title) => useDialogStore.getState().alert(msg, title ?? '图片附件'),
+    onError: (msg) => showToast('error', msg),
   });
 
   // Image upload via the OS file picker (same pipeline as the main chat).
@@ -434,16 +448,13 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
       const note = paperId
         ? await noteCreateUnderPaper(paperId, title, markdown)
         : await notesCreate(title, markdown);
-      useDialogStore.getState().alert(`已保存到笔记「${note.title}」`, '保存成功');
+      showToast('success', `已保存到笔记「${note.title}」`);
     } catch (err) {
-      useDialogStore.getState().alert(
-        `保存失败：${err instanceof Error ? err.message : String(err)}`,
-        '保存到笔记'
-      );
+      showToast('error', `保存失败：${err instanceof Error ? err.message : String(err)}`);
     } finally {
       setSavingNoteId(null);
     }
-  }, [context]);
+  }, [context, showToast]);
 
   // Message list auto-scroll (same behavior as the main chat panel).
   const messagesRef = useRef<HTMLDivElement>(null);
@@ -704,10 +715,7 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
       if (sel) {
         store.send(`解释当前段落：\n"${sel}"`);
       } else {
-        useDialogStore.getState().alert(
-          '请先在 PDF 中划选要解释的段落，再点击「解释当前段落」。',
-          '提示'
-        );
+        showToast('error', '请先在 PDF 中划选要解释的段落，再点击「解释当前段落」。');
       }
       return;
     }
@@ -718,7 +726,24 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
     .filter((cmd) => liveSelection || cmd !== SELECTION_COMMAND);
 
   return (
-    <div className="flex-1 min-h-0 flex flex-col">
+    <div className="relative flex-1 min-h-0 flex flex-col">
+      {/* Inline toast — see showToast for why this replaces modal alerts. */}
+      {toast && (
+        <div
+          className={`absolute top-2 left-1/2 -translate-x-1/2 z-50 max-w-[85%] flex items-start gap-1.5 px-3 py-1.5 rounded-lg shadow-lg text-[12px] leading-4 bg-surface border ${
+            toast.kind === 'success'
+              ? 'border-emerald-500/40 text-emerald-400'
+              : 'border-red-500/40 text-red-400'
+          }`}
+        >
+          {toast.kind === 'success' ? (
+            <CheckCircle2 size={13} className="mt-px shrink-0" />
+          ) : (
+            <AlertCircle size={13} className="mt-px shrink-0" />
+          )}
+          <span className="break-words">{toast.text}</span>
+        </div>
+      )}
       {/* Messages */}
       <div ref={messagesRef} onScroll={updateNearBottom} className="flex-1 min-h-0 overflow-y-auto p-3 space-y-3">
         {context && (
@@ -944,6 +969,7 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
               <ApprovalPolicySwitch
                 mode={approval.mode}
                 onPick={pickApprovalMode}
+                compact
                 titleSuffix="（对所有宠物智能体生效）"
               />
             </div>

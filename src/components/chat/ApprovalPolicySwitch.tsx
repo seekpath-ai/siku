@@ -17,12 +17,17 @@ interface ApprovalPolicySwitchProps {
   disabled?: boolean;
   /** Tooltip suffix, e.g. where the change applies. */
   titleSuffix?: string;
+  /** Dense single-line rows (hint moves to the row tooltip) for small
+   *  containers like the pet panel, where the full menu is taller than the
+   *  panel itself. */
+  compact?: boolean;
 }
 
 /** Shield button + dropdown for switching the approval policy. Shared by the
- *  pet panel; rendering-agnostic about where the config is persisted — the
- *  parent owns loading/saving and passes the current mode down. */
-export function ApprovalPolicySwitch({ mode, onPick, disabled, titleSuffix }: ApprovalPolicySwitchProps) {
+ *  main chat input and the pet panel; rendering-agnostic about where the
+ *  config is persisted — the parent owns loading/saving and passes the
+ *  current mode down. */
+export function ApprovalPolicySwitch({ mode, onPick, disabled, titleSuffix, compact }: ApprovalPolicySwitchProps) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -56,19 +61,28 @@ export function ApprovalPolicySwitch({ mode, onPick, disabled, titleSuffix }: Ap
         <ShieldCheck size={15} />
       </button>
       {open && (
-        <div className="absolute left-0 bottom-full z-50 mb-1 w-60 bg-surface border border-surface-hover rounded-lg shadow-xl py-1">
+        <div
+          className={`absolute left-0 bottom-full z-50 mb-1 bg-surface border border-surface-hover rounded-lg shadow-xl py-1 overflow-y-auto max-h-[min(320px,50vh)] ${
+            compact ? 'w-44' : 'w-60'
+          }`}
+        >
           {APPROVAL_OPTIONS.map((opt) => (
             <button
               key={opt.value}
+              title={compact ? opt.hint : undefined}
               onClick={() => {
                 setOpen(false);
                 onPick(opt.value);
               }}
-              className="w-full flex items-start gap-2 px-3 py-1.5 text-left hover:bg-surface-hover"
+              className={`w-full flex items-start gap-2 px-3 text-left hover:bg-surface-hover ${
+                compact ? 'py-1 items-center' : 'py-1.5'
+              }`}
             >
               <span className="flex-1 min-w-0">
                 <span className="block text-[12px] text-text-primary">{opt.label}</span>
-                <span className="block text-[10px] text-text-secondary/60">{opt.hint}</span>
+                {!compact && (
+                  <span className="block text-[10px] text-text-secondary/60">{opt.hint}</span>
+                )}
               </span>
               {mode === opt.value && (
                 <Check size={13} className="text-primary mt-0.5 shrink-0" />

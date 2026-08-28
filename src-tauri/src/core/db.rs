@@ -395,6 +395,10 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.context_budget: {}", e))?;
     if !had_context_budget {
+        // The UPDATE below fires the CR-SQLite update trigger; if this DB was
+        // registered as a CRR before some columns were added, the stale
+        // trigger aborts the statement with "expected N values, got M".
+        refresh_stale_crr_triggers(&db, "chat_sessions").await?;
         sqlx::query(
             "UPDATE chat_sessions SET context_budget = max_tokens, max_tokens = NULL \
              WHERE max_tokens IS NOT NULL"
@@ -426,6 +430,7 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // creation. Approval is now governed by the user's global
     // default_approval (pet panel shield), so clear that pin — NULL falls
     // back to the global default at runtime. Idempotent.
+    refresh_stale_crr_triggers(&db, "chat_sessions").await?;
     sqlx::query(
         "UPDATE chat_sessions SET approval_config = NULL \
          WHERE domain IS NOT NULL AND approval_config = '{\"mode\":\"manual\"}'"
@@ -561,6 +566,7 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for notes.is_folder: {}", e))?;
     // Mark existing notes that already have children as folders (legacy data).
+    refresh_stale_crr_triggers(&db, "notes").await?;
     sqlx::query(
         "UPDATE notes SET is_folder = 1 WHERE id IN \
          (SELECT DISTINCT parent_id FROM notes WHERE parent_id IS NOT NULL)"
@@ -1230,6 +1236,37 @@ pub(crate) async fn drop_crr_objects(db: &Db, table: &str) -> anyhow::Result<()>
     Ok(())
 }
 
+/// If `table` is already registered as a CRR but its triggers are stale
+/// (columns added after `crsql_as_crr`), drop and re-register it so that
+/// subsequent migration UPDATEs don't trip the stale trigger's
+/// "expected N values, got M" error. No-op for tables that are not CRRs
+/// (fresh installs, or optional sync tables while optional sync is off) —
+/// those get registered later by `register_crr_tables`.
+/// Call this right BEFORE any data-migration UPDATE that can match rows on
+/// a syncable table; the freshness pass in `register_crr_tables` runs too
+/// late (after all migrations) to protect them.
+pub(crate) async fn refresh_stale_crr_triggers(db: &Db, table: &str) -> anyhow::Result<()> {
+    let clock_table = format!("{}__crsql_clock", table);
+    let is_crr: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name = ?",
+    )
+    .bind(&clock_table)
+    .fetch_one(db)
+    .await
+    .with_context(|| format!("check CRR status for {}", table))?;
+    if is_crr.0 == 0 || crr_triggers_fresh(db, table).await? {
+        return Ok(());
+    }
+    info!(table = %table, "refreshing stale CRR triggers before data migration");
+    drop_crr_objects(db, table).await?;
+    let sql = format!("SELECT crsql_as_crr('{}')", table);
+    sqlx::query(&sql)
+        .execute(db)
+        .await
+        .with_context(|| format!("re-register {} as CRR", table))?;
+    Ok(())
+}
+
 /// Register tables as CR-SQLite CRRs.
 ///
 /// If a table is already a CRR but its triggers are stale (because columns
@@ -1547,6 +1584,58 @@ pub(crate) mod tests {
         sqlx::query("UPDATE chat_sessions SET title = 'updated' WHERE id = 's1'")
             .execute(&db)
             .await?;
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Regression test for the startup crash "migration failed for
+    /// chat_sessions max_tokens resemantic: expected 59 values, got 57":
+    /// a data-migration UPDATE on a table whose CRR triggers went stale
+    /// (columns added after registration) must refresh the triggers first —
+    /// register_crr_tables runs too late (after all migrations).
+    #[tokio::test]
+    async fn data_migration_update_refreshes_stale_crr_triggers() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-crr-migration-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db_path = dir.join("test.db");
+        let db = connect_with_crsqlite(&db_path).await?;
+
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db).await?;
+        sqlx::query("INSERT INTO chat_sessions (id, title) VALUES ('s1', 't')")
+            .execute(&db)
+            .await?;
+
+        // CRR registered against the current schema, then a later migration
+        // adds a column — the update trigger is now stale.
+        register_crr_tables(&db, &["chat_sessions"]).await?;
+        sqlx::query("ALTER TABLE chat_sessions ADD COLUMN another_test_col TEXT")
+            .execute(&db)
+            .await?;
+
+        // Without the refresh the UPDATE would fail inside the stale trigger.
+        refresh_stale_crr_triggers(&db, "chat_sessions").await?;
+        sqlx::query("UPDATE chat_sessions SET another_test_col = 'x' WHERE id = 's1'")
+            .execute(&db)
+            .await?;
+
+        // No-op for a table that is not a CRR (must not register it).
+        refresh_stale_crr_triggers(&db, "papers").await?;
+        let clock: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name = 'papers__crsql_clock'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(clock.0, 0, "refresh must not register a non-CRR table");
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;

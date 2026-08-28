@@ -385,6 +385,24 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     add_column_if_missing(&db, "chat_sessions", "max_tokens", "INTEGER DEFAULT 28000")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.max_tokens: {}", e))?;
+    // Migration: chat_sessions.max_tokens used to be the conversation context
+    // budget; it now means the per-round OUTPUT cap sent to the LLM API
+    // (NULL = follow the model config). Move legacy values to the new
+    // context_budget column, then clear max_tokens. Runs only when the column
+    // is first added — otherwise every restart would wipe user-set caps.
+    let had_context_budget = column_exists(&db, "chat_sessions", "context_budget").await?;
+    add_column_if_missing(&db, "chat_sessions", "context_budget", "INTEGER DEFAULT 28000")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.context_budget: {}", e))?;
+    if !had_context_budget {
+        sqlx::query(
+            "UPDATE chat_sessions SET context_budget = max_tokens, max_tokens = NULL \
+             WHERE max_tokens IS NOT NULL"
+        )
+        .execute(&db)
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions max_tokens resemantic: {}", e))?;
+    }
     add_column_if_missing(&db, "chat_sessions", "max_memory_rounds", "INTEGER DEFAULT 10")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.max_memory_rounds: {}", e))?;

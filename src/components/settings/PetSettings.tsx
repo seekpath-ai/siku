@@ -19,6 +19,8 @@ const DOMAINS: DomainConfig[] = [
 interface DomainState {
   enabled: boolean;
   prompt: string;
+  /** Per-round output cap override; '' = built-in domain default. */
+  maxTokens: string;
 }
 
 /** Settings page section: per-domain pet agent toggles + prompt overrides. */
@@ -29,6 +31,8 @@ export function PetSettings() {
   const [savedKey, setSavedKey] = useState<string | null>(null);
   /** Built-in default prompts per domain, shown as placeholders. */
   const [defaultPrompts, setDefaultPrompts] = useState<Record<string, string>>({});
+  /** Built-in per-domain output caps, shown as placeholders. */
+  const [defaultMaxTokens, setDefaultMaxTokens] = useState<Record<string, number | null>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -39,19 +43,22 @@ export function PetSettings() {
         const domains = await petDomains();
         if (!cancelled) {
           setDefaultPrompts(Object.fromEntries(domains.map((d) => [d.id, d.default_prompt])));
+          setDefaultMaxTokens(Object.fromEntries(domains.map((d) => [d.id, d.default_max_tokens])));
         }
       } catch (e) {
         console.error('load pet domains:', e);
       }
       const result: Record<string, DomainState> = {};
       for (const d of DOMAINS) {
-        const [enabled, prompt] = await Promise.all([
+        const [enabled, prompt, maxTokens] = await Promise.all([
           settingsGet(`pet.${d.id}.enabled`),
           settingsGet(`pet.${d.id}.prompt`),
-        ]).catch(() => [null, null] as const);
+          settingsGet(`pet.${d.id}.max_tokens`),
+        ]).catch(() => [null, null, null] as const);
         result[d.id] = {
           enabled: enabled !== '0', // default enabled
           prompt: prompt ?? '',
+          maxTokens: maxTokens ?? '',
         };
       }
       if (!cancelled) {
@@ -68,10 +75,15 @@ export function PetSettings() {
   };
 
   const savePrompt = async (id: string) => {
-    const prompt = states[id]?.prompt ?? '';
+    const st = states[id];
+    const prompt = st?.prompt ?? '';
+    const maxTokens = st?.maxTokens.trim() ?? '';
     setSavingKey(id);
     try {
+      // Empty string = clear the override; the runtime parser treats
+      // unset/unparsable values as "use the built-in default".
       await settingsSet(`pet.${id}.prompt`, prompt);
+      await settingsSet(`pet.${id}.max_tokens`, maxTokens);
       setSavedKey(id);
       window.setTimeout(() => setSavedKey(null), 2000);
     } catch (e) {
@@ -94,7 +106,7 @@ export function PetSettings() {
       <div>
         <h2 className="text-base font-semibold text-text-primary">宠物智能体</h2>
         <p className="text-xs text-text-secondary/60 mt-1">
-          全局宠物球在不同页面唤起对应的内置智能体。可在此控制各智能体是否启用，或自定义其提示词（留空使用默认）。
+          全局宠物球在不同页面唤起对应的内置智能体。可在此控制各智能体是否启用，或自定义其提示词与单轮输出上限（留空使用默认）。
         </p>
       </div>
 
@@ -127,6 +139,17 @@ export function PetSettings() {
 
             {st.enabled && (
               <div className="px-4 pb-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <label className="text-xs text-text-secondary/70 shrink-0">单轮输出上限</label>
+                  <input
+                    type="number"
+                    value={st.maxTokens}
+                    placeholder={defaultMaxTokens[d.id]?.toString() ?? '跟随模型'}
+                    onChange={(e) => setStates((s) => ({ ...s, [d.id]: { ...s[d.id], maxTokens: e.target.value } }))}
+                    className="w-28 rounded-lg bg-background border border-surface-hover px-2 py-1 text-xs text-text-primary placeholder:text-text-secondary/40 focus:outline-none focus:border-primary/40"
+                  />
+                  <span className="text-[10px] text-text-secondary/50">留空使用内置默认；作用于每轮 ReAct 输出，立即生效</span>
+                </div>
                 <textarea
                   value={st.prompt}
                   onChange={(e) => setStates((s) => ({ ...s, [d.id]: { ...s[d.id], prompt: e.target.value } }))}
@@ -154,7 +177,7 @@ export function PetSettings() {
                     ) : savedKey === d.id ? (
                       <><Check size={11} />已保存</>
                     ) : (
-                      '保存提示词'
+                      '保存'
                     )}
                   </button>
                 </div>

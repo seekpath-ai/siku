@@ -181,7 +181,10 @@ pub struct ChatSession {
     pub llm_provider_ids: Option<String>,
     pub approval_config: Option<String>,
     pub max_loops: Option<i32>,
+    /// Per-round output cap sent to the LLM API; None = follow the model config.
     pub max_tokens: Option<i32>,
+    /// Conversation context truncation budget; never sent to the API.
+    pub context_budget: Option<i32>,
     pub max_memory_rounds: Option<i32>,
     pub memory_file_path: Option<String>,
     pub memory_dir: Option<String>,
@@ -419,7 +422,10 @@ pub struct AgentSessionInput {
     pub llm_provider_ids: Vec<String>,
     pub approval_config: Option<crate::ai::agent::config::ApprovalConfig>,
     pub max_loops: Option<i32>,
+    /// Per-round output cap override; None = follow the model config.
     pub max_tokens: Option<i32>,
+    /// Conversation context truncation budget; None = global default.
+    pub context_budget: Option<i32>,
     pub max_memory_rounds: Option<i32>,
     pub memory_dir: Option<String>,
     pub skills_dir: Option<String>,
@@ -444,6 +450,7 @@ impl std::fmt::Debug for AgentSessionInput {
             .field("approval_config", &self.approval_config)
             .field("max_loops", &self.max_loops)
             .field("max_tokens", &self.max_tokens)
+            .field("context_budget", &self.context_budget)
             .field("max_memory_rounds", &self.max_memory_rounds)
             .field("memory_dir", &self.memory_dir)
             .field("skills_dir", &self.skills_dir)

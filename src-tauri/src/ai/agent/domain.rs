@@ -11,6 +11,9 @@ pub struct DomainAgent {
     /// Settings key controlling visibility.
     pub enabled_setting: &'static str,
     pub default_prompt: &'static str,
+    /// Built-in per-round output cap (max_tokens). None = follow the model
+    /// config. Overridable at runtime via the `pet.<id>.max_tokens` setting.
+    pub default_max_tokens: Option<i32>,
 }
 
 pub const NOTE_ORGANIZER_PROMPT: &str = "你是思库的内置「笔记整理」智能体，专门帮助用户整理当前这篇笔记。\
@@ -57,6 +60,8 @@ pub fn builtin_domains() -> Vec<DomainAgent> {
             prompt_setting: "pet.note_organizer.prompt",
             enabled_setting: "pet.note_organizer.enabled",
             default_prompt: NOTE_ORGANIZER_PROMPT,
+            // Rewrites whole notes — needs room for long outputs.
+            default_max_tokens: Some(8192),
         },
         DomainAgent {
             id: "literature_analyzer",
@@ -64,6 +69,9 @@ pub fn builtin_domains() -> Vec<DomainAgent> {
             prompt_setting: "pet.literature_analyzer.prompt",
             enabled_setting: "pet.literature_analyzer.enabled",
             default_prompt: LITERATURE_ANALYZER_PROMPT,
+            // Long summary + evidence JSON + thinking share one round's
+            // budget; the model-level 4096 default truncates this badly.
+            default_max_tokens: Some(16384),
         },
         DomainAgent {
             id: "research_tracker",
@@ -71,6 +79,7 @@ pub fn builtin_domains() -> Vec<DomainAgent> {
             prompt_setting: "pet.research_tracker.prompt",
             enabled_setting: "pet.research_tracker.enabled",
             default_prompt: RESEARCH_TRACKER_PROMPT,
+            default_max_tokens: Some(8192),
         },
         DomainAgent {
             id: "knowledge_curator",
@@ -78,6 +87,7 @@ pub fn builtin_domains() -> Vec<DomainAgent> {
             prompt_setting: "pet.knowledge_curator.prompt",
             enabled_setting: "pet.knowledge_curator.enabled",
             default_prompt: KNOWLEDGE_CURATOR_PROMPT,
+            default_max_tokens: None,
         },
         DomainAgent {
             id: "chat_summarizer",
@@ -85,6 +95,7 @@ pub fn builtin_domains() -> Vec<DomainAgent> {
             prompt_setting: "pet.chat_summarizer.prompt",
             enabled_setting: "pet.chat_summarizer.enabled",
             default_prompt: CHAT_SUMMARIZER_PROMPT,
+            default_max_tokens: None,
         },
     ]
 }
@@ -104,6 +115,54 @@ pub async fn effective_prompt(db: &SqlitePool, id: &str) -> String {
         }
         None => "你是思库的智能助手，帮助用户处理当前页面上的任务。".to_string(),
     }
+}
+
+/// Effective per-round output cap for a domain session, resolved at RUNTIME
+/// (unlike the session row, so setting changes take effect immediately):
+/// `pet.<id>.max_tokens` setting > built-in default > None (follow model).
+pub async fn effective_max_tokens(db: &SqlitePool, id: &str) -> Option<i32> {
+    let domain = get_domain(id)?;
+    let key = format!("pet.{}.max_tokens", domain.id);
+    if let Ok(Some(v)) = crate::core::settings_service::get_setting(db, &key).await {
+        if let Ok(n) = v.trim().parse::<i32>() {
+            if n > 0 {
+                return Some(n);
+            }
+        }
+    }
+    domain.default_max_tokens
+}
+
+/// Runtime system prompt for a domain session: the effective prompt plus,
+/// for the chat summarizer, the target conversation transcript (resolved
+/// from the session's context object id). Read on every turn so settings
+/// edits apply to existing sessions without recreating them.
+pub async fn runtime_prompt(db: &SqlitePool, id: &str, context: Option<&str>) -> String {
+    let mut prompt = effective_prompt(db, id).await;
+    if id == "chat_summarizer" {
+        let oid = context
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .and_then(|v| v.get("objectId").and_then(|o| o.as_str()).map(|s| s.to_string()));
+        if let Some(oid) = oid {
+            let msgs: Vec<crate::core::models::ChatMessage> = sqlx::query_as(
+                "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC LIMIT 60"
+            )
+            .bind(&oid)
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
+            if !msgs.is_empty() {
+                let mut transcript = String::new();
+                for m in msgs {
+                    let role = if m.role == "user" { "用户" } else { "助手" };
+                    transcript.push_str(&format!("{role}: {}\n", m.content));
+                }
+                prompt.push_str("\n\n【目标会话对话内容】\n");
+                prompt.push_str(&transcript);
+            }
+        }
+    }
+    prompt
 }
 
 /// Whether a domain agent is enabled (defaults to enabled when unset).

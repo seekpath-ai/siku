@@ -42,7 +42,10 @@ interface AgentCreateInput {
   llmModels: LlmConfigBlock[];
   approvalConfig: ApprovalConfig;
   maxLoops: number;
-  maxTokens: number;
+  /** Per-round output cap; undefined = follow the model config. */
+  maxTokens?: number;
+  /** Conversation context truncation budget. */
+  contextBudget: number;
   maxMemoryRounds: number;
   memoryDir?: string;
   skillsDir?: string;
@@ -226,6 +229,7 @@ export function AgentList() {
       approvalConfig: input.approvalConfig,
       maxLoops: input.maxLoops,
       maxTokens: input.maxTokens,
+      contextBudget: input.contextBudget,
       maxMemoryRounds: input.maxMemoryRounds,
       memoryDir: input.memoryDir,
       skillsDir: input.skillsDir,
@@ -248,6 +252,7 @@ export function AgentList() {
       approvalConfig: input.approvalConfig,
       maxLoops: input.maxLoops,
       maxTokens: input.maxTokens,
+      contextBudget: input.contextBudget,
       maxMemoryRounds: input.maxMemoryRounds,
       memoryDir: input.memoryDir,
       skillsDir: input.skillsDir,

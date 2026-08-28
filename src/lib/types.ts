@@ -156,7 +156,10 @@ export interface AgentSession {
   llm_provider_ids: string[] | null;
   approval_config: ApprovalConfig | null;
   max_loops: number | null;
+  /** Per-round output cap sent to the LLM API; null = follow the model config. */
   max_tokens: number | null;
+  /** Conversation context truncation budget; never sent to the API. */
+  context_budget: number | null;
   max_memory_rounds: number | null;
   memory_file_path: string | null;
   memory_dir: string | null;

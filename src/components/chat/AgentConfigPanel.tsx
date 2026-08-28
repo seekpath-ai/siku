@@ -21,7 +21,10 @@ interface Props {
     llmModels: LlmConfigBlock[];
     approvalConfig: ApprovalConfig;
     maxLoops: number;
-    maxTokens: number;
+    /** Per-round output cap; undefined = follow the model config. */
+    maxTokens?: number;
+    /** Conversation context truncation budget. */
+    contextBudget: number;
     maxMemoryRounds: number;
     memoryDir?: string;
     skillsDir?: string;
@@ -53,7 +56,9 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
   const [expireSec, setExpireSec] = useState(agent.approval_config?.expire_sec ?? 60);
   const [whitelist, setWhitelist] = useState((agent.approval_config?.whitelist || []).join(', '));
   const [maxLoops, setMaxLoops] = useState(agent.max_loops ?? 10);
-  const [maxTokens, setMaxTokens] = useState(agent.max_tokens ?? 28000);
+  /** Per-round output cap; '' = follow the model config. */
+  const [maxTokens, setMaxTokens] = useState(agent.max_tokens?.toString() ?? '');
+  const [contextBudget, setContextBudget] = useState(agent.context_budget ?? 28000);
   const [maxMemoryRounds, setMaxMemoryRounds] = useState(agent.max_memory_rounds ?? 10);
   const [memoryDir, setMemoryDir] = useState(agent.memory_dir ?? '');
   const [skillsDir, setSkillsDir] = useState(agent.skills_dir ?? '');
@@ -83,7 +88,8 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
     setExpireSec(agent.approval_config?.expire_sec ?? 60);
     setWhitelist((agent.approval_config?.whitelist || []).join(', '));
     setMaxLoops(agent.max_loops ?? 10);
-    setMaxTokens(agent.max_tokens ?? 28000);
+    setMaxTokens(agent.max_tokens?.toString() ?? '');
+    setContextBudget(agent.context_budget ?? 28000);
     setMaxMemoryRounds(agent.max_memory_rounds ?? 10);
     setMemoryDir(agent.memory_dir ?? '');
     setSkillsDir(agent.skills_dir ?? '');
@@ -113,7 +119,8 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
         llmModels: useCustomLlm ? [customLlm] : [],
         approvalConfig,
         maxLoops,
-        maxTokens,
+        maxTokens: maxTokens.trim() ? parseInt(maxTokens, 10) : undefined,
+        contextBudget,
         maxMemoryRounds,
         memoryDir: memoryDir.trim() || undefined,
         skillsDir: skillsDir.trim() || undefined,
@@ -297,7 +304,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
             )}
           </div>
 
-          <div className="grid grid-cols-3 gap-3 border-t border-codex-border pt-3">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 border-t border-codex-border pt-3">
             <div className="space-y-1">
               <label className="text-xs text-codex-muted">最大轮次</label>
               <input
@@ -308,11 +315,21 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
               />
             </div>
             <div className="space-y-1">
-              <label className="text-xs text-codex-muted">最大 Token</label>
+              <label className="text-xs text-codex-muted">单轮输出上限</label>
               <input
                 type="number"
                 value={maxTokens}
-                onChange={(e) => setMaxTokens(parseInt(e.target.value) || 0)}
+                placeholder="跟随模型"
+                onChange={(e) => setMaxTokens(e.target.value)}
+                className="w-full bg-codex-bg border border-codex-border rounded-lg px-3 py-2 text-sm text-codex-primary outline-none focus:border-codex-border-light"
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs text-codex-muted">上下文限制</label>
+              <input
+                type="number"
+                value={contextBudget}
+                onChange={(e) => setContextBudget(parseInt(e.target.value) || 0)}
                 className="w-full bg-codex-bg border border-codex-border rounded-lg px-3 py-2 text-sm text-codex-primary outline-none focus:border-codex-border-light"
               />
             </div>

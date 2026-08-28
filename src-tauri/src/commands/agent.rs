@@ -48,8 +48,10 @@ async fn ensure_agent_config(
     if config.max_loops.is_none() {
         config.max_loops = Some(app_settings.default_max_loops);
     }
-    if config.max_tokens.is_none() {
-        config.max_tokens = Some(app_settings.default_max_tokens);
+    // max_tokens (per-round output cap) stays None = follow the model config;
+    // the global default applies to the context budget instead.
+    if config.context_budget.is_none() {
+        config.context_budget = Some(app_settings.default_max_tokens);
     }
     if config.max_memory_rounds.is_none() {
         config.max_memory_rounds = Some(app_settings.default_max_memory_rounds);
@@ -163,6 +165,7 @@ async fn build_agent_config(
         approval,
         max_loops: session.max_loops,
         max_tokens: session.max_tokens,
+        context_budget: session.context_budget,
         max_memory_rounds: session.max_memory_rounds,
         memory_file_path: session.memory_file_path.clone(),
         memory_dir: session.memory_dir.clone(),
@@ -188,7 +191,8 @@ pub async fn agent_create_session(
         tools: Some(input.tools_enabled.clone()),
         approval: input.approval_config.unwrap_or_else(|| app_settings.default_approval.clone()),
         max_loops: input.max_loops.or(Some(app_settings.default_max_loops)),
-        max_tokens: input.max_tokens.or(Some(app_settings.default_max_tokens)),
+        max_tokens: input.max_tokens,
+        context_budget: input.context_budget.or(Some(app_settings.default_max_tokens)),
         max_memory_rounds: input.max_memory_rounds.or(Some(app_settings.default_max_memory_rounds)),
         memory_file_path: None,
         memory_dir: input.memory_dir.clone(),
@@ -216,10 +220,10 @@ pub async fn agent_create_session(
     sqlx::query(
         "INSERT INTO chat_sessions (
             id, title, mode, agent_mode, tools_enabled, system_prompt, project_id, working_dir, vision_provider_id, web_proxy,
-            llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, max_memory_rounds,
+            llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, context_budget, max_memory_rounds,
             memory_file_path, memory_dir, skills_dir,
             is_pinned, sort_order, paper_ids, created_at, updated_at
-        ) VALUES (?, ?, 'qa', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, '[]', ?, ?)"
+        ) VALUES (?, ?, 'qa', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, '[]', ?, ?)"
     )
     .bind(&id)
     .bind(&config.display_name)
@@ -235,6 +239,7 @@ pub async fn agent_create_session(
     .bind(&approval_json)
     .bind(config.max_loops)
     .bind(config.max_tokens)
+    .bind(config.context_budget)
     .bind(config.max_memory_rounds)
     .bind(&config.memory_file_path)
     .bind(&config.memory_dir)
@@ -261,6 +266,7 @@ pub async fn agent_create_session(
         "approval_config": config.approval,
         "max_loops": config.max_loops,
         "max_tokens": config.max_tokens,
+        "context_budget": config.context_budget,
         "max_memory_rounds": config.max_memory_rounds,
         "memory_file_path": config.memory_file_path,
         "memory_dir": config.memory_dir,
@@ -292,7 +298,8 @@ pub async fn agent_update_session(
         tools: Some(input.tools_enabled.clone()),
         approval: input.approval_config.unwrap_or_else(|| app_settings.default_approval.clone()),
         max_loops: input.max_loops.or(Some(app_settings.default_max_loops)),
-        max_tokens: input.max_tokens.or(Some(app_settings.default_max_tokens)),
+        max_tokens: input.max_tokens,
+        context_budget: input.context_budget.or(Some(app_settings.default_max_tokens)),
         max_memory_rounds: input.max_memory_rounds.or(Some(app_settings.default_max_memory_rounds)),
         memory_file_path: None,
         memory_dir: input.memory_dir.clone(),
@@ -313,7 +320,7 @@ pub async fn agent_update_session(
             vision_provider_id = COALESCE(?, vision_provider_id),
             web_proxy = COALESCE(?, web_proxy),
             llm_models = ?, llm_provider_ids = ?, approval_config = ?, max_loops = ?, max_tokens = ?,
-            max_memory_rounds = ?, memory_file_path = ?, memory_dir = ?, skills_dir = ?, updated_at = ?
+            context_budget = ?, max_memory_rounds = ?, memory_file_path = ?, memory_dir = ?, skills_dir = ?, updated_at = ?
          WHERE id = ?"
     )
     .bind(&config.display_name)
@@ -328,6 +335,7 @@ pub async fn agent_update_session(
     .bind(&approval_json)
     .bind(config.max_loops)
     .bind(config.max_tokens)
+    .bind(config.context_budget)
     .bind(config.max_memory_rounds)
     .bind(&config.memory_file_path)
     .bind(&config.memory_dir)
@@ -340,7 +348,7 @@ pub async fn agent_update_session(
 
     let session = sqlx::query_as::<_, ChatSession>(
         "SELECT id, title, mode, project_id, working_dir, vision_provider_id, web_proxy, agent_mode, tools_enabled, system_prompt,
-                llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, max_memory_rounds,
+                llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, context_budget, max_memory_rounds,
                 memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, icon, color, domain, context, paper_ids, created_at, updated_at
          FROM chat_sessions WHERE id = ?"
     )
@@ -379,7 +387,7 @@ pub async fn agent_get_session(
 ) -> Result<serde_json::Value, String> {
     let session = sqlx::query_as::<_, ChatSession>(
         "SELECT id, title, mode, project_id, working_dir, vision_provider_id, web_proxy, agent_mode, tools_enabled, system_prompt,
-                llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, max_memory_rounds,
+                llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, context_budget, max_memory_rounds,
                 memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, icon, color, domain, context, paper_ids, created_at, updated_at
          FROM chat_sessions WHERE id = ?"
     )
@@ -495,6 +503,7 @@ fn session_to_json(
         "approval_config": config.approval,
         "max_loops": config.max_loops,
         "max_tokens": config.max_tokens,
+        "context_budget": config.context_budget,
         "max_memory_rounds": config.max_memory_rounds,
         "memory_file_path": config.memory_file_path,
         "memory_dir": config.memory_dir,
@@ -522,7 +531,7 @@ pub(crate) async fn run_agent_turn(
 ) -> Result<(), String> {
     let session = sqlx::query_as::<_, ChatSession>(
         "SELECT id, title, mode, project_id, working_dir, vision_provider_id, web_proxy, agent_mode, tools_enabled, system_prompt,
-                llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, max_memory_rounds,
+                llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, context_budget, max_memory_rounds,
                 memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, icon, color, domain, context, paper_ids, created_at, updated_at
          FROM chat_sessions WHERE id = ?"
     )
@@ -532,7 +541,19 @@ pub(crate) async fn run_agent_turn(
     .map_err(|e| format!("db error: {e}"))?
     .ok_or_else(|| "session not found".to_string())?;
 
-    let config = build_agent_config(&state, &session).await?;
+    let mut config = build_agent_config(&state, &session).await?;
+    // Domain (pet) sessions: resolve the system prompt at RUNTIME so prompt
+    // edits in settings apply to existing sessions without recreating them.
+    if let Some(domain_id) = session.domain.as_deref() {
+        config.system_prompt = Some(
+            crate::ai::agent::domain::runtime_prompt(
+                &state.db,
+                domain_id,
+                session.context.as_deref(),
+            )
+            .await,
+        );
+    }
     let _app_settings = settings_service::load_app_settings(&state.db).await?;
     let device_settings = settings_service::load_device_settings(&state.db).await?;
 
@@ -607,6 +628,21 @@ pub(crate) async fn run_agent_turn(
                 return Err("当前消息包含图片，但默认模型不支持视觉且未配置视觉模型。请在会话设置中选择视觉模型。".to_string());
             }
         };
+    }
+
+    // Agent-level per-round output cap, applied AFTER any vision-model
+    // switch so it governs whichever model actually serves the turn. For pet
+    // domain sessions the live setting (pet.<domain>.max_tokens) and the
+    // built-in domain default outrank the session row, so settings edits
+    // take effect immediately. None = follow the model config.
+    let output_cap = match session.domain.as_deref() {
+        Some(d) => crate::ai::agent::domain::effective_max_tokens(&state.db, d)
+            .await
+            .or(session.max_tokens),
+        None => session.max_tokens,
+    };
+    if let Some(cap) = output_cap.filter(|v| *v > 0) {
+        llm_config.max_tokens = cap as u32;
     }
 
     if llm_config.api_key.is_empty() && llm_config.provider != llm::LlmProvider::Ollama {
@@ -920,30 +956,12 @@ pub async fn pet_create_session(
     let Some(agent) = crate::ai::agent::domain::get_domain(&domain) else {
         return Err(format!("unknown domain agent: {domain}"));
     };
-    let mut prompt = crate::ai::agent::domain::effective_prompt(&state.db, &domain).await;
-
-    // The chat summarizer needs the target conversation: inject its recent
-    // messages into the system prompt so the agent can summarize them.
-    if domain == "chat_summarizer" {
-        if let Some(oid) = context.get("objectId").and_then(|v| v.as_str()) {
-            let msgs: Vec<crate::core::models::ChatMessage> = sqlx::query_as(
-                "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC LIMIT 60"
-            )
-            .bind(oid)
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
-            if !msgs.is_empty() {
-                let mut transcript = String::new();
-                for m in msgs {
-                    let role = if m.role == "user" { "用户" } else { "助手" };
-                    transcript.push_str(&format!("{role}: {}\n", m.content));
-                }
-                prompt.push_str("\n\n【目标会话对话内容】\n");
-                prompt.push_str(&transcript);
-            }
-        }
-    }
+    let prompt = crate::ai::agent::domain::runtime_prompt(
+        &state.db,
+        &domain,
+        Some(&context.to_string()),
+    )
+    .await;
 
     let title = context
         .get("title")
@@ -977,8 +995,11 @@ pub async fn pet_create_session(
     let llm_models_json = serde_json::to_string(&llm_models).map_err(|e| format!("json: {e}"))?;
 
     sqlx::query(
-        "INSERT INTO chat_sessions (id, title, mode, paper_ids, agent_mode, tools_enabled, system_prompt, domain, context, llm_provider_ids, llm_models, approval_config, created_at, updated_at) \
-         VALUES (?, ?, 'qa', '[]', 'chat', ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        // max_tokens bound explicitly as NULL: existing DBs carry a legacy
+        // column DEFAULT of 28000, which under the new semantics (per-round
+        // output cap) must not leak in — domain caps resolve at runtime.
+        "INSERT INTO chat_sessions (id, title, mode, paper_ids, agent_mode, tools_enabled, system_prompt, domain, context, llm_provider_ids, llm_models, approval_config, max_tokens, created_at, updated_at) \
+         VALUES (?, ?, 'qa', '[]', 'chat', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)"
     )
     .bind(&id)
     .bind(&title)
@@ -1012,6 +1033,7 @@ pub struct PetDomainInfo {
     pub id: String,
     pub name: String,
     pub default_prompt: String,
+    pub default_max_tokens: Option<i32>,
 }
 
 /// List all built-in pet domain agents with their default system prompts.
@@ -1023,6 +1045,7 @@ pub async fn pet_domains() -> Result<Vec<PetDomainInfo>, String> {
             id: d.id.to_string(),
             name: d.name.to_string(),
             default_prompt: d.default_prompt.to_string(),
+            default_max_tokens: d.default_max_tokens,
         })
         .collect())
 }
@@ -1054,7 +1077,7 @@ pub async fn agent_list_sessions(
     project_id: Option<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
     const SESSION_COLS: &str = "id, title, mode, project_id, working_dir, vision_provider_id, web_proxy, agent_mode, tools_enabled, system_prompt, \
-         llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, max_memory_rounds, \
+         llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, context_budget, max_memory_rounds, \
          memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, icon, color, domain, context, paper_ids, created_at, updated_at";
 
     let rows = if let Some(pid) = project_id {

@@ -144,8 +144,12 @@ pub struct AgentConfig {
     pub approval: ApprovalConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_loops: Option<i32>,
+    /// Per-round output cap sent to the LLM API; None = follow the model config.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<i32>,
+    /// Conversation context truncation budget; never sent to the API.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_budget: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_memory_rounds: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,6 +171,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("approval", &self.approval)
             .field("max_loops", &self.max_loops)
             .field("max_tokens", &self.max_tokens)
+            .field("context_budget", &self.context_budget)
             .field("max_memory_rounds", &self.max_memory_rounds)
             .field("memory_file_path", &self.memory_file_path)
             .field("memory_dir", &self.memory_dir)
@@ -215,7 +220,8 @@ impl AgentConfig {
     }
 
     /// Token budget for the conversation context. `0` means do not truncate.
-    pub fn effective_max_tokens(&self) -> usize {
-        self.max_tokens.unwrap_or(28000).max(0) as usize
+    /// Never sent to the LLM API — the per-round output cap is `max_tokens`.
+    pub fn effective_context_budget(&self) -> usize {
+        self.context_budget.unwrap_or(28000).max(0) as usize
     }
 }

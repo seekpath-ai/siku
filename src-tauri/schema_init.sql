@@ -264,7 +264,10 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     llm_provider_ids TEXT,
     approval_config TEXT,
     max_loops INTEGER DEFAULT 10,
-    max_tokens INTEGER DEFAULT 28000,
+    -- Per-round OUTPUT cap sent to the LLM API; NULL = follow the model config.
+    max_tokens INTEGER,
+    -- Conversation context truncation budget (never sent to the API).
+    context_budget INTEGER DEFAULT 28000,
     max_memory_rounds INTEGER DEFAULT 10,
     memory_file_path TEXT,
     memory_dir TEXT,

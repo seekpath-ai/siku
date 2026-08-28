@@ -185,7 +185,10 @@ export interface AgentSessionInput {
   llmProviderIds?: string[];
   approvalConfig?: ApprovalConfig;
   maxLoops?: number;
+  /** Per-round output cap (ReAct limit); unset = follow the model config. */
   maxTokens?: number;
+  /** Conversation context truncation budget; unset = global default. */
+  contextBudget?: number;
   maxMemoryRounds?: number;
   memoryDir?: string;
   skillsDir?: string;
@@ -215,6 +218,7 @@ export interface PetDomainInfo {
   id: string;
   name: string;
   default_prompt: string;
+  default_max_tokens: number | null;
 }
 
 /** List built-in pet domain agents with their default system prompts. */

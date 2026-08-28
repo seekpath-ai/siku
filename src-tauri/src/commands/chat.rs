@@ -12,7 +12,7 @@ pub async fn list_chat_sessions(
     project_id: Option<String>,
 ) -> Result<Vec<ChatSession>, String> {
     const SESSION_COLS: &str = "id, title, mode, project_id, working_dir, vision_provider_id, web_proxy, agent_mode, tools_enabled, system_prompt, \
-         llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, max_memory_rounds, \
+         llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, context_budget, max_memory_rounds, \
          memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, icon, color, domain, context, paper_ids, created_at, updated_at";
 
     let sessions = if let Some(pid) = project_id {
@@ -55,8 +55,11 @@ pub async fn create_chat_session(
         .map_err(|e| format!("json error: {e}"))?;
 
     sqlx::query(
-        "INSERT INTO chat_sessions (id, title, mode, agent_mode, tools_enabled, system_prompt, project_id, paper_ids, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?)"
+        // max_tokens bound explicitly: existing DBs carry a legacy column
+        // DEFAULT of 28000, which under the new semantics (per-round output
+        // cap) must not leak into fresh sessions — NULL = follow the model.
+        "INSERT INTO chat_sessions (id, title, mode, agent_mode, tools_enabled, system_prompt, project_id, paper_ids, max_tokens, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, '[]', NULL, ?, ?)"
     )
     .bind(&id)
     .bind(&title)
@@ -73,7 +76,7 @@ pub async fn create_chat_session(
 
     let session = sqlx::query_as::<_, ChatSession>(
         "SELECT id, title, mode, project_id, working_dir, vision_provider_id, web_proxy, agent_mode, tools_enabled, system_prompt,
-                llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, max_memory_rounds,
+                llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, context_budget, max_memory_rounds,
                 memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, icon, color, domain, context, paper_ids, created_at, updated_at
          FROM chat_sessions WHERE id = ?"
     )

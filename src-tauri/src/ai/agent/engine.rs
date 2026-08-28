@@ -82,7 +82,7 @@ impl AgentEngine {
         long_term_memory: Option<String>,
     ) -> Self {
         let system_prompt = Some(config.effective_system_prompt());
-        let max_tokens = config.effective_max_tokens();
+        let max_tokens = config.effective_context_budget();
         let memory = ConversationMemory::new(max_tokens, system_prompt);
         Self {
             llm,
@@ -298,7 +298,8 @@ impl AgentEngine {
 
             // Truncate if needed
             if ConversationMemory::estimate_messages_tokens(&messages) > 100_000 {
-                messages = self.memory.truncate(&messages, 28_000);
+                let budget = self.config.effective_context_budget();
+                messages = self.memory.truncate(&messages, budget);
             }
 
             // Accumulate streaming response + tool call deltas
@@ -730,7 +731,7 @@ impl AgentEngine {
         } else if !final_content.trim().is_empty() {
             final_content
         } else if truncated_empty {
-            "（输出被截断：模型的思考过程占满了 max_tokens 额度，没有生成正文。请在「设置」中调大该模型的 max_tokens 后重试。）".to_string()
+            "（输出被截断：模型的思考过程占满了单轮输出额度（max_tokens），没有生成正文。请调大该智能体的 max_tokens（会话设置）或模型的 max_tokens（设置 → 模型）后重试。）".to_string()
         } else {
             final_content
         };

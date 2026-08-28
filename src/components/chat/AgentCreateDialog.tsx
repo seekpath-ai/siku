@@ -25,7 +25,10 @@ interface Props {
     llmModels: { provider: string; model: string; api_key: string; base_url: string }[];
     approvalConfig: ApprovalConfig;
     maxLoops: number;
-    maxTokens: number;
+    /** Per-round output cap; undefined = follow the model config. */
+    maxTokens?: number;
+    /** Conversation context truncation budget. */
+    contextBudget: number;
     maxMemoryRounds: number;
     memoryDir?: string;
     skillsDir?: string;
@@ -56,7 +59,9 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
   const [expireSec, setExpireSec] = useState(60);
   const [whitelist, setWhitelist] = useState('');
   const [maxLoops, setMaxLoops] = useState(10);
-  const [maxTokens, setMaxTokens] = useState(28000);
+  /** Per-round output cap; '' = follow the model config. */
+  const [maxTokens, setMaxTokens] = useState('');
+  const [contextBudget, setContextBudget] = useState(28000);
   const [maxMemoryRounds, setMaxMemoryRounds] = useState(10);
   const [memoryDir, setMemoryDir] = useState('');
   const [skillsDir, setSkillsDir] = useState('');
@@ -72,7 +77,7 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
         setExpireSec(s.default_approval.expire_sec ?? 60);
         setWhitelist((s.default_approval.whitelist ?? []).join(', '));
         setMaxLoops(s.default_max_loops);
-        setMaxTokens(s.default_max_tokens);
+        setContextBudget(s.default_max_tokens);
         setMaxMemoryRounds(s.default_max_memory_rounds);
       })
       .catch(() => {})
@@ -105,7 +110,8 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
         llmModels: useCustomLlm ? [customLlm] : [],
         approvalConfig,
         maxLoops,
-        maxTokens,
+        maxTokens: maxTokens.trim() ? parseInt(maxTokens, 10) : undefined,
+        contextBudget,
         maxMemoryRounds,
         memoryDir: memoryDir.trim() || undefined,
         skillsDir: skillsDir.trim() || undefined,
@@ -298,7 +304,7 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
             )}
           </div>
 
-          <div className="grid grid-cols-3 gap-3 border-t border-codex-border pt-3">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 border-t border-codex-border pt-3">
             <div className="space-y-1">
               <label className="text-xs text-codex-muted">最大轮次</label>
               <input
@@ -309,11 +315,21 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
               />
             </div>
             <div className="space-y-1">
-              <label className="text-xs text-codex-muted">最大 Token</label>
+              <label className="text-xs text-codex-muted">单轮输出上限</label>
               <input
                 type="number"
                 value={maxTokens}
-                onChange={(e) => setMaxTokens(parseInt(e.target.value) || 0)}
+                placeholder="跟随模型"
+                onChange={(e) => setMaxTokens(e.target.value)}
+                className="w-full bg-codex-bg border border-codex-border rounded-lg px-3 py-2 text-sm text-codex-primary outline-none focus:border-codex-border-light"
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs text-codex-muted">上下文限制</label>
+              <input
+                type="number"
+                value={contextBudget}
+                onChange={(e) => setContextBudget(parseInt(e.target.value) || 0)}
                 className="w-full bg-codex-bg border border-codex-border rounded-lg px-3 py-2 text-sm text-codex-primary outline-none focus:border-codex-border-light"
               />
             </div>

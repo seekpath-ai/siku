@@ -170,6 +170,37 @@ pub async fn ensure_default_project(
             }
             return Err(msg);
         }
+    } else {
+        // Self-heal: the default project points at the app data dir. If the
+        // stored path no longer exists but still looks like an app-data
+        // default (same folder name as the live one — e.g. the dir was
+        // cleaned, or the DB was moved to another machine), repoint it.
+        // User-chosen paths are never touched: a temporarily unplugged disk
+        // must not clobber a real project.
+        let first: Option<(String, String)> =
+            sqlx::query_as("SELECT id, path FROM projects ORDER BY created_at LIMIT 1")
+                .fetch_optional(db)
+                .await
+                .map_err(|e| format!("db error: {e}"))?;
+        if let Some((pid, path)) = first {
+            let looks_like_app_data = match (
+                std::path::Path::new(&path).file_name(),
+                app_data_dir.file_name(),
+            ) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+            if looks_like_app_data && !std::path::Path::new(&path).is_dir() {
+                let new_path = app_data_dir.to_string_lossy().to_string();
+                sqlx::query("UPDATE projects SET path = ?, updated_at = ? WHERE id = ?")
+                    .bind(&new_path)
+                    .bind(now_iso())
+                    .bind(&pid)
+                    .execute(db)
+                    .await
+                    .map_err(|e| format!("db error: {e}"))?;
+            }
+        }
     }
 
     // Backfill legacy sessions into the first project.
@@ -187,4 +218,80 @@ pub async fn ensure_default_project(
     .fetch_one(db)
     .await
     .map_err(|e| format!("db error: {e}"))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::db::{tests::connect_with_crsqlite, SCHEMA_INIT_SQL};
+
+    async fn fresh_db(dir: &std::path::Path) -> SqlitePool {
+        let db = connect_with_crsqlite(&dir.join("t.db")).await.unwrap();
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db).await.unwrap();
+        db
+    }
+
+    /// The default project points at the app data dir; when that stored path
+    /// goes stale (dir cleaned, DB moved to another machine) it is repointed
+    /// at the live app data dir on startup.
+    #[tokio::test]
+    async fn heals_stale_default_project_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let live_app_dir = dir.path().join("live").join("com.siku.reader");
+        std::fs::create_dir_all(&live_app_dir).unwrap();
+        let stale = dir.path().join("old").join("com.siku.reader"); // never created
+
+        let db = fresh_db(dir.path()).await;
+        sqlx::query(
+            "INSERT INTO projects (id, name, path, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("p1")
+        .bind("com.siku.reader")
+        .bind(stale.to_str().unwrap())
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&db)
+        .await
+        .unwrap();
+
+        ensure_default_project(&db, &live_app_dir).await.unwrap();
+        let (path,): (String,) = sqlx::query_as("SELECT path FROM projects WHERE id = 'p1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(path, live_app_dir.to_string_lossy());
+        db.close().await;
+    }
+
+    /// A user-chosen project path that is missing (e.g. an unplugged disk)
+    /// must NOT be rewritten — only app-data-shaped defaults are healed.
+    #[tokio::test]
+    async fn keeps_user_project_even_if_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let live_app_dir = dir.path().join("live").join("com.siku.reader");
+        std::fs::create_dir_all(&live_app_dir).unwrap();
+        let user_path = dir.path().join("unplugged-disk").join("my-vault"); // never created
+
+        let db = fresh_db(dir.path()).await;
+        sqlx::query(
+            "INSERT INTO projects (id, name, path, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("p1")
+        .bind("my-vault")
+        .bind(user_path.to_str().unwrap())
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&db)
+        .await
+        .unwrap();
+
+        ensure_default_project(&db, &live_app_dir).await.unwrap();
+        let (path,): (String,) = sqlx::query_as("SELECT path FROM projects WHERE id = 'p1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(path, user_path.to_str().unwrap());
+        db.close().await;
+    }
 }

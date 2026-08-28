@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager, State};
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 use crate::AppState;
 use crate::ai::agent::config::{AgentConfig, ApprovalConfig, LlmConfigBlock};
@@ -542,6 +542,48 @@ pub(crate) async fn run_agent_turn(
         None => None,
     };
 
+    // Runtime self-heal for the sandbox root. working_dir is a device-local
+    // absolute path that can go stale: the vault was moved or deleted, or
+    // the session row arrived via sync from another device (the column no
+    // longer syncs, but historical rows predate that). Re-resolve through
+    // the session's project and persist the fix locally. An unhealable root
+    // stays in place — file tools reject with a named-path error, bash
+    // degrades to the process cwd — and the model is told to inform the user.
+    let mut working_dir = session.working_dir.clone();
+    let mut working_dir_warning: Option<String> = None;
+    if let Some(wd) = working_dir.as_deref().filter(|w| !w.trim().is_empty()) {
+        if !std::path::Path::new(wd).is_dir() {
+            let healed = project_dir
+                .as_deref()
+                .filter(|p| std::path::Path::new(p).is_dir())
+                .filter(|p| *p != wd)
+                .map(|p| p.to_string());
+            match healed {
+                Some(p) => {
+                    info!(session_id=%session_id, old=%wd, new=%p, "healed stale working_dir");
+                    if let Err(e) =
+                        sqlx::query("UPDATE chat_sessions SET working_dir = ? WHERE id = ?")
+                            .bind(&p)
+                            .bind(&session_id)
+                            .execute(&state.db)
+                            .await
+                    {
+                        warn!(error=%e, "persist healed working_dir failed");
+                    }
+                    working_dir = Some(p);
+                }
+                None => {
+                    warn!(session_id=%session_id, working_dir=%wd, "session working_dir does not exist");
+                    working_dir_warning = Some(format!(
+                        "警告：本会话的工作目录 {wd} 在本机不存在（目录可能被移动/删除，或该会话同步自其他设备）。\
+                         文件类工具会报「working directory error」；bash 会降级到进程当前目录运行。\
+                         请直接告知用户此情况，并建议其在会话设置中重新指定工作目录或改为完全访问。"
+                    ));
+                }
+            }
+        }
+    }
+
     // Per-turn cancellation token. The engine and long-running tools/streams
     // watch it via `tokio::select!` so the user can abort promptly.
     let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -586,7 +628,7 @@ pub(crate) async fn run_agent_turn(
     let mut registry = ToolRegistry::default_registry(
         &state.db,
         &state.app_data_dir,
-        session.working_dir.clone(),
+        working_dir,
         state.tasks.clone(),
         Some(session.id.clone()),
         Some(app_handle.clone()),
@@ -659,6 +701,14 @@ pub(crate) async fn run_agent_turn(
         }
         format!("当前上下文：你在「{name}」场景中，当前对象：{title}（id: {oid}）{extra}。用户的请求针对该对象，请直接处理它。")
     });
+
+    // A stale sandbox root (heal failed) rides the same system-prompt channel
+    // so the model informs the user instead of retrying blindly.
+    let context_prompt = match (context_prompt, working_dir_warning) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    };
 
     // Long-term memory: injected into the system prompt when the user has
     // activated it for this agent (brain button in the chat input).

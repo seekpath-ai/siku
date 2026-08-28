@@ -27,7 +27,7 @@ pub fn resolve_path(base: Option<&str>, path: &str) -> Result<PathBuf, String> {
 
     let canon_base = base_path
         .canonicalize()
-        .map_err(|e| format!("working directory error: {e}"))?;
+        .map_err(|e| format!("working directory error: {base}: {e}"))?;
 
     // Canonicalize the deepest existing ancestor, then re-append missing parts.
     let mut missing: Vec<OsString> = Vec::new();
@@ -71,6 +71,16 @@ mod tests {
 
     /// Sandboxed resolution must reject every `..` escape shape — whether the
     /// target exists, only the parent exists, or nothing exists.
+    #[test]
+    fn missing_base_error_names_the_path() {
+        let missing = std::env::temp_dir()
+            .join(format!("siku-no-such-dir-{}", std::process::id()))
+            .join("sandbox");
+        let base_s = missing.to_str().unwrap();
+        let msg = resolve_path(Some(base_s), "x").unwrap_err();
+        assert!(msg.contains(base_s), "error must name the failing base: {msg}");
+    }
+
     #[test]
     fn rejects_dotdot_escape_shapes() {
         let dir = tempfile::tempdir().unwrap();

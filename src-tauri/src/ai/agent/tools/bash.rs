@@ -178,20 +178,31 @@ impl Tool for BashTool {
         cmd.arg(command);
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        // Explicit cwd: fail loudly — the caller asked for that directory.
+        // Default cwd (= sandbox root): a missing root must NOT kill
+        // sandbox-agnostic commands (e.g. `systeminfo`). The working dir
+        // never constrained bash anyway (a command can `cd` anywhere), so
+        // degrade to the process cwd and say so in the output.
+        let mut cwd_fallback: Option<String> = None;
         match args["cwd"].as_str().filter(|c| !c.trim().is_empty()) {
             Some(cwd) => {
                 cmd.current_dir(resolve_path(wd.as_deref(), cwd)?);
             }
-            // No explicit cwd: default to the sandbox root when a working
-            // directory is set, instead of inheriting the process cwd.
-            None if wd.is_some() => {
-                cmd.current_dir(resolve_path(wd.as_deref(), ".")?);
-            }
+            None if wd.is_some() => match resolve_path(wd.as_deref(), ".") {
+                Ok(dir) => {
+                    cmd.current_dir(dir);
+                }
+                Err(e) => {
+                    cwd_fallback = Some(format!(
+                        "working directory unavailable ({e}); command ran in the process cwd instead"
+                    ));
+                }
+            },
             None => {}
         }
 
         if background {
-            return self.run_background(&mut cmd, command, &args).await;
+            return self.run_background(&mut cmd, command, &args, cwd_fallback).await;
         }
 
         // Foreground: capture output with a hard timeout.
@@ -233,11 +244,18 @@ impl Tool for BashTool {
                 if truncated {
                     msg.push_str(&format!("\n[...output truncated at {OUTPUT_LIMIT_CHARS} chars]"));
                 }
+                if let Some(w) = cwd_fallback {
+                    msg = format!("[warning: {w}]\n{msg}");
+                }
                 Ok(msg)
             }
             Err(_) => {
                 // kill_on_drop terminates the child when `run` is dropped.
-                Ok(format!("Command timed out after {timeout_ms}ms"))
+                let mut msg = format!("Command timed out after {timeout_ms}ms");
+                if let Some(w) = cwd_fallback {
+                    msg = format!("[warning: {w}]\n{msg}");
+                }
+                Ok(msg)
             }
         }
     }
@@ -249,6 +267,7 @@ impl BashTool {
         cmd: &mut Command,
         command: &str,
         args: &serde_json::Value,
+        cwd_fallback: Option<String>,
     ) -> Result<String, String> {
         let description = args["description"].as_str().unwrap_or("bash").to_string();
         let id = uuid::Uuid::new_v4().to_string();
@@ -329,9 +348,63 @@ impl BashTool {
             tracing::info!(task_id = %task_id, status = status_str, log = %log_path2.display(), "background task finished");
         });
 
-        Ok(format!(
-            "Started background task `{id}`: {description}\nLog: {}",
-            log_path.display()
-        ))
+        let mut msg =
+            format!("Started background task `{id}`: {description}\nLog: {}", log_path.display());
+        if let Some(w) = cwd_fallback {
+            msg = format!("[warning: {w}]\n{msg}");
+        }
+        Ok(msg)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn missing_dir() -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("siku-bash-wd-test-{}", std::process::id()))
+            .join("no-such-dir")
+    }
+
+    /// A missing sandbox root must degrade to the process cwd with a
+    /// warning instead of killing the command — the working dir never
+    /// actually confined bash, so sandbox-agnostic commands (e.g.
+    /// `systeminfo`) must keep working.
+    #[tokio::test]
+    async fn missing_working_dir_degrades_with_warning() {
+        let tool = BashTool::new(TaskStore::default(), std::env::temp_dir(), None);
+        let missing = missing_dir();
+        let out = tool
+            .execute(serde_json::json!({
+                "command": "echo siku-bash-degrade-ok",
+                "_working_dir": missing.to_str().unwrap(),
+            }))
+            .await
+            .expect("command must run despite the missing working dir");
+        assert!(out.contains("warning"), "expected warning prefix: {out}");
+        assert!(
+            out.contains("no-such-dir"),
+            "warning must name the failing path: {out}"
+        );
+    }
+
+    /// An explicitly requested cwd must still fail loudly — the caller
+    /// asked for that directory.
+    #[tokio::test]
+    async fn explicit_cwd_fails_loudly() {
+        let tool = BashTool::new(TaskStore::default(), std::env::temp_dir(), None);
+        let missing = missing_dir();
+        let err = tool
+            .execute(serde_json::json!({
+                "command": "echo hi",
+                "cwd": ".",
+                "_working_dir": missing.to_str().unwrap(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("working directory error"), "{err}");
+        assert!(err.contains("no-such-dir"), "error must name the path: {err}");
     }
 }

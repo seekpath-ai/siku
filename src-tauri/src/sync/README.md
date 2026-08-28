@@ -24,7 +24,7 @@
 ## 数据模型
 
 - 核心同步表（始终同步）：notes、papers、annotations、vaults、note_versions、note_links、files、tags、paper_tags、collections、paper_collections、related_papers、bookmarks、file_bookmarks、saved_searches、saved_items、imports（见 `core/db.rs::CORE_SYNC_TABLES`）。
-- 可选同步表（`sync_optional_data` 开关）：chat_sessions、chat_messages、settings（`app_settings` 与 `account.*` 键永不同步）。
+- 可选同步表（`sync_optional_data` 开关）：chat_sessions、chat_messages、settings（`app_settings` 与 `account.*` 键永不同步；chat_sessions 的 `working_dir` 列是设备本地绝对路径，导出与应用两侧均剥离）。
 - 不同步：creators（接收端从 papers.authors 重建）、device_settings、搜索索引、LLM 提供商等设备本地数据。
 - 冲突解决：cr-sqlite 默认 col_version 合并 + 应用前按 `updated_at` 的 LWW 过滤；删除为 delete-wins（已知取舍：peer 旧删除会覆盖本地新编辑）。
 - 首次连接交换全量快照（`INSERT OR IGNORE`，幂等），之后按 per-peer 游标增量推送。

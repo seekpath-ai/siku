@@ -14,6 +14,16 @@ pub fn is_non_syncable_setting_key(key: &str) -> bool {
     key == "app_settings" || key.starts_with("account.")
 }
 
+/// Columns that must never leave this device. `chat_sessions.working_dir` is
+/// an absolute filesystem path: syncing it plants a foreign machine's path
+/// (e.g. `C:\Users\<other-user>\...`) into every peer, where it does not
+/// exist — every sandboxed tool call then fails with os error 3. The column
+/// stays device-local; peers run the session without a sandbox root until the
+/// user picks a directory locally.
+fn non_syncable_column(table: &str, cid: &str) -> bool {
+    table == "chat_sessions" && cid == "working_dir"
+}
+
 /// Whether the optional sync tables (chat_sessions, chat_messages, settings)
 /// are currently enabled. Read from the device-local settings cache so the
 /// runtime toggle in `set_sync_config` takes effect immediately.
@@ -91,6 +101,10 @@ pub async fn export_changes_since(db: &SqlitePool, since_db_version: i64) -> Res
         if !table_sync_enabled(&table) {
             continue;
         }
+        let cid: String = row.try_get::<String, _>("cid").unwrap_or_default();
+        if non_syncable_column(&table, &cid) {
+            continue;
+        }
         let pk: Vec<u8> = row.try_get("pk").unwrap_or_default();
         if setting_row_non_syncable(&table, &pk) {
             continue;
@@ -98,7 +112,7 @@ pub async fn export_changes_since(db: &SqlitePool, since_db_version: i64) -> Res
         changes.push(CrsqlChange {
             table,
             pk,
-            cid: row.try_get::<String, _>("cid").unwrap_or_default(),
+            cid,
             val: row.try_get::<Option<String>, _>("val").ok().flatten(),
             col_version: row.try_get::<i64, _>("col_version").unwrap_or_default(),
             db_version,
@@ -289,6 +303,12 @@ async fn apply_changes_inner(
             }
         }
         for change in group {
+            // Defense in depth: peers running older builds may still send
+            // device-local columns (e.g. chat_sessions.working_dir).
+            if non_syncable_column(table, &change.cid) {
+                skipped += 1;
+                continue;
+            }
             sqlx::query(
                 r#"INSERT INTO crsql_changes
                    ("table", "pk", "cid", "val", "col_version", "db_version", "site_id", "cl", "seq")
@@ -394,16 +414,24 @@ pub async fn export_full_snapshot(db: &SqlitePool, tables: &[&str]) -> Result<Ve
     let mut statements = Vec::new();
     for table in tables {
         let cols = table_columns(db, table).await?;
-        if cols.is_empty() {
+        // Drop device-local columns (e.g. chat_sessions.working_dir) from the
+        // projection; `SELECT *` column order matches PRAGMA table_info.
+        let keep: Vec<usize> = cols
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !non_syncable_column(table, c))
+            .map(|(i, _)| i)
+            .collect();
+        if keep.is_empty() {
             continue;
         }
         let rows = sqlx::query(&format!("SELECT * FROM \"{table}\""))
             .fetch_all(db)
             .await
             .with_context(|| format!("select full snapshot {table}"))?;
-        let col_list = cols
+        let col_list = keep
             .iter()
-            .map(|c| format!("\"{c}\""))
+            .map(|&i| format!("\"{}\"", cols[i]))
             .collect::<Vec<_>>()
             .join(", ");
         for row in &rows {
@@ -415,10 +443,9 @@ pub async fn export_full_snapshot(db: &SqlitePool, tables: &[&str]) -> Result<Ve
                     }
                 }
             }
-            let values = cols
+            let values = keep
                 .iter()
-                .enumerate()
-                .map(|(i, _)| row_value(row, i))
+                .map(|&i| row_value(row, i))
                 .collect::<Vec<_>>()
                 .join(", ");
             statements.push(format!(
@@ -691,6 +718,107 @@ mod tests {
                 .fetch_one(&db_b)
                 .await?;
         assert_eq!(setting_value.0, "dark");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
+    /// `chat_sessions.working_dir` is an absolute path local to the device
+    /// that created the session. It must be stripped from changesets AND
+    /// snapshots — otherwise peers receive a path that only exists on the
+    /// originating machine (e.g. `C:\Users\<other-user>\...`), and every
+    /// sandboxed tool call there fails with os error 3. The apply side also
+    /// rejects the column as defense in depth against older peers.
+    #[tokio::test]
+    async fn working_dir_never_leaves_device() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-crdt-wd-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a_path = dir.join("a.db");
+        let db_a = connect_with_crsqlite(&db_a_path).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db_a).await?;
+        register_crr_tables(&db_a, CORE_SYNC_TABLES).await?;
+        register_crr_tables(&db_a, OPTIONAL_SYNC_TABLES).await?;
+
+        sqlx::query(
+            "INSERT INTO chat_sessions (id, title, working_dir, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("s1")
+        .bind("Chat One")
+        .bind(r"C:\Users\other-machine\vault")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&db_a)
+        .await?;
+
+        // Incremental export: the row syncs, the working_dir column does not.
+        let changes = export_changes_since(&db_a, 0).await?;
+        assert!(!changes.changes.is_empty(), "should export the session row");
+        assert!(
+            changes
+                .changes
+                .iter()
+                .all(|c| !(c.table == "chat_sessions" && c.cid == "working_dir")),
+            "working_dir must be stripped from the changeset"
+        );
+
+        // Snapshot export: no statement may carry the column at all.
+        let statements = export_full_snapshot(&db_a, &["chat_sessions"]).await?;
+        assert!(!statements.is_empty(), "snapshot should contain the row");
+        assert!(
+            statements.iter().all(|s| !s.contains("working_dir")),
+            "working_dir must be stripped from the snapshot"
+        );
+
+        // Apply the stripped changeset: row arrives with working_dir NULL.
+        let db_b_path = dir.join("b.db");
+        let db_b = connect_with_crsqlite(&db_b_path).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db_b).await?;
+        register_crr_tables(&db_b, CORE_SYNC_TABLES).await?;
+        register_crr_tables(&db_b, OPTIONAL_SYNC_TABLES).await?;
+        apply_changes(&db_b, &changes).await?;
+        let wd: (Option<String>,) =
+            sqlx::query_as("SELECT working_dir FROM chat_sessions WHERE id = 's1'")
+                .fetch_one(&db_b)
+                .await?;
+        assert_eq!(wd.0, None, "applied session must not carry working_dir");
+
+        // Defense in depth: even a hand-crafted changeset from an old peer
+        // that DOES include working_dir must not write the column.
+        // pk blob for id "s1": [ncols=1][text=0x0B][len=2]['s']['1'].
+        let forged = ChangesetMessage {
+            from_db_version: 0,
+            to_db_version: 1,
+            changes: vec![CrsqlChange {
+                table: "chat_sessions".into(),
+                pk: vec![1, 0x0B, 2, b's', b'1'],
+                cid: "working_dir".into(),
+                val: Some(r"C:\Users\other-machine\vault".into()),
+                col_version: 99,
+                db_version: 1,
+                site_id: vec![9, 9, 9, 9],
+                cl: 1,
+                seq: 0,
+            }],
+        };
+        apply_changes(&db_b, &forged).await?;
+        let wd: (Option<String>,) =
+            sqlx::query_as("SELECT working_dir FROM chat_sessions WHERE id = 's1'")
+                .fetch_one(&db_b)
+                .await?;
+        assert_eq!(wd.0, None, "forged working_dir change must be rejected");
 
         sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
         sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;

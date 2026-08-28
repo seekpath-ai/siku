@@ -77,7 +77,7 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
         setExpireSec(s.default_approval.expire_sec ?? 60);
         setWhitelist((s.default_approval.whitelist ?? []).join(', '));
         setMaxLoops(s.default_max_loops);
-        setContextBudget(s.default_max_tokens);
+        setContextBudget(s.default_context_budget);
         setMaxMemoryRounds(s.default_max_memory_rounds);
       })
       .catch(() => {})

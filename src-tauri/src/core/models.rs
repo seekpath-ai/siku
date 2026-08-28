@@ -484,7 +484,10 @@ pub struct AppSettings {
     pub default_llm_provider_id: Option<String>,
     pub default_approval: crate::ai::agent::config::ApprovalConfig,
     pub default_max_loops: i32,
-    pub default_max_tokens: i32,
+    /// Default conversation context truncation budget for new agent sessions
+    /// (renamed from `default_max_tokens`; alias kept for stored settings).
+    #[serde(alias = "default_max_tokens")]
+    pub default_context_budget: i32,
     pub default_max_memory_rounds: i32,
 
     // ── UI features ──
@@ -609,7 +612,7 @@ impl std::fmt::Debug for AppSettings {
             .field("default_llm_provider_id", &self.default_llm_provider_id)
             .field("default_approval", &self.default_approval)
             .field("default_max_loops", &self.default_max_loops)
-            .field("default_max_tokens", &self.default_max_tokens)
+            .field("default_context_budget", &self.default_context_budget)
             .field("default_max_memory_rounds", &self.default_max_memory_rounds)
             .field("show_pet", &self.show_pet)
             .field("sidebar_order", &self.sidebar_order)
@@ -735,7 +738,7 @@ impl Default for AppSettings {
             default_llm_provider_id: None,
             default_approval: crate::ai::agent::config::ApprovalConfig::default(),
             default_max_loops: 10,
-            default_max_tokens: 28000,
+            default_context_budget: 28000,
             default_max_memory_rounds: 10,
             show_pet: default_show_pet(),
             sidebar_order: None,

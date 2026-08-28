@@ -22,7 +22,7 @@ export function AgentDefaultsSettings() {
   const [defaultProviderId, setDefaultProviderId] = useState<string>('');
   const [approval, setApproval] = useState<ApprovalConfig>({ mode: 'auto' });
   const [maxLoops, setMaxLoops] = useState(10);
-  const [maxTokens, setMaxTokens] = useState(28000);
+  const [contextBudget, setContextBudget] = useState(28000);
   const [maxMemoryRounds, setMaxMemoryRounds] = useState(10);
   const [memoryDir, setMemoryDir] = useState('');
   const [skillsDir, setSkillsDir] = useState('');
@@ -39,7 +39,7 @@ export function AgentDefaultsSettings() {
         );
         setApproval({ ...s.default_approval });
         setMaxLoops(s.default_max_loops);
-        setMaxTokens(s.default_max_tokens);
+        setContextBudget(s.default_context_budget);
         setMaxMemoryRounds(s.default_max_memory_rounds);
         setMemoryDir(s.memory_dir ?? '');
         setSkillsDir(s.skills_dir ?? '');
@@ -64,7 +64,7 @@ export function AgentDefaultsSettings() {
         default_llm_provider_id: defaultProviderId || null,
         default_approval: approval,
         default_max_loops: maxLoops,
-        default_max_tokens: maxTokens,
+        default_context_budget: contextBudget,
         default_max_memory_rounds: maxMemoryRounds,
         memory_dir: memoryDir || null,
         skills_dir: skillsDir || null,
@@ -120,11 +120,11 @@ export function AgentDefaultsSettings() {
           <p className="text-xs text-text-secondary/60">0 表示不限制（硬上限 1000）</p>
         </div>
         <div className="space-y-2">
-          <label className="block text-sm text-text-secondary">最大 Token</label>
+          <label className="block text-sm text-text-secondary">上下文限制</label>
           <input
             type="number"
-            value={maxTokens}
-            onChange={(e) => setMaxTokens(parseInt(e.target.value) || 0)}
+            value={contextBudget}
+            onChange={(e) => setContextBudget(parseInt(e.target.value) || 0)}
             className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
           />
           <p className="text-xs text-text-secondary/60">0 表示不截断</p>

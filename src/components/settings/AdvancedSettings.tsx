@@ -45,7 +45,7 @@ const TOOL_FIELDS: LimitField[] = [
 const DEFAULT_VALUES: AppSettings = {
   default_approval: { mode: 'auto' },
   default_max_loops: 10,
-  default_max_tokens: 28000,
+  default_context_budget: 28000,
   default_max_memory_rounds: 10,
   log_max_size_mb: 10,
   log_max_files: 5,

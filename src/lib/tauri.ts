@@ -357,7 +357,7 @@ export interface AppSettings {
   default_llm_provider_id?: string | null;
   default_approval: ApprovalConfig;
   default_max_loops: number;
-  default_max_tokens: number;
+  default_context_budget: number;
   default_max_memory_rounds: number;
   data_dir?: string | null;
   memory_dir?: string | null;

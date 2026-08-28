@@ -51,7 +51,7 @@ async fn ensure_agent_config(
     // max_tokens (per-round output cap) stays None = follow the model config;
     // the global default applies to the context budget instead.
     if config.context_budget.is_none() {
-        config.context_budget = Some(app_settings.default_max_tokens);
+        config.context_budget = Some(app_settings.default_context_budget);
     }
     if config.max_memory_rounds.is_none() {
         config.max_memory_rounds = Some(app_settings.default_max_memory_rounds);
@@ -192,7 +192,7 @@ pub async fn agent_create_session(
         approval: input.approval_config.unwrap_or_else(|| app_settings.default_approval.clone()),
         max_loops: input.max_loops.or(Some(app_settings.default_max_loops)),
         max_tokens: input.max_tokens,
-        context_budget: input.context_budget.or(Some(app_settings.default_max_tokens)),
+        context_budget: input.context_budget.or(Some(app_settings.default_context_budget)),
         max_memory_rounds: input.max_memory_rounds.or(Some(app_settings.default_max_memory_rounds)),
         memory_file_path: None,
         memory_dir: input.memory_dir.clone(),
@@ -299,7 +299,7 @@ pub async fn agent_update_session(
         approval: input.approval_config.unwrap_or_else(|| app_settings.default_approval.clone()),
         max_loops: input.max_loops.or(Some(app_settings.default_max_loops)),
         max_tokens: input.max_tokens,
-        context_budget: input.context_budget.or(Some(app_settings.default_max_tokens)),
+        context_budget: input.context_budget.or(Some(app_settings.default_context_budget)),
         max_memory_rounds: input.max_memory_rounds.or(Some(app_settings.default_max_memory_rounds)),
         memory_file_path: None,
         memory_dir: input.memory_dir.clone(),

@@ -38,15 +38,21 @@ impl MailboxClient {
         })
     }
 
-    /// Register a handler for incoming mailbox batches. The handler runs on a
-    /// background task; it must be cheap (spawn heavy work itself).
-    pub fn on_batch<F>(&self, handler: F)
+    /// Register a handler for incoming mailbox batches, plus a handler for
+    /// relay `Error` messages (surfaced so the engine can record them in its
+    /// status). The handlers run on a background task; they must be cheap
+    /// (spawn heavy work themselves).
+    pub fn on_batch<F, E>(&self, handler: F, on_error: E)
     where
         F: Fn(Vec<MailboxMessage>) + Send + Sync + 'static,
+        E: Fn(String) + Send + Sync + 'static,
     {
         self.spawn_listener(move |msg| match msg {
             RelayServerMsg::MailboxBatch { payload: MailboxBatchPayload { messages } } => {
                 handler(messages);
+            }
+            RelayServerMsg::Error { payload } => {
+                on_error(format!("{}: {}", payload.code, payload.message));
             }
             _ => {}
         });
@@ -73,6 +79,16 @@ impl MailboxClient {
         }
     }
 
+    /// Test-only constructor wrapping a supplied relay (typically a
+    /// [`RelayClient::new_for_test`] driven by a fake relay).
+    #[cfg(test)]
+    pub fn new_for_test(relay: RelayClient) -> Self {
+        Self {
+            relay,
+            tasks: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
     /// Encrypt `plaintext` with the account sync key and deposit it for
     /// `to_device_id`.
     pub async fn deposit_encrypted(
@@ -90,9 +106,40 @@ impl MailboxClient {
                     ciphertext: base64::engine::general_purpose::STANDARD.encode(ciphertext),
                     nonce: base64::engine::general_purpose::STANDARD.encode(nonce),
                     ttl_seconds: ttl_seconds.or(Some(DEFAULT_TTL_SECONDS)),
+                    message_id: None,
                 },
             })
             .context("send mailbox deposit")
+    }
+
+    /// Like [`Self::deposit_encrypted`] but waits for the relay's
+    /// `MailboxDepositAck`: returns Ok only when the message is durably
+    /// stored. Used by the sync engine to advance its cursor only after a
+    /// confirmed deposit (see `sync::engine::sync_over_mailbox`). Pass a
+    /// fixed `message_id` when the deposit may be retried (outbox), so the
+    /// relay dedupes the retransmits; `None` generates a fresh one.
+    pub async fn deposit_encrypted_await_ack(
+        &self,
+        to_device_id: &str,
+        ciphertext: Vec<u8>,
+        nonce: [u8; crate::sync::crypto::NONCE_LEN],
+        ttl_seconds: Option<u64>,
+        message_id: Option<String>,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<(), crate::sync::relay_client::AckError> {
+        use base64::Engine;
+        self.relay
+            .deposit_await_ack(
+                MailboxDepositPayload {
+                    to_device_id: to_device_id.to_string(),
+                    ciphertext: base64::engine::general_purpose::STANDARD.encode(ciphertext),
+                    nonce: base64::engine::general_purpose::STANDARD.encode(nonce),
+                    ttl_seconds: ttl_seconds.or(Some(DEFAULT_TTL_SECONDS)),
+                    message_id,
+                },
+                timeout,
+            )
+            .await
     }
 
     /// Acknowledge processed message ids so the relay can drop them.

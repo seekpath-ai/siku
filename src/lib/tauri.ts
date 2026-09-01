@@ -1318,6 +1318,7 @@ export async function stopCloudSession(): Promise<void> {
 
 export interface SyncConfig {
   sync_optional_data: boolean;
+  allow_plaintext_relay: boolean;
 }
 
 export async function getSyncConfig(): Promise<SyncConfig> {

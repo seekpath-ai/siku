@@ -19,6 +19,7 @@ base64 = "0.22"
 sha2 = "0.10"
 rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"

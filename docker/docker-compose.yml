@@ -1,11 +1,12 @@
 # Siku sync service (production) — signaling + encrypted mailbox
 #
 # Usage:
-#   docker compose -f docker/docker-compose.yml up -d
+#   docker compose -f docker/docker-compose.yml up -d              # bare relay
+#   docker compose -f docker/docker-compose.yml --profile tls up -d  # relay + Caddy TLS
 #
 # Environment overrides (create a .env next to this file):
 #   JWT_SECRET=<long random string>   # REQUIRED in production
-#   RELAY_DOMAIN=relay.example.com    # for Caddy TLS
+#   RELAY_DOMAIN=relay.example.com    # for Caddy TLS (tls profile)
 
 services:
   sync-relay:
@@ -15,12 +16,14 @@ services:
     container_name: siku-sync-relay
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      # 公网流量应走 Caddy 443 (wss)；8080 仅本机/内网调试，不对外暴露。
+      - "127.0.0.1:8080:8080"
     environment:
       RELAY_HOST: 0.0.0.0
       RELAY_PORT: "8080"
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       RELAY_DB_PATH: /data/accounts.json
+      RELAY_MAILBOX_DB_PATH: /data/mailbox.sqlite
     volumes:
       - siku-relay-data:/data
 
@@ -28,11 +31,12 @@ services:
     image: caddy:2-alpine
     container_name: siku-sync-relay-caddy
     restart: unless-stopped
+    profiles: [tls]
     ports:
       - "80:80"
       - "443:443"
     environment:
-      RELAY_DOMAIN: ${RELAY_DOMAIN:?set RELAY_DOMAIN in .env}
+      RELAY_DOMAIN: ${RELAY_DOMAIN:-localhost}
     volumes:
       - caddy-data:/data
       - caddy-config:/config

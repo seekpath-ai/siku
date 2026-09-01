@@ -27,6 +27,19 @@ pub enum RelayServerMsg {
     Ping,
     Error { payload: ErrorPayload },
     MailboxBatch { payload: MailboxBatchPayload },
+    /// Acknowledges a `MailboxDeposit` after the message is durably stored
+    /// (or rejected). `ok=false` means the deposit was NOT stored — the
+    /// sender must retry / queue it rather than advance its cursor.
+    MailboxDepositAck { payload: MailboxDepositAckPayload },
+    /// Capability handshake sent by the relay right after a successful Join.
+    /// `protocol >= 2` means mailbox deposit acks are supported; a relay that
+    /// never sends this (or sends protocol 1) is a legacy build.
+    ServerHello { payload: ServerHelloPayload },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerHelloPayload {
+    pub protocol: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +102,11 @@ pub struct MailboxDepositPayload {
     pub nonce: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_seconds: Option<u64>,
+    /// Client correlation id: the relay echoes it back in `MailboxDepositAck`
+    /// so the sender only advances its sync cursor after the message is
+    /// durably stored. Re-depositing the same id is an idempotent retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +130,15 @@ pub struct MailboxMessage {
     /// account); false for per-device messages.
     #[serde(default)]
     pub account_level: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailboxDepositAckPayload {
+    /// The stored message id (the client's `message_id` when provided).
+    pub id: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

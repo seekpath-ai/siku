@@ -63,6 +63,7 @@ notify = "7.0"
 zip = { version = "2.2", features = ["aes-crypto"] }
 webrtc = "0.12"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+http = "1"
 libsqlite3-sys = "0.30"
 
 # macOS-only: window transparency APIs (.transparent()) are gated behind this

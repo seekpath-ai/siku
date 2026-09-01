@@ -1,6 +1,6 @@
 use anyhow::Context;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Pool, Row, Sqlite};
+use sqlx::{Connection, Pool, Row, Sqlite};
 use std::path::{Path, PathBuf};
 use tauri::Manager;
 use tracing::{info, instrument};
@@ -12,6 +12,7 @@ pub(crate) const SCHEMA_INIT_SQL: &str = include_str!("../../schema_init.sql");
 pub(crate) const CORE_SYNC_TABLES: &[&str] = &[
     "notes",
     "papers",
+    "attachments",
     "annotations",
     // Note organization
     "vaults",
@@ -313,6 +314,12 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // Initialize schema if tables don't exist (data persists across restarts)
     info!("initializing schema from schema_init.sql");
     sqlx::query(SCHEMA_INIT_SQL).execute(&db).await?;
+
+    // Migration: sync_outbox gains the relay message_id so outbox retries
+    // re-deposit with the same id (relay-side idempotent dedupe) (added 2026-08-31)
+    add_column_if_missing(&db, "sync_outbox", "message_id", "TEXT")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for sync_outbox.message_id: {}", e))?;
 
     // Migration: add tags/translation columns to annotations (added 2026-06-19)
     add_column_if_missing(&db, "annotations", "tags", "TEXT DEFAULT '[]'")
@@ -769,6 +776,22 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // triggers become stale and UPDATEs fail with "expected N values, got M".
     register_crr_tables(&db, CORE_SYNC_TABLES).await?;
 
+    // Provision (or converge) the system "我的图书馆" folder for the default
+    // vault. Must run AFTER CRR registration so the folder row is tracked as a
+    // sync delta from day one; converging legacy random-id folders here also
+    // makes every device settle on one deterministic folder id, so literature
+    // notes never dangle under a folder the peer does not have.
+    {
+        let vault_id = crate::core::vault_service::get_current_vault_id(&db)
+            .await
+            .unwrap_or_else(|_| DEFAULT_VAULT_ID.to_string());
+        if let Err(e) =
+            crate::core::note_service::ensure_system_library_folder(&db, &vault_id).await
+        {
+            tracing::warn!(error = %e, "failed to provision system library folder");
+        }
+    }
+
     // Optionally register chat sessions/messages and global settings.
     let mut device_settings = crate::core::settings_service::load_device_settings(&db)
         .await
@@ -1120,6 +1143,76 @@ async fn migrate_sync_schema_v2_inner(conn: &mut sqlx::SqliteConnection) -> anyh
         info!(rows = old_rows.len(), "migrated note_versions to TEXT uuid PK");
     }
 
+    // ── attachments: drop the checked FK so it can become a CRR ──
+    // CR-SQLite forbids checked foreign keys on CRR tables. The paper
+    // attachments table currently declares REFERENCES papers(id) ON DELETE
+    // CASCADE; rebuild it FK-free (purge_paper deletes attachment rows
+    // explicitly, tracked as CRDT deletes). Requires NOT NULL TEXT PK.
+    //
+    // Crash recovery: a crash between RENAME and DROP leaves `attachments_old`
+    // behind while the guard below no longer fires (schema_init recreated an
+    // empty FK-free `attachments`). Merge any stranded rows back — OR IGNORE
+    // covers a crash after the INSERT — and drop the leftover table. This must
+    // run BEFORE the rebuild below, whose RENAME would collide with it.
+    if !table_definition_sql(&mut *conn, "attachments_old")
+        .await?
+        .is_empty()
+    {
+        let mut tx = conn.begin().await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO attachments (id, paper_id, file_name, file_path, file_type, description, created_at)
+             SELECT id, paper_id, file_name, file_path, file_type, description, created_at FROM attachments_old",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DROP TABLE attachments_old")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        info!("recovered stranded attachments_old rows after interrupted rebuild");
+    }
+
+    // The rebuild (RENAME → CREATE → INSERT → DROP) runs in ONE transaction:
+    // previously each statement auto-committed, so a crash after the RENAME
+    // stranded the data in `attachments_old` (the REFERENCES guard would no
+    // longer fire on the next startup).
+    if table_definition_sql(&mut *conn, "attachments")
+        .await?
+        .contains("REFERENCES")
+    {
+        info!("rebuilding attachments table without FK constraint (CRR sync)");
+        let mut tx = conn.begin().await?;
+        sqlx::query("ALTER TABLE attachments RENAME TO attachments_old")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE attachments (
+                id TEXT PRIMARY KEY NOT NULL,
+                paper_id TEXT NOT NULL DEFAULT '',
+                file_name TEXT NOT NULL DEFAULT '',
+                file_path TEXT NOT NULL DEFAULT '',
+                file_type TEXT NOT NULL DEFAULT '',
+                description TEXT,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO attachments (id, paper_id, file_name, file_path, file_type, description, created_at)
+             SELECT id, paper_id, file_name, file_path, file_type, description, created_at FROM attachments_old",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DROP TABLE attachments_old")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_attachments_paper ON attachments(paper_id)")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+    }
+
     // ── TEXT primary keys must be declared NOT NULL for CR-SQLite ──
     // SQLite treats non-INTEGER PRIMARY KEY columns as nullable unless NOT
     // NULL is stated, and crsql_as_crr rejects such tables. The tags rebuild
@@ -1466,6 +1559,194 @@ pub(crate) mod tests {
             .fetch_one(&db)
             .await?;
         assert_eq!(vault_count, 2);
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Legacy `attachments` tables declare `REFERENCES papers(id) ON DELETE
+    /// CASCADE`; CR-SQLite forbids checked FKs on CRR tables, so the v2 sync
+    /// migration must rebuild the table FK-free (data preserved) before
+    /// attachments can join CORE_SYNC_TABLES.
+    #[tokio::test]
+    async fn sync_schema_v2_rebuilds_attachments_without_fk() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-attach-migrate-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db_path = dir.join("test.db");
+        let db = connect_with_crsqlite(&db_path).await?;
+
+        // Legacy schema: NOT NULL TEXT PK (nullable PK would be fixed by the
+        // same migration family) with a checked FK.
+        sqlx::query(
+            "CREATE TABLE papers (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL DEFAULT '')",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE attachments (
+                id TEXT PRIMARY KEY,
+                paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                description TEXT,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO papers (id, title) VALUES ('p1', 'Paper One')",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO attachments (id, paper_id, file_name, file_path, file_type, created_at) \
+             VALUES ('att-legacy', 'p1', 'main.pdf', 'blobs/x.pdf', 'pdf', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&db)
+        .await?;
+
+        super::migrate_sync_schema_v2(&db).await?;
+
+        let ddl: (String,) = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='attachments'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert!(
+            !ddl.0.contains("REFERENCES"),
+            "attachments must be FK-free after migration: {}",
+            ddl.0
+        );
+        assert!(
+            ddl.0.contains("NOT NULL"),
+            "attachments PK must be NOT NULL for CR-SQLite: {}",
+            ddl.0
+        );
+        let (name,): (String,) =
+            sqlx::query_as("SELECT file_name FROM attachments WHERE id = 'att-legacy'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(name, "main.pdf", "data must survive the rebuild");
+
+        // The FK-free table must register as a CRR without error.
+        register_crr_tables(&db, &["attachments"]).await?;
+        let clock: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='attachments__crsql_clock'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(clock.0, 1, "attachments must be registered as a CRR");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Crash recovery: if the app died between the RENAME and DROP of the
+    /// attachments rebuild, the next startup has an empty FK-free
+    /// `attachments` (recreated by schema_init's CREATE TABLE IF NOT EXISTS)
+    /// plus a stranded `attachments_old` — and the `REFERENCES` guard no
+    /// longer fires. The migration must merge the stranded rows back
+    /// (OR IGNORE also covers rows already copied before a later crash point)
+    /// and drop the old table.
+    #[tokio::test]
+    async fn sync_schema_v2_recovers_stranded_attachments_old() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-attach-recover-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = connect_with_crsqlite(&dir.join("test.db")).await?;
+
+        sqlx::query(
+            "CREATE TABLE papers (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL DEFAULT '')",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query("INSERT INTO papers (id, title) VALUES ('p1', 'Paper One')")
+            .execute(&db)
+            .await?;
+
+        // Post-crash state: the FK-free table recreated by schema_init holds
+        // only what the interrupted INSERT had already copied…
+        sqlx::query(
+            "CREATE TABLE attachments (
+                id TEXT PRIMARY KEY NOT NULL,
+                paper_id TEXT NOT NULL DEFAULT '',
+                file_name TEXT NOT NULL DEFAULT '',
+                file_path TEXT NOT NULL DEFAULT '',
+                file_type TEXT NOT NULL DEFAULT '',
+                description TEXT,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO attachments (id, paper_id, file_name, file_path, file_type, created_at) \
+             VALUES ('att-copied', 'p1', 'main.pdf', 'blobs/x.pdf', 'pdf', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&db)
+        .await?;
+        // …while the legacy table (still carrying the FK) holds everything.
+        sqlx::query(
+            "CREATE TABLE attachments_old (
+                id TEXT PRIMARY KEY,
+                paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                description TEXT,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO attachments_old (id, paper_id, file_name, file_path, file_type, created_at) \
+             VALUES ('att-copied', 'p1', 'main.pdf', 'blobs/x.pdf', 'pdf', '2026-01-01T00:00:00Z'), \
+                    ('att-stranded', 'p1', 'supp.pdf', 'blobs/y.pdf', 'pdf', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&db)
+        .await?;
+
+        super::migrate_sync_schema_v2(&db).await?;
+
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT file_name FROM attachments ORDER BY id",
+        )
+        .fetch_all(&db)
+        .await?;
+        assert_eq!(names, vec!["main.pdf", "supp.pdf"], "stranded rows must be merged back");
+        let old_left: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='attachments_old'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(old_left.0, 0, "attachments_old must be dropped");
+
+        // Idempotent: a second run leaves the data untouched.
+        super::migrate_sync_schema_v2(&db).await?;
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM attachments")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(count, 2);
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;

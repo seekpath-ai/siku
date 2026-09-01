@@ -471,26 +471,153 @@ fn parse_tags(content: &str) -> String {
 /// Reserved name for the system library folder (paper-mapped note tree root).
 pub const SYSTEM_LIBRARY_NAME: &str = "我的图书馆";
 
+/// Deterministic id for the system "我的图书馆" folder of a vault.
+///
+/// Every device must converge on the SAME row (the same pattern as
+/// `DEFAULT_VAULT_ID`): with a random UUID each device creates its own folder
+/// the first time it needs one — which usually happens BEFORE the synced
+/// folder row arrives. Literature notes then hang off different parent ids,
+/// and the folder shows up missing or empty on peers (notes with a dangling
+/// `parent_id` are not rendered in the tree).
+fn system_library_folder_id(vault_id: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"siku:system-library-folder:");
+    hasher.update(vault_id.as_bytes());
+    let digest = hasher.finalize();
+    let hex_str = hex::encode(&digest[..16]); // 32 hex chars → uuid-like id
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex_str[0..8],
+        &hex_str[8..12],
+        &hex_str[12..16],
+        &hex_str[16..20],
+        &hex_str[20..32]
+    )
+}
+
 /// Find or create the system "我的图书馆" folder note for a vault.
+///
+/// Convergence rules (multi-device):
+/// - A legacy system folder with a random id is RENAMED onto the deterministic
+///   id (children and vault files are reparented, the old row is deleted), so
+///   every device ends up with exactly one system folder and all literature
+///   notes attach to it — even when the folder row itself never arrives via
+///   sync (pre-CRR rows or a pruned mailbox archive).
+/// - When no system folder exists, it is created with the deterministic id.
 pub async fn ensure_system_library_folder(db: &SqlitePool, vault_id: &str) -> Result<String, String> {
-    let existing: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM notes WHERE vault_id = ? AND is_system = 1 AND is_folder = 1 LIMIT 1"
+    let deterministic = system_library_folder_id(vault_id);
+    // Legacy random-id folders only — the deterministic row is excluded so it
+    // is never treated as legacy. Multiple devices may each have created their
+    // own random-id folder before sync converged them, so ALL legacy rows must
+    // be converged (a bare `LIMIT 1` left the rest around forever: a later run
+    // could hit the deterministic row first and early-return).
+    let legacy: Vec<(String,)> = sqlx::query_as(
+        "SELECT id FROM notes WHERE vault_id = ? AND is_system = 1 AND is_folder = 1 AND id != ?",
     )
     .bind(vault_id)
-    .fetch_optional(db)
+    .bind(&deterministic)
+    .fetch_all(db)
     .await
     .map_err(|e| format!("db: {e}"))?;
-    if let Some((id,)) = existing {
-        return Ok(id);
+    if legacy.is_empty() {
+        let det: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM notes WHERE id = ? AND vault_id = ?")
+                .bind(&deterministic)
+                .bind(vault_id)
+                .fetch_optional(db)
+                .await
+                .map_err(|e| format!("db: {e}"))?;
+        return match det {
+            Some((id,)) => Ok(id),
+            None => create_system_library_folder(db, vault_id, &deterministic).await,
+        };
     }
-    let folder = create_note(db, SYSTEM_LIBRARY_NAME, "", None, None, vault_id, true).await?;
-    sqlx::query("UPDATE notes SET is_system = 1, updated_at = ? WHERE id = ?")
+    // Legacy random-id folder(s): converge each onto the deterministic id in
+    // one transaction per row — reparent children/vault files, delete the old
+    // row, insert the deterministic one. Runs once per vault (subsequent calls
+    // find no legacy rows and no-op).
+    for (found_id,) in legacy {
+        converge_system_library_folder(db, vault_id, &found_id, &deterministic).await?;
+    }
+    Ok(deterministic)
+}
+
+/// Insert the system "我的图书馆" folder row with a specific id (no random
+/// UUID — the id is the convergence key across devices).
+async fn create_system_library_folder(
+    db: &SqlitePool,
+    vault_id: &str,
+    folder_id: &str,
+) -> Result<String, String> {
+    let now = crate::core::time::now_iso();
+    sqlx::query(
+        "INSERT OR IGNORE INTO notes \
+         (id, vault_id, title, content, content_plain, tags, aliases, is_folder, is_system, parent_id, created_at, updated_at) \
+         VALUES (?, ?, ?, '', '', '[]', '[]', 1, 1, NULL, ?, ?)",
+    )
+    .bind(folder_id)
+    .bind(vault_id)
+    .bind(SYSTEM_LIBRARY_NAME)
+    .bind(&now)
+    .bind(&now)
+    .execute(db)
+    .await
+    .map_err(|e| format!("db: {e}"))?;
+    Ok(folder_id.to_string())
+}
+
+/// Converge a legacy (random-id) system folder onto the deterministic id.
+/// CR-SQLite records each step (reparent children, delete old row, insert new
+/// row) as normal deltas, so peers converge to a single "我的图书馆" folder.
+async fn converge_system_library_folder(
+    db: &SqlitePool,
+    vault_id: &str,
+    old_id: &str,
+    new_id: &str,
+) -> Result<(), String> {
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| format!("db begin: {e}"))?;
+    // Reparent direct children (notes) and vault files under the new id.
+    sqlx::query("UPDATE notes SET parent_id = ?, updated_at = ? WHERE parent_id = ?")
+        .bind(new_id)
         .bind(crate::core::time::now_iso())
-        .bind(&folder.id)
-        .execute(db)
+        .bind(old_id)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("db: {e}"))?;
-    Ok(folder.id)
+    sqlx::query("UPDATE files SET parent_id = ? WHERE parent_id = ?")
+        .bind(new_id)
+        .bind(old_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("db: {e}"))?;
+    // Explicit delete + insert (never a PK rename): CR-SQLite propagates the
+    // delete (delete-wins) and the insert, and `INSERT OR IGNORE` is a no-op
+    // when another device already created the deterministic row.
+    let now = crate::core::time::now_iso();
+    sqlx::query("DELETE FROM notes WHERE id = ?")
+        .bind(old_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("db: {e}"))?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO notes \
+         (id, vault_id, title, content, content_plain, tags, aliases, is_folder, is_system, parent_id, created_at, updated_at) \
+         VALUES (?, ?, ?, '', '', '[]', '[]', 1, 1, NULL, ?, ?)",
+    )
+    .bind(new_id)
+    .bind(vault_id)
+    .bind(SYSTEM_LIBRARY_NAME)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("db: {e}"))?;
+    tx.commit().await.map_err(|e| format!("db commit: {e}"))?;
+    Ok(())
 }
 
 /// Find or create a collection-mapped folder note under a parent, linked to the
@@ -698,6 +825,209 @@ mod tests {
         let content = "这是一段很长的中文内容，其中包含一个需要搜索的关键词，后面还有更多文字用来拉长内容以便截断产生省略号前后缀。";
         let s = make_snippet(content, "关键词", 40);
         assert!(s.contains("关键词"));
+    }
+
+    /// The system "我的图书馆" folder must converge on a DETERMINISTIC id:
+    /// - a legacy random-id folder is renamed onto it, children and vault
+    ///   files reparented, the legacy row dropped;
+    /// - a fresh device creates the same id for the same vault;
+    /// - repeated calls are idempotent.
+    /// This is what keeps literature notes from dangling under a folder the
+    /// peer never received (the "我的图书馆 不同步/为空" symptom).
+    #[tokio::test]
+    async fn system_library_folder_converges_on_deterministic_id() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-syslib-folder-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = crate::core::db::tests::connect_with_crsqlite(&dir.join("a.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db).await?;
+        crate::core::db::register_crr_tables(&db, crate::core::db::CORE_SYNC_TABLES).await?;
+
+        let vault = crate::core::db::DEFAULT_VAULT_ID;
+        let now = "2026-01-01T00:00:00Z";
+
+        // Simulate a legacy install: random-id system folder + literature note
+        // + vault file under it.
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, is_folder, is_system, created_at, updated_at) \
+             VALUES ('legacy-syslib', ?, '我的图书馆', 1, 1, ?, ?)",
+        )
+        .bind(vault).bind(now).bind(now)
+        .execute(&db).await?;
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, parent_id, is_literature_note, created_at, updated_at) \
+             VALUES ('lit-note', ?, 'Some Paper Notes', 'legacy-syslib', 1, ?, ?)",
+        )
+        .bind(vault).bind(now).bind(now)
+        .execute(&db).await?;
+        sqlx::query(
+            "INSERT INTO files (id, vault_id, parent_id, name, blob_path, created_at, updated_at) \
+             VALUES ('vault-file', ?, 'legacy-syslib', 'paper.pdf', 'blobs/x.pdf', ?, ?)",
+        )
+        .bind(vault).bind(now).bind(now)
+        .execute(&db).await?;
+
+        let expected = system_library_folder_id(vault);
+        let got = ensure_system_library_folder(&db, vault)
+            .await
+            .expect("ensure system library folder");
+        assert_eq!(got, expected, "converged folder must use the deterministic id");
+
+        // Exactly one system folder, with the deterministic id.
+        let sys_folders: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM notes WHERE vault_id = ? AND is_system = 1 AND is_folder = 1",
+        )
+        .bind(vault)
+        .fetch_all(&db)
+        .await?;
+        assert_eq!(
+            sys_folders,
+            vec![(expected.clone(),)],
+            "legacy folder must be gone; only the deterministic folder remains"
+        );
+        // Children and vault files reparented.
+        let parent: Option<String> =
+            sqlx::query_scalar("SELECT parent_id FROM notes WHERE id = 'lit-note'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(
+            parent,
+            Some(expected.clone()),
+            "literature note must attach to the deterministic folder"
+        );
+        let file_parent: Option<String> =
+            sqlx::query_scalar("SELECT parent_id FROM files WHERE id = 'vault-file'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(
+            file_parent,
+            Some(expected.clone()),
+            "vault file must be reparented"
+        );
+
+        // Idempotent: a second call is a no-op.
+        let got2 = ensure_system_library_folder(&db, vault)
+            .await
+            .expect("ensure again");
+        assert_eq!(got2, expected);
+        let count: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM notes WHERE vault_id = ? AND is_system = 1 AND is_folder = 1",
+        )
+        .bind(vault)
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(count.0, 1, "must not create duplicate folders");
+
+        // A second "device" (fresh DB, no folder yet) must converge on the
+        // SAME id, and a literature note created there attaches to it.
+        let db_b = crate::core::db::tests::connect_with_crsqlite(&dir.join("b.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL)
+            .execute(&db_b)
+            .await?;
+        crate::core::db::register_crr_tables(&db_b, crate::core::db::CORE_SYNC_TABLES).await?;
+        let got_b = ensure_system_library_folder(&db_b, vault)
+            .await
+            .expect("fresh device folder");
+        assert_eq!(got_b, expected, "fresh device must create the same folder id");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
+        db.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
+    /// Multi-device case: TWO legacy random-id system folders (each device
+    /// created its own before sync) must BOTH converge onto the deterministic
+    /// id — all children reparented, all legacy rows gone. A `LIMIT 1` legacy
+    /// query would only ever converge one of them.
+    #[tokio::test]
+    async fn system_library_folder_converges_all_legacy_rows() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-syslib-multi-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = crate::core::db::tests::connect_with_crsqlite(&dir.join("a.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db).await?;
+        crate::core::db::register_crr_tables(&db, crate::core::db::CORE_SYNC_TABLES).await?;
+
+        let vault = crate::core::db::DEFAULT_VAULT_ID;
+        let now = "2026-01-01T00:00:00Z";
+
+        // Two legacy installs (two devices), each with its own literature note.
+        for (folder, note) in [("legacy-a", "note-a"), ("legacy-b", "note-b")] {
+            sqlx::query(
+                "INSERT INTO notes (id, vault_id, title, is_folder, is_system, created_at, updated_at) \
+                 VALUES (?, ?, '我的图书馆', 1, 1, ?, ?)",
+            )
+            .bind(folder).bind(vault).bind(now).bind(now)
+            .execute(&db).await?;
+            sqlx::query(
+                "INSERT INTO notes (id, vault_id, title, parent_id, is_literature_note, created_at, updated_at) \
+                 VALUES (?, ?, 'Paper Notes', ?, 1, ?, ?)",
+            )
+            .bind(note).bind(vault).bind(folder).bind(now).bind(now)
+            .execute(&db).await?;
+        }
+
+        let expected = system_library_folder_id(vault);
+        let got = ensure_system_library_folder(&db, vault)
+            .await
+            .expect("ensure system library folder");
+        assert_eq!(got, expected, "converged folder must use the deterministic id");
+
+        // Exactly ONE system folder remains — both legacy rows deleted.
+        let sys_folders: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM notes WHERE vault_id = ? AND is_system = 1 AND is_folder = 1",
+        )
+        .bind(vault)
+        .fetch_all(&db)
+        .await?;
+        assert_eq!(
+            sys_folders,
+            vec![(expected.clone(),)],
+            "every legacy folder must be gone; only the deterministic folder remains"
+        );
+        // Children of BOTH legacy folders reparented.
+        for note in ["note-a", "note-b"] {
+            let parent: Option<String> =
+                sqlx::query_scalar("SELECT parent_id FROM notes WHERE id = ?")
+                    .bind(note)
+                    .fetch_one(&db)
+                    .await?;
+            assert_eq!(
+                parent,
+                Some(expected.clone()),
+                "{note} must attach to the deterministic folder"
+            );
+        }
+        // Idempotent: a second call stays a no-op.
+        let got2 = ensure_system_library_folder(&db, vault)
+            .await
+            .expect("ensure again");
+        assert_eq!(got2, expected);
+        let count: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM notes WHERE vault_id = ? AND is_system = 1 AND is_folder = 1",
+        )
+        .bind(vault)
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(count.0, 1, "must not create duplicate folders");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
     }
 
     #[tokio::test]

@@ -9,9 +9,13 @@ use tracing::{info, instrument};
 /// credentials to every paired device and let last-writer-wins clobber
 /// per-device secrets. Account state now lives in `device_settings`, which is
 /// device-local by design; this guard also covers rows written before the
-/// migration.
+/// migration. `notes.current_vault_id` is a device-local UI preference (which
+/// vault the user is looking at) — syncing it makes devices fight over the
+/// active vault via LWW.
 pub fn is_non_syncable_setting_key(key: &str) -> bool {
-    key == "app_settings" || key.starts_with("account.")
+    key == "app_settings"
+        || key.starts_with("account.")
+        || key == crate::core::vault_service::CURRENT_VAULT_KEY
 }
 
 /// Columns that must never leave this device. `chat_sessions.working_dir` is
@@ -216,16 +220,37 @@ async fn local_updated_at(
     Ok(row.and_then(|(ts,)| ts))
 }
 
+/// Whether the local `updated_at` is strictly newer than the peer's. Both
+/// sides write RFC3339 (seconds historically, milliseconds since
+/// 2026-08-31), and mixed-precision strings do NOT order lexicographically
+/// at a second boundary ('.' < 'Z', so "...:00.500Z" sorts before "...:00Z"
+/// despite being later) — parse before comparing. Unparseable values fall
+/// back to lexicographic order. Equal timestamps return false so the change
+/// is applied and cr-sqlite's col_version merge decides.
+fn local_ts_is_newer(local_ts: &str, peer_ts: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(local_ts),
+        chrono::DateTime::parse_from_rfc3339(peer_ts),
+    ) {
+        (Ok(local), Ok(peer)) => local > peer,
+        _ => local_ts > peer_ts,
+    }
+}
+
 /// Apply a changeset from a peer into the local `crsql_changes` table.
+/// Returns the number of changes actually written (received minus the ones
+/// skipped by the sync-scope / last-write-wins / non-syncable-column filters).
 #[instrument(skip(db, msg))]
-pub async fn apply_changes(db: &SqlitePool, msg: &ChangesetMessage) -> Result<()> {
+pub async fn apply_changes(db: &SqlitePool, msg: &ChangesetMessage) -> Result<u64> {
     // Last-write-wins by wall clock: CR-SQLite's default conflict rule is
     // "higher col_version wins", and col_version counts edits per site — a
     // peer that edited a row fewer times (but later) would lose to an older
     // edit. When both sides carry `updated_at`, rows whose local timestamp is
-    // newer than the peer's are dropped entirely before the extension's
-    // merge logic runs. Delete markers (cid "-1") carry no timestamp and are
-    // always applied.
+    // strictly newer than the peer's are dropped entirely before the
+    // extension's merge logic runs. Equal timestamps do NOT skip: the change
+    // goes through cr-sqlite's col_version merge, so a same-second peer edit
+    // is not silently lost. Delete markers (cid "-1") carry no timestamp and
+    // are always applied.
     let mut groups: std::collections::BTreeMap<(String, Vec<u8>), Vec<&CrsqlChange>> =
         std::collections::BTreeMap::new();
     for c in &msg.changes {
@@ -270,7 +295,7 @@ pub async fn apply_changes(db: &SqlitePool, msg: &ChangesetMessage) -> Result<()
     }
 
     info!(count = msg.changes.len(), skipped, "applied changes");
-    Ok(())
+    Ok((msg.changes.len() - skipped) as u64)
 }
 
 /// Inner part of [`apply_changes`], running on an FK-disabled connection.
@@ -296,7 +321,7 @@ async fn apply_changes_inner(
             .and_then(|c| c.val.as_deref());
         if let Some(peer_ts) = peer_ts {
             if let Some(local_ts) = local_updated_at(&mut *tx, table, pk).await? {
-                if local_ts.as_str() >= peer_ts {
+                if local_ts_is_newer(&local_ts, peer_ts) {
                     skipped += group.len();
                     continue;
                 }
@@ -364,16 +389,20 @@ pub async fn current_db_version(db: &SqlitePool) -> Result<i64> {
     Ok(row.0)
 }
 
-// ── Full snapshot sync ─────────────────────────────────────────────────────
+// ── Full snapshot sync (legacy wire format) ────────────────────────────────
 //
-// `crsql_changes` only records writes made *after* a table became a CRR.
-// Pre-existing rows (created before the first launch with sync enabled) never
-// appear there, so a brand-new device would receive nothing over the
-// incremental path. On first connection each side sends a full snapshot
-// (one INSERT OR REPLACE statement per row) which is idempotent; afterwards
-// the incremental changesets keep both sides in sync.
+// `crsql_changes` only records writes made *after* a table became a CRR, but
+// CR-SQLite backfills initial changes for pre-existing rows at registration,
+// so a full-history changeset (db_version 0 → now) covers the whole library —
+// including tombstones. Senders therefore ship a full changeset instead of
+// row INSERTs (see `engine::sync_once_inner` / `deliver_full_snapshot_mailbox`);
+// the export/apply functions below remain for BACKWARD COMPATIBILITY with
+// pre-changeset peers. `apply_full_snapshot` filters out rows this device has
+// already deleted (tombstones in crsql_changes) so an old peer's snapshot can
+// no longer resurrect them.
 
 /// Column list for a table, from `PRAGMA table_info`.
+#[allow(dead_code)] // legacy snapshot export (tests + reference for the wire format)
 async fn table_columns(db: &SqlitePool, table: &str) -> Result<Vec<String>> {
     let rows = sqlx::query(&format!("PRAGMA table_info(\"{table}\")"))
         .fetch_all(db)
@@ -388,6 +417,7 @@ async fn table_columns(db: &SqlitePool, table: &str) -> Result<Vec<String>> {
 
 /// Serialize one row value as a SQL literal, trying the storage classes in
 /// order (TEXT → INTEGER → REAL → BLOB → NULL).
+#[allow(dead_code)] // legacy snapshot export (tests + reference for the wire format)
 fn row_value(row: &sqlx::sqlite::SqliteRow, i: usize) -> String {
     use sqlx::Row as _;
     if let Ok(Some(s)) = row.try_get::<Option<String>, _>(i) {
@@ -409,6 +439,10 @@ fn row_value(row: &sqlx::sqlite::SqliteRow, i: usize) -> String {
 }
 
 /// Dump the sync-relevant tables as idempotent `INSERT OR REPLACE` statements.
+/// No longer sent by current builds (senders ship a full-history changeset);
+/// kept for tests and as the reference for the legacy wire format that
+/// `apply_full_snapshot` still accepts from old peers.
+#[allow(dead_code)]
 #[instrument(skip(db))]
 pub async fn export_full_snapshot(db: &SqlitePool, tables: &[&str]) -> Result<Vec<String>> {
     let mut statements = Vec::new();
@@ -492,8 +526,11 @@ fn settings_statement_key(stmt: &str) -> Option<String> {
 /// Apply a full snapshot: execute the statements inside one transaction.
 /// `statements` is skipped from instrument fields: a full snapshot can hold
 /// thousands of data-bearing SQL rows and must never be logged verbatim.
+/// Returns the number of rows actually inserted (INSERT OR IGNORE rows that
+/// hit existing data — and rows dropped by the tombstone/sync-scope filters —
+/// do not count).
 #[instrument(skip(db, statements))]
-pub async fn apply_full_snapshot(db: &SqlitePool, statements: &[String]) -> Result<()> {
+pub async fn apply_full_snapshot(db: &SqlitePool, statements: &[String]) -> Result<u64> {
     // Same defensive FK-off as apply_changes (see there for the rationale);
     // CRR tables declare no REFERENCES, so this is a no-op safeguard.
     let mut conn = db.acquire().await.context("acquire snapshot conn")?;
@@ -506,7 +543,7 @@ pub async fn apply_full_snapshot(db: &SqlitePool, statements: &[String]) -> Resu
         .execute(&mut *conn)
         .await
         .context("re-enable foreign keys after snapshot")?;
-    let saw_papers = apply_result?;
+    let (saw_papers, applied) = apply_result?;
     drop(conn);
 
     // Fill the device-local creators overlay for freshly arrived papers
@@ -517,18 +554,27 @@ pub async fn apply_full_snapshot(db: &SqlitePool, statements: &[String]) -> Resu
         }
     }
 
-    info!(count = statements.len(), "applied full snapshot");
-    Ok(())
+    info!(count = statements.len(), applied, "applied full snapshot");
+    Ok(applied)
 }
 
 /// Inner part of [`apply_full_snapshot`] on an FK-disabled connection.
-/// Returns whether any `papers` rows were part of the snapshot.
+/// Returns (whether any `papers` rows were part of the snapshot, rows
+/// actually inserted).
 async fn apply_full_snapshot_inner(
     conn: &mut sqlx::SqliteConnection,
     statements: &[String],
-) -> Result<bool> {
+) -> Result<(bool, u64)> {
     let mut saw_papers = false;
+    let mut applied = 0u64;
     let mut tx = conn.begin().await.context("begin snapshot tx")?;
+    // Lazily-filled per-table caches for the tombstone filter: pk column
+    // names, and the decoded pks that carry a delete marker (cid "-1").
+    let mut pk_cols_cache: std::collections::HashMap<String, Vec<String>> = Default::default();
+    let mut tombstone_cache: std::collections::HashMap<
+        String,
+        std::collections::HashSet<Vec<String>>,
+    > = Default::default();
     for stmt in statements {
         // Defense in depth: never apply rows for disabled optional tables or
         // non-syncable settings keys, even if the peer sends them.
@@ -543,17 +589,191 @@ async fn apply_full_snapshot_inner(
                     }
                 }
             }
+            // Tombstone filter: a row this device deleted must not be
+            // resurrected by a peer's legacy snapshot. INSERT OR IGNORE would
+            // re-insert it as a LOCAL write (firing the CRR triggers with
+            // this device's site_id), breaking delete-wins and broadcasting
+            // the zombie row back to every peer. Skip statements whose pk
+            // already has a delete marker in crsql_changes.
+            if snapshot_row_is_tombstoned(
+                &mut tx,
+                &mut pk_cols_cache,
+                &mut tombstone_cache,
+                table,
+                stmt,
+            )
+            .await?
+            {
+                continue;
+            }
             if table == "papers" {
                 saw_papers = true;
             }
         }
-        sqlx::query(stmt)
+        let res = sqlx::query(stmt)
             .execute(&mut *tx)
             .await
             .with_context(|| format!("apply snapshot statement: {}", &stmt[..stmt.len().min(160)]))?;
+        applied += res.rows_affected();
     }
     tx.commit().await.context("commit snapshot tx")?;
-    Ok(saw_papers)
+    Ok((saw_papers, applied))
+}
+
+/// Whether the row a legacy snapshot statement inserts is known-deleted
+/// locally, i.e. a delete marker (cid "-1") for its pk exists in
+/// `crsql_changes`. Parse/lookup failures are non-fatal: the statement is
+/// let through to the merge rather than dropped.
+async fn snapshot_row_is_tombstoned(
+    conn: &mut sqlx::SqliteConnection,
+    pk_cols_cache: &mut std::collections::HashMap<String, Vec<String>>,
+    tombstone_cache: &mut std::collections::HashMap<String, std::collections::HashSet<Vec<String>>>,
+    table: &str,
+    stmt: &str,
+) -> Result<bool> {
+    if !pk_cols_cache.contains_key(table) {
+        let cols: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk",
+        )
+        .bind(table)
+        .fetch_all(&mut *conn)
+        .await?;
+        pk_cols_cache.insert(table.to_string(), cols);
+    }
+    let pk_cols = &pk_cols_cache[table];
+    if pk_cols.is_empty() {
+        return Ok(false);
+    }
+    let Some((cols, values)) = parse_snapshot_statement(stmt) else {
+        return Ok(false);
+    };
+    let mut pk_values = Vec::with_capacity(pk_cols.len());
+    for pk_col in pk_cols {
+        let Some(idx) = cols.iter().position(|c| c == pk_col) else {
+            return Ok(false);
+        };
+        let Some(v) = values.get(idx) else {
+            return Ok(false);
+        };
+        pk_values.push(v.clone());
+    }
+    if !tombstone_cache.contains_key(table) {
+        let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT pk FROM crsql_changes WHERE \"table\" = ? AND cid = '-1'",
+        )
+        .bind(table)
+        .fetch_all(&mut *conn)
+        .await
+        .context("read tombstones for snapshot filter")?;
+        let set = rows.iter().filter_map(|pk| decode_pk(pk)).collect();
+        tombstone_cache.insert(table.to_string(), set);
+    }
+    Ok(tombstone_cache[table].contains(&pk_values))
+}
+
+/// Split a legacy snapshot statement into its column names and value
+/// literals, normalized to the same string form [`decode_pk`] produces
+/// (integers as decimal text, blobs as `X'<lowercase hex>'`, text raw).
+/// Format: `INSERT OR IGNORE INTO "t" ("c1", ...) VALUES (v1, ...)`.
+fn parse_snapshot_statement(stmt: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let cols_open = stmt.find('(')?;
+    let cols_close = matching_paren(stmt, cols_open)?;
+    let cols = stmt[cols_open + 1..cols_close]
+        .split(',')
+        .map(|c| c.trim().trim_matches('"').to_string())
+        .collect();
+    let values_part = stmt[cols_close + 1..]
+        .trim()
+        .strip_prefix("VALUES")?
+        .trim()
+        .strip_prefix('(')?
+        .strip_suffix(')')?;
+    Some((cols, split_sql_literals(values_part)))
+}
+
+/// Find the `)` matching the `(` at byte index `open`, skipping single-quoted
+/// SQL strings (with '' escapes).
+fn matching_paren(s: &str, open: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if bytes.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split a SQL VALUES literal list on top-level commas (respecting quoted
+/// strings) and normalize each literal to [`decode_pk`]'s string form.
+fn split_sql_literals(values: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = values.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+        } else if bytes[i] == b',' {
+            out.push(normalize_sql_literal(&values[start..i]));
+            start = i + 1;
+        }
+        i += 1;
+    }
+    out.push(normalize_sql_literal(&values[start..]));
+    out
+}
+
+/// Normalize one SQL literal (as produced by `row_value` in snapshot export)
+/// to the string form [`decode_pk`] yields for the same value. NULL maps to
+/// a sentinel that can never match a decoded pk (pks are never NULL).
+fn normalize_sql_literal(tok: &str) -> String {
+    let t = tok.trim();
+    if t.eq_ignore_ascii_case("null") {
+        return "\u{0}NULL".to_string();
+    }
+    if t.len() >= 2 && t[..1].eq_ignore_ascii_case("x") && t[1..].starts_with('\'') && t.ends_with('\'') {
+        return format!("X'{}", t[2..t.len() - 1].to_lowercase());
+    }
+    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        return t[1..t.len() - 1].replace("''", "'");
+    }
+    if let Ok(n) = t.parse::<i64>() {
+        return n.to_string();
+    }
+    t.to_string()
 }
 
 #[cfg(test)]
@@ -723,6 +943,76 @@ mod tests {
         sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
         db_a.close().await;
         db_b.close().await;
+        Ok(())
+    }
+
+    /// `notes.current_vault_id` is a device-local UI preference (which vault
+    /// the user is looking at). Syncing it makes devices fight over the
+    /// active vault via LWW — switching vaults on one device would yank every
+    /// other device's notes view to a different vault. It must be filtered
+    /// from changesets like the secret settings rows.
+    #[tokio::test]
+    async fn current_vault_setting_never_leaves_device() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-crdt-vault-setting-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db = connect_with_crsqlite(&dir.join("a.db")).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db).await?;
+        register_crr_tables(&db, CORE_SYNC_TABLES).await?;
+        register_crr_tables(&db, OPTIONAL_SYNC_TABLES).await?;
+
+        // A syncable setting (should export) + the device-local vault pointer
+        // (must NOT export) + a secret key (must NOT export).
+        sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)")
+            .bind("theme")
+            .bind("dark")
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&db)
+            .await?;
+        sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)")
+            .bind(crate::core::vault_service::CURRENT_VAULT_KEY)
+            .bind("00000000-0000-0000-0000-000000000001")
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&db)
+            .await?;
+        sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)")
+            .bind("account.sync_key")
+            .bind("secret")
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&db)
+            .await?;
+
+        let changes = export_changes_since(&db, 0).await?;
+        let settings_keys: Vec<String> = changes
+            .changes
+            .iter()
+            .filter(|c| c.table == "settings")
+            .filter_map(|c| decode_pk(&c.pk).and_then(|v| v.into_iter().next()))
+            .collect();
+        assert!(
+            settings_keys.contains(&"theme".to_string()),
+            "ordinary settings must still sync: {settings_keys:?}"
+        );
+        assert!(
+            !settings_keys
+                .contains(&crate::core::vault_service::CURRENT_VAULT_KEY.to_string()),
+            "current-vault pointer must never leave the device: {settings_keys:?}"
+        );
+        assert!(
+            !settings_keys.contains(&"account.sync_key".to_string()),
+            "account.* secrets must never leave the device"
+        );
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
         Ok(())
     }
 
@@ -1152,6 +1442,258 @@ mod tests {
                 .fetch_one(&db_b)
                 .await?;
         assert_eq!(creators_count, 1, "creators overlay should be rebuilt");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
+    #[test]
+    fn local_ts_is_newer_compares_parsed_instants() {
+        // Millis beats the same second's second-precision form.
+        assert!(local_ts_is_newer("2026-06-16T10:30:00.500Z", "2026-06-16T10:30:00Z"));
+        assert!(!local_ts_is_newer("2026-06-16T10:30:00Z", "2026-06-16T10:30:00.500Z"));
+        // Equal timestamps are NOT "newer" — the change goes to the merge.
+        assert!(!local_ts_is_newer("2026-06-16T10:30:00Z", "2026-06-16T10:30:00Z"));
+        assert!(!local_ts_is_newer("2026-06-16T10:30:00.000Z", "2026-06-16T10:30:00Z"));
+        // Ordinary ordering still holds across precisions.
+        assert!(local_ts_is_newer("2026-06-16T10:30:01Z", "2026-06-16T10:30:00.999Z"));
+        assert!(!local_ts_is_newer("2026-06-16T10:29:59Z", "2026-06-16T10:30:00Z"));
+    }
+
+    /// Equal `updated_at` on both sides must NOT drop the peer's change
+    /// (the LWW pre-filter is strictly-greater): the merge falls through to
+    /// cr-sqlite's col_version rule, which deterministically picks the side
+    /// with more edits. Regression guard for the old `>=` comparison that
+    /// silently discarded same-timestamp peer edits.
+    #[tokio::test]
+    async fn equal_updated_at_lets_col_version_merge_decide() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-lww-eq-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a = connect_with_crsqlite(&dir.join("a.db")).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db_a).await?;
+        register_crr_tables(&db_a, CORE_SYNC_TABLES).await?;
+        let db_b = connect_with_crsqlite(&dir.join("b.db")).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db_b).await?;
+        register_crr_tables(&db_b, CORE_SYNC_TABLES).await?;
+
+        let ts = "2026-01-01T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, content, content_plain, tags, aliases, created_at, updated_at) \
+             VALUES ('n1', 1, 'original', 'body', 'body', '[]', '[]', ?, ?)",
+        )
+        .bind(ts)
+        .bind(ts)
+        .execute(&db_a)
+        .await?;
+        let changes = export_changes_since(&db_a, 0).await?;
+        apply_changes(&db_b, &changes).await?;
+
+        // Both sides edit the title with the SAME updated_at. A edits twice
+        // (title col_version 3), B once (col_version 2) — cr-sqlite's merge
+        // must deterministically pick A.
+        sqlx::query("UPDATE notes SET title = 'A-edit-1', updated_at = ? WHERE id = 'n1'")
+            .bind(ts)
+            .execute(&db_a)
+            .await?;
+        sqlx::query("UPDATE notes SET title = 'A-edit-2', updated_at = ? WHERE id = 'n1'")
+            .bind(ts)
+            .execute(&db_a)
+            .await?;
+        sqlx::query("UPDATE notes SET title = 'B-edit', updated_at = ? WHERE id = 'n1'")
+            .bind(ts)
+            .execute(&db_b)
+            .await?;
+
+        let changes = export_changes_since(&db_a, 0).await?;
+        apply_changes(&db_b, &changes).await?;
+
+        let title: (String,) =
+            sqlx::query_as("SELECT title FROM notes WHERE id = 'n1'")
+                .fetch_one(&db_b)
+                .await?;
+        assert_eq!(
+            title.0, "A-edit-2",
+            "same-timestamp peer change must reach the merge (higher col_version wins)"
+        );
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
+    /// A legacy full snapshot (INSERT OR IGNORE statements from a
+    /// pre-changeset peer) must not resurrect a row this device deleted, and
+    /// the skipped row must not be recorded as a LOCAL change (which would
+    /// re-broadcast the zombie to every peer).
+    #[tokio::test]
+    async fn legacy_snapshot_does_not_resurrect_deleted_row() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-snap-tombstone-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a = connect_with_crsqlite(&dir.join("a.db")).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db_a).await?;
+        register_crr_tables(&db_a, CORE_SYNC_TABLES).await?;
+        let db_b = connect_with_crsqlite(&dir.join("b.db")).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db_b).await?;
+        register_crr_tables(&db_b, CORE_SYNC_TABLES).await?;
+
+        let ts = "2026-01-01T00:00:00Z";
+        for (id, title) in [("n1", "Note One"), ("n2", "Note Two")] {
+            sqlx::query(
+                "INSERT INTO notes (id, vault_id, title, content, content_plain, tags, aliases, created_at, updated_at) \
+                 VALUES (?, 1, ?, 'body', 'body', '[]', '[]', ?, ?)",
+            )
+            .bind(id)
+            .bind(title)
+            .bind(ts)
+            .bind(ts)
+            .execute(&db_a)
+            .await?;
+        }
+        // B receives both notes via the normal changeset path...
+        let changes = export_changes_since(&db_a, 0).await?;
+        apply_changes(&db_b, &changes).await?;
+        // ...then deletes n1 (delete-wins tombstone with B's site_id).
+        sqlx::query("DELETE FROM notes WHERE id = 'n1'")
+            .execute(&db_b)
+            .await?;
+        let b_site: (Vec<u8>,) = sqlx::query_as("SELECT crsql_site_id()")
+            .fetch_one(&db_b)
+            .await?;
+        let b_site_rows_before: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM crsql_changes WHERE site_id = ?")
+                .bind(&b_site.0)
+                .fetch_one(&db_b)
+                .await?;
+
+        // A (never saw the delete) ships a legacy full snapshot.
+        let statements = export_full_snapshot(&db_a, &["notes"]).await?;
+        assert!(
+            statements.iter().any(|s| s.contains("n1")),
+            "test snapshot must contain the deleted row"
+        );
+        apply_full_snapshot(&db_b, &statements).await?;
+
+        let n1: (i64,) = sqlx::query_as("SELECT count(*) FROM notes WHERE id = 'n1'")
+            .fetch_one(&db_b)
+            .await?;
+        assert_eq!(n1.0, 0, "deleted row must not be resurrected by a snapshot");
+        let n2: (i64,) = sqlx::query_as("SELECT count(*) FROM notes WHERE id = 'n2'")
+            .fetch_one(&db_b)
+            .await?;
+        assert_eq!(n2.0, 1, "live rows in the snapshot must still apply");
+        let b_site_rows_after: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM crsql_changes WHERE site_id = ?")
+                .bind(&b_site.0)
+                .fetch_one(&db_b)
+                .await?;
+        assert_eq!(
+            b_site_rows_after, b_site_rows_before,
+            "applying the snapshot must not record local (B-site) changes"
+        );
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
+    /// The full-history changeset (what replaced the legacy snapshot on the
+    /// send side) must also respect a local delete: re-applying the sender's
+    /// whole history goes through the cr-sqlite merge, where the tombstone's
+    /// higher causal length wins.
+    #[tokio::test]
+    async fn full_changeset_does_not_resurrect_deleted_row() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-changeset-tombstone-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a = connect_with_crsqlite(&dir.join("a.db")).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db_a).await?;
+        register_crr_tables(&db_a, CORE_SYNC_TABLES).await?;
+        let db_b = connect_with_crsqlite(&dir.join("b.db")).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db_b).await?;
+        register_crr_tables(&db_b, CORE_SYNC_TABLES).await?;
+
+        let ts = "2026-01-01T00:00:00Z";
+        for (id, title) in [("n1", "Note One"), ("n2", "Note Two")] {
+            sqlx::query(
+                "INSERT INTO notes (id, vault_id, title, content, content_plain, tags, aliases, created_at, updated_at) \
+                 VALUES (?, 1, ?, 'body', 'body', '[]', '[]', ?, ?)",
+            )
+            .bind(id)
+            .bind(title)
+            .bind(ts)
+            .bind(ts)
+            .execute(&db_a)
+            .await?;
+        }
+        let changes = export_changes_since(&db_a, 0).await?;
+        apply_changes(&db_b, &changes).await?;
+        sqlx::query("DELETE FROM notes WHERE id = 'n1'")
+            .execute(&db_b)
+            .await?;
+        let b_site: (Vec<u8>,) = sqlx::query_as("SELECT crsql_site_id()")
+            .fetch_one(&db_b)
+            .await?;
+        let b_site_rows_before: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM crsql_changes WHERE site_id = ?")
+                .bind(&b_site.0)
+                .fetch_one(&db_b)
+                .await?;
+
+        // A re-exports its FULL history (db_version 0 → now) — A never saw
+        // the delete, so the changeset carries n1's insert again.
+        let full = export_changes_since(&db_a, 0).await?;
+        apply_changes(&db_b, &full).await?;
+
+        let n1: (i64,) = sqlx::query_as("SELECT count(*) FROM notes WHERE id = 'n1'")
+            .fetch_one(&db_b)
+            .await?;
+        assert_eq!(n1.0, 0, "deleted row must not be resurrected by a full changeset");
+        let n2: (i64,) = sqlx::query_as("SELECT count(*) FROM notes WHERE id = 'n2'")
+            .fetch_one(&db_b)
+            .await?;
+        assert_eq!(n2.0, 1);
+        let b_site_rows_after: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM crsql_changes WHERE site_id = ?")
+                .bind(&b_site.0)
+                .fetch_one(&db_b)
+                .await?;
+        assert_eq!(
+            b_site_rows_after, b_site_rows_before,
+            "re-applying the full history must not record local (B-site) changes"
+        );
 
         sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
         sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;

@@ -571,6 +571,11 @@ pub struct DeviceAppSettings {
     /// Whether to sync optional data (chat_sessions, chat_messages, global settings).
     #[serde(default = "default_true")]
     pub sync_optional_data: bool,
+    /// Allow unencrypted (`ws://`) relay connections. OFF by default: the
+    /// relay should be served over TLS (`wss://`); this is only for LAN
+    /// debugging with a self-hosted plaintext relay.
+    #[serde(default)]
+    pub allow_plaintext_relay: bool,
     /// Stable device identifier used for pairing and sync presence.
     #[serde(default = "default_empty_string")]
     pub device_id: String,
@@ -587,6 +592,7 @@ impl std::fmt::Debug for DeviceAppSettings {
                 &crate::core::redact::redact_api_key(&self.embedding_api_key),
             )
             .field("sync_optional_data", &self.sync_optional_data)
+            .field("allow_plaintext_relay", &self.allow_plaintext_relay)
             .field("device_id", &self.device_id)
             .finish()
     }
@@ -600,6 +606,7 @@ impl Default for DeviceAppSettings {
             skills_dir: None,
             embedding_api_key: default_embedding_api_key(),
             sync_optional_data: true,
+            allow_plaintext_relay: false,
             device_id: default_empty_string(),
         }
     }

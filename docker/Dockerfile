@@ -11,7 +11,8 @@ EXPOSE 8080
 ENV RELAY_HOST=0.0.0.0 \
     RELAY_PORT=8080 \
     JWT_SECRET=change-me \
-    RELAY_DB_PATH=/data/accounts.json
+    RELAY_DB_PATH=/data/accounts.json \
+    RELAY_MAILBOX_DB_PATH=/data/mailbox.sqlite
 VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
 ENTRYPOINT ["/usr/local/bin/siku-sync-relay"]

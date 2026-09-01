@@ -1,10 +1,15 @@
 # siku-sync-relay
 
-Siku 多端同步的官方中继服务。职责三块：**WebRTC 信令转发**（设备发现 + SDP/ICE）、**账户服务**（注册/登录/设备管理）、**加密邮箱**（离线投递）。服务只接触密文与账户元数据，**不接触用户的明文数据与密钥**。
+Siku 多端同步的官方中继服务。职责三块：**WebRTC 信令转发**（设备发现 + SDP/ICE）、**账户服务**（注册/登录/设备管理）、**加密邮箱**（离线投递，SQLite 持久化）。服务只接触密文与账户元数据，**不接触用户明文数据**。
+
+> ⚠️ 已知限制：账号级同步密钥（`sync_key`）目前由服务器在注册时生成、登录时下发，即服务器持有密钥——并非严格 E2E。改造方案（客户端持钥 + 设备配对）见 `docs/sync-hardening-plan.md` #1。
+
+> 📌 版本要求：本服务实现协议 v2（`ServerHello` + `mailbox_deposit_ack`）。客户端与 relay 必须同批升级——旧 relay 不回 ack，新客户端会判定为「relay 过旧」并暂停 mailbox 投递（数据不丢，走 outbox 兜底重投）。
 
 ## 功能
 
-- WebSocket 接入：`/v1/signaling?token=<jwt>`
+- WebSocket 接入：`/v1/signaling`，token 走 `Authorization: Bearer <jwt>` 头（旧客户端的 `?token=` 查询串仍兼容）
+- 协议握手：join 成功后服务端回发 `server_hello { protocol: 2 }`，客户端据此识别 relay 能力（无 hello 或 protocol < 2 = 旧版 relay，mailbox 确认不可用）
 - 账户 API：`/api/register`、`/api/login`、`/api/devices`（列表/改名/移除）
 - JWT（HS256）认证：token 由 `/api/login` 服务端签发（有效期 7 天，claims 含 `jti`）
 - 设备校验：已移除或未知设备的连接在 WS 握手阶段直接拒绝
@@ -12,9 +17,11 @@ Siku 多端同步的官方中继服务。职责三块：**WebRTC 信令转发**�
 - `PeerOnline` / `PeerOffline` / `Presence` 状态广播
 - `signal` 消息转发（offer / answer / ICE candidate）
 - 通用加密转发 `relay`（密文透传，不落盘）
-- **加密邮箱（离线投递）**：`mailbox_deposit` / `mailbox_poll` / `mailbox_ack`
+- **加密邮箱（离线投递，SQLite 持久化）**：`mailbox_deposit` / `mailbox_poll` / `mailbox_ack`
   - per-device 队列（上限 500 条）+ 账号级 archive（上限 2000 条，空 `to_device_id` 即投递到账号级，未来设备也能拉到）
-  - 只存密文，TTL 默认 7 天，FIFO 超限丢最旧
+  - 只存密文，TTL 默认 7 天，FIFO 超限丢最旧；重启不丢消息
+  - 投递确认：每个 `mailbox_deposit` 落库后回 `mailbox_deposit_ack`（含拒绝，携带客户端 `message_id`；同 id 重投为幂等 no-op）
+  - per-device 消息：poll 只标记 `delivered_at` 不删除，**ack 才删**；60 秒未 ack 自动重投（客户端按游标/幂等键去重）
 - 心跳保活：服务端按间隔发 `ping`，超过接收超时未收到任何消息即断开
 - 健康检查：`/healthz`
 
@@ -27,26 +34,40 @@ cd src-tauri/crates/sync-relay
 cargo run
 ```
 
-默认监听 `127.0.0.1:8080`，默认 `JWT_SECRET=siku-dev-secret-change-me`，账户/邮箱数据默认存内存（`:memory:`）。
+默认监听 `127.0.0.1:8080`，默认 `JWT_SECRET=siku-dev-secret-change-me`；账户库与邮箱库均默认存内存（`:memory:`，重启即丢，仅适合本地开发）。
 
 ### Docker Compose
+
+> 本目录的 `docker-compose.yml` 是**本地开发最小起**（无持久化卷、无 TLS）。生产部署（持久化 + Caddy TLS）请用仓库根目录的 `docker/docker-compose.yml`，见下方「生产部署」。
 
 ```bash
 cd src-tauri/crates/sync-relay
 # 使用默认密钥
 docker-compose up --build
 
-# 或指定自定义密钥与持久化数据库
+# 或指定自定义密钥与持久化数据库（邮箱库默认紧随账户库：<RELAY_DB_PATH>.mailbox.sqlite）
 JWT_SECRET=your-strong-secret RELAY_DB_PATH=/data/relay.json docker-compose up --build
 ```
 
 服务暴露在宿主机的 `8080` 端口。
 
-> ⚠️ 当前 Dockerfile 未挂载持久化卷，容器重建会丢失账户与邮箱数据。生产部署请挂载 volume 并设置 `RELAY_DB_PATH=/data/relay.json`。
+> ⚠️ 本目录的 Dockerfile 未挂载持久化卷，容器重建会丢失账户与邮箱数据。生产部署请挂载 volume 并设置 `RELAY_DB_PATH`（邮箱库可用 `RELAY_MAILBOX_DB_PATH` 单独指定）。
 
-### Docker Compose（生产）
+### Docker Compose（生产，推荐）
 
-仓库自带 `docker-compose.prod.yml`：仅绑定本机回环地址、数据持久化到 volume、带健康检查，并要求显式提供 `JWT_SECRET`（防止默认密钥上线）：
+仓库根目录的 `docker/docker-compose.yml` 是推荐的生产编排：账户库与邮箱库持久化到 volume、relay 只绑本机回环（`127.0.0.1:8080`）、强制显式提供 `JWT_SECRET`，并内置 Caddy TLS 终止（`tls` profile）：
+
+```bash
+cd docker
+# 裸 relay（仅本机回环，前置自己的反向代理）
+JWT_SECRET=your-strong-secret docker compose up -d --build
+
+# relay + Caddy 自动 HTTPS（公网域名）
+JWT_SECRET=your-strong-secret RELAY_DOMAIN=relay.example.com \
+  docker compose --profile tls up -d --build
+```
+
+本目录另附 `docker-compose.prod.yml`（无 TLS 的简化版）：仅绑定本机回环地址、数据持久化到 volume、带健康检查，并要求显式提供 `JWT_SECRET`（防止默认密钥上线）：
 
 ```bash
 cd src-tauri/crates/sync-relay
@@ -198,7 +219,8 @@ sudo systemctl enable --now siku-sync-relay
 | `RELAY_HOST` | `127.0.0.1` | 监听地址。容器内请用 `0.0.0.0` |
 | `RELAY_PORT` | `8080` | 监听端口 |
 | `JWT_SECRET` | `siku-dev-secret-change-me` | HS256 签名密钥（账户 token 签发 + WS token 验签） |
-| `RELAY_DB_PATH` | `:memory:` | 账户/设备/邮箱持久化路径（JSON 文件）。`docker-compose.yml` 里默认未设置 |
+| `RELAY_DB_PATH` | `:memory:` | 账户/设备持久化路径（JSON 文件） |
+| `RELAY_MAILBOX_DB_PATH` | `<RELAY_DB_PATH>.mailbox.sqlite` | 邮箱持久化路径（SQLite）。`RELAY_DB_PATH=:memory:` 时默认同为 `:memory:` |
 | `HEARTBEAT_INTERVAL_SECONDS` | `30` | 服务端发送 Ping 的间隔 |
 | `HEARTBEAT_TIMEOUT_SECONDS` | `60` | 多久没收到任何消息就断开（`docker-compose.yml` 显式覆盖为 `120`） |
 | `RUST_LOG` | `info` | 日志级别 |
@@ -257,7 +279,8 @@ TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/login \
   -H 'Content-Type: application/json' \
   -d '{"email":"me@example.com","password":"hunter2","device_id":"device-a","device_name":"A"}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
-websocat "ws://127.0.0.1:8080/v1/signaling?token=$TOKEN"
+# token 走 Authorization 头（不要放 URL 查询串——会进访问日志/代理日志）
+websocat "ws://127.0.0.1:8080/v1/signaling" -H "Authorization: Bearer $TOKEN"
 ```
 
 连接后发送 join（room 必须与 token 的 `sub` 一致，否则被拒）：
@@ -266,29 +289,32 @@ websocat "ws://127.0.0.1:8080/v1/signaling?token=$TOKEN"
 {"type":"join","payload":{"room_id":"<token 里的 sub>"}}
 ```
 
-再开另一个终端用 `device-b` 登录并加入同一 room，双方会收到 `peer_online`。
+join 成功后服务端先回发 `server_hello`（`protocol: 2`），随后推送邮箱存量（`mailbox_batch`）与在线状态。再开另一个终端用 `device-b` 登录并加入同一 room，双方会收到 `peer_online`。
 
 ### 协议消息一览
 
 客户端 → 服务端：`join`、`signal`、`relay`、`mailbox_deposit`、`mailbox_poll`、`mailbox_ack`、`pong`
 
-服务端 → 客户端：`peer_online`、`peer_offline`、`presence`、`signal`、`relay`、`mailbox_batch`、`ping`、`error`
+服务端 → 客户端：`server_hello`、`peer_online`、`peer_offline`、`presence`、`signal`、`relay`、`mailbox_batch`、`mailbox_deposit_ack`、`ping`、`error`
 
 ## 与 Siku 客户端对接
 
 1. 启动 relay（生产环境置于反向代理后，用 `wss://` 地址）。
-2. 在 Siku 设置页「中继服务器」填入 `wss://relay.siku.app/v1/signaling`（本地测试为 `ws://127.0.0.1:8080/v1/signaling`）。
+2. 在 Siku 设置页「中继服务器」填入 `wss://relay.siku.app/v1/signaling`（本地测试为 `ws://127.0.0.1:8080/v1/signaling`——客户端默认拒绝明文 `ws://`，需在「同步 → 同步范围」开启「允许明文中继（仅局域网调试）」）。
 3. 用邮箱 + 密码登录：客户端自动调用 `/api/login` 获取 `access_token` 与 `sync_key` 并本地保存。
-4. 同一账号的多个设备登录后自动互相发现并同步；离线期间的变更通过加密邮箱投递，对方上线即收到。
+4. 同一账号的多个设备登录后自动互相发现并同步；离线期间的变更通过加密邮箱投递（ack 确认 + 失败重投），对方上线即收到。
 5. 局域网直连（同网段无需 relay）走独立的 LAN 配对流程，不经过本服务。
+
+> relay 与客户端必须同批升级：protocol v2 的客户端连旧 relay 会报「relay 过旧」并暂停 mailbox 投递（数据经 outbox 兜底，不丢）。
 
 ## 数据与安全模型
 
-- **明文不落盘**：邮箱只存 E2E 加密后的密文（`ciphertext` + `nonce`），密钥（`sync_key`）只由客户端持有、在 `/api/login` 响应中下发。
+- **明文不落盘**：邮箱只存加密后的密文（`ciphertext` + `nonce`），SQLite 持久化，重启不丢。
+- **密钥现状（非严格 E2E）**：`sync_key` 由服务器在注册时生成、随 `/api/login` 响应下发到各设备——**服务器当前持有密钥**，可解密邮箱载荷。真 E2E（客户端持钥 + 设备配对 + 服务器只存指纹）在 `docs/sync-hardening-plan.md` #1，实施前自托管者需信任自己的 relay 主机。
 - **账户凭据**：密码以迭代 SHA-256（10 万轮 + 随机盐，PBKDF2 风格）存储，见 `auth.rs`。
 - **设备移除**：`/api/devices/:id` DELETE 直接删除设备记录，其 refresh token 同步失效，后续 WS 连接在握手阶段即被拒绝；重新登录会注册为全新设备。
 - **生产注意事项**：
   - 替换默认 `JWT_SECRET`（固定密钥仅用于本地/内部测试）；
-  - 挂载持久化卷并设置 `RELAY_DB_PATH`；
+  - 挂载持久化卷并设置 `RELAY_DB_PATH`（邮箱库默认紧随其后，或用 `RELAY_MAILBOX_DB_PATH` 单独指定）；
   - 密码哈希若需更强抗性，可换 argon2id（当前为无依赖的务实选择）；
   - 如需横向扩展，把 JSON 文件存储换成 SQLite/Postgres（见 `db.rs` 注释）。

@@ -48,15 +48,18 @@ CREATE INDEX IF NOT EXISTS idx_papers_journal ON papers(journal);
 CREATE INDEX IF NOT EXISTS idx_papers_created ON papers(created_at);
 CREATE INDEX IF NOT EXISTS idx_papers_citation_key ON papers(citation_key);
 
--- attachments
+-- attachments (paper attachment files, incl. the main-PDF record at import).
+-- No FK constraint: this is a CRR table and CR-SQLite forbids checked FKs on
+-- them — paper cleanup deletes attachment rows explicitly (paper_service::
+-- purge_paper), tracked as CRDT deletes.
 CREATE TABLE IF NOT EXISTS attachments (
-    id TEXT PRIMARY KEY,
-    paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
-    file_name TEXT NOT NULL,
-    file_path TEXT NOT NULL,
-    file_type TEXT NOT NULL,
+    id TEXT PRIMARY KEY NOT NULL,
+    paper_id TEXT NOT NULL DEFAULT '',
+    file_name TEXT NOT NULL DEFAULT '',
+    file_path TEXT NOT NULL DEFAULT '',
+    file_type TEXT NOT NULL DEFAULT '',
     description TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_paper ON attachments(paper_id);
 
@@ -597,6 +600,7 @@ CREATE TABLE IF NOT EXISTS sync_outbox (
     nonce TEXT NOT NULL,
     ttl_seconds INTEGER NOT NULL,
     created_at TEXT NOT NULL,
-    retry_count INTEGER DEFAULT 0
+    retry_count INTEGER DEFAULT 0,
+    message_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sync_outbox_peer ON sync_outbox(to_device_id);

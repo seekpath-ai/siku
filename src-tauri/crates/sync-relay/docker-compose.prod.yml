@@ -15,6 +15,8 @@ services:
       # 必填：不设置则启动即失败（防止误用默认开发密钥上线）
       - JWT_SECRET=${JWT_SECRET:?请通过环境变量设置强密钥，禁止使用默认值}
       - RELAY_DB_PATH=/data/relay.json
+      # 邮箱库（SQLite，离线消息持久化）；不设置则默认 /data/relay.json.mailbox.sqlite
+      - RELAY_MAILBOX_DB_PATH=/data/mailbox.sqlite
       - HEARTBEAT_INTERVAL_SECONDS=30
       - HEARTBEAT_TIMEOUT_SECONDS=120
       - RUST_LOG=info

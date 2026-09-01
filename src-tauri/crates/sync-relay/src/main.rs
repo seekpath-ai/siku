@@ -76,6 +76,12 @@ struct MailboxDepositPayload {
     nonce: String,
     #[serde(default)]
     ttl_seconds: Option<u64>,
+    /// Client correlation id: echoed back in `MailboxDepositAck` so the sender
+    /// only advances its sync cursor after the message is durably stored.
+    /// Legacy clients omit it; the relay then generates its own id and sends
+    /// an ack the client ignores.
+    #[serde(default)]
+    message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +159,33 @@ enum RelayServerMsg {
     Ping,
     Error { payload: ErrorPayload },
     MailboxBatch { payload: MailboxBatchPayload },
+    /// Acknowledges a `MailboxDeposit` after the message is durably stored
+    /// (or rejected). `ok=false` means the deposit was NOT stored — the
+    /// sender must retry / queue it rather than advance its cursor.
+    MailboxDepositAck { payload: MailboxDepositAckPayload },
+    /// Capability handshake sent right after a successful Join. Lets the
+    /// client detect a legacy relay that never acks mailbox deposits instead
+    /// of timing out on every deposit. Old clients ignore unknown message
+    /// types, so this is safe to send to them.
+    ServerHello { payload: ServerHelloPayload },
+}
+
+/// Relay protocol versions: 1 = legacy (no mailbox deposit acks), 2 = durable
+/// mailbox with `MailboxDepositAck`.
+const RELAY_PROTOCOL_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ServerHelloPayload {
+    protocol: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MailboxDepositAckPayload {
+    /// The stored message id (the client's `message_id` when provided).
+    id: String,
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,11 +212,6 @@ struct ErrorPayload {
 }
 
 // ── JWT authentication ─────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct TokenQuery {
-    token: String,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -233,11 +261,21 @@ struct AppState {
 impl AppState {
     fn new() -> Self {
         let db_path = std::env::var("RELAY_DB_PATH").unwrap_or_else(|_| ":memory:".to_string());
+        // Mailbox persistence: separate SQLite file next to the account db.
+        // ":memory:" account db → ":memory:" mailbox (ephemeral, tests/dev).
+        let mailbox_db_path = std::env::var("RELAY_MAILBOX_DB_PATH").unwrap_or_else(|_| {
+            if db_path == ":memory:" {
+                ":memory:".to_string()
+            } else {
+                format!("{db_path}.mailbox.sqlite")
+            }
+        });
         Self {
             rooms: Mutex::new(HashMap::new()),
             db: db::Db::new(std::path::Path::new(&db_path)).expect("account db"),
             auth: auth::Auth::new(jwt_secret()),
-            mailboxes: mailbox::Mailbox::new(),
+            mailboxes: mailbox::Mailbox::open(std::path::Path::new(&mailbox_db_path))
+                .expect("mailbox db"),
         }
     }
 
@@ -338,12 +376,29 @@ impl AppState {
 
 // ── HTTP / WebSocket handlers ──────────────────────────────────────────────
 
+/// Extract the device JWT from the request. Newer clients send it in the
+/// `Authorization: Bearer <token>` header (never logged by proxies); the
+/// legacy `?token=` query string is still accepted for older clients.
+fn extract_token(headers: &axum::http::HeaderMap, query: &HashMap<String, String>) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+        .or_else(|| query.get("token").cloned())
+}
+
 async fn signaling_handler(
     ws: WebSocketUpgrade,
-    Query(query): Query<TokenQuery>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let claims = match decode_token(&query.token) {
+    let Some(token) = extract_token(&headers, &query) else {
+        warn!("websocket connection without token");
+        return (StatusCode::UNAUTHORIZED, "missing token").into_response();
+    };
+    let claims = match decode_token(&token) {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "invalid token");
@@ -485,6 +540,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                         state.mailboxes.ensure_device(&room_id, &join_device_id);
                         joined_room = Some(room_id.clone());
 
+                        // Capability handshake, sent before anything else so
+                        // the client can tell a modern relay (mailbox deposit
+                        // acks) from a legacy one. Clients that predate this
+                        // message ignore the unknown type.
+                        let _ = tx.send(RelayServerMsg::ServerHello {
+                            payload: ServerHelloPayload {
+                                protocol: RELAY_PROTOCOL_VERSION,
+                            },
+                        });
+
                         if is_first_connection {
                             let pending = state
                                 .mailboxes
@@ -591,11 +656,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                         }
                     }
                     RelayClientMsg::MailboxDeposit { payload } => {
+                        let MailboxDepositPayload {
+                            to_device_id,
+                            ciphertext,
+                            nonce,
+                            ttl_seconds,
+                            message_id,
+                        } = payload;
+                        let ack_id = message_id.clone().unwrap_or_default();
                         let Some(room) = joined_room.as_ref() else {
-                            let _ = tx.send(RelayServerMsg::Error {
-                                payload: ErrorPayload {
-                                    code: "not_joined".to_string(),
-                                    message: "send join before mailbox deposit".to_string(),
+                            let _ = tx.send(RelayServerMsg::MailboxDepositAck {
+                                payload: MailboxDepositAckPayload {
+                                    id: ack_id,
+                                    ok: false,
+                                    error: Some("send join before mailbox deposit".to_string()),
                                 },
                             });
                             continue;
@@ -603,21 +677,34 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                         match state.mailboxes.deposit(
                             room,
                             &device_id,
-                            &payload.to_device_id,
-                            payload.ciphertext,
-                            payload.nonce,
-                            payload.ttl_seconds,
+                            &to_device_id,
+                            ciphertext,
+                            nonce,
+                            ttl_seconds,
+                            message_id,
                         ) {
-                            Ok(()) => info!(
-                                from = %device_id,
-                                to = %payload.to_device_id,
-                                "mailbox deposit accepted"
-                            ),
+                            Ok(id) => {
+                                info!(
+                                    from = %device_id,
+                                    to = %to_device_id,
+                                    message_id = %id,
+                                    "mailbox deposit accepted (durable)"
+                                );
+                                let _ = tx.send(RelayServerMsg::MailboxDepositAck {
+                                    payload: MailboxDepositAckPayload {
+                                        id,
+                                        ok: true,
+                                        error: None,
+                                    },
+                                });
+                            }
                             Err(e) => {
-                                let _ = tx.send(RelayServerMsg::Error {
-                                    payload: ErrorPayload {
-                                        code: "bad_request".to_string(),
-                                        message: e,
+                                warn!(from = %device_id, to = %to_device_id, error = %e, "mailbox deposit rejected");
+                                let _ = tx.send(RelayServerMsg::MailboxDepositAck {
+                                    payload: MailboxDepositAckPayload {
+                                        id: ack_id,
+                                        ok: false,
+                                        error: Some(e),
                                     },
                                 });
                             }
@@ -952,13 +1039,28 @@ mod tests {
         .unwrap()
     }
 
+    /// The signaling handler rejects unknown devices (401), so WebSocket
+    /// integration tests must register the user + devices in the account db
+    /// first — mirroring a real login flow.
+    fn seed_account(state: &AppState) {
+        state
+            .db
+            .create_user("user-1", "test@example.com", "hash", "sync-key")
+            .unwrap();
+        state.db.register_device("user-1", "device-a", "A").unwrap();
+        state.db.register_device("user-1", "device-b", "B").unwrap();
+    }
+
     #[tokio::test]
     async fn two_peers_see_each_other() {
         use futures::{SinkExt, StreamExt};
-        use tokio_tungstenite::{connect_async, tungstenite::Message};
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message;
 
         std::env::set_var("JWT_SECRET", "test-secret");
         let state = Arc::new(AppState::new());
+        seed_account(&state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -971,12 +1073,26 @@ mod tests {
         let token_a = make_token("user-1", "device-a");
         let token_b = make_token("user-1", "device-b");
 
-        let (mut a, _) = connect_async(format!("ws://127.0.0.1:{}/v1/signaling?token={}", port, token_a))
-            .await
-            .unwrap();
-        let (mut b, _) = connect_async(format!("ws://127.0.0.1:{}/v1/signaling?token={}", port, token_b))
-            .await
-            .unwrap();
+        // Newer clients send the token in the Authorization header (never in
+        // the URL query string, which proxies log).
+        async fn connect_with_header(
+            port: u16,
+            token: &str,
+        ) -> (
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            axum::http::Response<Option<Vec<u8>>>,
+        ) {
+            let mut request = format!("ws://127.0.0.1:{port}/v1/signaling")
+                .into_client_request()
+                .unwrap();
+            request.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+            connect_async(request).await.unwrap()
+        }
+        let (mut a, _) = connect_with_header(port, &token_a).await;
+        let (mut b, _) = connect_with_header(port, &token_b).await;
 
         // Both join the same room.
         a.send(Message::Text(
@@ -1029,6 +1145,7 @@ mod tests {
 
         std::env::set_var("JWT_SECRET", "test-secret");
         let state = Arc::new(AppState::new());
+        seed_account(&state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server_state = state.clone();
@@ -1129,5 +1246,212 @@ mod tests {
         state.leave("user-1", "device-a", 3);
         assert!(!state.is_online("device-a"));
         assert!(state.device_ids_in_room("user-1").is_empty());
+    }
+
+    /// MailboxDeposit over the wire is acked with ok=true and echoes the
+    /// client's message_id once the message is durably stored.
+    #[tokio::test]
+    async fn mailbox_deposit_ack_ok_over_websocket() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message;
+
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let state = Arc::new(AppState::new());
+        seed_account(&state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        async fn connect(
+            port: u16,
+            token: &str,
+        ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+        {
+            let mut request = format!("ws://127.0.0.1:{port}/v1/signaling")
+                .into_client_request()
+                .unwrap();
+            request.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+            let (ws, _) = connect_async(request).await.unwrap();
+            ws
+        }
+
+        let token_a = make_token("user-1", "device-a");
+        let token_b = make_token("user-1", "device-b");
+        let mut a = connect(port, &token_a).await;
+        let mut b = connect(port, &token_b).await;
+
+        // Both join the room — a per-device deposit requires the target to be
+        // registered (joined).
+        a.send(Message::Text(
+            r#"{"type":"join","payload":{"room_id":"user-1"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        b.send(Message::Text(
+            r#"{"type":"join","payload":{"room_id":"user-1"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        a.send(Message::Text(
+            r#"{"type":"mailbox_deposit","payload":{"to_device_id":"device-b","ciphertext":"cipher-1","nonce":"nonce-1","message_id":"m-1"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let ack = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(Message::Text(text))) = a.next().await {
+                if text.contains("mailbox_deposit_ack") {
+                    return text;
+                }
+            }
+            String::new()
+        })
+        .await
+        .unwrap();
+        assert!(ack.contains(r#""ok":true"#), "deposit should be acked ok, got: {ack}");
+        assert!(ack.contains(r#""id":"m-1""#), "ack must echo the client message_id, got: {ack}");
+    }
+
+    /// MailboxDeposit is rejected (ok=false) when the sender never joined the
+    /// room, and when the target device is not in the room.
+    #[tokio::test]
+    async fn mailbox_deposit_ack_rejected_over_websocket() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message;
+
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let state = Arc::new(AppState::new());
+        seed_account(&state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        async fn connect(
+            port: u16,
+            token: &str,
+        ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+        {
+            let mut request = format!("ws://127.0.0.1:{port}/v1/signaling")
+                .into_client_request()
+                .unwrap();
+            request.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+            );
+            let (ws, _) = connect_async(request).await.unwrap();
+            ws
+        }
+
+        let token_a = make_token("user-1", "device-a");
+        let mut a = connect(port, &token_a).await;
+
+        // 1) Deposit before joining → rejected.
+        a.send(Message::Text(
+            r#"{"type":"mailbox_deposit","payload":{"to_device_id":"device-b","ciphertext":"c","nonce":"n","message_id":"m-not-joined"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(Message::Text(text))) = a.next().await {
+                if text.contains("mailbox_deposit_ack") {
+                    return text;
+                }
+            }
+            String::new()
+        })
+        .await
+        .unwrap();
+        assert!(ack.contains(r#""ok":false"#), "deposit before join must be rejected, got: {ack}");
+        assert!(ack.contains(r#""id":"m-not-joined""#), "got: {ack}");
+
+        // 2) Joined, but the target device is not in the room → rejected.
+        a.send(Message::Text(
+            r#"{"type":"join","payload":{"room_id":"user-1"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        a.send(Message::Text(
+            r#"{"type":"mailbox_deposit","payload":{"to_device_id":"ghost-device","ciphertext":"c","nonce":"n","message_id":"m-ghost"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(Message::Text(text))) = a.next().await {
+                if text.contains("mailbox_deposit_ack") && text.contains("m-ghost") {
+                    return text;
+                }
+            }
+            String::new()
+        })
+        .await
+        .unwrap();
+        assert!(ack.contains(r#""ok":false"#), "deposit to unknown device must be rejected, got: {ack}");
+        assert!(ack.contains("not in room"), "got: {ack}");
+    }
+
+    /// A successful Join is answered by a `ServerHello` capability handshake
+    /// carrying the relay's protocol version (>= 2 = mailbox deposit acks).
+    #[tokio::test]
+    async fn join_receives_server_hello() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message;
+
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let state = Arc::new(AppState::new());
+        seed_account(&state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let token_a = make_token("user-1", "device-a");
+        let mut request = format!("ws://127.0.0.1:{port}/v1/signaling")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {token_a}")).unwrap(),
+        );
+        let (mut a, _) = connect_async(request).await.unwrap();
+
+        a.send(Message::Text(
+            r#"{"type":"join","payload":{"room_id":"user-1"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let hello = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(Message::Text(text))) = a.next().await {
+                if text.contains("server_hello") {
+                    return text;
+                }
+            }
+            String::new()
+        })
+        .await
+        .unwrap();
+        assert!(
+            hello.contains(r#""protocol":2"#),
+            "join must be answered by server_hello with protocol 2, got: {hello}"
+        );
     }
 }

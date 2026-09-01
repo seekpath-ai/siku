@@ -5970,6 +5970,7 @@ dependencies = [
  "fastembed",
  "futures",
  "hex",
+ "http",
  "image",
  "libsqlite3-sys",
  "lopdf",

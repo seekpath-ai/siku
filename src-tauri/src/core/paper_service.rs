@@ -823,7 +823,18 @@ pub async fn purge_paper(db: &SqlitePool, app_data_dir: &Path, id: &str) -> Resu
     // Junction/org tables have no FK cascades (CR-SQLite forbids checked FKs
     // on CRRs) — delete children explicitly so the deletions are tracked as
     // CRDT changes and propagate to other devices. This also removes
-    // annotations, which never had a cascade and were previously orphaned.
+    // annotations and attachments, which never had a cascade and were
+    // previously orphaned.
+    //
+    // Capture attachment blob paths BEFORE deleting the rows: the blob
+    // cleanup below only knew about `paper.file_path` (the main PDF), so
+    // non-main attachment blobs were never removed from disk.
+    let attachment_blob_paths: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT file_path FROM attachments WHERE paper_id = ? AND file_path != ''",
+    )
+    .bind(id)
+    .fetch_all(db)
+    .await?;
     sqlx::query("DELETE FROM paper_tags WHERE paper_id = ?")
         .bind(id)
         .execute(db)
@@ -841,42 +852,53 @@ pub async fn purge_paper(db: &SqlitePool, app_data_dir: &Path, id: &str) -> Resu
         .bind(id)
         .execute(db)
         .await?;
+    sqlx::query("DELETE FROM attachments WHERE paper_id = ?")
+        .bind(id)
+        .execute(db)
+        .await?;
 
-    // Delete from database (cascades to attachments, chunks, creators, etc.)
+    // Delete from database (cascades to chunks, creators, etc.)
     sqlx::query("DELETE FROM papers WHERE id = ?")
         .bind(id)
         .execute(db)
         .await?;
 
-    // Try to clean up the PDF blob if no other paper or attachment references it.
+    // Try to clean up blobs (main PDF + attachment files) once no other paper
+    // or attachment references them. Missing files only warn — same as before.
+    let mut blob_paths = attachment_blob_paths;
     if let Some(rel_path) = paper.file_path.as_deref() {
-        let blob_path = file_store::resolve_blob_path(app_data_dir, rel_path);
-        if blob_path.exists() {
-            let count_papers: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM papers WHERE file_path = ? AND id != ?"
-            )
-            .bind(rel_path)
-            .bind(id)
-            .fetch_one(db)
-            .await
-            .unwrap_or(0);
-            let count_attachments: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM attachments WHERE file_path = ?"
-            )
-            .bind(rel_path)
-            .bind(id)
-            .fetch_one(db)
-            .await
-            .unwrap_or(0);
-            if count_papers == 0 && count_attachments == 0 {
-                if let Err(e) = std::fs::remove_file(&blob_path) {
-                    warn!(
-                        paper_id = %id,
-                        path = %blob_path.display(),
-                        error = %e,
-                        "failed to remove unreferenced blob"
-                    );
-                }
+        if !blob_paths.iter().any(|p| p == rel_path) {
+            blob_paths.push(rel_path.to_string());
+        }
+    }
+    for rel_path in blob_paths {
+        let blob_path = file_store::resolve_blob_path(app_data_dir, &rel_path);
+        if !blob_path.exists() {
+            continue;
+        }
+        let count_papers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM papers WHERE file_path = ? AND id != ?",
+        )
+        .bind(&rel_path)
+        .bind(id)
+        .fetch_one(db)
+        .await
+        .unwrap_or(0);
+        let count_attachments: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM attachments WHERE file_path = ?",
+        )
+        .bind(&rel_path)
+        .fetch_one(db)
+        .await
+        .unwrap_or(0);
+        if count_papers == 0 && count_attachments == 0 {
+            if let Err(e) = std::fs::remove_file(&blob_path) {
+                warn!(
+                    paper_id = %id,
+                    path = %blob_path.display(),
+                    error = %e,
+                    "failed to remove unreferenced blob"
+                );
             }
         }
     }
@@ -1459,4 +1481,79 @@ pub async fn set_creators(
         .await?;
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// purge_paper must delete the disk blobs of BOTH the main PDF
+    /// (paper.file_path) and non-main attachments (attachments.file_path) —
+    /// previously only the main PDF blob was removed. A missing blob file
+    /// must not abort the purge.
+    #[tokio::test]
+    async fn purge_paper_removes_attachment_blobs() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-purge-blobs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = crate::core::db::tests::connect_with_crsqlite(&dir.join("t.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL)
+            .execute(&db)
+            .await?;
+
+        let blobs = crate::file_store::blob_dir(&dir);
+        std::fs::create_dir_all(&blobs)?;
+        std::fs::write(blobs.join("main.pdf"), b"main")?;
+        std::fs::write(blobs.join("supp.pdf"), b"supp")?;
+
+        sqlx::query(
+            "INSERT INTO papers (id, title, file_path) VALUES ('p1', 'Paper', 'blobs/main.pdf')",
+        )
+        .execute(&db)
+        .await?;
+        // a1 shares the main-PDF blob; a2 is a non-main attachment blob;
+        // a3's blob file is missing on disk.
+        sqlx::query(
+            "INSERT INTO attachments (id, paper_id, file_name, file_path, file_type, created_at) VALUES \
+             ('a1', 'p1', 'main.pdf', 'blobs/main.pdf', 'pdf', '2026-01-01T00:00:00Z'), \
+             ('a2', 'p1', 'supp.pdf', 'blobs/supp.pdf', 'pdf', '2026-01-01T00:00:00Z'), \
+             ('a3', 'p1', 'gone.pdf', 'blobs/gone.pdf', 'pdf', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&db)
+        .await?;
+
+        purge_paper(&db, &dir, "p1").await?;
+
+        assert!(
+            !blobs.join("main.pdf").exists(),
+            "main PDF blob must be removed"
+        );
+        assert!(
+            !blobs.join("supp.pdf").exists(),
+            "attachment blob must be removed"
+        );
+
+        // The missing blob must not have aborted the purge.
+        let (papers,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM papers WHERE id = 'p1'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(papers, 0);
+        let (attachments,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM attachments WHERE paper_id = 'p1'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(attachments, 0);
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
 }

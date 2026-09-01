@@ -18,12 +18,15 @@ use tracing::info;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SyncConfig {
     pub sync_optional_data: bool,
+    /// Allow unencrypted (`ws://`) relay connections (LAN debugging only).
+    pub allow_plaintext_relay: bool,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             sync_optional_data: true,
+            allow_plaintext_relay: false,
         }
     }
 }
@@ -32,8 +35,16 @@ impl From<&DeviceAppSettings> for SyncConfig {
     fn from(settings: &DeviceAppSettings) -> Self {
         Self {
             sync_optional_data: settings.sync_optional_data,
+            allow_plaintext_relay: settings.allow_plaintext_relay,
         }
     }
+}
+
+/// True when `relay_url` is an unencrypted `ws://` endpoint that the device is
+/// not configured to allow. Used to block plaintext relay connections unless
+/// the user explicitly enables them (see `SyncConfig.allow_plaintext_relay`).
+fn plaintext_relay_blocked(relay_url: &str, allow_plaintext: bool) -> bool {
+    !allow_plaintext && relay_url.starts_with("ws://")
 }
 
 pub struct SyncState {
@@ -408,6 +419,19 @@ pub async fn spawn_auto_sync_proxy(
     token: &str,
 ) {
     let relay_url = normalize_ws_url(relay_url);
+    // Security: refuse plaintext (`ws://`) relays unless the user explicitly
+    // allowed them. Tokens and (until true E2E lands) sync keys would cross
+    // the network unencrypted; a public relay must be served as `wss://`.
+    let device_settings = settings_service::load_device_settings(&app_state.db)
+        .await
+        .unwrap_or_default();
+    if plaintext_relay_blocked(&relay_url, device_settings.allow_plaintext_relay) {
+        tracing::warn!(
+            relay_url = %relay_url,
+            "auto-sync: refusing unencrypted relay (enable \"允许明文中继\" in 同步设置 to override)"
+        );
+        return;
+    }
     let token = token.to_string();
     let room_id = match jwt_sub(&token) {
         Ok(r) => r,
@@ -500,6 +524,23 @@ pub async fn spawn_auto_sync_proxy(
             let mut mailbox_tick =
                 tokio::time::interval(std::time::Duration::from_secs(10));
             mailbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            // Also drop a FULL SNAPSHOT into the archive on connect and then
+            // every ~2h. The delta path (crsql_changes) can still lose rows
+            // when the relay archive prunes old changesets (7-day TTL /
+            // 2000-message cap) after this device's cursor already advanced
+            // past them — a device that comes online later would never see
+            // them, e.g. an old "我的图书馆" folder row or its notes. The
+            // snapshot is INSERT OR IGNORE, so it is idempotent and simply
+            // fills whatever the peer is missing.
+            if let Some(key) = &mailbox_key {
+                if let Err(e) =
+                    crate::sync::engine::deliver_full_snapshot_mailbox(&db, &relay, key).await
+                {
+                    tracing::warn!(error = %e, "auto-sync: initial mailbox snapshot failed");
+                }
+            }
+            let mut snapshot_ticks: u64 = 0;
 
             loop {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -639,11 +680,7 @@ pub async fn spawn_auto_sync_proxy(
                                 // relay delivers them on join. Apply them even
                                 // without a P2P session.
                                 if let Some(key) = &mailbox_key {
-                                    let account_msgs = payload
-                                        .messages
-                                        .iter()
-                                        .filter(|m| m.account_level)
-                                        .count();
+                                    let batch_full = payload.messages.len() >= 100;
                                     if let Err(e) = crate::sync::engine::handle_mailbox_batch(
                                         &db, &app_data_dir, key, &relay, payload.messages,
                                     )
@@ -652,9 +689,12 @@ pub async fn spawn_auto_sync_proxy(
                                         tracing::warn!(error = %e, "auto-sync: mailbox batch failed");
                                     }
                                     // A large account-level archive is paged:
-                                    // poll again while the last batch was full
-                                    // of archive messages (more may remain).
-                                    if account_msgs >= 100 {
+                                    // poll again while the last batch was full —
+                                    // account messages may still be queued even
+                                    // when the page was filled by per-device
+                                    // messages (poll drains the device queue
+                                    // first and would otherwise hide them).
+                                    if batch_full {
                                         relay
                                             .send(crate::sync::types::RelayClientMsg::MailboxPoll {
                                                 payload: crate::sync::types::MailboxPollPayload {
@@ -710,6 +750,46 @@ pub async fn spawn_auto_sync_proxy(
                             .await
                             {
                                 tracing::warn!(error = %e, "auto-sync: account-level mailbox deposit failed");
+                            }
+                            // Drain the local outbox on every tick: rows queued
+                            // while the relay was unreachable are otherwise
+                            // only retried by the P2P engine loop (which pure
+                            // mailbox users never run) or a manual command.
+                            // Failures are retried on the next tick.
+                            if let Err(e) = flush_outbox_with(&db, &relay).await {
+                                tracing::warn!(error = %e, "auto-sync: outbox flush failed");
+                            }
+                        }
+                        // Periodically drain the mailbox (account archive +
+                        // this device's per-device queue). The relay only
+                        // pushes a MailboxBatch on a device's FIRST join; after
+                        // a reconnect — or when the relay still holds a stale
+                        // connection for this device (heartbeat timeout window)
+                        // — no batch is delivered, so changes deposited while
+                        // this device was offline would otherwise sit in the
+                        // archive until the next clean disconnect/join cycle
+                        // (or indefinitely if the connection stays up). This
+                        // poll makes the mailbox a real bidirectional offline
+                        // channel. The relay responses are handled above in the
+                        // `MailboxBatch` arm of this select.
+                        relay
+                            .send(crate::sync::types::RelayClientMsg::MailboxPoll {
+                                payload: crate::sync::types::MailboxPollPayload {
+                                    max_count: Some(100),
+                                },
+                            })
+                            .ok();
+                        // Refresh the account archive's full snapshot so a
+                        // device that connects days later still finds one
+                        // before the 7-day TTL prunes the connect-time copy.
+                        snapshot_ticks += 1;
+                        if snapshot_ticks % 720 == 0 {
+                            if let Some(key) = &mailbox_key {
+                                if let Err(e) =
+                                    crate::sync::engine::deliver_full_snapshot_mailbox(&db, &relay, key).await
+                                {
+                                    tracing::warn!(error = %e, "auto-sync: periodic mailbox snapshot failed");
+                                }
                             }
                         }
                     }
@@ -817,6 +897,18 @@ async fn attach_mailbox(
         info!("no sync key yet; mailbox transport disabled");
         return engine;
     };
+    // Refuse plaintext relays for the mailbox transport (P2P itself is DTLS
+    // and unaffected, but mailbox payloads would leave the device via ws://).
+    let device_settings = settings_service::load_device_settings(db)
+        .await
+        .unwrap_or_default();
+    if plaintext_relay_blocked(relay_url, device_settings.allow_plaintext_relay) {
+        tracing::warn!(
+            relay_url = %relay_url,
+            "mailbox transport disabled: unencrypted relay not allowed"
+        );
+        return engine;
+    }
     let device_id = match ensure_device_id(db).await {
         Ok(id) => id,
         Err(e) => {
@@ -846,7 +938,7 @@ pub async fn flush_sync_outbox(
         return Ok("outbox flushed".to_string());
     }
     let client = build_mailbox_from_account(&app_state).await?;
-    let result = flush_outbox_with(&app_state.db, &client).await;
+    let result = flush_outbox_with(&app_state.db, client.relay()).await;
     // Close the one-shot mailbox connection (see mailbox_deliver_offline).
     client.shutdown();
     result.map_err(|e| e.to_string())?;
@@ -923,7 +1015,17 @@ async fn build_mailbox_from_account(app_state: &AppState) -> Result<MailboxClien
         .ok_or("账号未登录")?;
     let device_id = ensure_device_id(db).await.map_err(|e| e.to_string())?;
     let room_id = jwt_sub(&token).map_err(|e| format!("token 无效: {e}"))?;
-    MailboxClient::connect(&normalize_ws_url(&relay_url), &token, &room_id, &device_id)
+    let normalized = normalize_ws_url(&relay_url);
+    let device_settings = settings_service::load_device_settings(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    if plaintext_relay_blocked(&normalized, device_settings.allow_plaintext_relay) {
+        return Err(
+            "中继地址为不加密的 ws://，已拒绝连接。生产环境请使用 wss://；仅局域网调试可在「同步 → 同步范围」开启「允许明文中继」"
+                .to_string(),
+        );
+    }
+    MailboxClient::connect(&normalized, &token, &room_id, &device_id)
         .await
         .map_err(|e| format!("邮箱连接失败: {e}"))
 }
@@ -965,28 +1067,94 @@ pub async fn get_sync_config(state: State<'_, AppState>) -> Result<SyncConfig, S
 /// registers the optional tables as CRRs (so their changes are tracked and
 /// sent), disabling drops the CRR artifacts (so they stop being tracked). The
 /// export/apply filters in `crdt.rs` gate on the same setting, so a restart
-/// is no longer required.
+/// is no longer required. Persisting the plaintext-relay override restarts the
+/// auto-sync proxy when it changed, so the new policy applies without an app
+/// restart.
 #[tauri::command]
-pub async fn set_sync_config(state: State<'_, AppState>, config: SyncConfig) -> Result<(), String> {
+pub async fn set_sync_config(
+    state: State<'_, AppState>,
+    sync_state: State<'_, SyncState>,
+    config: SyncConfig,
+) -> Result<(), String> {
     let mut device_settings = settings_service::load_device_settings(&state.db).await?;
-    if device_settings.sync_optional_data == config.sync_optional_data {
-        return Ok(());
-    }
+    let optional_changed = device_settings.sync_optional_data != config.sync_optional_data;
+    let plaintext_changed =
+        device_settings.allow_plaintext_relay != config.allow_plaintext_relay;
     device_settings.sync_optional_data = config.sync_optional_data;
+    device_settings.allow_plaintext_relay = config.allow_plaintext_relay;
     settings_service::save_device_settings(&state.db, &device_settings).await?;
 
-    if config.sync_optional_data {
-        crate::core::db::register_crr_tables(&state.db, crate::core::db::OPTIONAL_SYNC_TABLES)
-            .await
-            .map_err(|e| format!("启用可选同步表失败: {e}"))?;
-    } else {
-        for table in crate::core::db::OPTIONAL_SYNC_TABLES {
-            crate::core::db::drop_crr_objects(&state.db, table)
+    if optional_changed {
+        if config.sync_optional_data {
+            crate::core::db::register_crr_tables(&state.db, crate::core::db::OPTIONAL_SYNC_TABLES)
                 .await
-                .map_err(|e| format!("停用可选同步表 {table} 失败: {e}"))?;
+                .map_err(|e| format!("启用可选同步表失败: {e}"))?;
+        } else {
+            for table in crate::core::db::OPTIONAL_SYNC_TABLES {
+                crate::core::db::drop_crr_objects(&state.db, table)
+                    .await
+                    .map_err(|e| format!("停用可选同步表 {table} 失败: {e}"))?;
+            }
         }
     }
+
+    // The plaintext-relay override is only consulted when a relay connection
+    // is established. Restart the auto-sync proxy so the new value takes
+    // effect immediately — both directions: a refused proxy retries, and a
+    // live ws:// connection is torn down when the user disables the override.
+    if plaintext_changed {
+        restart_auto_sync_proxy(&sync_state, &state).await;
+    }
     Ok(())
+}
+
+/// Restart the account auto-sync proxy so connection-level settings (currently
+/// `allow_plaintext_relay`) apply without an app restart. Stops the old proxy
+/// the same way a disconnect does (stop flag + direct discovery-socket
+/// shutdown), then respawns it from the persisted account credentials. A live
+/// cloud P2P engine is left alone — it is an established session, not a relay
+/// connection attempt. No-op when the device is not logged in.
+async fn restart_auto_sync_proxy(sync_state: &SyncState, app_state: &AppState) {
+    sync_state
+        .auto_stop
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(relay) = sync_state.discovery_relay.lock().await.take() {
+        relay.shutdown();
+    }
+    let db = &app_state.db;
+    let relay_url = settings_service::get_device_setting(
+        db,
+        crate::commands::account::ACCOUNT_RELAY_URL_KEY,
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    let token = settings_service::get_device_setting(
+        db,
+        crate::commands::account::ACCOUNT_TOKEN_KEY,
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    if relay_url.is_empty() || token.is_empty() {
+        return;
+    }
+    // Same refresh-on-stale dance as the startup restore in lib.rs.
+    let token = if crate::commands::account::access_token_is_fresh(db).await {
+        token
+    } else {
+        match crate::commands::account::refresh_access_token(db, &relay_url).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "auto-sync restart: token refresh failed");
+                return;
+            }
+        }
+    };
+    spawn_auto_sync_proxy(sync_state, app_state, &relay_url, &token).await;
+    tracing::info!("auto-sync proxy restarted after sync config change");
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

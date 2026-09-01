@@ -57,7 +57,10 @@ export function SyncSettings() {
 
   // Status
   const [syncStatus, setSyncStatus] = useState<SyncStatus>({ connected: false });
-  const [syncConfig, setSyncConfig] = useState<SyncConfig>({ sync_optional_data: true });
+  const [syncConfig, setSyncConfig] = useState<SyncConfig>({
+    sync_optional_data: true,
+    allow_plaintext_relay: false,
+  });
   const [configSaving, setConfigSaving] = useState(false);
   const [outboxCount, setOutboxCount] = useState(0);
   const [flushingOutbox, setFlushingOutbox] = useState(false);
@@ -180,7 +183,10 @@ export function SyncSettings() {
   }, []);
 
   const handleToggleOptionalSync = useCallback(async () => {
-    const next = { sync_optional_data: !syncConfig.sync_optional_data };
+    const next = {
+      ...syncConfig,
+      sync_optional_data: !syncConfig.sync_optional_data,
+    };
     setSyncConfig(next);
     setConfigSaving(true);
     try {
@@ -188,7 +194,31 @@ export function SyncSettings() {
     } catch (err) {
       console.error('Failed to save sync config:', err);
       alert(`保存同步设置失败: ${err}`);
-      setSyncConfig({ sync_optional_data: !next.sync_optional_data });
+      setSyncConfig({
+        ...syncConfig,
+        sync_optional_data: !next.sync_optional_data,
+      });
+    } finally {
+      setConfigSaving(false);
+    }
+  }, [syncConfig]);
+
+  const handleTogglePlaintextRelay = useCallback(async () => {
+    const next = {
+      ...syncConfig,
+      allow_plaintext_relay: !syncConfig.allow_plaintext_relay,
+    };
+    setSyncConfig(next);
+    setConfigSaving(true);
+    try {
+      await setRemoteSyncConfig(next);
+    } catch (err) {
+      console.error('Failed to save sync config:', err);
+      alert(`保存同步设置失败: ${err}`);
+      setSyncConfig({
+        ...syncConfig,
+        allow_plaintext_relay: !next.allow_plaintext_relay,
+      });
     } finally {
       setConfigSaving(false);
     }
@@ -393,6 +423,30 @@ export function SyncSettings() {
             <span
               className={`block w-4 h-4 rounded-full bg-white shadow transition-transform ${
                 syncConfig.sync_optional_data ? 'translate-x-[18px]' : 'translate-x-0.5'
+              }`}
+            />
+          </button>
+        </div>
+
+        <div className="flex items-center justify-between px-4 py-3 bg-surface border border-surface-hover rounded-xl">
+          <div>
+            <div className="text-sm text-text-primary">允许不加密的中继连接（ws://）</div>
+            <div className="text-xs text-text-secondary">
+              中继连接默认要求加密（wss://）；公网明文传输会暴露账号令牌，仅自建局域网中继调试时开启
+            </div>
+          </div>
+          <button
+            role="switch"
+            aria-checked={syncConfig.allow_plaintext_relay}
+            disabled={configSaving}
+            onClick={handleTogglePlaintextRelay}
+            className={`w-9 h-5 rounded-full transition-colors shrink-0 disabled:opacity-50 ${
+              syncConfig.allow_plaintext_relay ? 'bg-red-500/80' : 'bg-surface-hover'
+            }`}
+          >
+            <span
+              className={`block w-4 h-4 rounded-full bg-white shadow transition-transform ${
+                syncConfig.allow_plaintext_relay ? 'translate-x-[18px]' : 'translate-x-0.5'
               }`}
             />
           </button>

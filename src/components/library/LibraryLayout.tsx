@@ -1,4 +1,6 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
+import { useQueryClient } from '@tanstack/react-query';
 import { useLibraryStore } from '@/stores/libraryStore';
 import { useShellStore } from '@/stores/shellStore';
 import { CollectionTree } from './CollectionTree';
@@ -12,6 +14,7 @@ const LEFT_PANEL_COLLAPSE_THRESHOLD = 256;
 const LEFT_PANEL_DEFAULT_WIDTH = 256;
 
 export function LibraryLayout() {
+  const queryClient = useQueryClient();
   const leftWidth = useLibraryStore((s) => s.leftPanelWidth);
   const rightWidth = useLibraryStore((s) => s.rightPanelWidth);
   const rightPanelCollapsed = useLibraryStore((s) => s.rightPanelCollapsed);
@@ -26,6 +29,34 @@ export function LibraryLayout() {
 
   const rightDragStartCollapsed = useRef(false);
   const rightDragStartWidth = useRef(rightWidth);
+
+  // Reload library data when sync applies remote changes (P2P or the offline
+  // mailbox path). The notes page already does this; without it, papers /
+  // attachments / collections / tags arriving from another device never show
+  // up in the library view because the queries are cached (staleTime 30s) and
+  // only refetch on remount or explicit refresh. Debounced because changesets
+  // and mailbox batches can arrive in bursts.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const unlisten = listen('sync:remote_applied', () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        queryClient.invalidateQueries({ queryKey: ['papers'] });
+        queryClient.invalidateQueries({ queryKey: ['paper'] });
+        queryClient.invalidateQueries({ queryKey: ['paper-notes'] });
+        queryClient.invalidateQueries({ queryKey: ['paper-tags'] });
+        queryClient.invalidateQueries({ queryKey: ['paper-related'] });
+        queryClient.invalidateQueries({ queryKey: ['paper-attachments'] });
+        queryClient.invalidateQueries({ queryKey: ['collections'] });
+        queryClient.invalidateQueries({ queryKey: ['tags'] });
+        queryClient.invalidateQueries({ queryKey: ['saved-searches'] });
+      }, 500);
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      unlisten.then((fn) => fn());
+    };
+  }, [queryClient]);
 
   const leftDragStartCollapsed = useRef(false);
   const leftDragStartWidth = useRef(leftWidth);

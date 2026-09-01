@@ -84,6 +84,11 @@ const MAX_WIRE_MSG: usize = 16_000;
 /// no manual "sync now" needed for continuous sync.
 const SYNC_PUSH_INTERVAL_SECS: u64 = 15;
 
+/// How long to wait for the relay's `MailboxDepositAck` before treating a
+/// deposit as unconfirmed (queued to the outbox / retried). Short enough that
+/// a dead relay cannot stall the sync loop for long.
+const MAILBOX_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// device_settings keys persisting sync progress per peer. Progress must be
 /// keyed by peer: a global watermark would make a freshly reconnected peer
 /// skip changes that were only delivered to a different peer.
@@ -186,28 +191,6 @@ pub struct SyncEngine {
     /// Stable identity of the peer used to persist sync progress
     /// (device id, or "lan" when unknown).
     peer_key: String,
-}
-
-fn decode_nonce(b64: &str) -> [u8; crate::sync::crypto::NONCE_LEN] {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .ok()
-        .and_then(|v| v.try_into().ok())
-        .unwrap_or([0u8; crate::sync::crypto::NONCE_LEN])
-}
-
-/// Tables included in a full snapshot: core sync tables, plus optional ones
-/// when the user enabled syncing them.
-async fn snapshot_tables(db: &SqlitePool) -> Vec<&'static str> {
-    let mut tables = crate::core::db::CORE_SYNC_TABLES.to_vec();
-    let optional = crate::core::settings_service::load_device_settings(db)
-        .await
-        .unwrap_or_default();
-    if optional.sync_optional_data {
-        tables.extend(crate::core::db::OPTIONAL_SYNC_TABLES.iter().copied());
-    }
-    tables
 }
 
 impl SyncEngine {
@@ -437,14 +420,17 @@ impl SyncEngine {
 
     /// Receive and apply a changeset from the peer.
     pub async fn handle_changeset(&self, msg: ChangesetMessage) -> Result<()> {
-        let received = msg.changes.len() as i64;
-        apply_changes(&self.db, &msg).await?;
+        let applied_rows = apply_changes(&self.db, &msg).await? as i64;
         let mut applied = self.last_applied_db_version.lock().await;
         *applied = applied.max(msg.to_db_version);
         drop(applied);
-        self.status.lock().await.pulled += received;
+        self.status.lock().await.pulled += applied_rows;
         self.mark_synced().await;
-        crate::sync::emit_remote_applied(received);
+        // Notify the frontend only when rows actually changed; a changeset
+        // fully filtered out by LWW/sync-scope must not trigger a reload.
+        if applied_rows > 0 {
+            crate::sync::emit_remote_applied(applied_rows);
+        }
         self.request_missing_blobs().await?;
         Ok(())
     }
@@ -526,20 +512,22 @@ impl SyncEngine {
 
     async fn sync_once_inner(&self) -> Result<()> {
         info!("sync_once starting");
-        // First time on this connection: exchange a full snapshot so
-        // pre-CRR history (which never appears in crsql_changes) reaches the
-        // peer. Idempotent INSERT OR REPLACE, so re-sending is harmless.
+        // First time on this connection: send a full-history changeset
+        // (everything in crsql_changes since db_version 0, tombstones
+        // included) so pre-existing history reaches the peer. The receiver
+        // runs it through the same cr-sqlite merge as incremental sync, so
+        // rows deleted on either side stay deleted — plain INSERT snapshots
+        // used to resurrect them. Idempotent, so re-sending is harmless.
         {
             let mut sent = self.full_snapshot_sent.lock().await;
             if !*sent {
-                let tables = snapshot_tables(&self.db).await;
-                let statements = crate::sync::crdt::export_full_snapshot(&self.db, &tables).await?;
-                if !statements.is_empty() {
-                    let msg = SyncMessage::FullSnapshot {
-                        statements: statements.clone(),
-                    };
-                    self.send_message(&msg).await.context("send full snapshot")?;
-                    info!(count = statements.len(), "sent full snapshot");
+                let msg = export_changes_since(&self.db, 0).await?;
+                if !msg.changes.is_empty() {
+                    let count = msg.changes.len();
+                    self.send_message(&SyncMessage::Changeset(msg))
+                        .await
+                        .context("send full-history changeset")?;
+                    info!(count, "sent full-history changeset");
                     self.persist_snapshot_sent().await;
                 }
                 *sent = true;
@@ -578,19 +566,29 @@ impl SyncEngine {
         let (ciphertext, nonce) =
             crate::sync::crypto::encrypt_bytes(key, json.as_bytes()).map_err(anyhow::Error::msg)?;
 
-        match mailbox.deposit_encrypted(to_device_id, ciphertext.clone(), nonce, None).await {
+        // The message_id is fixed BEFORE the first deposit attempt so an
+        // outbox retry reuses it (relay-side dedupe makes the retry
+        // idempotent even when the original deposit was stored but its ack
+        // was lost).
+        let message_id = uuid::Uuid::new_v4().to_string();
+        match mailbox
+            .deposit_encrypted_await_ack(to_device_id, ciphertext.clone(), nonce, None, Some(message_id.clone()), MAILBOX_ACK_TIMEOUT)
+            .await
+        {
             Ok(()) => {
                 let v = envelope.to_db_version().unwrap_or(since);
                 *self.last_sent_db_version.lock().await = v;
                 self.persist_sent_cursor().await;
                 self.status.lock().await.pushed += sent;
                 self.mark_synced().await;
-                info!(to = %to_device_id, to_db_version = v, "changeset deposited to mailbox");
+                info!(to = %to_device_id, to_db_version = v, "changeset deposited to mailbox (acked)");
                 self.set_transport("mailbox").await;
             }
             Err(e) => {
-                warn!(error = %e, "mailbox deposit failed; writing to outbox");
-                self.write_outbox(to_device_id, &ciphertext, &nonce).await?;
+                // Unconfirmed deposit: do NOT advance the cursor — queue the
+                // changeset so it is retried instead of lost.
+                warn!(error = %e, "mailbox deposit unacknowledged; writing to outbox");
+                self.write_outbox(to_device_id, &ciphertext, &nonce, &message_id).await?;
                 self.refresh_outbox_count().await;
             }
         }
@@ -633,6 +631,31 @@ impl SyncEngine {
                 // depositing our changeset back.
                 if let Err(e) = self.sync_over_mailbox(&mb_msg.from_device_id).await {
                     warn!(error = %e, "mailbox pull reply failed");
+                }
+            }
+            SyncMessage::FullSnapshot { statements } => {
+                // A peer shipped its whole database through the mailbox so
+                // pre-CRR history (rows that never appear in crsql_changes)
+                // reaches a device that has never had a P2P session.
+                match crate::sync::crdt::apply_full_snapshot(&self.db, &statements).await {
+                    Ok(applied) => {
+                        let applied = applied as i64;
+                        info!(count = applied, "applied mailbox full snapshot");
+                        if applied > 0 {
+                            self.status.lock().await.pulled += applied;
+                            self.mark_synced().await;
+                            crate::sync::emit_remote_applied(applied);
+                        }
+                        // Snapshot rows may reference blobs (paper PDFs, note
+                        // images) the mailbox does not carry — request them
+                        // from the sender, same as the changeset branch.
+                        if let Err(e) =
+                            self.request_missing_blobs_from(&mb_msg.from_device_id).await
+                        {
+                            warn!(error = %e, from = %mb_msg.from_device_id, "mailbox blob request after snapshot failed");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "apply mailbox full snapshot failed"),
                 }
             }
             attachment_msg @ (SyncMessage::AttachmentRequest { .. } | SyncMessage::AttachmentPayload { .. }) => {
@@ -700,17 +723,24 @@ impl SyncEngine {
 
     /// Retry delivering queued outbox messages; drop ones that succeed.
     /// The outbox stores the ciphertext base64-encoded (see `write_outbox`);
-    /// it must be decoded before re-depositing — feeding the base64 text into
-    /// `deposit_encrypted` double-encodes it and the peer can never decrypt it.
+    /// the flush validates and re-sends it as-is — feeding the base64 text
+    /// through `deposit_encrypted` would double-encode it and the peer could
+    /// never decrypt it.
     pub async fn flush_outbox(&self) -> Result<()> {
         let Some(mailbox) = &self.mailbox else {
             return Ok(());
         };
-        flush_outbox_with(&self.db, mailbox).await
+        flush_outbox_with(&self.db, mailbox.relay()).await
     }
 
-    async fn write_outbox(&self, to_device_id: &str, ciphertext: &[u8], nonce: &[u8]) -> Result<()> {
-        write_outbox_row(&self.db, to_device_id, ciphertext, nonce).await
+    async fn write_outbox(
+        &self,
+        to_device_id: &str,
+        ciphertext: &[u8],
+        nonce: &[u8],
+        message_id: &str,
+    ) -> Result<()> {
+        write_outbox_row(&self.db, to_device_id, ciphertext, nonce, message_id).await
     }
 
     async fn refresh_outbox_count(&self) {
@@ -771,9 +801,12 @@ impl SyncEngine {
                                 }
                                 Ok(SyncMessage::FullSnapshot { statements }) => {
                                     match crate::sync::crdt::apply_full_snapshot(&engine.db, &statements).await {
-                                        Ok(()) => {
-                                            engine.status.lock().await.pulled += statements.len() as i64;
-                                            crate::sync::emit_remote_applied(statements.len() as i64);
+                                        Ok(applied) => {
+                                            let applied = applied as i64;
+                                            if applied > 0 {
+                                                engine.status.lock().await.pulled += applied;
+                                                crate::sync::emit_remote_applied(applied);
+                                            }
                                             // A snapshot can bring in rows (e.g. note
                                             // Markdown referencing `blobs/...`) without a
                                             // following changeset; request the referenced
@@ -812,9 +845,12 @@ impl SyncEngine {
                     }
                     Ok(SyncMessage::FullSnapshot { statements }) => {
                         match crate::sync::crdt::apply_full_snapshot(&engine.db, &statements).await {
-                            Ok(()) => {
-                                engine.status.lock().await.pulled += statements.len() as i64;
-                                crate::sync::emit_remote_applied(statements.len() as i64);
+                            Ok(applied) => {
+                                let applied = applied as i64;
+                                if applied > 0 {
+                                    engine.status.lock().await.pulled += applied;
+                                    crate::sync::emit_remote_applied(applied);
+                                }
                                 // Request blob files referenced by the snapshot
                                 // (note images, paper PDFs) — see above.
                                 if let Err(e) = engine.request_missing_blobs().await {
@@ -849,19 +885,30 @@ impl SyncEngine {
             });
         });
 
-        // Route encrypted mailbox batches into the same changeset pipeline.
+        // Route encrypted mailbox batches into the same changeset pipeline;
+        // relay Error messages surface in the engine status.
         if let Some(mailbox) = &self.mailbox {
             let engine = self.clone();
-            mailbox.on_batch(move |messages| {
-                let engine = engine.clone();
-                tokio::spawn(async move {
-                    for msg in messages {
-                        if let Err(e) = engine.handle_mailbox_message(msg).await {
-                            warn!(error = %e, "handle mailbox message failed");
+            let err_engine = self.clone();
+            mailbox.on_batch(
+                move |messages| {
+                    let engine = engine.clone();
+                    tokio::spawn(async move {
+                        for msg in messages {
+                            if let Err(e) = engine.handle_mailbox_message(msg).await {
+                                warn!(error = %e, "handle mailbox message failed");
+                            }
                         }
-                    }
-                });
-            });
+                    });
+                },
+                move |err| {
+                    let engine = err_engine.clone();
+                    tokio::spawn(async move {
+                        warn!(error = %err, "mailbox relay error");
+                        engine.set_last_error(Some(format!("relay: {err}"))).await;
+                    });
+                },
+            );
         }
 
         // Continuous incremental sync: while the session is alive, push local
@@ -960,47 +1007,90 @@ async fn prune_outbox(db: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-/// Deliver queued outbox messages through the given mailbox transport; drop
-/// rows that are delivered, bump `retry_count` on failure. Also refreshes the
-/// `sync_outbox` table only — engine status is updated by callers that have
-/// one. Free function so the command layer can flush without a live engine.
-pub async fn flush_outbox_with(db: &SqlitePool, mailbox: &MailboxClient) -> Result<()> {
+/// Deliver queued outbox messages through the given relay connection; drop
+/// rows that are delivered, bump `retry_count` on explicit rejection. A dead
+/// transport (send failure / ack timeout) does NOT count against the message
+/// — it is not poison, just early; the row's TTL bounds how long it can
+/// linger. Free function so the command layer can flush without a live
+/// engine.
+///
+/// The stored ciphertext/nonce are already base64 in the exact form the
+/// deposit payload expects; they are only validated here. Re-sending reuses
+/// the stored `message_id`, so the relay dedupes retransmits of a deposit it
+/// already stored (idempotent retry).
+pub async fn flush_outbox_with(
+    db: &SqlitePool,
+    relay: &crate::sync::relay_client::RelayClient,
+) -> Result<()> {
     prune_outbox(db).await?;
-    let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
-        "SELECT id, to_device_id, ciphertext, nonce, retry_count FROM sync_outbox ORDER BY created_at LIMIT 50",
+    let rows: Vec<(String, String, String, String, i64, Option<String>, i64)> = sqlx::query_as(
+        "SELECT id, to_device_id, ciphertext, nonce, ttl_seconds, message_id, retry_count FROM sync_outbox ORDER BY created_at LIMIT 50",
     )
     .fetch_all(db)
     .await
     .context("read outbox")?;
-    for (id, to_device_id, ciphertext, nonce, _retries) in rows {
-        let ct = match base64::engine::general_purpose::STANDARD.decode(&ciphertext) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(id = %id, error = %e, "outbox ciphertext is not valid base64; dropping");
-                sqlx::query("DELETE FROM sync_outbox WHERE id = ?")
+    for (id, to_device_id, ciphertext, nonce, ttl_seconds, message_id, _retries) in rows {
+        if base64::engine::general_purpose::STANDARD.decode(&ciphertext).is_err()
+            || base64::engine::general_purpose::STANDARD.decode(&nonce).is_err()
+        {
+            warn!(id = %id, "outbox row is not valid base64; dropping");
+            sqlx::query("DELETE FROM sync_outbox WHERE id = ?")
+                .bind(&id)
+                .execute(db)
+                .await?;
+            continue;
+        }
+        // Rows written before the message_id column existed get a stable id
+        // now, so later flushes retry with the SAME id.
+        let message_id = match message_id {
+            Some(m) => m,
+            None => {
+                let m = uuid::Uuid::new_v4().to_string();
+                sqlx::query("UPDATE sync_outbox SET message_id = ? WHERE id = ?")
+                    .bind(&m)
                     .bind(&id)
                     .execute(db)
                     .await?;
-                continue;
+                m
             }
         };
-        match mailbox
-            .deposit_encrypted(&to_device_id, ct, decode_nonce(&nonce), None)
-            .await
-        {
+        let ack_result = relay
+            .deposit_await_ack(
+                crate::sync::types::MailboxDepositPayload {
+                    to_device_id: to_device_id.clone(),
+                    ciphertext,
+                    nonce,
+                    ttl_seconds: Some(ttl_seconds.max(0) as u64),
+                    message_id: Some(message_id),
+                },
+                MAILBOX_ACK_TIMEOUT,
+            )
+            .await;
+        match ack_result {
             Ok(()) => {
                 sqlx::query("DELETE FROM sync_outbox WHERE id = ?")
                     .bind(&id)
                     .execute(db)
                     .await?;
-                info!(id = %id, to = %to_device_id, "outbox message delivered");
+                info!(id = %id, to = %to_device_id, "outbox message delivered (acked)");
             }
-            Err(e) => {
+            Err(crate::sync::relay_client::AckError::Rejected(e)) => {
+                // Explicitly rejected (e.g. per-device target not in the room):
+                // keep the row for a later retry — the peer may join later.
                 sqlx::query("UPDATE sync_outbox SET retry_count = retry_count + 1 WHERE id = ?")
                     .bind(&id)
                     .execute(db)
                     .await?;
-                warn!(id = %id, error = %e, "outbox retry failed");
+                warn!(id = %id, error = %e, "outbox deposit rejected; will retry");
+            }
+            Err(e @ (crate::sync::relay_client::AckError::TimedOut
+                | crate::sync::relay_client::AckError::SendFailed(_))) => {
+                // Unconfirmed: the transport is likely down. Stop the flush —
+                // every remaining row would only time out again, and stalling
+                // here blocks the sync loop. The retry count is NOT bumped:
+                // a transport outage does not make the message poison.
+                warn!(id = %id, error = %e, "outbox deposit unconfirmed; pausing flush");
+                break;
             }
         }
     }
@@ -1021,6 +1111,19 @@ pub async fn deliver_changes_mailbox(
 ) -> Result<i64> {
     use base64::Engine as _;
     let (since, _) = load_peer_progress(db, peer_key).await;
+    // Backpressure: an undelivered outbox row for this target means a previous
+    // deposit failed. Re-exporting the same (never-advanced) range and
+    // queueing another copy on every tick would grow the outbox without bound
+    // while the relay is unreachable — `flush_outbox_with` retries the queued
+    // row instead.
+    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM sync_outbox WHERE to_device_id = ?")
+        .bind(to_device_id)
+        .fetch_one(db)
+        .await
+        .context("check outbox backpressure")?;
+    if pending > 0 {
+        return Ok(since);
+    }
     let changes = export_changes_since(db, since).await?;
     if changes.changes.is_empty() {
         return Ok(since);
@@ -1029,29 +1132,88 @@ pub async fn deliver_changes_mailbox(
     let json = serde_json::to_string(&SyncMessage::Changeset(changes)).context("serialize")?;
     let (ciphertext, nonce) =
         crate::sync::crypto::encrypt_bytes(key, json.as_bytes()).map_err(anyhow::Error::msg)?;
+    // The message_id is fixed BEFORE the deposit so an outbox retry reuses it
+    // (relay-side dedupe makes the retry idempotent even when the original
+    // deposit was stored but its ack was lost).
+    let message_id = uuid::Uuid::new_v4().to_string();
     let payload = crate::sync::types::MailboxDepositPayload {
         to_device_id: to_device_id.to_string(),
         ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
         nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
         ttl_seconds: Some(7 * 24 * 3600),
+        message_id: Some(message_id.clone()),
     };
-    if relay
-        .send(crate::sync::types::RelayClientMsg::MailboxDeposit { payload })
-        .is_err()
-    {
-        // Transport dead: queue for retry instead of losing the changes.
-        warn!(to = %to_device_id, "mailbox deposit send failed; queuing to outbox");
-        write_outbox_row(db, to_device_id, &ciphertext, &nonce).await?;
-        return Ok(since);
+    // Advance the cursor ONLY after the relay acknowledges the deposit is
+    // durably stored. A rejected deposit (e.g. per-device target not in room)
+    // or a missing ack (dead transport) queues the changeset for retry instead
+    // of silently losing it behind an advanced watermark.
+    match relay.deposit_await_ack(payload, MAILBOX_ACK_TIMEOUT).await {
+        Ok(()) => {
+            let _ = crate::core::settings_service::set_device_setting(
+                db,
+                &sent_cursor_key(peer_key),
+                &delivered_to.to_string(),
+            )
+            .await;
+            info!(to = %to_device_id, to_db_version = delivered_to, "changeset deposited to mailbox (offline, acked)");
+            Ok(delivered_to)
+        }
+        Err(e) => {
+            warn!(to = %to_device_id, error = %e, "mailbox deposit unacknowledged; queuing to outbox");
+            write_outbox_row(db, to_device_id, &ciphertext, &nonce, &message_id).await?;
+            Ok(since)
+        }
     }
-    let _ = crate::core::settings_service::set_device_setting(
-        db,
-        &sent_cursor_key(peer_key),
-        &delivered_to.to_string(),
-    )
-    .await;
-    info!(to = %to_device_id, to_db_version = delivered_to, "changeset deposited to mailbox (offline)");
-    Ok(delivered_to)
+}
+
+/// Serialized mailbox snapshot larger than this is skipped (P2P covers those
+/// libraries); the relay has no frame limit, but a multi-MB single frame is
+/// wasteful for what is only a history-fill safety net.
+const MAX_MAILBOX_SNAPSHOT_BYTES: usize = 12 * 1024 * 1024;
+
+/// Export the full change history (everything in `crsql_changes` since
+/// db_version 0 — including tombstones, which CR-SQLite backfills for
+/// pre-CRR rows at registration), encrypt it as a regular changeset, and
+/// deposit it into the ACCOUNT-LEVEL archive so any device of the account —
+/// including one that never had a P2P session — can pick up the complete
+/// library and rows the archive may have pruned. The receiver applies it
+/// through the same cr-sqlite merge as incremental sync (delete-wins
+/// preserved), so refreshing the archive can no longer resurrect rows a peer
+/// deleted. Deliberately does NOT touch `sync.cursor.sent.*`: the delta
+/// cursor is managed exclusively by `deliver_changes_mailbox`.
+pub async fn deliver_full_snapshot_mailbox(
+    db: &SqlitePool,
+    relay: &crate::sync::relay_client::RelayClient,
+    key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
+) -> Result<()> {
+    use base64::Engine as _;
+    let changes = export_changes_since(db, 0).await?;
+    if changes.changes.is_empty() {
+        return Ok(());
+    }
+    let json = serde_json::to_string(&SyncMessage::Changeset(changes))?;
+    if json.len() > MAX_MAILBOX_SNAPSHOT_BYTES {
+        warn!(
+            bytes = json.len(),
+            "full-history changeset too large for mailbox; skipping (P2P will carry it)"
+        );
+        return Ok(());
+    }
+    let (ciphertext, nonce) =
+        crate::sync::crypto::encrypt_bytes(key, json.as_bytes()).map_err(anyhow::Error::msg)?;
+    relay
+        .send(crate::sync::types::RelayClientMsg::MailboxDeposit {
+            payload: crate::sync::types::MailboxDepositPayload {
+                to_device_id: String::new(), // account-level archive
+                ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+                nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
+                ttl_seconds: Some(7 * 24 * 3600),
+                message_id: Some(uuid::Uuid::new_v4().to_string()),
+            },
+        })
+        .context("deposit full-history changeset to account archive")?;
+    info!(bytes = json.len(), "full-history changeset deposited to account archive");
+    Ok(())
 }
 
 /// Decrypt one mailbox message into its wire envelope (no side effects).
@@ -1110,6 +1272,7 @@ async fn deposit_sync_message_to(
                 ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
                 nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
                 ttl_seconds: Some(7 * 24 * 3600),
+                message_id: Some(uuid::Uuid::new_v4().to_string()),
             },
         })
         .context("deposit sync message to mailbox")
@@ -1156,8 +1319,7 @@ pub async fn handle_mailbox_batch(
                     if cs.to_db_version <= applied {
                         continue;
                     }
-                    apply_changes(db, &cs).await?;
-                    applied_changes += cs.changes.len() as i64;
+                    applied_changes += apply_changes(db, &cs).await? as i64;
                     let _ = crate::core::settings_service::set_device_setting(
                         db,
                         &cursor_key,
@@ -1166,8 +1328,7 @@ pub async fn handle_mailbox_batch(
                     .await;
                     info!(from = %mb_msg.from_device_id, to_db_version = cs.to_db_version, "applied account-level mailbox changeset");
                 } else {
-                    apply_changes(db, &cs).await?;
-                    applied_changes += cs.changes.len() as i64;
+                    applied_changes += apply_changes(db, &cs).await? as i64;
                     info!(from = %mb_msg.from_device_id, "applied per-device mailbox changeset");
                 }
                 // The mailbox path carries row changes, not blob files. Ask the
@@ -1192,6 +1353,35 @@ pub async fn handle_mailbox_batch(
                         .await
                 {
                     warn!(error = %e, "mailbox pull reply failed");
+                }
+            }
+            SyncMessage::FullSnapshot { statements } => {
+                // Full-snapshot delivery through the account archive: covers
+                // pre-CRR history (rows that never appear in crsql_changes) so
+                // a device that only ever syncs via the mailbox still receives
+                // the complete library. INSERT OR IGNORE is idempotent.
+                match crate::sync::crdt::apply_full_snapshot(db, &statements).await {
+                    Ok(applied) => {
+                        // Count only rows actually inserted — a re-applied
+                        // archive snapshot IGNOREs almost every row, and
+                        // counting it would spam a full frontend reload.
+                        applied_changes += applied as i64;
+                        info!(count = applied, "applied account-level full snapshot");
+                        // Snapshot rows may reference blobs (paper PDFs, note
+                        // images) the mailbox does not carry — ask the sender.
+                        if let Err(e) = request_missing_blobs_over_relay(
+                            db,
+                            app_data_dir,
+                            key,
+                            relay,
+                            &mb_msg.from_device_id,
+                        )
+                        .await
+                        {
+                            warn!(error = %e, from = %mb_msg.from_device_id, "mailbox blob request after snapshot failed");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "apply account-level full snapshot failed"),
                 }
             }
             attachment_msg @ (SyncMessage::AttachmentRequest { .. } | SyncMessage::AttachmentPayload { .. }) => {
@@ -1284,6 +1474,8 @@ async fn handle_mailbox_attachment_message(
 }
 
 /// Queue an encrypted changeset into the local outbox for later delivery.
+/// `message_id` is the id of the original deposit attempt; the flush path
+/// reuses it so the relay dedupes retransmits (idempotent retry).
 /// Free function so the command layer (offline mailbox fallback) can enqueue
 /// without a live engine.
 pub async fn write_outbox_row(
@@ -1291,11 +1483,12 @@ pub async fn write_outbox_row(
     to_device_id: &str,
     ciphertext: &[u8],
     nonce: &[u8],
+    message_id: &str,
 ) -> Result<()> {
     use base64::Engine as _;
     sqlx::query(
-        "INSERT INTO sync_outbox (id, to_device_id, ciphertext, nonce, ttl_seconds, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO sync_outbox (id, to_device_id, ciphertext, nonce, ttl_seconds, created_at, message_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(to_device_id)
@@ -1303,6 +1496,7 @@ pub async fn write_outbox_row(
     .bind(base64::engine::general_purpose::STANDARD.encode(nonce))
     .bind(7 * 24 * 3600i64)
     .bind(crate::core::time::now_iso())
+    .bind(message_id)
     .execute(db)
     .await
     .context("write outbox")?;
@@ -2027,6 +2221,798 @@ mod tests {
             vec![("fresh".to_string(),)],
             "only the fresh row must survive pruning"
         );
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// The account-level archive path (what the auto-sync proxy actually uses
+    /// for offline delivery) must bring library rows — papers, annotations,
+    /// collections, paper_collections, tags, paper_tags — onto a peer that was
+    /// offline, and re-delivering the same archive message must be a no-op
+    /// (per-sender applied cursor). Regression guard for "我的图书馆不能离线同步".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mailbox_account_archive_applies_library_tables_once() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-mailbox-account-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a = crate::core::db::tests::connect_with_crsqlite(&dir.join("a.db")).await?;
+        let db_b = crate::core::db::tests::connect_with_crsqlite(&dir.join("b.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db_a).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db_b).await?;
+        crate::core::db::register_crr_tables(&db_a, crate::core::db::CORE_SYNC_TABLES).await?;
+        crate::core::db::register_crr_tables(&db_b, crate::core::db::CORE_SYNC_TABLES).await?;
+
+        // A edits its library: a paper, an annotation, a collection and its
+        // membership row, a tag and its paper tag.
+        let now = "2026-01-01T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO papers (id, title, authors, keywords, file_path, created_at, updated_at, imported_at) \
+             VALUES ('p1', 'Paper One', '[]', '[]', 'blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pdf', ?, ?, ?)",
+        )
+        .bind(now).bind(now).bind(now)
+        .execute(&db_a)
+        .await?;
+        sqlx::query(
+            "INSERT INTO annotations (id, paper_id, page, type, rect, color, created_at, updated_at) \
+             VALUES ('a1', 'p1', 3, 'highlight', '0,0,1,1', '#ffeb3b', ?, ?)",
+        )
+        .bind(now).bind(now)
+        .execute(&db_a)
+        .await?;
+        sqlx::query(
+            "INSERT INTO collections (id, name, created_at) VALUES ('c1', 'Reading List', ?)",
+        )
+        .bind(now)
+        .execute(&db_a)
+        .await?;
+        sqlx::query("INSERT INTO paper_collections (paper_id, collection_id) VALUES ('p1', 'c1')")
+            .execute(&db_a)
+            .await?;
+        sqlx::query(
+            "INSERT INTO tags (id, name, created_at) VALUES ('t1', 'important', ?)",
+        )
+        .bind(now)
+        .execute(&db_a)
+        .await?;
+        sqlx::query("INSERT INTO paper_tags (paper_id, tag_id) VALUES ('p1', 't1')")
+            .execute(&db_a)
+            .await?;
+
+        let key = crate::sync::crypto::generate_sync_key();
+        use base64::Engine as _;
+
+        // A deposits its changes into the account archive (to_device_id "",
+        // account_level = true) exactly like the auto-sync proxy does.
+        let changes = crate::sync::crdt::export_changes_since(&db_a, 0).await?;
+        assert!(!changes.changes.is_empty(), "A must have library changes");
+        let json = serde_json::to_string(&SyncMessage::Changeset(changes))?;
+        let (ct, nonce) = crate::sync::crypto::encrypt_bytes(&key, json.as_bytes())
+            .map_err(anyhow::Error::msg)?;
+        let msg = crate::sync::types::MailboxMessage {
+            id: "acct-1".to_string(),
+            from_device_id: "device-a".to_string(),
+            ciphertext: base64::engine::general_purpose::STANDARD.encode(&ct),
+            nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
+            account_level: true,
+        };
+
+        // B (offline until now) connects and gets the archive batch.
+        let (b_tx, mut b_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay_b = crate::sync::relay_client::RelayClient::new_for_test(b_tx);
+        handle_mailbox_batch(&db_b, &dir, &key, &relay_b, vec![msg.clone()]).await?;
+
+        for (table, id_col, id) in [
+            ("papers", "id", "p1"),
+            ("annotations", "id", "a1"),
+            ("collections", "id", "c1"),
+            ("paper_collections", "paper_id", "p1"),
+            ("tags", "id", "t1"),
+            ("paper_tags", "paper_id", "p1"),
+        ] {
+            let count: (i64,) = sqlx::query_as(&format!(
+                "SELECT count(*) FROM {table} WHERE {id_col} = ?"
+            ))
+            .bind(id)
+            .fetch_one(&db_b)
+            .await?;
+            assert_eq!(count.0, 1, "{table} row must reach B via the account archive");
+        }
+
+        // B acknowledges; the relay keeps account-level messages. Re-delivering
+        // the same archive message must be a no-op (applied cursor), not a
+        // duplicate.
+        handle_mailbox_batch(&db_b, &dir, &key, &relay_b, vec![msg]).await?;
+        for table in [
+            "papers",
+            "annotations",
+            "collections",
+            "paper_collections",
+            "tags",
+            "paper_tags",
+        ] {
+            let count: (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM {table}"))
+                .fetch_one(&db_b)
+                .await?;
+            assert_eq!(count.0, 1, "{table} must not get duplicates on re-delivery");
+        }
+
+        // B's reply stream may carry an AttachmentRequest for the referenced
+        // PDF; drain whatever was queued (the request itself is validated by
+        // the dedicated blob test above).
+        while b_rx.try_recv().is_ok() {}
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
+    /// A full snapshot deposited into the account archive must reach a peer
+    /// that applies it via `handle_mailbox_batch`. This is the safety net for
+    /// rows the DELTA path cannot deliver — e.g. changesets the relay archive
+    /// pruned (7-day TTL / 2000-message cap) after the sender's cursor already
+    /// advanced past them, or a device that never had a P2P session. It is
+    /// also what keeps a "我的图书馆" folder and its notes from being missing
+    /// on a device that only ever syncs over the mailbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mailbox_full_snapshot_fills_peer_database() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-mailbox-snapshot-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a = crate::core::db::tests::connect_with_crsqlite(&dir.join("a.db")).await?;
+        let db_b = crate::core::db::tests::connect_with_crsqlite(&dir.join("b.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db_a).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db_b).await?;
+        crate::core::db::register_crr_tables(&db_a, crate::core::db::CORE_SYNC_TABLES).await?;
+        crate::core::db::register_crr_tables(&db_b, crate::core::db::CORE_SYNC_TABLES).await?;
+
+        // A's library (post-CRR; would also sync as deltas, but the snapshot
+        // must carry it regardless).
+        let now = "2026-01-01T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, content, content_plain, tags, aliases, created_at, updated_at) \
+             VALUES ('snap-note', 1, 'Snapshot Note', 'body', 'body', '[]', '[]', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&db_a)
+        .await?;
+        sqlx::query(
+            "INSERT INTO papers (id, title, authors, keywords, created_at, updated_at, imported_at) \
+             VALUES ('snap-paper', 'Snapshot Paper', '[]', '[]', ?, ?, ?)",
+        )
+        .bind(now).bind(now).bind(now)
+        .execute(&db_a)
+        .await?;
+
+        let key = crate::sync::crypto::generate_sync_key();
+
+        // A deposits a full snapshot into the account archive.
+        let (a_tx, mut a_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay_a = crate::sync::relay_client::RelayClient::new_for_test(a_tx);
+        deliver_full_snapshot_mailbox(&db_a, &relay_a, &key).await?;
+        let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = a_rx
+            .recv()
+            .await
+            .context("A must deposit a snapshot into the account archive")?
+        else {
+            anyhow::bail!("expected mailbox deposit");
+        };
+
+        // B (offline device) applies the snapshot.
+        let (b_tx, _b_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay_b = crate::sync::relay_client::RelayClient::new_for_test(b_tx);
+        handle_mailbox_batch(
+            &db_b,
+            &dir,
+            &key,
+            &relay_b,
+            vec![crate::sync::types::MailboxMessage {
+                id: "snap-1".to_string(),
+                from_device_id: "device-a".to_string(),
+                ciphertext: payload.ciphertext,
+                nonce: payload.nonce,
+                account_level: true,
+            }],
+        )
+        .await?;
+
+        for (table, id) in [("notes", "snap-note"), ("papers", "snap-paper")] {
+            let count: (i64,) = sqlx::query_as(&format!(
+                "SELECT count(*) FROM {table} WHERE id = ?"
+            ))
+            .bind(id)
+            .fetch_one(&db_b)
+            .await?;
+            assert_eq!(count.0, 1, "{table} row must reach B via the mailbox snapshot");
+        }
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
+    /// Multi-hop topology: A creates a note, A→B syncs, then B→C syncs.
+    /// Changes received from A carry A's db_version numbers; when B re-exports
+    /// them to C using B's own sent cursor, they must NOT be skipped because
+    /// their db_version is lower than B's cursor. Regression guard for
+    /// "note created on A never reaches C when B is the middleman".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn changes_received_from_a_are_relayed_through_b_to_c() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-relay-hop-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a = crate::core::db::tests::connect_with_crsqlite(&dir.join("a.db")).await?;
+        let db_b = crate::core::db::tests::connect_with_crsqlite(&dir.join("b.db")).await?;
+        let db_c = crate::core::db::tests::connect_with_crsqlite(&dir.join("c.db")).await?;
+        for db in [&db_a, &db_b, &db_c] {
+            sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(db).await?;
+            crate::core::db::register_crr_tables(db, crate::core::db::CORE_SYNC_TABLES).await?;
+        }
+
+        let now = "2026-01-01T00:00:00Z";
+        // B creates a note and syncs with C FIRST, so B's sent cursor for C is
+        // already past B's own early db_versions.
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, content, content_plain, tags, aliases, created_at, updated_at) \
+             VALUES ('b-note', 1, 'B Note', 'b', 'b', '[]', '[]', ?, ?)",
+        )
+        .bind(now).bind(now)
+        .execute(&db_b)
+        .await?;
+        let b_to_c_1 = crate::sync::crdt::export_changes_since(&db_b, 0).await?;
+        assert!(!b_to_c_1.changes.is_empty());
+        let mut cursor_b_for_c = b_to_c_1.to_db_version;
+        crate::sync::crdt::apply_changes(&db_c, &b_to_c_1).await?;
+
+        // A creates a note and syncs it to B (A's db_version numbering is
+        // independent of B's, typically much lower).
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, content, content_plain, tags, aliases, created_at, updated_at) \
+             VALUES ('a-note', 1, 'A Note', 'a', 'a', '[]', '[]', ?, ?)",
+        )
+        .bind(now).bind(now)
+        .execute(&db_a)
+        .await?;
+        let a_to_b = crate::sync::crdt::export_changes_since(&db_a, 0).await?;
+        eprintln!("A→B export rows={} to_db_version={}", a_to_b.changes.len(), a_to_b.to_db_version);
+        crate::sync::crdt::apply_changes(&db_b, &a_to_b).await?;
+
+        // Inspect B's crsql_changes after applying A's changes.
+        let b_rows: Vec<(String, String, Option<String>, i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT \"table\", cid, CAST(val AS TEXT), db_version, site_id FROM crsql_changes ORDER BY db_version",
+        )
+        .fetch_all(&db_b)
+        .await?;
+        eprintln!(
+            "B crsql_changes after apply ({} rows): {:?}",
+            b_rows.len(),
+            b_rows
+                .iter()
+                .map(|(t, cid, val, dv, _)| format!("{t}.{cid}={val:?}@dv{dv}"))
+                .collect::<Vec<_>>()
+        );
+        let b_db_version: (i64,) =
+            sqlx::query_as("SELECT crsql_db_version()").fetch_one(&db_b).await?;
+        eprintln!("B crsql_db_version()={}", b_db_version.0);
+
+        // B relays to C using its persisted cursor for C. cr-sqlite re-versions
+        // applied foreign rows with B's local db_version (see inspection
+        // above), so they are NOT skipped even though A's numbering was lower.
+        let b_to_c_2 = crate::sync::crdt::export_changes_since(&db_b, cursor_b_for_c).await?;
+        eprintln!(
+            "B→C cursor={} second export rows={} (a-note title among them: {})",
+            cursor_b_for_c,
+            b_to_c_2.changes.len(),
+            b_to_c_2
+                .changes
+                .iter()
+                .any(|c| c.table == "notes" && c.val.as_deref() == Some("A Note"))
+        );
+        cursor_b_for_c = cursor_b_for_c.max(b_to_c_2.to_db_version);
+        crate::sync::crdt::apply_changes(&db_c, &b_to_c_2).await?;
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM notes WHERE id = 'a-note'")
+                .fetch_one(&db_c)
+                .await?;
+        assert_eq!(
+            count.0, 1,
+            "A's note must reach C through B, even though its db_version predates B's cursor for C"
+        );
+
+        // The other direction: C's changes relayed back through B to A.
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, content, content_plain, tags, aliases, created_at, updated_at) \
+             VALUES ('c-note', 1, 'C Note', 'c', 'c', '[]', '[]', ?, ?)",
+        )
+        .bind(now).bind(now)
+        .execute(&db_c)
+        .await?;
+        let c_to_b = crate::sync::crdt::export_changes_since(&db_c, 0).await?;
+        crate::sync::crdt::apply_changes(&db_b, &c_to_b).await?;
+        let b_to_a = crate::sync::crdt::export_changes_since(&db_b, 0).await?;
+        crate::sync::crdt::apply_changes(&db_a, &b_to_a).await?;
+        let count_c: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM notes WHERE id = 'c-note'")
+                .fetch_one(&db_a)
+                .await?;
+        assert_eq!(count_c.0, 1, "C's note must reach A through B");
+
+        for db in [&db_a, &db_b, &db_c] {
+            sqlx::query("SELECT crsql_finalize()").execute(db).await?;
+            db.close().await;
+        }
+        Ok(())
+    }
+
+    /// Notes search runs against the device-local FTS index (notes_fts),
+    /// which is maintained by triggers on the notes table. A note that only
+    /// arrives via sync must still be searchable — i.e. cr-sqlite's apply
+    /// path must fire the FTS triggers like any normal write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn synced_note_is_searchable_via_fts() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-fts-sync-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a = crate::core::db::tests::connect_with_crsqlite(&dir.join("a.db")).await?;
+        let db_b = crate::core::db::tests::connect_with_crsqlite(&dir.join("b.db")).await?;
+        for db in [&db_a, &db_b] {
+            sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(db).await?;
+            crate::core::db::register_crr_tables(db, crate::core::db::CORE_SYNC_TABLES).await?;
+        }
+
+        let now = "2026-01-01T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, content, content_plain, tags, aliases, created_at, updated_at) \
+             VALUES ('fts-note', 1, 'Neural Sync Paper', 'searchable keyword zzzq', 'searchable keyword zzzq', '[]', '[]', ?, ?)",
+        )
+        .bind(now).bind(now)
+        .execute(&db_a)
+        .await?;
+
+        let changes = crate::sync::crdt::export_changes_since(&db_a, 0).await?;
+        crate::sync::crdt::apply_changes(&db_b, &changes).await?;
+
+        // The note row exists on B...
+        let count: (i64,) = sqlx::query_as("SELECT count(*) FROM notes WHERE id = 'fts-note'")
+            .fetch_one(&db_b)
+            .await?;
+        assert_eq!(count.0, 1, "note must sync to B");
+
+        // ...and must be found by the FTS-based notes search.
+        let fts_count: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM notes_fts WHERE notes_fts MATCH 'zzzq'",
+        )
+        .fetch_one(&db_b)
+        .await?;
+        assert_eq!(
+            fts_count.0, 1,
+            "synced note must be in the FTS index (triggers must fire on cr-sqlite apply)"
+        );
+
+        for db in [&db_a, &db_b] {
+            sqlx::query("SELECT crsql_finalize()").execute(db).await?;
+            db.close().await;
+        }
+        Ok(())
+    }
+
+    /// `attachments` rows (paper attachments, including the main-PDF record
+    /// created at import) must sync like papers: previously the table was
+    /// missing from CORE_SYNC_TABLES, so every paper's attachment list was
+    /// empty on peers even though the papers themselves synced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn paper_attachments_sync_to_peer() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-attach-sync-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a = crate::core::db::tests::connect_with_crsqlite(&dir.join("a.db")).await?;
+        let db_b = crate::core::db::tests::connect_with_crsqlite(&dir.join("b.db")).await?;
+        for db in [&db_a, &db_b] {
+            sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(db).await?;
+            crate::core::db::register_crr_tables(db, crate::core::db::CORE_SYNC_TABLES).await?;
+        }
+
+        let now = "2026-01-01T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO papers (id, title, authors, keywords, file_path, created_at, updated_at, imported_at) \
+             VALUES ('p-att', 'Attached Paper', '[]', '[]', 'blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pdf', ?, ?, ?)",
+        )
+        .bind(now).bind(now).bind(now)
+        .execute(&db_a)
+        .await?;
+        sqlx::query(
+            "INSERT INTO attachments (id, paper_id, file_name, file_path, file_type, description, created_at) \
+             VALUES ('att-1', 'p-att', 'main.pdf', 'blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pdf', 'pdf', 'the pdf', ?)",
+        )
+        .bind(now)
+        .execute(&db_a)
+        .await?;
+        sqlx::query(
+            "INSERT INTO attachments (id, paper_id, file_name, file_path, file_type, created_at) \
+             VALUES ('att-2', 'p-att', 'supplement.xlsx', 'blobs/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.pdf', 'xlsx', ?)",
+        )
+        .bind(now)
+        .execute(&db_a)
+        .await?;
+
+        let changes = crate::sync::crdt::export_changes_since(&db_a, 0).await?;
+        crate::sync::crdt::apply_changes(&db_b, &changes).await?;
+
+        for id in ["att-1", "att-2"] {
+            let count: (i64,) = sqlx::query_as("SELECT count(*) FROM attachments WHERE id = ?")
+                .bind(id)
+                .fetch_one(&db_b)
+                .await?;
+            assert_eq!(count.0, 1, "attachment {id} must sync to B");
+        }
+        let paper_count: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM papers WHERE id = 'p-att'")
+                .fetch_one(&db_b)
+                .await?;
+        assert_eq!(paper_count.0, 1);
+
+        for db in [&db_a, &db_b] {
+            sqlx::query("SELECT crsql_finalize()").execute(db).await?;
+            db.close().await;
+        }
+        Ok(())
+    }
+
+    /// The mailbox cursor may only advance after the relay ACKNOWLEDGES the
+    /// deposit (durably stored). A rejected deposit must NOT advance the
+    /// cursor; the changeset goes to the outbox for retry instead of being
+    /// lost behind the watermark.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mailbox_cursor_advances_only_after_ack() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-ack-cursor-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db = crate::core::db::tests::connect_with_crsqlite(&dir.join("a.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db).await?;
+        crate::core::db::register_crr_tables(&db, crate::core::db::CORE_SYNC_TABLES).await?;
+        let now = "2026-01-01T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, content, content_plain, tags, aliases, created_at, updated_at) \
+             VALUES ('ack-note', 1, 'Ack Note', 'body', 'body', '[]', '[]', ?, ?)",
+        )
+        .bind(now).bind(now)
+        .execute(&db)
+        .await?;
+        let expected = crate::sync::crdt::export_changes_since(&db, 0).await?.to_db_version;
+        let key = crate::sync::crypto::generate_sync_key();
+        let cursor_key = sent_cursor_key("account");
+
+        // 1) Accepted deposit → cursor advances.
+        {
+            let (tx, mut rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+            let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+            let relay_for_ack = relay.clone();
+            let ack_task = tokio::spawn(async move {
+                let msg = rx.recv().await.expect("deposit must be sent");
+                let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = msg else {
+                    panic!("expected mailbox deposit");
+                };
+                let id = payload.message_id.expect("client must send message_id");
+                relay_for_ack.route_ack(crate::sync::types::MailboxDepositAckPayload {
+                    id,
+                    ok: true,
+                    error: None,
+                });
+            });
+            let delivered = deliver_changes_mailbox(&db, &relay, &key, "", "account").await?;
+            assert_eq!(delivered, expected, "cursor should advance to the acked watermark");
+            ack_task.await?;
+            let cursor = crate::core::settings_service::get_device_setting(&db, &cursor_key)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            assert_eq!(cursor, expected.to_string(), "cursor must be persisted after ack");
+        }
+
+        // 2) Rejected deposit → cursor NOT advanced, changeset queued.
+        {
+            // 2a) No new changes since the acked watermark → no deposit is
+            // sent at all (a no-op); the cursor stays put.
+            let (tx, _rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+            let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+            let delivered = deliver_changes_mailbox(&db, &relay, &key, "", "account").await?;
+            assert_eq!(delivered, expected, "no-op call must not move the cursor");
+
+            // 2b) Force a new change; the deposit is now sent and REJECTED by
+            // the (fake) relay. The cursor must NOT advance and the changeset
+            // must be queued to the outbox.
+            sqlx::query(
+                "UPDATE notes SET content = 'edited', updated_at = ? WHERE id = 'ack-note'",
+            )
+            .bind("2026-01-01T00:00:01Z")
+            .execute(&db)
+            .await?;
+            let (tx2, mut rx2) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+            let relay2 = crate::sync::relay_client::RelayClient::new_for_test(tx2);
+            let relay2_for_ack = relay2.clone();
+            let ack_task2 = tokio::spawn(async move {
+                let msg = rx2.recv().await.expect("deposit must be sent");
+                let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = msg else {
+                    panic!("expected mailbox deposit");
+                };
+                let id = payload.message_id.expect("client must send message_id");
+                relay2_for_ack.route_ack(crate::sync::types::MailboxDepositAckPayload {
+                    id,
+                    ok: false,
+                    error: Some("target device not in room".to_string()),
+                });
+            });
+            let delivered2 = deliver_changes_mailbox(&db, &relay2, &key, "", "account").await?;
+            assert_eq!(delivered2, expected, "cursor must NOT advance on rejection");
+            ack_task2.await?;
+
+            let outbox: (i64,) = sqlx::query_as("SELECT count(*) FROM sync_outbox")
+                .fetch_one(&db)
+                .await?;
+            assert_eq!(outbox.0, 1, "rejected changeset must be queued for retry");
+            let cursor2 = crate::core::settings_service::get_device_setting(&db, &cursor_key)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            assert_eq!(cursor2, expected.to_string(), "cursor must stay at the acked watermark");
+        }
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Outbox rows are dropped only after the relay ACKS the re-deposit; a
+    /// rejected re-deposit keeps the row (retry later).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn outbox_row_dropped_only_after_ack() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-outbox-ack-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db = crate::core::db::tests::connect_with_crsqlite(&dir.join("a.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db).await?;
+        // sync_outbox must exist (created by SCHEMA_INIT_SQL).
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        use base64::Engine as _;
+        let ct = base64::engine::general_purpose::STANDARD.encode(b"cipher");
+        let nonce_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 12]);
+        sqlx::query(
+            "INSERT INTO sync_outbox (id, to_device_id, ciphertext, nonce, ttl_seconds, created_at) \
+             VALUES ('o1', 'dev-b', ?, ?, 604800, ?)",
+        )
+        .bind(&ct)
+        .bind(&nonce_b64)
+        .bind(&now)
+        .execute(&db)
+        .await?;
+
+        // Ack accepted → row dropped.
+        {
+            let (tx, mut rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+            let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+            let relay_for_ack = relay.clone();
+            let ack_task = tokio::spawn(async move {
+                let msg = rx.recv().await.expect("deposit must be sent");
+                let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = msg else {
+                    panic!("expected mailbox deposit");
+                };
+                relay_for_ack.route_ack(crate::sync::types::MailboxDepositAckPayload {
+                    id: payload.message_id.unwrap(),
+                    ok: true,
+                    error: None,
+                });
+            });
+            flush_outbox_with(&db, &relay).await?;
+            ack_task.await?;
+            let remaining: (i64,) = sqlx::query_as("SELECT count(*) FROM sync_outbox")
+                .fetch_one(&db)
+                .await?;
+            assert_eq!(remaining.0, 0, "acked outbox row must be dropped");
+        }
+
+        // Rejected → row kept with bumped retry_count.
+        {
+            sqlx::query(
+                "INSERT INTO sync_outbox (id, to_device_id, ciphertext, nonce, ttl_seconds, created_at) \
+                 VALUES ('o2', 'dev-b', ?, ?, 604800, ?)",
+            )
+            .bind(&ct)
+            .bind(&nonce_b64)
+            .bind(&now)
+            .execute(&db)
+            .await?;
+            let (tx, mut rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+            let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+            let relay_for_ack = relay.clone();
+            let ack_task = tokio::spawn(async move {
+                let msg = rx.recv().await.expect("deposit must be sent");
+                let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = msg else {
+                    panic!("expected mailbox deposit");
+                };
+                relay_for_ack.route_ack(crate::sync::types::MailboxDepositAckPayload {
+                    id: payload.message_id.unwrap(),
+                    ok: false,
+                    error: Some("target device not in room".to_string()),
+                });
+            });
+            flush_outbox_with(&db, &relay).await?;
+            ack_task.await?;
+            let retries: (i64,) =
+                sqlx::query_as("SELECT retry_count FROM sync_outbox WHERE id = 'o2'")
+                    .fetch_one(&db)
+                    .await?;
+            assert_eq!(retries.0, 1, "rejected row must be kept for retry");
+        }
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Backpressure: while an outbox row for the same target is still
+    /// pending, repeated deliver attempts must NOT queue duplicates — the
+    /// cursor never advanced, so every tick re-exports the same range and
+    /// would otherwise grow the outbox without bound while the relay is
+    /// unreachable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deliver_changes_mailbox_backpressure_keeps_single_outbox_row() -> anyhow::Result<()> {
+        let (db, _dir) = create_test_db().await?;
+        let now = "2026-01-01T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, content, content_plain, tags, aliases, created_at, updated_at) \
+             VALUES ('bp-note', 1, 'Backpressure', 'body', 'body', '[]', '[]', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&db)
+        .await?;
+        let key = crate::sync::crypto::generate_sync_key();
+
+        // First deliver: the relay rejects → exactly one outbox row.
+        {
+            let (tx, mut rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+            let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+            let relay_for_ack = relay.clone();
+            let ack_task = tokio::spawn(async move {
+                let msg = rx.recv().await.expect("deposit must be sent");
+                let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = msg else {
+                    panic!("expected mailbox deposit");
+                };
+                relay_for_ack.route_ack(crate::sync::types::MailboxDepositAckPayload {
+                    id: payload.message_id.unwrap(),
+                    ok: false,
+                    error: Some("relay overloaded".to_string()),
+                });
+            });
+            deliver_changes_mailbox(&db, &relay, &key, "dev-b", "dev-b").await?;
+            ack_task.await?;
+        }
+
+        // Further delivers see the pending row and skip entirely: no new
+        // deposit is even sent.
+        for _ in 0..2 {
+            let (tx, mut rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+            let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+            deliver_changes_mailbox(&db, &relay, &key, "dev-b", "dev-b").await?;
+            assert!(
+                rx.try_recv().is_err(),
+                "no new deposit may be sent while an outbox row is pending"
+            );
+        }
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM sync_outbox WHERE to_device_id = 'dev-b'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(count.0, 1, "outbox must hold exactly one row per pending range");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// An outbox retry must re-deposit with the SAME message_id the row was
+    /// queued with, so the relay dedupes retransmits of a deposit it already
+    /// stored (idempotent retry after a lost ack).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_outbox_reuses_stored_message_id() -> anyhow::Result<()> {
+        let (db, _dir) = create_test_db().await?;
+        write_outbox_row(&db, "dev-b", b"cipher", &[7u8; 12], "mid-fixed-1").await?;
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+        let relay_for_ack = relay.clone();
+        let ack_task = tokio::spawn(async move {
+            let msg = rx.recv().await.expect("deposit must be sent");
+            let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = msg else {
+                panic!("expected mailbox deposit");
+            };
+            assert_eq!(
+                payload.message_id.as_deref(),
+                Some("mid-fixed-1"),
+                "flush must reuse the stored message_id"
+            );
+            relay_for_ack.route_ack(crate::sync::types::MailboxDepositAckPayload {
+                id: "mid-fixed-1".to_string(),
+                ok: true,
+                error: None,
+            });
+        });
+        flush_outbox_with(&db, &relay).await?;
+        ack_task.await?;
+
+        let remaining: (i64,) = sqlx::query_as("SELECT count(*) FROM sync_outbox")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(remaining.0, 0, "acked outbox row must be dropped");
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;

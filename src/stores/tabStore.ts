@@ -6,6 +6,8 @@ export interface Tab {
   icon?: string;
   route: string;
   params?: Record<string, string>;
+  /** Route search params (e.g. { note: '<id>' } for note tabs). */
+  search?: Record<string, unknown>;
   closable?: boolean; // false = persistent tab like home
 }
 
@@ -53,9 +55,13 @@ function createHomeTab(route: string = DEFAULT_HOME_ROUTE): Tab {
   };
 }
 
-// Prevent re-opening a tab immediately after it was closed
+// Prevent re-opening a tab immediately after it was closed. The window is
+// deliberately short: it only exists to swallow the automatic re-activation
+// that closing the active tab can trigger, but a longer window also eats
+// legitimate re-opens (e.g. closing a note tab then clicking the same note in
+// the list right away).
 const recentlyClosed = new Set<string>();
-const BLOCK_MS = 600;
+const BLOCK_MS = 150;
 
 export const useTabStore = create<TabState>((set, get) => ({
   tabs: [createHomeTab()],
@@ -74,7 +80,10 @@ export const useTabStore = create<TabState>((set, get) => ({
 
   openRoute: (route, config) => {
     const { tabs } = get();
-    const existing = tabs.find((t) => t.route === route);
+    // Only dedupe against plain route tabs — parameterized tabs (note tabs
+    // with ?note=, reader tabs with paperId) are distinct documents, not
+    // instances of the route's home page.
+    const existing = tabs.find((t) => t.route === route && !t.params && !t.search);
     if (existing) {
       set({ activeTabId: existing.id });
       return existing;

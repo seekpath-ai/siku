@@ -38,6 +38,7 @@ import {
   filesOpen,
 } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
+import { openNoteTab } from '@/lib/openNote';
 
 function NotesPage() {
   const [notes, setNotes] = useState<Note[]>([]);
@@ -237,6 +238,13 @@ function NotesPage() {
     if (activeId) {
       const n = notes.find((note) => note.id === activeId);
       setActiveNote(n || null);
+      // Keep the note tab's title in sync (covers AI renames / sync writes
+      // that bypass the rename handlers).
+      if (n) {
+        const title = n.title || '未命名笔记';
+        const tab = useTabStore.getState().findById(`note_${n.id}`);
+        if (tab && tab.title !== title) useTabStore.getState().updateTab(tab.id, { title });
+      }
       // Expose the focused note to the global pet.
       usePetContextStore.getState().setContext(
         n ? { page: 'notes', objectId: n.id, title: n.title || '未命名笔记' } : null
@@ -264,7 +272,7 @@ function NotesPage() {
     try {
       const note = await notesCreate('新笔记', '', undefined, parentId);
       await loadNotes();
-      setActiveId(note.id);
+      openNoteTab(navigate, note);
     } catch (err) {
       console.error('create note:', err);
     }
@@ -287,7 +295,7 @@ function NotesPage() {
     try {
       const note = await notesCreate('新子笔记', '', undefined, parentId);
       await loadNotes();
-      setActiveId(note.id);
+      openNoteTab(navigate, note);
     } catch (err) {
       console.error('create sub-note:', err);
     }
@@ -307,6 +315,7 @@ function NotesPage() {
   const handleRename = async (id: string, title: string) => {
     try {
       await notesUpdate(id, title, undefined, undefined, undefined, undefined, false);
+      useTabStore.getState().updateTab(`note_${id}`, { title });
       await loadNotes();
     } catch (err) {
       console.error('rename note:', err);
@@ -316,6 +325,7 @@ function NotesPage() {
   const handleUpdate = async (id: string, title: string, content: string) => {
     try {
       await notesUpdate(id, title, content, undefined);
+      if (title) useTabStore.getState().updateTab(`note_${id}`, { title });
       await loadNotes();
     } catch (err) {
       console.error('update note:', err);
@@ -552,7 +562,7 @@ function NotesPage() {
     try {
       const note = await notesCreate(title, '', undefined, undefined);
       await loadNotes();
-      setActiveId(note.id);
+      openNoteTab(navigate, note);
     } catch (err) {
       console.error('create note from link:', err);
     }
@@ -582,6 +592,14 @@ function NotesPage() {
     }
   };
 
+  /** Open a note in its own tab and navigate to it (list click, wikilink,
+   *  breadcrumb — every in-app "open note" goes through here). */
+  const openNote = useCallback((id: string) => {
+    setActiveFileId(null);
+    const n = notes.find((x) => x.id === id);
+    openNoteTab(navigate, { id, title: n?.title });
+  }, [navigate, notes]);
+
   return (
     <div className="flex h-full">
       <ListPanel width={260}>
@@ -590,10 +608,7 @@ function NotesPage() {
           files={files}
           activeNoteId={activeId}
           vaultId={currentVault?.id}
-          onSelect={(id) => {
-            setActiveId(id);
-            setActiveFileId(null);
-          }}
+          onSelect={openNote}
           onCreate={handleCreate}
           onCreateFolder={handleCreateFolder}
           onCreateSubNote={handleCreateSubNote}
@@ -629,7 +644,7 @@ function NotesPage() {
             notes={notes}
             onUpdate={handleUpdate}
             onUpdateAliases={handleUpdateAliases}
-            onNavigate={setActiveId}
+            onNavigate={openNote}
             onCreateLink={handleCreateLink}
             onDelete={handleDelete}
             onToggleFavorite={handleToggleFavorite}

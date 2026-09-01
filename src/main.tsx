@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { RouterProvider, createRouter } from '@tanstack/react-router';
 import { routeTree } from './routes/routeTree';
 import { settingsGetAll, settingsSet } from './lib/tauri';
+import { openNoteTab } from './lib/openNote';
 import { OnboardingWizard } from './components/layout/OnboardingWizard';
 import { PetBallWindow } from './components/pet/PetBallWindow';
 import { PetChatWindow } from './components/pet/PetChatWindow';
@@ -83,9 +84,10 @@ function App() {
         localStorage.removeItem('siku.pending-note');
         const parsed = JSON.parse(raw) as { id?: string; ts?: number };
         if (parsed.id && typeof parsed.ts === 'number' && Date.now() - parsed.ts < 30_000) {
-          (window as Window & { __sikuRouter?: { navigate: (o: { to: string; search: Record<string, unknown> }) => Promise<unknown> } }).__sikuRouter
-            ?.navigate({ to: '/notes', search: { note: parsed.id } })
-            .catch(() => {});
+          const router = (window as Window & { __sikuRouter?: { navigate: (o: { to: string; search?: Record<string, unknown> }) => Promise<unknown> } }).__sikuRouter;
+          if (router) {
+            openNoteTab((opts) => router.navigate(opts).catch(() => {}), { id: parsed.id });
+          }
         }
       }
     } catch { /* ignore */ }

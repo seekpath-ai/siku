@@ -19,6 +19,7 @@ import {
   Folder,
 } from 'lucide-react';
 import { useTabStore } from '@/stores/tabStore';
+import { openNoteTab } from '@/lib/openNote';
 import {
   notesSearch,
   listPapers,
@@ -267,8 +268,7 @@ export function GlobalSearch({ onImportPdf }: GlobalSearchProps) {
               subtitle: n.snippet,
               icon: <FileText size={16} className="text-emerald-400" />,
               action: () => {
-                const tab = openRoute('/notes', { title: n.title || 'Untitled', icon: 'note' });
-                navigate({ to: tab.route, search: { note: n.id } });
+                openNoteTab(navigate, { id: n.id, title: n.title || 'Untitled' });
               },
             }))
           );

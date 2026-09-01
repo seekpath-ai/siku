@@ -11,6 +11,7 @@ import { useImportPaper } from '@/hooks/useLibrary';
 import { useShellStore } from '@/stores/shellStore';
 import { useTabStore } from '@/stores/tabStore';
 import { notesCreate, bookmarksCreate, settingsAppGet, settingsAppSave } from '@/lib/tauri';
+import { openNoteTab } from '@/lib/openNote';
 import { listen } from '@tauri-apps/api/event';
 
 interface AppShellProps { children: React.ReactNode; }
@@ -35,7 +36,7 @@ export function AppShell({ children }: AppShellProps) {
   const toggleSidePanel = useShellStore((state) => state.toggleSidePanel);
   const isMaximized = useShellStore((state) => state.isMaximized);
   const navigate = useNavigate();
-  const { openRoute, open: openTab } = useTabStore();
+  const { openRoute } = useTabStore();
   const zoomRef = useRef(1);
   const creatingNoteRef = useRef(false);
 
@@ -161,9 +162,7 @@ export function AppShell({ children }: AppShellProps) {
     creatingNoteRef.current = true;
     try {
       const note = await notesCreate('Untitled.md', '', undefined, undefined, false);
-      const id = `note_${note.id}`;
-      openTab({ id, title: note.title || 'Untitled.md', route: '/notes', icon: 'note' });
-      navigate({ to: '/notes', search: { note: note.id } });
+      openNoteTab(navigate, note);
       window.dispatchEvent(new CustomEvent('siku:note-created', { detail: note.id }));
     } catch (err) {
       showToast(`新建笔记失败: ${err}`, 'warning');
@@ -171,7 +170,7 @@ export function AppShell({ children }: AppShellProps) {
       // Keep the guard for a short moment to prevent double key events.
       setTimeout(() => { creatingNoteRef.current = false; }, 300);
     }
-  }, [navigate, openTab, showToast]);
+  }, [navigate, showToast]);
 
   // Open a route in a tab AND navigate to it. Keyboard shortcuts must do
   // both (like the menu bar), otherwise only the tab highlight changes

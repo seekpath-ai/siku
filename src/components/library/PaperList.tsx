@@ -50,6 +50,7 @@ import {
 } from '@/hooks/useLibrary';
 import { useLibraryStore } from '@/stores/libraryStore';
 import { useTabStore } from '@/stores/tabStore';
+import { openNoteTab } from '@/lib/openNote';
 import { useDialog } from '@/hooks/useDialog';
 import { parseJsonArray } from '@/lib/types';
 import { isoToDisplay } from '@/lib/time';
@@ -192,7 +193,7 @@ function PaperChildren({ paper }: { paper: Paper }) {
   };
 
   const openNote = (note: Note) => {
-    navigate({ to: '/notes', search: { note: note.id } });
+    openNoteTab(navigate, note);
   };
 
   return (

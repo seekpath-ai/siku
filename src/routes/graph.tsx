@@ -4,6 +4,7 @@ import { Route as RootRoute } from './__root';
 import { Loader2 } from 'lucide-react';
 import ForceGraph2D from 'react-force-graph-2d';
 import { graphGet } from '@/lib/tauri';
+import { openNoteTab } from '@/lib/openNote';
 
 interface GraphNode {
   id: string; label: string; node_type: string; color: string;
@@ -59,7 +60,7 @@ function GraphPage() {
     const n = node as GraphNode;
     if (!n?.id) return;
     if (n.node_type === 'note') {
-      navigate({ to: '/notes', search: { note: n.id } });
+      openNoteTab(navigate, { id: n.id, title: n.label });
     } else if (n.node_type === 'paper' || n.node_type === 'tag') {
       navigate({ to: '/library' });
     } else if (n.node_type === 'knowledge_item') {

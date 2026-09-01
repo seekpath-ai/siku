@@ -27,6 +27,7 @@ import { EditorView } from '@codemirror/view';
 import { MarkdownEditor } from '@/components/editor/MarkdownEditor';
 import type { Note, NoteVersion } from '@/lib/types';
 import { parseNoteTags, parseNoteAliases } from '@/lib/types';
+import { useNoteEditorStore, type NoteViewMode } from '@/stores/noteEditorStore';
 
 interface Props {
   note: Note;
@@ -45,7 +46,7 @@ interface Props {
 }
 
 type SaveStatus = 'saved' | 'saving' | 'unsaved';
-type ViewMode = 'edit' | 'source' | 'reading' | 'split-h' | 'split-v' | 'backlinks';
+type ViewMode = NoteViewMode;
 
 const SAVE_DEBOUNCE_MS = 800;
 
@@ -58,7 +59,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   const [aliasInput, setAliasInput] = useState('');
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleInput, setTitleInput] = useState(note.title);
-  const [mode, setMode] = useState<ViewMode>('edit');
+  const [mode, setMode] = useState<ViewMode>(() => useNoteEditorStore.getState().getState(note.id).mode);
   const [attachmentsDir, setAttachmentsDir] = useState<string | undefined>(undefined);
   const { confirm } = useDialog();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -113,6 +114,17 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   const savedVersionRef = useRef(0);
   const cursorPosRef = useRef(0);
   const onUpdateRef = useRef(onUpdate);
+  // Latest content / note id / title for flush-on-switch and per-note state
+  // memory. Refs (not the effect closure) are used so a rename that happened
+  // after the effect last ran isn't reverted by the flush.
+  const contentRef = useRef(note.content);
+  const noteIdRef = useRef(note.id);
+  const titleRef = useRef(note.title);
+
+  useEffect(() => {
+    noteIdRef.current = note.id;
+    titleRef.current = note.title;
+  }, [note.id, note.title]);
 
   useEffect(() => {
     onUpdateRef.current = onUpdate;
@@ -120,17 +132,40 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
 
   const handleContentChange = useCallback((value: string) => {
     setContent(value);
+    contentRef.current = value;
     saveVersionRef.current += 1;
   }, []);
 
   // Reset local state when the active note changes
   useEffect(() => {
+    // Restore the per-note editor state (view mode, scroll, cursor)
+    // remembered from the last time this note was open.
+    const saved = useNoteEditorStore.getState().getState(note.id);
+    setMode(saved.mode);
     setContent(note.content);
+    contentRef.current = note.content;
     setTitleInput(note.title);
     setEditingTitle(false);
     setSaveStatus('saved');
     saveVersionRef.current = 0;
     savedVersionRef.current = 0;
+    // Wait a frame so CodeMirror has swapped in the new document.
+    requestAnimationFrame(() => {
+      const view = viewRef.current;
+      if (!view) return;
+      view.scrollDOM.scrollTop = saved.scroll;
+      const pos = Math.min(saved.cursor, view.state.doc.length);
+      if (pos > 0) view.dispatch({ selection: { anchor: pos } });
+    });
+    return () => {
+      // Flush pending edits before switching notes / unmounting: the debounced
+      // autosave below is cancelled on teardown and would otherwise drop the
+      // last <800ms of typing.
+      if (saveVersionRef.current !== savedVersionRef.current) {
+        onUpdateRef.current(noteIdRef.current, titleRef.current, contentRef.current)
+          .catch((err) => console.error('flush on note switch:', err));
+      }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [note.id]);
 
@@ -141,7 +176,10 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   useEffect(() => {
     const clean = saveVersionRef.current === savedVersionRef.current;
     if (!clean) return;
-    if (note.content !== content) setContent(note.content);
+    if (note.content !== content) {
+      setContent(note.content);
+      contentRef.current = note.content;
+    }
     if (note.title !== titleInput && !editingTitle) setTitleInput(note.title);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [note.content, note.title]);
@@ -167,6 +205,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
     setEditingTitle(false);
     const t = titleInput.trim();
     if (t && t !== note.title) {
+      titleRef.current = t; // keep the flush-on-switch title up to date
       onUpdate(note.id, t, content).catch((err) => console.error('笔记重命名失败:', err));
     } else {
       setTitleInput(note.title);
@@ -207,7 +246,14 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   );
 
   // ── View mode & overflow menu ────────────────────────────────
-  const toggleMode = useCallback((next: ViewMode) => setMode((m) => (m === next ? 'edit' : next)), []);
+  const toggleMode = useCallback((next: ViewMode) => {
+    setMode((m) => {
+      const v = m === next ? 'edit' : next;
+      // Remember per-note so switching tabs restores the view mode.
+      useNoteEditorStore.getState().setState(noteIdRef.current, { mode: v });
+      return v;
+    });
+  }, []);
 
   // "导出为 PDF" — currently exports the note as Markdown (.md).
   // Restore a note from a version snapshot, then let the parent refresh.
@@ -288,7 +334,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
     }
   }, [note.title, content]);
 
-  // Cursor position for the status bar.
+  // Cursor position for the status bar (also remembered per note).
   const cursorListener = useMemo(
     () =>
       EditorView.updateListener.of((u) => {
@@ -297,6 +343,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
           if (head !== cursorPosRef.current) {
             cursorPosRef.current = head;
             setCursorPos(head);
+            useNoteEditorStore.getState().setState(noteIdRef.current, { cursor: head });
           }
         }
       }),
@@ -332,7 +379,13 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
       editorRef={(view) => {
         viewRef.current = view;
       }}
-      onEditorScroll={() => syncScroll('editor')}
+      onEditorScroll={() => {
+        syncScroll('editor');
+        const top = viewRef.current?.scrollDOM.scrollTop;
+        if (top != null) {
+          useNoteEditorStore.getState().setState(noteIdRef.current, { scroll: top });
+        }
+      }}
       extensions={[cursorListener]}
       vaultId={note.vault_id}
       attachmentsDir={attachmentsDir}

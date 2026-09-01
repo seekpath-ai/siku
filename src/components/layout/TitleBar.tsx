@@ -6,6 +6,7 @@ import { useRouterState, useNavigate } from '@tanstack/react-router';
 import { useShellStore } from '@/stores/shellStore';
 import { useTabStore } from '@/stores/tabStore';
 import { notesCreate, bookmarksCreate } from '@/lib/tauri';
+import { openNoteTab } from '@/lib/openNote';
 
 function isTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -55,7 +56,7 @@ export function TitleBar() {
   const { location } = useRouterState();
   const isReader = location.pathname.startsWith('/reader/');
 
-  const { tabs, activeTabId, activate, close, closeAll, closeOthers, closeToRight, closeToLeft, open: openTab, openRoute } = useTabStore();
+  const { tabs, activeTabId, activate, close, closeAll, closeOthers, closeToRight, closeToLeft, openRoute } = useTabStore();
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -135,22 +136,20 @@ export function TitleBar() {
     creatingNoteRef.current = true;
     try {
       const note = await notesCreate('Untitled.md', '', undefined, undefined, false);
-      const id = `note_${note.id}`;
-      openTab({ id, title: note.title || 'Untitled.md', route: '/notes', icon: 'note' });
-      navigate({ to: '/notes', search: { note: note.id } });
+      openNoteTab(navigate, note);
       window.dispatchEvent(new CustomEvent('siku:note-created', { detail: note.id }));
     } catch (err) {
       console.error('新建笔记失败:', err);
     } finally {
       setTimeout(() => { creatingNoteRef.current = false; }, 300);
     }
-  }, [navigate, openTab]);
+  }, [navigate]);
 
   const handleActivateTab = useCallback((tabId: string) => {
     const tab = useTabStore.getState().findById(tabId);
     if (!tab) return;
     activate(tabId);
-    navigate({ to: tab.route, params: tab.params });
+    navigate({ to: tab.route, params: tab.params, search: tab.search });
   }, [activate, navigate]);
 
   const handleCloseTab = useCallback((e: React.MouseEvent, tabId: string) => {
@@ -159,7 +158,7 @@ export function TitleBar() {
     const { activeTabId: nextId, tabs: remaining } = useTabStore.getState();
     if (nextId) {
       const next = remaining.find((t) => t.id === nextId);
-      if (next) navigate({ to: next.route, params: next.params });
+      if (next) navigate({ to: next.route, params: next.params, search: next.search });
       else navigate({ to: '/library' });
     } else {
       navigate({ to: '/library' });
@@ -177,7 +176,7 @@ export function TitleBar() {
     const { activeTabId: nextId, tabs: remaining } = useTabStore.getState();
     if (nextId && nextId !== targetTabId) {
       const next = remaining.find((t) => t.id === nextId);
-      if (next) navigate({ to: next.route, params: next.params });
+      if (next) navigate({ to: next.route, params: next.params, search: next.search });
     }
   }, [navigate]);
 
@@ -206,7 +205,17 @@ export function TitleBar() {
   // highlighted.
   useEffect(() => {
     const pathname = location.pathname;
+    const noteSearch = (location.search as { note?: unknown }).note;
     const matched = tabs.find((t) => {
+      // Note tabs are keyed by their ?note=<id> search param: match exactly so
+      // the "笔记" list-home tab (no search) and individual note tabs highlight
+      // independently.
+      if (t.route === '/notes') {
+        if (pathname !== '/notes') return false;
+        const tabNote = typeof t.search?.note === 'string' ? t.search.note : undefined;
+        const locNote = typeof noteSearch === 'string' ? noteSearch : undefined;
+        return tabNote === locNote;
+      }
       if (t.route === '/reader/$paperId') {
         return pathname.startsWith('/reader/') && t.params?.paperId === pathname.split('/')[2];
       }
@@ -215,7 +224,7 @@ export function TitleBar() {
     if (matched && matched.id !== activeTabId) {
       activate(matched.id);
     }
-  }, [location.pathname, tabs, activeTabId, activate]);
+  }, [location.pathname, location.search, tabs, activeTabId, activate]);
 
   const dispatch = (name: string, detail?: string) => {
     window.dispatchEvent(new CustomEvent(name, detail ? { detail } : undefined));

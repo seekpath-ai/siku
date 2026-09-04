@@ -46,6 +46,11 @@ pub struct SyncStatus {
     /// 由 `get_sync_status` 并入（见 `quota_exceeded()`）。
     #[serde(default)]
     pub quota_exceeded: bool,
+    /// 本设备的 discovery relay 连接是否存活。进程级状态（auto-sync proxy
+    /// 维护，与 engine 会话独立），由 `get_sync_status` 并入；前端据此区分
+    /// 「未连接云端」与「已连接，同步中…」。
+    #[serde(default)]
+    pub relay_connected: bool,
 }
 
 fn default_transport() -> String {
@@ -65,6 +70,37 @@ pub fn quota_exceeded() -> bool {
 
 fn set_quota_exceeded(exceeded: bool) {
     QUOTA_EXCEEDED.store(exceeded, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 进程级「discovery relay 已连接」标记：auto-sync proxy 的 discovery 连接
+/// Join 成功后置位，断开/停止/被新一代 proxy 取代时清除。与 engine 会话
+/// 独立（无 P2P 会话时纯邮箱路径也在同步），由 `get_sync_status` 并入。
+static RELAY_CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 当前 discovery relay 连接是否存活（见 RELAY_CONNECTED）。
+pub fn relay_connected() -> bool {
+    RELAY_CONNECTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_relay_connected(connected: bool) {
+    RELAY_CONNECTED.store(connected, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 进程级最近一次「与云端/对端达成一致」的时间。engine 会话的
+/// `mark_synced` 与 auto-sync proxy 的邮箱 batch 路径（无 engine 实例，
+/// 空 batch 即「与云端一致」的信号）都会更新它；`get_sync_status` 在会话
+/// 没有 last_sync_at 时用它兜底。
+static LAST_SYNC_AT: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// 进程级最近同步时间（见 LAST_SYNC_AT）。
+pub fn last_sync_at() -> Option<String> {
+    LAST_SYNC_AT.read().unwrap().clone()
+}
+
+/// 记录「刚刚与云端对齐」（无 engine 会话的路径调用，如 proxy 收到邮箱
+/// batch——包括空 batch）。
+pub fn note_synced_now() {
+    *LAST_SYNC_AT.write().unwrap() = Some(crate::core::time::now_iso());
 }
 
 /// Wire message envelope exchanged over the sync DataChannel.
@@ -328,7 +364,9 @@ impl SyncEngine {
     }
 
     pub async fn mark_synced(&self) {
-        self.status.lock().await.last_sync_at = Some(crate::core::time::now_iso());
+        let now = crate::core::time::now_iso();
+        self.status.lock().await.last_sync_at = Some(now.clone());
+        *LAST_SYNC_AT.write().unwrap() = Some(now);
     }
 
     /// Persist the sent watermark for this peer so a future session (or the

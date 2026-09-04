@@ -262,8 +262,19 @@ fn chunk_mailbox_messages(messages: Vec<MailboxMessage>, max_bytes: usize) -> Ve
 }
 
 /// Send a poll result as one or more byte-budgeted `MailboxBatch` frames.
+/// An empty result is still answered with an empty batch: without a frame the
+/// client cannot distinguish "no new messages" from "no answer yet", and the
+/// empty batch is the relay's explicit "you are up to date" signal. Old
+/// clients treat an empty batch as a no-op, so this is additive.
 fn send_mailbox_batches(tx: &mpsc::UnboundedSender<RelayServerMsg>, messages: Vec<MailboxMessage>) {
-    for batch in chunk_mailbox_messages(messages, MAILBOX_BATCH_MAX_BYTES) {
+    let batches = chunk_mailbox_messages(messages, MAILBOX_BATCH_MAX_BYTES);
+    if batches.is_empty() {
+        let _ = tx.send(RelayServerMsg::MailboxBatch {
+            payload: MailboxBatchPayload { messages: Vec::new() },
+        });
+        return;
+    }
+    for batch in batches {
         let _ = tx.send(RelayServerMsg::MailboxBatch {
             payload: MailboxBatchPayload { messages: batch },
         });
@@ -676,8 +687,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                             let pending = state
                                 .mailboxes
                                 .poll(&room_id, &join_device_id, Some(100));
-                            if !pending.is_empty() {
-                                send_mailbox_batches(&tx, pending);
+                            let had_pending = !pending.is_empty();
+                            // Always answer, even with an empty batch: the
+                            // empty batch is the client's "in sync with the
+                            // cloud archive" signal.
+                            send_mailbox_batches(&tx, pending);
+                            if had_pending {
                                 info!(device_id = %join_device_id, "delivered pending mailbox batch");
                             }
                         }
@@ -1975,6 +1990,81 @@ mod tests {
         assert!(
             hello.contains(r#""protocol":2"#),
             "join must be answered by server_hello with protocol 2, got: {hello}"
+        );
+    }
+
+    /// An empty mailbox must still be answered: the Join-time catch-up and an
+    /// explicit MailboxPoll both send a `MailboxBatch` with `messages: []`, so
+    /// the client can tell "no new messages" apart from "no answer yet".
+    #[tokio::test]
+    async fn empty_mailbox_poll_returns_empty_batch() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message;
+
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let state = Arc::new(AppState::new());
+        seed_account(&state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let token_a = make_token("user-1", "device-a");
+        let mut request = format!("ws://127.0.0.1:{port}/v1/signaling")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {token_a}")).unwrap(),
+        );
+        let (mut a, _) = connect_async(request).await.unwrap();
+
+        a.send(Message::Text(
+            r#"{"type":"join","payload":{"room_id":"user-1"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        // First connection with an empty mailbox: the Join-time catch-up is an
+        // empty batch, not silence.
+        let join_batch = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(Message::Text(text))) = a.next().await {
+                if text.contains("mailbox_batch") {
+                    return text;
+                }
+            }
+            String::new()
+        })
+        .await
+        .unwrap();
+        assert!(
+            join_batch.contains(r#""messages":[]"#),
+            "join with an empty mailbox must deliver an empty batch, got: {join_batch}"
+        );
+
+        // An explicit poll of the still-empty mailbox is answered too.
+        a.send(Message::Text(
+            r#"{"type":"mailbox_poll","payload":{"max_count":100}}"#.into(),
+        ))
+        .await
+        .unwrap();
+        let poll_batch = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(Message::Text(text))) = a.next().await {
+                if text.contains("mailbox_batch") {
+                    return text;
+                }
+            }
+            String::new()
+        })
+        .await
+        .unwrap();
+        assert!(
+            poll_batch.contains(r#""messages":[]"#),
+            "empty mailbox poll must return an empty batch, got: {poll_batch}"
         );
     }
 

@@ -272,7 +272,7 @@ export function SyncSettings() {
     }
   }, [seedPassword]);
 
-  // ── User-facing sync status (three states) ──
+  // ── User-facing sync status (cloud: 五态；LAN: 见 lanStateView) ──
   const fmtSyncTime = (iso?: string) => {
     if (!iso) return '';
     const d = new Date(iso);
@@ -280,10 +280,20 @@ export function SyncSettings() {
     const pad = (n: number) => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   };
-  // Cloud-state helpers: the shared engine slot may hold a LAN session, so
-  // cloud UI must only react to cloud-kind sessions (and vice versa).
-  const isCloudConnected =
-    syncStatus.connected && (!syncStatus.kind || syncStatus.kind === 'cloud');
+  // 云端「已同步」行只显示时刻（HH:MM），日期由上下文自明。
+  const fmtSyncClock = (iso?: string) => {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+  // Cloud-state helpers: 「已同步」= 本机已获取其它所有设备当前可见（云端存档
+  // 或对端直连）的全部变更，与传输方式无关；云端连接状态看进程级
+  // relay_connected（auto-sync proxy 的 discovery 连接），不看 engine 会话
+  // （无 P2P 会话时纯邮箱路径也在同步）。LAN 会话存活期间 relay_connected
+  // 同样可能为 true，两个 tab 的状态互不冲突。
+  const isCloudConnected = !!syncStatus.relay_connected;
   const isLanConnected = syncStatus.connected && syncStatus.kind === 'lan';
 
   const syncStateView = (() => {
@@ -315,20 +325,20 @@ export function SyncSettings() {
       const tail = counters.length ? ` · ${counters.join(' · ')}` : '';
       return {
         icon: <CheckCircle2 size={14} className="text-accent" />,
-        text: `已同步 ${fmtSyncTime(syncStatus.last_sync_at)}${tail}`,
+        text: `已同步 ${fmtSyncClock(syncStatus.last_sync_at)}${tail}`,
         cls: 'text-accent',
       };
     }
     if (isCloudConnected) {
       return {
-        icon: <CheckCircle2 size={14} className="text-accent" />,
-        text: '已连接',
+        icon: <Loader2 size={14} className="animate-spin text-accent" />,
+        text: '已连接，同步中…',
         cls: 'text-accent',
       };
     }
     return {
       icon: <span className="w-2.5 h-2.5 rounded-full bg-text-secondary/40" />,
-      text: '未同步',
+      text: '未连接云端',
       cls: 'text-text-secondary',
     };
   })();
@@ -465,7 +475,7 @@ export function SyncSettings() {
         <div className="space-y-6">
           <AccountSettings onLoggedIn={() => {}} />
 
-          {/* 同步状态（用户三态） */}
+          {/* 同步状态（云端五态：存储已满 / 失败 / 已同步 / 同步中 / 未连接） */}
           <div className="space-y-3">
             <div className="text-sm font-medium text-text-primary">同步状态</div>
             <div className="flex items-center justify-between px-4 py-3 bg-surface border border-surface-hover rounded-xl">
@@ -490,7 +500,7 @@ export function SyncSettings() {
             {outboxCount > 0 && (
               <div className="flex items-center justify-between px-4 py-2 bg-surface/60 border border-surface-hover rounded-lg">
                 <span className="text-xs text-text-secondary">
-                  邮箱待投递 {outboxCount} 条（对方上线后自动发送）
+                  本地有 {outboxCount} 条待同步变更（对端上线后自动投递）
                 </span>
                 <button
                   onClick={handleFlushOutbox}

@@ -509,6 +509,9 @@ pub async fn spawn_auto_sync_proxy(
                 continue;
             }
             info!("auto-sync discovery connected");
+            // 进程级 relay 连接状态：前端据此显示「已连接，同步中…/已同步」，
+            // 与是否有 P2P engine 会话无关。
+            crate::sync::engine::set_relay_connected(true);
 
             // Register this connection so a logout/disconnect can shut it down
             // directly (a stop-check race in this loop must never leave the
@@ -545,6 +548,7 @@ pub async fn spawn_auto_sync_proxy(
             loop {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     info!("auto-sync proxy stopped");
+                    crate::sync::engine::set_relay_connected(false);
                     relay.shutdown();
                     if discovery_slot
                         .lock()
@@ -559,6 +563,7 @@ pub async fn spawn_auto_sync_proxy(
                 }
                 if gen_flag.load(std::sync::atomic::Ordering::Relaxed) != generation {
                     info!("auto-sync proxy superseded; dropping connection");
+                    crate::sync::engine::set_relay_connected(false);
                     relay.shutdown();
                     if discovery_slot
                         .lock()
@@ -679,6 +684,7 @@ pub async fn spawn_auto_sync_proxy(
                                 // offline (per-device or account archive); the
                                 // relay delivers them on join. Apply them even
                                 // without a P2P session.
+                                let batch_is_empty = payload.messages.is_empty();
                                 if let Some(key) = &mailbox_key {
                                     let batch_full = payload.messages.len() >= 100;
                                     if let Err(e) = crate::sync::engine::handle_mailbox_batch(
@@ -703,11 +709,20 @@ pub async fn spawn_auto_sync_proxy(
                                             })
                                             .ok();
                                     }
+                                    // batch 应用完成（空 batch 亦然——它正是 relay
+                                    // 「没有新消息」的明确信号）：本机已获取云端当前
+                                    // 可见的全部变更，更新进程级最近同步时间。
+                                    crate::sync::engine::note_synced_now();
+                                } else if batch_is_empty {
+                                    // 无 sync key 时无法解密应用非空 batch；但空 batch
+                                    // 本身即「与云端一致」，与是否能解密无关。
+                                    crate::sync::engine::note_synced_now();
                                 }
                             }
                             Some(_) => continue,
                             None => {
                                 info!("auto-sync discovery relay closed; reconnecting");
+                                crate::sync::engine::set_relay_connected(false);
                                 relay.shutdown();
                                 if discovery_slot
                                     .lock()
@@ -724,6 +739,7 @@ pub async fn spawn_auto_sync_proxy(
                     }
                     _ = watch_stop_flag(&stop) => {
                         info!("auto-sync proxy stop requested; closing discovery connection");
+                        crate::sync::engine::set_relay_connected(false);
                         relay.shutdown();
                         if discovery_slot
                             .lock()
@@ -1345,6 +1361,14 @@ pub async fn get_sync_status(
     };
     // 「云端存储已满」是账号级状态，与是否有活跃会话无关，始终并入。
     status.quota_exceeded = crate::sync::engine::quota_exceeded();
+    // relay 连接是进程级状态（auto-sync proxy 的 discovery 连接维护），与
+    // engine 会话独立，始终并入：无 P2P 会话时纯邮箱路径也在同步。
+    status.relay_connected = crate::sync::engine::relay_connected();
+    // 会话没有 last_sync_at（或没有会话）时，用进程级最近同步时间兜底；
+    // 有会话时优先会话值。
+    if status.last_sync_at.is_none() {
+        status.last_sync_at = crate::sync::engine::last_sync_at();
+    }
     Ok(status)
 }
 

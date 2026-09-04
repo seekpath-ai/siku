@@ -1298,6 +1298,8 @@ export interface SyncStatus {
   pushed?: number;
   pulled?: number;
   kind?: 'lan' | 'cloud' | 'unknown';
+  /** 本设备的 discovery relay 连接是否存活（进程级，由 auto-sync proxy 维护）。 */
+  relay_connected?: boolean;
 }
 
 /** Status of the sync session for `kind` (undefined = most recent session).

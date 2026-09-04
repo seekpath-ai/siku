@@ -343,9 +343,10 @@ impl Db {
         list
     }
 
-    /// A user's pending upgrade order, if any — order creation is idempotent:
-    /// a second application returns the existing pending order instead of
-    /// piling up duplicates for the admin to review.
+    /// A user's pending upgrade order, if any. Order creation is idempotent
+    /// per (plan, period): repeating the same selection returns this order,
+    /// while choosing a different plan/period cancels it (see
+    /// api_create_storage_order).
     pub fn pending_order_for_user(&self, user_id: &str) -> Option<Order> {
         let snap = self.inner.lock().unwrap();
         snap.orders

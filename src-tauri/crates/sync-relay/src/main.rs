@@ -1236,10 +1236,21 @@ async fn api_create_storage_order(
             ))
         }
     };
-    // Idempotent: an existing pending order is returned as-is so repeated
-    // applications never pile up for the admin to review.
+    // Idempotent only for the SAME plan+period: a repeated submission returns
+    // the existing pending order instead of piling up duplicates. A pending
+    // order for a DIFFERENT plan/period is the user changing their mind —
+    // cancel the stale one and create the new selection.
     if let Some(existing) = state.db.pending_order_for_user(&claims.sub) {
-        return Ok(axum::Json(order_response(&existing, &state)));
+        if existing.plan_id == plan.id && existing.duration_days == duration_days {
+            return Ok(axum::Json(order_response(&existing, &state)));
+        }
+        let _ = state.db.update_order_status(
+            &existing.id,
+            db::OrderStatus::Cancelled,
+            None,
+            Some("superseded by a new order".to_string()),
+        );
+        info!(user_id = %claims.sub, order_id = %existing.id, "stale pending order cancelled (plan changed)");
     }
     let order = db::Order {
         id: uuid::Uuid::new_v4().to_string(),
@@ -2046,6 +2057,27 @@ mod tests {
         let orders = orders.as_array().unwrap();
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0]["id"], first["order_id"]);
+
+        // Applying for a DIFFERENT plan/period cancels the stale pending
+        // order and returns a fresh one reflecting the new selection.
+        let (status, third) = http_json(
+            state.clone(),
+            "POST",
+            "/api/storage/orders",
+            Some(&token),
+            Some(serde_json::json!({"plan_id": "pro", "period": "year"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(third["order_id"], first["order_id"]);
+        assert_eq!(third["plan_id"], "pro");
+        assert_eq!(third["amount_cny"], 150.0);
+        let (_, orders) =
+            http_json(state.clone(), "GET", "/api/storage/orders", Some(&token), None).await;
+        let orders = orders.as_array().unwrap();
+        assert_eq!(orders.len(), 2);
+        let old = orders.iter().find(|o| o["id"] == first["order_id"]).unwrap();
+        assert_eq!(old["status"], "cancelled");
 
         // Unknown plan / bad period are rejected.
         let (status, _) = http_json(

@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useCallback, useRef, type MouseEvent } fr
 import {
   Plus, Folder, FileText, ChevronRight, ChevronsUpDown, ChevronsDownUp, Search, Trash2,
   MoreHorizontal, FolderPlus, FilePlus, ArrowUpToLine, X, Crosshair,
-  Settings, HelpCircle, Database, Move, Bookmark,
+  Settings, HelpCircle, Database, Move, Bookmark, Copy,
   File as FileIcon, Image as ImageIcon, FileSpreadsheet, ExternalLink,
 } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -32,6 +32,8 @@ interface Props {
   /** Bulk delete with a single confirmation; falls back to per-item onDelete. */
   onBulkDelete?: (ids: string[]) => void;
   onToggleFavorite?: (id: string, favorite: boolean) => void;
+  /** Duplicate a note as "标题 副本" under the same parent (notes only). */
+  onDuplicate?: (id: string) => void;
   onMoveToRoot?: (id: string) => void;
   /** Move a note under a folder (or to root when parentId is null). */
   onMoveToFolder?: (id: string, parentId: string | null) => void;
@@ -103,6 +105,7 @@ export function NoteList({
   onDelete,
   onBulkDelete,
   onToggleFavorite,
+  onDuplicate,
   onMoveToRoot,
   onMoveToFolder,
   onBulkCreateFolder,
@@ -775,6 +778,14 @@ export function NoteList({
           label: note.is_favorite === 1 ? '取消收藏' : '收藏',
           icon: <Bookmark size={12} />,
           onClick: () => onToggleFavorite(note.id, note.is_favorite !== 1),
+        });
+      }
+      // 创建副本：仅普通笔记（文件夹需递归复制子树，系统目录是保留结构）
+      if (onDuplicate && note.is_folder !== 1) {
+        items.push({
+          label: '创建副本',
+          icon: <Copy size={12} />,
+          onClick: () => onDuplicate(note.id),
         });
       }
       items.push({

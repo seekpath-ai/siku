@@ -772,6 +772,9 @@ export async function notesCreate(title: string, content: string, paperId?: stri
 export async function notesGet(id: string): Promise<Note> {
   return invoke<Note>('notes_get', { id });
 }
+export async function notesDuplicate(id: string): Promise<Note> {
+  return invoke<Note>('note_duplicate', { id });
+}
 export async function notesUpdate(id: string, title?: string, content?: string, paperId?: string, aliases?: string, isFavorite?: number, touch?: boolean): Promise<Note> {
   return invoke<Note>('notes_update', { id, title, content, paperId, aliases, isFavorite, touch });
 }

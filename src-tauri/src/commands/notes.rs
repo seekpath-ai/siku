@@ -22,6 +22,16 @@ pub async fn notes_create(
     crate::core::note_service::create_note(&state.db, &title, &content, paper_id.as_deref(), parent_id.as_deref(), &vault_id, is_folder.unwrap_or(false)).await
 }
 
+/// Duplicate a note as "标题 副本" under the same parent.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn note_duplicate(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Note, String> {
+    crate::core::note_service::duplicate_note(&state.db, &id).await
+}
+
 /// Create a note under the paper's collection folder tree (Zotero-style).
 #[tauri::command]
 #[instrument(skip(state))]

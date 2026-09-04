@@ -795,6 +795,7 @@ pub fn run() {
             commands::research::research_update_source_status,
             // Notes
             commands::notes::notes_create,
+            commands::notes::note_duplicate,
             commands::notes::notes_get,
             commands::notes::notes_update,
             commands::notes::notes_delete,

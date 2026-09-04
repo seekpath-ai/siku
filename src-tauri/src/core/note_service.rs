@@ -42,6 +42,30 @@ pub async fn get_note(db: &SqlitePool, id: &str) -> Result<Note, String> {
         .ok_or_else(|| format!("note not found: {id}"))
 }
 
+/// Duplicate a note: same content under the same parent, titled "标题 副本".
+/// Only the note itself is copied (no subtree); folders and the system
+/// library root are not duplicable. The copy is not favorited and its wiki
+/// links are re-parsed by create_note.
+pub async fn duplicate_note(db: &SqlitePool, id: &str) -> Result<Note, String> {
+    let src = get_note(db, id).await?;
+    if src.is_folder == 1 {
+        return Err("文件夹不支持创建副本".to_string());
+    }
+    if src.is_system == 1 {
+        return Err("系统目录不支持创建副本".to_string());
+    }
+    create_note(
+        db,
+        &format!("{} 副本", src.title),
+        &src.content,
+        src.paper_id.as_deref(),
+        src.parent_id.as_deref(),
+        &src.vault_id,
+        false,
+    )
+    .await
+}
+
 /// Update a note. When `touch` is `Some(false)` the `updated_at` timestamp is
 /// left untouched so the note keeps its current position in the tree.
 #[instrument(skip(db))]
@@ -1083,5 +1107,62 @@ mod tests {
         assert_eq!(sys_alive, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 创建副本：内容/目录归属与原笔记一致，标题加「副本」；文件夹与系统
+    /// 目录拒绝复制。
+    #[tokio::test]
+    async fn duplicate_note_copies_content_under_same_parent() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-note-dup-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = crate::core::db::tests::connect_with_crsqlite(&dir.join("d.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db).await?;
+        crate::core::db::register_crr_tables(&db, crate::core::db::CORE_SYNC_TABLES).await?;
+
+        let vault = crate::core::db::DEFAULT_VAULT_ID;
+        let folder = create_note(&db, "文件夹", "", None, None, vault, true)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        // 链接目标真实存在，wiki 链接才会解析入库
+        create_note(&db, "某链接", "", None, None, vault, false)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let src = create_note(&db, "原始笔记", "正文 [[某链接]]", None, Some(&folder.id), vault, false)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let copy = duplicate_note(&db, &src.id).await.map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(copy.title, "原始笔记 副本");
+        assert_eq!(copy.content, "正文 [[某链接]]");
+        assert_eq!(copy.parent_id.as_deref(), Some(folder.id.as_str()));
+        assert_eq!(copy.is_favorite, 0, "副本不继承收藏状态");
+        assert_ne!(copy.id, src.id);
+        // 副本内容里的 wiki 链接已重新解析入库
+        let links: Vec<(String,)> =
+            sqlx::query_as("SELECT target_id FROM note_links WHERE source_id = ?")
+                .bind(&copy.id)
+                .fetch_all(&db)
+                .await?;
+        assert_eq!(links.len(), 1, "copy must re-parse wiki links");
+
+        // 文件夹与系统目录不可复制
+        assert!(duplicate_note(&db, &folder.id).await.is_err());
+        sqlx::query("UPDATE notes SET is_system = 1 WHERE id = ?")
+            .bind(&src.id)
+            .execute(&db)
+            .await?;
+        assert!(duplicate_note(&db, &src.id).await.is_err());
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

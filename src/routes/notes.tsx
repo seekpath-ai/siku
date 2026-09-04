@@ -18,6 +18,7 @@ import type { Note, Vault, FileItem } from '@/lib/types';
 import {
   notesListAll,
   notesCreate,
+  notesDuplicate,
   notesUpdate,
   notesDelete,
   notesMove,
@@ -298,6 +299,17 @@ function NotesPage() {
       openNoteTab(navigate, note);
     } catch (err) {
       console.error('create sub-note:', err);
+    }
+  };
+
+  /** 右键「创建副本」：复制笔记内容到同目录，标题加「副本」后缀。 */
+  const handleDuplicate = async (id: string) => {
+    try {
+      const note = await notesDuplicate(id);
+      await loadNotes();
+      openNoteTab(navigate, note);
+    } catch (err) {
+      console.error('duplicate note:', err);
     }
   };
 
@@ -617,6 +629,7 @@ function NotesPage() {
           onDelete={handleDelete}
           onBulkDelete={handleBulkDelete}
           onToggleFavorite={handleToggleFavorite}
+          onDuplicate={handleDuplicate}
           onMoveToRoot={handleMoveToRoot}
           onMoveToFolder={handleMoveToFolder}
           onBulkCreateFolder={handleBulkCreateFolder}

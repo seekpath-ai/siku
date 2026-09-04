@@ -542,6 +542,17 @@ pub async fn spawn_auto_sync_proxy(
                 {
                     tracing::warn!(error = %e, "auto-sync: initial mailbox snapshot failed");
                 }
+                // Self-heal on (re)connect: blobs whose earlier request or
+                // response was lost (TTL expiry, pre-blob-support clients) are
+                // otherwise only re-requested when the peer happens to send a
+                // new changeset. Ask every other device of the account once.
+                if let Err(e) = crate::sync::engine::rescan_missing_blobs_at_startup(
+                    &db, &app_data_dir, key, &relay, &relay_url, &token, &self_id,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "auto-sync: startup blob rescan failed");
+                }
             }
             let mut snapshot_ticks: u64 = 0;
 

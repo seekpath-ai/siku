@@ -1,5 +1,7 @@
 use crate::sync::attachments::{
-    blob_fits_mailbox, collect_missing_blob_hashes, read_blob_base64, write_blob_from_base64,
+    blob_answer_on_cooldown, blob_fits_mailbox, blob_request_on_cooldown,
+    collect_missing_blob_hashes, note_blob_answered, note_blob_request_sent, read_blob_base64,
+    write_blob_from_base64,
 };
 use crate::sync::crdt::{apply_changes, export_changes_since, export_own_changes_since, ChangesetMessage};
 use crate::sync::mailbox_client::MailboxClient;
@@ -439,6 +441,20 @@ impl SyncEngine {
         if missing.is_empty() {
             return Ok(());
         }
+        // Throttle: every applied changeset lands here, so a batch of N
+        // changesets would otherwise fire N identical full-list requests —
+        // each one answered with the full blob set by the peer.
+        let peer_key = self
+            .status
+            .lock()
+            .await
+            .peer_device_id
+            .clone()
+            .unwrap_or_default();
+        if blob_request_on_cooldown(&peer_key) {
+            return Ok(());
+        }
+        note_blob_request_sent(&peer_key);
         info!(count = missing.len(), "requesting missing blobs");
         let msg = SyncMessage::AttachmentRequest { hashes: missing };
         if let Err(e) = self.send_message(&msg).await {
@@ -502,6 +518,11 @@ impl SyncEngine {
             SyncMessage::AttachmentRequest { hashes } => {
                 info!(count = hashes.len(), "received blob request");
                 for (hash, ext) in hashes {
+                    // Dedup: the same hash may be requested by several queued
+                    // request messages; answer it once per cooldown window.
+                    if blob_answer_on_cooldown(&hash) {
+                        continue;
+                    }
                     match read_blob_base64(&self.app_data_dir, &hash, &ext) {
                         Ok(Some(data)) => {
                             // Route through send_message: real PDFs/blobs exceed
@@ -511,6 +532,7 @@ impl SyncEngine {
                                 ext: ext.clone(),
                                 data,
                             };
+                            let mut answered = false;
                             if let Err(e) = self.send_message(&payload).await {
                                 // DataChannel unavailable: try mailbox fallback
                                 // when we know which peer asked. Oversized blobs
@@ -535,10 +557,16 @@ impl SyncEngine {
                                         );
                                     } else {
                                         info!(to = %peer, hash = %hash, "deposited blob payload to mailbox");
+                                        answered = true;
                                     }
                                 } else {
                                     warn!(error = %e, hash = %hash, "failed to send blob payload");
                                 }
+                            } else {
+                                answered = true;
+                            }
+                            if answered {
+                                note_blob_answered(&hash);
                             }
                         }
                         Ok(None) => warn!(hash = %hash, "peer requested blob we do not have"),
@@ -744,10 +772,14 @@ impl SyncEngine {
 
     /// Request missing blobs from a specific peer via mailbox.
     async fn request_missing_blobs_from(&self, peer_device_id: &str) -> Result<()> {
+        if blob_request_on_cooldown(peer_device_id) {
+            return Ok(());
+        }
         let missing = collect_missing_blob_hashes(&self.db, &self.app_data_dir).await?;
         if missing.is_empty() {
             return Ok(());
         }
+        note_blob_request_sent(peer_device_id);
         info!(count = missing.len(), to = %peer_device_id, "requesting missing blobs over mailbox");
         let msg = SyncMessage::AttachmentRequest { hashes: missing };
         self.deposit_message_to(peer_device_id, &msg).await
@@ -764,6 +796,9 @@ impl SyncEngine {
             SyncMessage::AttachmentRequest { hashes } => {
                 info!(count = hashes.len(), from = %from_device_id, "received mailbox blob request");
                 for (hash, ext) in hashes {
+                    if blob_answer_on_cooldown(&hash) {
+                        continue;
+                    }
                     if !blob_fits_mailbox(&self.app_data_dir, &hash, &ext) {
                         warn!(hash = %hash, "blob exceeds mailbox size limit; only P2P will carry it");
                         continue;
@@ -778,6 +813,8 @@ impl SyncEngine {
                             if let Err(e) = self.deposit_message_to(from_device_id, &payload).await
                             {
                                 warn!(error = %e, hash = %hash, "failed to deposit blob payload");
+                            } else {
+                                note_blob_answered(&hash);
                             }
                         }
                         Ok(None) => warn!(hash = %hash, "peer requested blob we do not have"),
@@ -1581,13 +1618,85 @@ async fn request_missing_blobs_over_relay(
     relay: &crate::sync::relay_client::RelayClient,
     peer_device_id: &str,
 ) -> Result<()> {
+    // Throttle before scanning: a batch of N changesets from the same sender
+    // would otherwise fire N identical full-list requests, each answered with
+    // the full blob set — an amplification that once stalled the sender's own
+    // outbox (deposit ack timeouts).
+    if blob_request_on_cooldown(peer_device_id) {
+        return Ok(());
+    }
     let missing = collect_missing_blob_hashes(db, app_data_dir).await?;
     if missing.is_empty() {
         return Ok(());
     }
+    note_blob_request_sent(peer_device_id);
     info!(count = missing.len(), to = %peer_device_id, "requesting missing blobs over mailbox");
     let msg = SyncMessage::AttachmentRequest { hashes: missing };
     deposit_sync_message_to(relay, key, peer_device_id, &msg).await
+}
+
+/// Startup self-heal: rows applied long ago may reference blobs whose
+/// request/response was lost (7-day TTL expiry, older clients without blob
+/// support). Nothing re-triggers a request until the peer sends another
+/// changeset, so on auto-sync connect we re-scan once and ask every other
+/// device of the account for whatever is still missing. Peers we ask
+/// needlessly answer with "don't have it" warnings only.
+pub async fn rescan_missing_blobs_at_startup(
+    db: &SqlitePool,
+    app_data_dir: &std::path::Path,
+    key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
+    relay: &crate::sync::relay_client::RelayClient,
+    relay_url: &str,
+    token: &str,
+    self_device_id: &str,
+) -> Result<()> {
+    let missing = collect_missing_blob_hashes(db, app_data_dir).await?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let peers = list_account_device_ids(relay_url, token)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "startup blob rescan: device list unavailable");
+            Vec::new()
+        });
+    let mut asked = 0usize;
+    for peer in peers.iter().filter(|p| p.as_str() != self_device_id) {
+        if let Err(e) =
+            request_missing_blobs_over_relay(db, app_data_dir, key, relay, peer).await
+        {
+            warn!(error = %e, to = %peer, "startup blob rescan: request failed");
+        } else {
+            asked += 1;
+        }
+    }
+    if asked == 0 {
+        info!(
+            count = missing.len(),
+            "startup blob rescan: blobs missing but no peer device to ask"
+        );
+    }
+    Ok(())
+}
+
+/// Fetch the account's device ids from the relay's HTTP API (best effort).
+async fn list_account_device_ids(relay_url: &str, token: &str) -> Result<Vec<String>> {
+    let base = crate::sync::onboarding::normalize_http_base(relay_url);
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?
+        .get(format!("{}/api/devices", base.trim_end_matches('/')))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("device list: HTTP {}", resp.status());
+    }
+    let rows: Vec<serde_json::Value> = resp.json().await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| r.get("device_id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect())
 }
 
 /// Handle an attachment request/payload that arrived over the mailbox path.
@@ -1602,6 +1711,12 @@ async fn handle_mailbox_attachment_message(
         SyncMessage::AttachmentRequest { hashes } => {
             info!(count = hashes.len(), from = %from_device_id, "received mailbox blob request");
             for (hash, ext) in hashes {
+                // Dedup: identical requests queued before the throttle existed
+                // (or sent by several devices) must not each trigger a full
+                // payload deposit.
+                if blob_answer_on_cooldown(&hash) {
+                    continue;
+                }
                 if !blob_fits_mailbox(app_data_dir, &hash, &ext) {
                     warn!(hash = %hash, "blob exceeds mailbox size limit; only P2P will carry it");
                     continue;
@@ -1617,6 +1732,8 @@ async fn handle_mailbox_attachment_message(
                             deposit_sync_message_to(relay, key, from_device_id, &payload).await
                         {
                             warn!(error = %e, hash = %hash, "failed to deposit blob payload");
+                        } else {
+                            note_blob_answered(&hash);
                         }
                     }
                     Ok(None) => warn!(hash = %hash, "peer requested blob we do not have"),

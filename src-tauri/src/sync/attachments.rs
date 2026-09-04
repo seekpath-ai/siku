@@ -2,6 +2,9 @@ use crate::file_store;
 use anyhow::{Context, Result};
 use base64::Engine;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tracing::info;
 
 #[allow(dead_code)]
@@ -128,6 +131,82 @@ pub fn blob_fits_mailbox(app_data_dir: &std::path::Path, hash: &str, ext: &str) 
         .unwrap_or(false)
 }
 
+// ── Request/answer throttling ───────────────────────────────────────────────
+//
+// Blob sync is request-driven and every applied changeset re-scans for missing
+// blobs. Without throttling, a batch of N changesets fires N identical
+// full-list requests within a second, and each queued request is answered with
+// the FULL blob set — an N×M payload amplification that once clogged a
+// device's own outbox (deposit ack timeouts) and flooded the relay mailbox.
+
+/// Per-peer cooldown for outgoing blob requests.
+#[cfg_attr(test, allow(dead_code))]
+const BLOB_REQUEST_COOLDOWN: Duration = Duration::from_secs(300);
+/// Per-hash cooldown for answering blob requests: duplicate queued requests
+/// are answered once per hash per window, not once per request message.
+#[cfg_attr(test, allow(dead_code))]
+const BLOB_ANSWER_COOLDOWN: Duration = Duration::from_secs(600);
+
+/// Engine integration tests run several engines in one process and share this
+/// global state; throttling there would make blob transfers timing-dependent
+/// (and parallel tests reuse keys like "device-a"), so the test build disables
+/// the cooldowns. The cooldown logic itself is covered by the unit tests below
+/// via `on_cooldown` with an explicit duration.
+#[cfg(test)]
+const REQUEST_COOLDOWN: Duration = Duration::ZERO;
+#[cfg(not(test))]
+const REQUEST_COOLDOWN: Duration = BLOB_REQUEST_COOLDOWN;
+#[cfg(test)]
+const ANSWER_COOLDOWN: Duration = Duration::ZERO;
+#[cfg(not(test))]
+const ANSWER_COOLDOWN: Duration = BLOB_ANSWER_COOLDOWN;
+
+fn blob_request_log() -> &'static Mutex<HashMap<String, Instant>> {
+    static LOG: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn blob_answer_log() -> &'static Mutex<HashMap<String, Instant>> {
+    static LOG: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn on_cooldown(log: &Mutex<HashMap<String, Instant>>, key: &str, cooldown: Duration) -> bool {
+    log.lock()
+        .unwrap()
+        .get(key)
+        .map(|t| t.elapsed() < cooldown)
+        .unwrap_or(false)
+}
+
+/// True while a blob request to `peer` is inside its cooldown window.
+pub fn blob_request_on_cooldown(peer_device_id: &str) -> bool {
+    on_cooldown(blob_request_log(), peer_device_id, REQUEST_COOLDOWN)
+}
+
+/// Record that a blob request to `peer` was (attempted to be) sent. Recorded
+/// on attempt rather than success so a failing relay is not hammered on every
+/// incoming changeset.
+pub fn note_blob_request_sent(peer_device_id: &str) {
+    blob_request_log()
+        .lock()
+        .unwrap()
+        .insert(peer_device_id.to_string(), Instant::now());
+}
+
+/// True while answers for `hash` are inside their cooldown window.
+pub fn blob_answer_on_cooldown(hash: &str) -> bool {
+    on_cooldown(blob_answer_log(), hash, ANSWER_COOLDOWN)
+}
+
+/// Record that the payload for `hash` was sent to a requester.
+pub fn note_blob_answered(hash: &str) {
+    blob_answer_log()
+        .lock()
+        .unwrap()
+        .insert(hash.to_string(), Instant::now());
+}
+
 /// Read a blob and encode it as base64 for transport.
 pub fn read_blob_base64(
     app_data_dir: &std::path::Path,
@@ -159,6 +238,13 @@ pub fn write_blob_from_base64(
         anyhow::bail!("blob hash mismatch: expected {}, got {}", hash, computed);
     }
     let dest = file_store::blob_path(app_data_dir, hash, ext);
+    // Content-addressed: an existing file with this name already holds these
+    // exact bytes. Duplicate payloads (several peers answering the same
+    // startup rescan, or pre-throttle request storms still in flight) must
+    // not rewrite it.
+    if dest.exists() {
+        return Ok(());
+    }
     std::fs::create_dir_all(file_store::blob_dir(app_data_dir))?;
     std::fs::write(&dest, bytes).with_context(|| format!("write blob {}", dest.display()))?;
     info!(hash = %hash, ext = %ext, "wrote received blob");
@@ -206,6 +292,27 @@ mod tests {
         assert!(refs.contains(&blob_ref(&h2, "jpg")), "jpg ref: {refs:?}");
         assert!(refs.contains(&blob_ref(&h3, "webp")), "webp ref: {refs:?}");
         assert_eq!(refs.len(), 3, "only full sha256 blobs/: paths: {refs:?}");
+    }
+
+    #[test]
+    fn blob_request_throttle_blocks_immediate_repeat() {
+        // The public wrappers use a zero cooldown in test builds (parallel
+        // engine tests share the global state), so exercise the logic via
+        // `on_cooldown` with an explicit window.
+        let peer = format!("throttle-peer-{}", std::process::id());
+        let window = Duration::from_secs(3600);
+        assert!(!on_cooldown(blob_request_log(), &peer, window));
+        note_blob_request_sent(&peer);
+        assert!(on_cooldown(blob_request_log(), &peer, window));
+    }
+
+    #[test]
+    fn blob_answer_throttle_blocks_immediate_repeat() {
+        let hash = format!("throttle-hash-{}", std::process::id());
+        let window = Duration::from_secs(3600);
+        assert!(!on_cooldown(blob_answer_log(), &hash, window));
+        note_blob_answered(&hash);
+        assert!(on_cooldown(blob_answer_log(), &hash, window));
     }
 
     #[tokio::test]

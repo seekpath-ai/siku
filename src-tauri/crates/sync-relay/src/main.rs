@@ -1272,16 +1272,51 @@ async fn api_create_storage_order(
     Ok(axum::Json(order_response(&order, &state)))
 }
 
+/// 用户侧订单列表的响应行（GET /api/storage/orders）。与 db::Order 分离：
+/// payment_info 来自运行时配置（RELAY_PAYMENT_INFO），不入库存储，且只在
+/// 订单仍为 pending 时下发——历史订单不再携带收款信息。
+#[derive(Serialize)]
+struct OrderRow {
+    id: String,
+    user_id: String,
+    plan_id: String,
+    quota_bytes: i64,
+    duration_days: u32,
+    amount_cny: f64,
+    status: db::OrderStatus,
+    created_at: String,
+    paid_at: Option<String>,
+    admin_note: Option<String>,
+    payment_info: String,
+}
+
 async fn api_list_my_storage_orders(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-) -> Result<axum::Json<Vec<db::Order>>, (StatusCode, String)> {
+) -> Result<axum::Json<Vec<OrderRow>>, (StatusCode, String)> {
     let claims = bearer_claims(&state, &headers)?;
     let orders = state
         .db
         .list_orders(None)
         .into_iter()
         .filter(|o| o.user_id == claims.sub)
+        .map(|o| OrderRow {
+            payment_info: if o.status == db::OrderStatus::Pending {
+                state.payment_info.clone()
+            } else {
+                String::new()
+            },
+            id: o.id,
+            user_id: o.user_id,
+            plan_id: o.plan_id,
+            quota_bytes: o.quota_bytes,
+            duration_days: o.duration_days,
+            amount_cny: o.amount_cny,
+            status: o.status,
+            created_at: o.created_at,
+            paid_at: o.paid_at,
+            admin_note: o.admin_note,
+        })
         .collect();
     Ok(axum::Json(orders))
 }
@@ -2050,13 +2085,15 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(second["order_id"], first["order_id"]);
 
-        // The user sees exactly one order.
+        // The user sees exactly one order; a pending order carries the
+        // payment instructions so the client can re-show them at any time.
         let (status, orders) =
             http_json(state.clone(), "GET", "/api/storage/orders", Some(&token), None).await;
         assert_eq!(status, StatusCode::OK);
         let orders = orders.as_array().unwrap();
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0]["id"], first["order_id"]);
+        assert_eq!(orders[0]["payment_info"], "pay to alipay 158xxxx, note order id");
 
         // Applying for a DIFFERENT plan/period cancels the stale pending
         // order and returns a fresh one reflecting the new selection.
@@ -2078,6 +2115,10 @@ mod tests {
         assert_eq!(orders.len(), 2);
         let old = orders.iter().find(|o| o["id"] == first["order_id"]).unwrap();
         assert_eq!(old["status"], "cancelled");
+        // Non-pending orders never expose the payment instructions.
+        assert_eq!(old["payment_info"], "");
+        let current = orders.iter().find(|o| o["id"] == third["order_id"]).unwrap();
+        assert_eq!(current["payment_info"], "pay to alipay 158xxxx, note order id");
 
         // Unknown plan / bad period are rejected.
         let (status, _) = http_json(
@@ -2105,6 +2146,7 @@ mod tests {
         std::env::set_var("JWT_SECRET", "test-secret");
         let mut state = AppState::new();
         state.admin_token = Some("test-admin-token".to_string());
+        state.payment_info = "pay to alipay 158xxxx, note order id".to_string();
         let state = Arc::new(state);
         seed_account(&state);
         let token = state.auth.issue_device_token("user-1", "device-a").unwrap();
@@ -2145,6 +2187,15 @@ mod tests {
         let expiry = chrono::DateTime::parse_from_rfc3339(storage["expires_at"].as_str().unwrap()).unwrap();
         let days = (expiry.timestamp() - chrono::Utc::now().timestamp()) / 86400;
         assert!((29..=30).contains(&days), "expiry should be ~30 days out, got {days}");
+
+        // Once paid, the order no longer exposes payment instructions.
+        let (status, orders) =
+            http_json(state.clone(), "GET", "/api/storage/orders", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let orders = orders.as_array().unwrap();
+        let paid = orders.iter().find(|o| o["id"] == order_id).unwrap();
+        assert_eq!(paid["status"], "paid");
+        assert_eq!(paid["payment_info"], "");
 
         // Re-confirming a paid order is a conflict.
         let (status, _) = http_json(

@@ -484,6 +484,9 @@ pub struct StorageOrder {
     pub paid_at: Option<String>,
     #[serde(default)]
     pub admin_note: Option<String>,
+    /// 收款说明：relay 仅在订单仍为 pending 时返回，其余状态为空。
+    #[serde(default)]
+    pub payment_info: Option<String>,
 }
 
 /// 查询当前账号的云端存储用量与配额。

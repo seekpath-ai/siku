@@ -1407,6 +1407,8 @@ export interface StorageOrder {
   created_at: string;
   paid_at?: string | null;
   admin_note?: string | null;
+  /** 收款说明：仅 pending 订单由 relay 下发，其他状态为空。 */
+  payment_info?: string | null;
 }
 
 export interface StorageOrderCreateResult {

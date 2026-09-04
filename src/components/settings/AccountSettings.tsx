@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Cloud,
   Loader2,
   LogOut,
@@ -104,6 +106,9 @@ export function AccountSettings({ onLoggedIn }: Props) {
   const [orderPeriod, setOrderPeriod] = useState<'month' | 'year'>('year');
   const [ordering, setOrdering] = useState(false);
   const [orderResult, setOrderResult] = useState<StorageOrderCreateResult | null>(null);
+  // 待支付订单的付款方式弹窗 / 历史订单折叠
+  const [paymentOrder, setPaymentOrder] = useState<StorageOrder | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   const httpBase = serverUrl.trim();
 
@@ -204,6 +209,7 @@ export function AccountSettings({ onLoggedIn }: Props) {
       setStorageOrders([]);
       setPlanModalOpen(false);
       setOrderResult(null);
+      setPaymentOrder(null);
       return;
     }
     refreshStorage();
@@ -341,9 +347,13 @@ export function AccountSettings({ onLoggedIn }: Props) {
   const storagePctCls =
     storagePct >= 100 ? 'text-red-400' : storagePct > 90 ? 'text-amber-400' : 'text-text-secondary';
 
-  const recentOrders = [...storageOrders]
-    .sort((a, b) => b.created_at.localeCompare(a.created_at))
-    .slice(0, 5);
+  // 待支付订单单独置顶展示；已完结的订单折叠进「历史订单」。
+  const pendingOrders = storageOrders
+    .filter((o) => o.status === 'pending')
+    .sort((a, b) => b.created_at.localeCompare(a.created_at));
+  const historyOrders = storageOrders
+    .filter((o) => o.status !== 'pending')
+    .sort((a, b) => b.created_at.localeCompare(a.created_at));
 
   const selectedPlan = plans.find((p) => p.id === selectedPlanId) ?? null;
 
@@ -544,27 +554,56 @@ export function AccountSettings({ onLoggedIn }: Props) {
               </div>
             )
           )}
-          {recentOrders.length > 0 && (
+          {pendingOrders.map((o) => (
+            <div
+              key={o.id}
+              className="flex items-center justify-between gap-2 px-3 py-2 bg-amber-500/10 border border-amber-500/40 rounded-lg"
+            >
+              <div className="min-w-0">
+                <div className="text-xs text-text-primary font-medium">
+                  {planNameOf(o.plan_id)} · ¥{o.amount_cny}
+                </div>
+                <div className="text-[10px] text-text-secondary/60">
+                  <span className="font-mono">{o.id.slice(0, 8)}…</span> · {formatDateTime(o.created_at)}
+                </div>
+              </div>
+              <button
+                onClick={() => setPaymentOrder(o)}
+                className="shrink-0 px-2.5 py-1 text-[11px] rounded-md bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 transition-colors"
+              >
+                查看付款方式
+              </button>
+            </div>
+          ))}
+          {historyOrders.length > 0 && (
             <div className="space-y-1.5">
-              {recentOrders.map((o) => {
-                const view = ORDER_STATUS_VIEW[o.status] ?? ORDER_STATUS_VIEW.cancelled;
-                return (
-                  <div
-                    key={o.id}
-                    className="flex items-center justify-between px-3 py-1.5 bg-surface/60 border border-surface-hover rounded-lg"
-                  >
-                    <div className="min-w-0">
-                      <div className="text-xs text-text-primary">
-                        {planNameOf(o.plan_id)} · ¥{o.amount_cny}
+              <button
+                onClick={() => setHistoryOpen((v) => !v)}
+                className="flex items-center gap-1 text-[11px] text-text-secondary hover:text-text-primary transition-colors"
+              >
+                {historyOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                历史订单（{historyOrders.length}）
+              </button>
+              {historyOpen &&
+                historyOrders.map((o) => {
+                  const view = ORDER_STATUS_VIEW[o.status] ?? ORDER_STATUS_VIEW.cancelled;
+                  return (
+                    <div
+                      key={o.id}
+                      className="flex items-center justify-between px-3 py-1.5 bg-surface/60 border border-surface-hover rounded-lg"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-xs text-text-primary">
+                          {planNameOf(o.plan_id)} · ¥{o.amount_cny}
+                        </div>
+                        <div className="text-[10px] text-text-secondary/60">
+                          <span className="font-mono">{o.id.slice(0, 8)}…</span> · {formatDateTime(o.created_at)}
+                        </div>
                       </div>
-                      <div className="text-[10px] text-text-secondary/60 font-mono truncate">
-                        {o.id} · {formatDateTime(o.created_at)}
-                      </div>
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${view.cls}`}>{view.label}</span>
                     </div>
-                    <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${view.cls}`}>{view.label}</span>
-                  </div>
-                );
-              })}
+                  );
+                })}
             </div>
           )}
           {error && <div className="text-xs text-red-400">{error}</div>}
@@ -686,6 +725,49 @@ export function AccountSettings({ onLoggedIn }: Props) {
                 </div>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* 待支付订单的付款方式弹窗（与扩容弹窗同风格条件渲染） */}
+      {paymentOrder && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          onClick={() => setPaymentOrder(null)}
+        >
+          <div
+            className="w-full max-w-md bg-surface border border-surface-hover rounded-xl p-4 space-y-3"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-medium text-text-primary">付款方式</div>
+              <button
+                onClick={() => setPaymentOrder(null)}
+                className="text-text-secondary hover:text-text-primary transition-colors"
+              >
+                <X size={14} />
+              </button>
+            </div>
+            <div className="px-3 py-2 border border-surface-hover rounded-lg space-y-1.5">
+              <div className="text-xs text-text-secondary">
+                订单号：<span className="font-mono text-text-primary break-all select-all">{paymentOrder.id}</span>
+              </div>
+              <div className="text-xs text-text-secondary">
+                金额：<span className="text-text-primary">¥{paymentOrder.amount_cny}</span>
+              </div>
+              <div className="text-xs text-text-primary whitespace-pre-wrap">
+                {paymentOrder.payment_info || '（收款信息未配置，请联系管理员）'}
+              </div>
+            </div>
+            <div className="text-[11px] text-amber-400">
+              转账时请备注订单号，管理员确认收款后将自动开通对应套餐。
+            </div>
+            <button
+              onClick={() => setPaymentOrder(null)}
+              className="w-full px-4 py-2 bg-primary text-white text-sm rounded-lg hover:opacity-90 transition-opacity"
+            >
+              完成
+            </button>
           </div>
         </div>
       )}

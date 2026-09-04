@@ -19,6 +19,14 @@ pub struct User {
     /// they can decrypt mailbox messages without a separate pairing step.
     pub sync_key: String,
     pub created_at: String,
+    /// Custom storage quota in bytes. While `quota_expires_at` is in the
+    /// future (or None = admin-granted permanent quota) this overrides the
+    /// relay default; otherwise the default applies.
+    #[serde(default)]
+    pub storage_quota_bytes: Option<i64>,
+    /// RFC3339 expiry for `storage_quota_bytes`; None = never expires.
+    #[serde(default)]
+    pub quota_expires_at: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -35,11 +43,38 @@ pub struct Device {
     pub refresh_token: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderStatus {
+    Pending,
+    Paid,
+    Rejected,
+    Cancelled,
+}
+
+/// A storage upgrade order: the user applies for a plan, pays out-of-band,
+/// and an admin confirms payment via the admin API.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Order {
+    pub id: String,
+    pub user_id: String,
+    pub plan_id: String,
+    pub quota_bytes: i64,
+    pub duration_days: u32,
+    pub amount_cny: f64,
+    pub status: OrderStatus,
+    pub created_at: String,
+    pub paid_at: Option<String>,
+    pub admin_note: Option<String>,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Snapshot {
     users: HashMap<String, User>,
     devices: HashMap<String, Device>,
     email_to_user: HashMap<String, String>,
+    #[serde(default)]
+    orders: HashMap<String, Order>,
 }
 
 pub struct Db {
@@ -90,6 +125,8 @@ impl Db {
                 password_hash: password_hash.to_string(),
                 sync_key: sync_key.to_string(),
                 created_at: crate::now_iso(),
+                storage_quota_bytes: None,
+                quota_expires_at: None,
             },
         );
         snap.email_to_user.insert(email.to_string(), id.to_string());
@@ -247,6 +284,97 @@ impl Db {
         if let Some(dev) = snap.devices.get_mut(device_id) {
             dev.last_seen_at = Some(crate::now_iso());
         }
+    }
+
+    pub fn list_users(&self) -> Vec<User> {
+        let snap = self.inner.lock().unwrap();
+        let mut list: Vec<User> = snap.users.values().cloned().collect();
+        list.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        list
+    }
+
+    /// The user's custom quota and its expiry (both None when never set).
+    pub fn get_user_quota(&self, user_id: &str) -> Option<(Option<i64>, Option<String>)> {
+        let snap = self.inner.lock().unwrap();
+        snap.users
+            .get(user_id)
+            .map(|u| (u.storage_quota_bytes, u.quota_expires_at.clone()))
+    }
+
+    pub fn set_user_quota(
+        &self,
+        user_id: &str,
+        quota_bytes: Option<i64>,
+        expires_at: Option<String>,
+    ) -> anyhow::Result<()> {
+        let mut snap = self.inner.lock().unwrap();
+        let Some(user) = snap.users.get_mut(user_id) else {
+            anyhow::bail!("user not found");
+        };
+        user.storage_quota_bytes = quota_bytes;
+        user.quota_expires_at = expires_at;
+        self.persist(&snap);
+        Ok(())
+    }
+
+    pub fn create_order(&self, order: Order) -> anyhow::Result<()> {
+        let mut snap = self.inner.lock().unwrap();
+        if !snap.users.contains_key(&order.user_id) {
+            anyhow::bail!("user not found");
+        }
+        snap.orders.insert(order.id.clone(), order);
+        self.persist(&snap);
+        Ok(())
+    }
+
+    pub fn get_order(&self, id: &str) -> Option<Order> {
+        self.inner.lock().unwrap().orders.get(id).cloned()
+    }
+
+    pub fn list_orders(&self, status: Option<OrderStatus>) -> Vec<Order> {
+        let snap = self.inner.lock().unwrap();
+        let mut list: Vec<Order> = snap
+            .orders
+            .values()
+            .filter(|o| status.is_none() || Some(o.status) == status)
+            .cloned()
+            .collect();
+        list.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        list
+    }
+
+    /// A user's pending upgrade order, if any — order creation is idempotent:
+    /// a second application returns the existing pending order instead of
+    /// piling up duplicates for the admin to review.
+    pub fn pending_order_for_user(&self, user_id: &str) -> Option<Order> {
+        let snap = self.inner.lock().unwrap();
+        snap.orders
+            .values()
+            .find(|o| o.user_id == user_id && o.status == OrderStatus::Pending)
+            .cloned()
+    }
+
+    pub fn update_order_status(
+        &self,
+        id: &str,
+        status: OrderStatus,
+        paid_at: Option<String>,
+        admin_note: Option<String>,
+    ) -> anyhow::Result<Order> {
+        let mut snap = self.inner.lock().unwrap();
+        let Some(order) = snap.orders.get_mut(id) else {
+            anyhow::bail!("order not found");
+        };
+        order.status = status;
+        if paid_at.is_some() {
+            order.paid_at = paid_at;
+        }
+        if admin_note.is_some() {
+            order.admin_note = admin_note;
+        }
+        let order = order.clone();
+        self.persist(&snap);
+        Ok(order)
     }
 }
 

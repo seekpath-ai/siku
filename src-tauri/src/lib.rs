@@ -873,6 +873,10 @@ pub fn run() {
             commands::account::device_remove,
             commands::account::device_rename,
             commands::account::suggest_device_name,
+            commands::account::storage_status,
+            commands::account::storage_plans,
+            commands::account::storage_order_create,
+            commands::account::storage_order_list,
             // Sync
             commands::sync::start_auto_sync,
             commands::sync::get_local_ip,

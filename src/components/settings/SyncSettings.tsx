@@ -294,6 +294,13 @@ export function SyncSettings() {
         cls: 'text-primary',
       };
     }
+    if (syncStatus.last_error?.includes('quota_exceeded')) {
+      return {
+        icon: <AlertCircle size={14} className="text-amber-400" />,
+        text: '云端存储已满，新更改暂存本地，扩容后自动恢复',
+        cls: 'text-amber-400',
+      };
+    }
     if (syncStatus.last_error) {
       return {
         icon: <AlertCircle size={14} className="text-red-400" />,

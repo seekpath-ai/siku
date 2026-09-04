@@ -1,5 +1,17 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Loader2, LogOut, RefreshCw, Smartphone, Trash2, User, KeyRound } from 'lucide-react';
+import {
+  CheckCircle2,
+  Cloud,
+  Loader2,
+  LogOut,
+  RefreshCw,
+  Smartphone,
+  Trash2,
+  User,
+  KeyRound,
+  X,
+  Zap,
+} from 'lucide-react';
 import {
   authLogin,
   authLogout,
@@ -8,11 +20,43 @@ import {
   deviceList,
   deviceRename,
   deviceRemove,
+  storageOrderCreate,
+  storageOrderList,
+  storagePlans,
+  storageStatus,
   suggestDeviceName,
   type AccountDeviceRow,
   type AuthInfo,
+  type StorageOrder,
+  type StorageOrderCreateResult,
+  type StoragePlan,
+  type StorageStatus,
 } from '@/lib/tauri';
 import { useDialog } from '@/hooks/useDialog';
+
+/** 用量字节数转人类可读单位（GB/MB/KB）。 */
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
+  if (bytes >= 1 << 30) return `${(bytes / (1 << 30)).toFixed(1)} GB`;
+  if (bytes >= 1 << 20) return `${(bytes / (1 << 20)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+/** RFC3339 时间转本地日期时间；解析失败时原样返回。 */
+function formatDateTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+const ORDER_STATUS_VIEW: Record<StorageOrder['status'], { label: string; cls: string }> = {
+  pending: { label: '审核中', cls: 'bg-amber-500/15 text-amber-400' },
+  paid: { label: '已开通', cls: 'bg-emerald-500/15 text-emerald-400' },
+  rejected: { label: '已拒绝', cls: 'bg-red-500/15 text-red-400' },
+  cancelled: { label: '已取消', cls: 'bg-surface-hover text-text-secondary/50' },
+};
 
 const SERVER_URL_KEY = 'siku.sync.serverUrl';
 const LEGACY_HOST_KEY = 'siku.sync.serverHost';
@@ -48,6 +92,18 @@ export function AccountSettings({ onLoggedIn }: Props) {
   const [error, setError] = useState('');
   const [devices, setDevices] = useState<AccountDeviceRow[]>([]);
   const [loadingDevices, setLoadingDevices] = useState(false);
+
+  // 云端存储（配额 / 套餐 / 扩容订单）
+  const [storage, setStorage] = useState<StorageStatus | null>(null);
+  const [storageOrders, setStorageOrders] = useState<StorageOrder[]>([]);
+  const [loadingStorage, setLoadingStorage] = useState(false);
+  const [planModalOpen, setPlanModalOpen] = useState(false);
+  const [plans, setPlans] = useState<StoragePlan[]>([]);
+  const [loadingPlans, setLoadingPlans] = useState(false);
+  const [selectedPlanId, setSelectedPlanId] = useState('');
+  const [orderPeriod, setOrderPeriod] = useState<'month' | 'year'>('year');
+  const [ordering, setOrdering] = useState(false);
+  const [orderResult, setOrderResult] = useState<StorageOrderCreateResult | null>(null);
 
   const httpBase = serverUrl.trim();
 
@@ -113,6 +169,76 @@ export function AccountSettings({ onLoggedIn }: Props) {
     const id = window.setInterval(() => refreshDevices(false), 5000);
     return () => window.clearInterval(id);
   }, [auth, refreshDevices]);
+
+  const refreshStorage = useCallback(
+    async (showLoading = true) => {
+      if (!auth?.access_token) return;
+      if (showLoading) setLoadingStorage(true);
+      try {
+        const [status, orders] = await Promise.all([
+          storageStatus(httpBase),
+          storageOrderList(httpBase),
+        ]);
+        setStorage(status);
+        setStorageOrders(orders);
+      } catch (e) {
+        if (isAuthError(e)) {
+          await authLogout().catch(() => {});
+          setAuth(null);
+          setDevices([]);
+          setError('登录已过期，请重新登录');
+        } else {
+          setError(`加载云端存储信息失败: ${e}`);
+        }
+      } finally {
+        if (showLoading) setLoadingStorage(false);
+      }
+    },
+    [auth, httpBase]
+  );
+
+  // 进入设置页 / 登录状态变化时加载云端存储用量与订单；退出登录后清空
+  useEffect(() => {
+    if (!auth?.access_token) {
+      setStorage(null);
+      setStorageOrders([]);
+      setPlanModalOpen(false);
+      setOrderResult(null);
+      return;
+    }
+    refreshStorage();
+  }, [auth, refreshStorage]);
+
+  const openPlanModal = async () => {
+    setPlanModalOpen(true);
+    setOrderResult(null);
+    setSelectedPlanId('');
+    setLoadingPlans(true);
+    try {
+      const list = await storagePlans(httpBase);
+      // 只展示付费套餐（free 免费档不参与扩容选择）
+      setPlans(list.filter((p) => p.id !== 'free'));
+    } catch (e) {
+      setError(`加载套餐失败: ${e}`);
+      setPlanModalOpen(false);
+    } finally {
+      setLoadingPlans(false);
+    }
+  };
+
+  const handleCreateOrder = async () => {
+    if (!selectedPlanId) return;
+    setOrdering(true);
+    try {
+      const result = await storageOrderCreate(httpBase, selectedPlanId, orderPeriod);
+      setOrderResult(result);
+      await refreshStorage(false);
+    } catch (e) {
+      setError(`提交扩容申请失败: ${e}`);
+    } finally {
+      setOrdering(false);
+    }
+  };
 
   const handleLogin = async () => {
     setBusy(true);
@@ -199,6 +325,27 @@ export function AccountSettings({ onLoggedIn }: Props) {
       setBusy(false);
     }
   };
+
+  // 套餐显示名：优先用已加载的套餐表，未加载时回退到 plan_id
+  const planNameOf = (planId: string | null | undefined) => {
+    if (!planId || planId === 'free') return '免费版';
+    return plans.find((p) => p.id === planId)?.name ?? planId;
+  };
+
+  const storagePct =
+    storage && storage.quota_bytes > 0
+      ? Math.min(100, Math.round((storage.used_bytes / storage.quota_bytes) * 100))
+      : 0;
+  // 使用率 >90% 黄色预警，已满红色
+  const storageBarCls = storagePct >= 100 ? 'bg-red-500' : storagePct > 90 ? 'bg-amber-400' : 'bg-primary';
+  const storagePctCls =
+    storagePct >= 100 ? 'text-red-400' : storagePct > 90 ? 'text-amber-400' : 'text-text-secondary';
+
+  const recentOrders = [...storageOrders]
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))
+    .slice(0, 5);
+
+  const selectedPlan = plans.find((p) => p.id === selectedPlanId) ?? null;
 
   return (
     <div className="space-y-3">
@@ -348,7 +495,198 @@ export function AccountSettings({ onLoggedIn }: Props) {
               </div>
             )}
           </div>
+
+          {/* 云端存储 */}
+          <div className="flex items-center justify-between pt-1">
+            <div className="text-xs font-medium text-text-secondary">云端存储</div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => refreshStorage()}
+                disabled={loadingStorage}
+                title="刷新用量与订单"
+                className="flex items-center gap-1 text-[10px] text-text-secondary hover:text-primary disabled:opacity-30 transition-colors"
+              >
+                {loadingStorage ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />} 刷新
+              </button>
+              <button
+                onClick={openPlanModal}
+                className="flex items-center gap-1 text-[10px] text-text-secondary hover:text-primary transition-colors"
+              >
+                <Zap size={11} /> 扩容
+              </button>
+            </div>
+          </div>
+          {storage ? (
+            <div className="px-3 py-2 bg-surface border border-surface-hover rounded-lg space-y-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="flex items-center gap-1.5 text-text-primary">
+                  <Cloud size={12} className="text-primary" />
+                  已用 {formatBytes(storage.used_bytes)} / {formatBytes(storage.quota_bytes)}
+                </span>
+                <span className={storagePctCls}>{storagePct}%</span>
+              </div>
+              <div className="h-1.5 rounded-full bg-surface-hover overflow-hidden">
+                <div className={`h-full rounded-full ${storageBarCls}`} style={{ width: `${storagePct}%` }} />
+              </div>
+              <div className="text-[11px] text-text-secondary/60">
+                当前套餐：{planNameOf(storage.plan_id)}
+                {storage.expires_at
+                  ? ` · ${formatDateTime(storage.expires_at)} 到期`
+                  : storage.plan_id && storage.plan_id !== 'free'
+                    ? ' · 永久'
+                    : ''}
+              </div>
+            </div>
+          ) : (
+            loadingStorage && (
+              <div className="flex items-center gap-2 text-xs text-text-secondary/60">
+                <Loader2 size={12} className="animate-spin" /> 加载中…
+              </div>
+            )
+          )}
+          {recentOrders.length > 0 && (
+            <div className="space-y-1.5">
+              {recentOrders.map((o) => {
+                const view = ORDER_STATUS_VIEW[o.status] ?? ORDER_STATUS_VIEW.cancelled;
+                return (
+                  <div
+                    key={o.id}
+                    className="flex items-center justify-between px-3 py-1.5 bg-surface/60 border border-surface-hover rounded-lg"
+                  >
+                    <div className="min-w-0">
+                      <div className="text-xs text-text-primary">
+                        {planNameOf(o.plan_id)} · ¥{o.amount_cny}
+                      </div>
+                      <div className="text-[10px] text-text-secondary/60 font-mono truncate">
+                        {o.id} · {formatDateTime(o.created_at)}
+                      </div>
+                    </div>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${view.cls}`}>{view.label}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
           {error && <div className="text-xs text-red-400">{error}</div>}
+        </div>
+      )}
+
+      {/* 扩容套餐选择弹窗（项目无通用卡片弹窗组件，按本文件风格条件渲染） */}
+      {planModalOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          onClick={() => !ordering && setPlanModalOpen(false)}
+        >
+          <div
+            className="w-full max-w-md max-h-[85vh] overflow-y-auto bg-surface border border-surface-hover rounded-xl p-4 space-y-3"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-medium text-text-primary">扩容云端存储</div>
+              <button
+                onClick={() => setPlanModalOpen(false)}
+                disabled={ordering}
+                className="text-text-secondary hover:text-text-primary disabled:opacity-30 transition-colors"
+              >
+                <X size={14} />
+              </button>
+            </div>
+
+            {orderResult ? (
+              <div className="space-y-3">
+                <div className="flex items-center gap-2 text-sm text-emerald-400">
+                  <CheckCircle2 size={14} /> 申请已提交，等待管理员确认收款
+                </div>
+                <div className="px-3 py-2 border border-surface-hover rounded-lg space-y-1.5">
+                  <div className="text-xs text-text-secondary">
+                    订单号：<span className="font-mono text-text-primary break-all">{orderResult.order_id}</span>
+                  </div>
+                  <div className="text-xs text-text-secondary">
+                    金额：<span className="text-text-primary">¥{orderResult.amount_cny}</span>
+                  </div>
+                  <div className="text-xs text-text-primary whitespace-pre-wrap">{orderResult.payment_info}</div>
+                </div>
+                <div className="text-[11px] text-amber-400">
+                  转账时请备注订单号，管理员确认收款后将自动开通对应套餐。
+                </div>
+                <button
+                  onClick={() => setPlanModalOpen(false)}
+                  className="w-full px-4 py-2 bg-primary text-white text-sm rounded-lg hover:opacity-90 transition-opacity"
+                >
+                  完成
+                </button>
+              </div>
+            ) : (
+              <>
+                {loadingPlans ? (
+                  <div className="flex items-center gap-2 text-xs text-text-secondary/60">
+                    <Loader2 size={12} className="animate-spin" /> 加载套餐…
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {plans.map((p) => {
+                      const selected = p.id === selectedPlanId;
+                      return (
+                        <button
+                          key={p.id}
+                          onClick={() => setSelectedPlanId(p.id)}
+                          className={`w-full flex items-center justify-between px-3 py-2.5 border rounded-lg text-left transition-colors ${
+                            selected
+                              ? 'border-primary bg-primary/10'
+                              : 'border-surface-hover hover:border-primary/50'
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <div className="text-sm text-text-primary font-medium">{p.name}</div>
+                            <div className="text-[11px] text-text-secondary/60">{formatBytes(p.quota_bytes)}</div>
+                          </div>
+                          <div className="text-right shrink-0">
+                            <div className="text-xs text-text-primary">¥{p.monthly_cny}/月</div>
+                            <div className="text-[11px] text-text-secondary/60">¥{p.yearly_cny}/年</div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                    {plans.length === 0 && (
+                      <div className="text-xs text-text-secondary/60">暂无可选套餐</div>
+                    )}
+                  </div>
+                )}
+
+                <div className="flex gap-1 p-1 border border-surface-hover rounded-lg">
+                  {(['month', 'year'] as const).map((per) => (
+                    <button
+                      key={per}
+                      onClick={() => setOrderPeriod(per)}
+                      className={`flex-1 py-1.5 text-xs rounded-md transition-colors ${
+                        orderPeriod === per
+                          ? 'bg-primary/20 text-primary font-medium'
+                          : 'text-text-secondary hover:bg-surface-hover'
+                      }`}
+                    >
+                      {per === 'month' ? '月付' : '年付（约 8.3 折）'}
+                    </button>
+                  ))}
+                </div>
+
+                <button
+                  onClick={handleCreateOrder}
+                  disabled={!selectedPlan || ordering}
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-primary text-white text-sm rounded-lg hover:opacity-90 disabled:opacity-50 transition-opacity"
+                >
+                  {ordering ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
+                  {selectedPlan
+                    ? `提交申请（¥${orderPeriod === 'month' ? selectedPlan.monthly_cny : selectedPlan.yearly_cny}/${
+                        orderPeriod === 'month' ? '月' : '年'
+                      }）`
+                    : '请选择套餐'}
+                </button>
+                <div className="text-[11px] text-text-secondary/60">
+                  提交后按展示的收款信息线下转账，转账时请备注订单号。
+                </div>
+              </>
+            )}
+          </div>
         </div>
       )}
     </div>

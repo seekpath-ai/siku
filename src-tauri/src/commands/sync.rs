@@ -1339,10 +1339,13 @@ pub async fn get_sync_status(
     state: State<'_, SyncState>,
     kind: Option<String>,
 ) -> Result<crate::sync::engine::SyncStatus, String> {
-    Ok(match engine_by_kind(&state, kind.as_deref()).await {
+    let mut status = match engine_by_kind(&state, kind.as_deref()).await {
         Some(engine) => engine.status().await,
         None => crate::sync::engine::SyncStatus::default(),
-    })
+    };
+    // 「云端存储已满」是账号级状态，与是否有活跃会话无关，始终并入。
+    status.quota_exceeded = crate::sync::engine::quota_exceeded();
+    Ok(status)
 }
 
 /// Disconnect the LAN-local sync session only: stop the LAN host loop and the

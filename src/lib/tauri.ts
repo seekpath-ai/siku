@@ -1374,6 +1374,67 @@ export async function deviceRename(relayUrl: string, deviceId: string, name: str
   return invoke<void>('device_rename', { relayUrl, deviceId, name });
 }
 
+// ============================================================
+// Cloud storage quota & subscription plans
+// ============================================================
+
+export interface StorageStatus {
+  used_bytes: number;
+  quota_bytes: number;
+  plan_id: string | null;
+  /** RFC3339 到期时间；null = 永久（管理员直调配额） */
+  expires_at: string | null;
+}
+
+export interface StoragePlan {
+  id: string;
+  name: string;
+  quota_bytes: number;
+  monthly_cny: number;
+  yearly_cny: number;
+}
+
+export type StorageOrderStatus = 'pending' | 'paid' | 'rejected' | 'cancelled';
+
+export interface StorageOrder {
+  id: string;
+  user_id?: string;
+  plan_id: string;
+  quota_bytes?: number;
+  duration_days?: number;
+  amount_cny: number;
+  status: StorageOrderStatus;
+  created_at: string;
+  paid_at?: string | null;
+  admin_note?: string | null;
+}
+
+export interface StorageOrderCreateResult {
+  order_id: string;
+  amount_cny: number;
+  payment_info: string;
+}
+
+export async function storageStatus(relayUrl: string): Promise<StorageStatus> {
+  return invoke<StorageStatus>('storage_status', { relayUrl });
+}
+
+export async function storagePlans(relayUrl: string): Promise<StoragePlan[]> {
+  return invoke<StoragePlan[]>('storage_plans', { relayUrl });
+}
+
+export async function storageOrderCreate(
+  relayUrl: string,
+  planId: string,
+  period: 'month' | 'year'
+): Promise<StorageOrderCreateResult> {
+  return invoke<StorageOrderCreateResult>('storage_order_create', { relayUrl, planId, period });
+}
+
+export async function storageOrderList(relayUrl: string): Promise<StorageOrder[]> {
+  return invoke<StorageOrder[]>('storage_order_list', { relayUrl });
+}
+
 export async function setSyncConfig(config: SyncConfig): Promise<void> {
   return invoke<void>('set_sync_config', { config });
 }

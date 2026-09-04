@@ -41,10 +41,30 @@ pub struct SyncStatus {
     /// tab and vice versa.
     #[serde(default)]
     pub kind: Option<String>,
+    /// 云端存储（mailbox）配额已满：relay 以 quota_exceeded 拒收新写入，
+    /// 本地更改暂存 outbox 不丢数据，扩容后重试自动恢复。进程级账号状态，
+    /// 由 `get_sync_status` 并入（见 `quota_exceeded()`）。
+    #[serde(default)]
+    pub quota_exceeded: bool,
 }
 
 fn default_transport() -> String {
     "none".to_string()
+}
+
+/// 进程级「云端存储已满」标记：任一 mailbox deposit 被 relay 以
+/// quota_exceeded 拒绝时置位，任一 deposit 被确认存储（说明已扩容或用量
+/// 回落）时清除。账号级状态，且 auto-sync proxy 的邮箱投递路径没有 engine
+/// 实例，因此放在 engine 之外的全局位置。
+static QUOTA_EXCEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 当前是否处于「云端存储已满」状态（见 QUOTA_EXCEEDED）。
+pub fn quota_exceeded() -> bool {
+    QUOTA_EXCEEDED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_quota_exceeded(exceeded: bool) {
+    QUOTA_EXCEEDED.store(exceeded, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Wire message envelope exchanged over the sync DataChannel.
@@ -588,10 +608,19 @@ impl SyncEngine {
                 self.mark_synced().await;
                 info!(to = %to_device_id, to_db_version = v, "changeset deposited to mailbox (acked)");
                 self.set_transport("mailbox").await;
+                // deposit 被确认存储，说明配额已恢复（扩容或用量回落）。
+                set_quota_exceeded(false);
             }
             Err(e) => {
                 // Unconfirmed deposit: do NOT advance the cursor — queue the
                 // changeset so it is retried instead of lost.
+                if e.is_quota_exceeded() {
+                    // 云端存储已满：写入同步状态供前端提示（错误文本含
+                    // quota_exceeded 关键字）；消息已入 outbox，扩容后的
+                    // flush 会自动恢复。
+                    set_quota_exceeded(true);
+                    self.set_last_error(Some(e.to_string())).await;
+                }
                 warn!(error = %e, "mailbox deposit unacknowledged; writing to outbox");
                 self.write_outbox(to_device_id, &ciphertext, &nonce, &message_id).await?;
                 self.refresh_outbox_count().await;
@@ -1136,6 +1165,17 @@ pub async fn flush_outbox_with(
                 any_acked = true;
                 info!(id = %id, to = %to_device_id, "outbox message delivered (acked)");
             }
+            Err(e @ crate::sync::relay_client::AckError::Rejected(_))
+                if e.is_quota_exceeded() =>
+            {
+                // 云端存储已满：保留该行但不计 retry_count —— 这不是 poison
+                // 消息，计入次数会在 50 次后被 prune_outbox 丢弃（丢数据）。
+                // 账号级配额对后续所有行同样生效，直接停止本轮 flush；消息
+                // 留在 outbox，扩容后下一次 flush 自动恢复。
+                set_quota_exceeded(true);
+                warn!(id = %id, "outbox deposit rejected: quota exceeded; will retry after upgrade");
+                break;
+            }
             Err(crate::sync::relay_client::AckError::Rejected(e)) => {
                 // Explicitly rejected (e.g. per-device target not in the room):
                 // keep the row for a later retry — the peer may join later.
@@ -1163,6 +1203,10 @@ pub async fn flush_outbox_with(
         flush_backoff_reset();
     } else {
         flush_backoff_record_failure();
+    }
+    if any_acked {
+        // 有 deposit 被确认存储，说明配额已恢复（扩容或用量回落）。
+        set_quota_exceeded(false);
     }
     Ok(())
 }
@@ -1226,9 +1270,16 @@ pub async fn deliver_changes_mailbox(
             )
             .await;
             info!(to = %to_device_id, to_db_version = delivered_to, "changeset deposited to mailbox (offline, acked)");
+            // deposit 被确认存储，说明配额已恢复（扩容或用量回落）。
+            set_quota_exceeded(false);
             Ok(delivered_to)
         }
         Err(e) => {
+            if e.is_quota_exceeded() {
+                // 云端存储已满：标记同步状态（无 engine 实例时也生效）；
+                // changeset 照常入 outbox，扩容后 flush 自动恢复。
+                set_quota_exceeded(true);
+            }
             warn!(to = %to_device_id, error = %e, "mailbox deposit unacknowledged; queuing to outbox");
             write_outbox_row(db, to_device_id, &ciphertext, &nonce, &message_id).await?;
             Ok(since)

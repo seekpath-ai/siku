@@ -75,6 +75,18 @@ impl std::fmt::Display for AckError {
     }
 }
 
+impl AckError {
+    /// 配额拒收：relay 因账号 mailbox 存储已满（quota_exceeded）拒绝了这次
+    /// deposit。这不是传输故障——消息不是 poison，不应计入重试次数，扩容
+    /// 或用量回落后重试即可恢复。
+    pub fn is_quota_exceeded(&self) -> bool {
+        match self {
+            AckError::Rejected(e) | AckError::SendFailed(e) => e.contains("quota_exceeded"),
+            AckError::TimedOut => false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RelayClient {
     tx: mpsc::UnboundedSender<RelayClientMsg>,

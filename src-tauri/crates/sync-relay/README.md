@@ -19,11 +19,13 @@ Siku 多端同步的官方中继服务。职责三块：**WebRTC 信令转发**�
 - 通用加密转发 `relay`（密文透传，不落盘）
 - **加密邮箱（离线投递，SQLite 持久化）**：`mailbox_deposit` / `mailbox_poll` / `mailbox_ack`
   - per-device 队列（上限 500 条）+ 账号级 archive（上限 2000 条，空 `to_device_id` 即投递到账号级，未来设备也能拉到）
-  - 只存密文，TTL 默认 7 天，FIFO 超限丢最旧；重启不丢消息
+  - 只存密文，TTL 默认 7 天；重启不丢消息
+  - **账号存储配额**：按账号统计 mailbox 占用（密文+nonce 字节），超出生效配额时拒收新 deposit（`quota_exceeded`），客户端消息留在本地 outbox 重试，不丢数据；幂等重投（同 message_id）不受配额限制
   - 投递确认：每个 `mailbox_deposit` 落库后回 `mailbox_deposit_ack`（含拒绝，携带客户端 `message_id`；同 id 重投为幂等 no-op）
   - per-device 消息：poll 只标记 `delivered_at` 不删除，**ack 才删**；60 秒未 ack 自动重投（客户端按游标/幂等键去重）
 - 心跳保活：服务端按间隔发 `ping`，超过接收超时未收到任何消息即断开
 - 健康检查：`/healthz`
+- **存储配额与付费扩容**：默认每账号 1GB；套餐订阅（`GET /api/plans`）、用户下单申请（`POST /api/storage/orders`）、管理员审核开通（`/api/admin/*`，Bearer `RELAY_ADMIN_TOKEN`）；到期未续费自动回落默认配额（存量数据不删，只拒新写入）
 
 ## 快速启动
 
@@ -223,6 +225,9 @@ sudo systemctl enable --now siku-sync-relay
 | `RELAY_MAILBOX_DB_PATH` | `<RELAY_DB_PATH>.mailbox.sqlite` | 邮箱持久化路径（SQLite）。`RELAY_DB_PATH=:memory:` 时默认同为 `:memory:` |
 | `HEARTBEAT_INTERVAL_SECONDS` | `30` | 服务端发送 Ping 的间隔 |
 | `HEARTBEAT_TIMEOUT_SECONDS` | `60` | 多久没收到任何消息就断开（`docker-compose.yml` 显式覆盖为 `120`） |
+| `RELAY_DEFAULT_QUOTA_BYTES` | `1073741824`（1GiB） | 账号默认存储配额（无有效订阅时生效） |
+| `RELAY_ADMIN_TOKEN` | 未设置 | 管理接口（`/api/admin/*`）的 Bearer 令牌；未设置时管理接口一律 404 |
+| `RELAY_PAYMENT_INFO` | 空 | 收款说明文本（如「支付宝 158xxxx，转账备注订单号」），创建扩容订单时随响应返回给客户端展示 |
 | `RUST_LOG` | `info` | 日志级别 |
 
 ## 账户与 Token
@@ -268,6 +273,69 @@ const token = jwt.sign(
   { algorithm: 'HS256', expiresIn: '1h' }
 );
 console.log(token);
+```
+
+## 存储配额与付费扩容
+
+每个账号的 mailbox 存储（账号级 archive + 各设备队列，按密文字节计）受配额限制。生效配额每次使用时现算：
+
+```
+用户有未过期订阅配额 → 用订阅配额（quota_expires_at 为 NULL 表示永久）
+否则 → RELAY_DEFAULT_QUOTA_BYTES（默认 1GiB）
+```
+
+超限后 `mailbox_deposit` 被拒（ack 中 `ok=false, error="quota_exceeded"`），客户端消息留在本地 outbox 持续重试；同 message_id 的幂等重投不受配额限制。到期/缩容不会删除存量数据，只拒新写入。
+
+### 套餐
+
+| 套餐 | 配额 | 月付（30 天） | 年付（365 天） |
+|---|---|---|---|
+| free | 1GB | ¥0 | ¥0 |
+| plus | 10GB | ¥6 | ¥60 |
+| pro | 50GB | ¥15 | ¥150 |
+| max | 200GB | ¥30 | ¥300 |
+
+### 用户侧 API（Bearer 用户 JWT）
+
+```bash
+# 套餐表
+curl http://127.0.0.1:8080/api/plans -H "Authorization: Bearer $TOKEN"
+
+# 当前用量/配额/套餐/到期时间
+curl http://127.0.0.1:8080/api/storage -H "Authorization: Bearer $TOKEN"
+# → {"used_bytes":123,"quota_bytes":1073741824,"plan_id":"free","expires_at":null}
+
+# 创建扩容订单（幂等：已有 pending 订单时返回既有订单）
+curl -X POST http://127.0.0.1:8080/api/storage/orders \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"plan_id":"plus","period":"year"}'
+# → {"order_id":"...","amount_cny":60.0,"payment_info":"<RELAY_PAYMENT_INFO>",...}
+
+# 我的订单列表
+curl http://127.0.0.1:8080/api/storage/orders -H "Authorization: Bearer $TOKEN"
+```
+
+### 管理侧 API（Bearer `RELAY_ADMIN_TOKEN`）
+
+收费流程为「申请 + 人工确认」：用户下单后按 `payment_info` 线下转账（备注订单号），管理员核实收款后 confirm 开通；若用户现有订阅未到期，到期时间顺延累加。
+
+```bash
+ADMIN=<RELAY_ADMIN_TOKEN>
+# 所有用户的用量/配额
+curl http://127.0.0.1:8080/api/admin/users -H "Authorization: Bearer $ADMIN"
+
+# 待审核订单
+curl "http://127.0.0.1:8080/api/admin/orders?status=pending" -H "Authorization: Bearer $ADMIN"
+
+# 确认收款并开通 / 拒绝
+curl -X POST http://127.0.0.1:8080/api/admin/orders/<order_id>/confirm -H "Authorization: Bearer $ADMIN"
+curl -X POST http://127.0.0.1:8080/api/admin/orders/<order_id>/reject \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{"note":"未收到款项"}'
+
+# 直接调整某用户配额（赠送/测试用；expires_at 可省略 = 永久）
+curl -X PUT http://127.0.0.1:8080/api/admin/users/<user_id>/quota \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"quota_bytes":10737418240,"expires_at":"2027-01-01T00:00:00Z"}'
 ```
 
 ## 测试 WebSocket 连接

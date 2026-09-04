@@ -25,13 +25,6 @@ pub const DEFAULT_TTL_SECONDS: u64 = 7 * 24 * 3600; // 7 days
 const MAX_MESSAGES_PER_DEVICE: usize = 500;
 const MAX_ACCOUNT_MESSAGES: usize = 2000;
 
-/// Byte quota for the account-level archive (summed `length(ciphertext)` per
-/// room). Full-snapshot sync messages run to ~10MB each, so the 2000-row cap
-/// alone allowed hundreds of MB to accumulate — more than a single WebSocket
-/// frame can ever deliver. Oldest rows are evicted first; eviction is logged
-/// because a dropped row may never have been seen by some device.
-pub const ACCOUNT_ARCHIVE_MAX_BYTES: usize = 100 * 1024 * 1024;
-
 /// Per-device messages are re-delivered when a poll's delivery was never
 /// acked within this window (the relay or client may have died between poll
 /// and the client's apply + ack). Redelivery is safe: clients dedupe by
@@ -201,65 +194,18 @@ impl Mailbox {
         );
     }
 
-    /// Enforce the account archive byte quota: while the summed ciphertext
-    /// length exceeds `max_bytes`, delete rows oldest-first. Evictions are
-    /// logged — an evicted row may be a message some device never saw.
-    fn enforce_account_archive_quota(
-        conn: &mut rusqlite::Connection,
-        room_id: &str,
-        max_bytes: usize,
-    ) -> Result<(), String> {
-        let total: i64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(LENGTH(ciphertext)), 0) FROM mailbox_messages
-                 WHERE room_id = ?1 AND to_device_id = ''",
-                rusqlite::params![room_id],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        if total <= max_bytes as i64 {
-            return Ok(());
-        }
-        let rows: Vec<(i64, i64)> = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT seq, LENGTH(ciphertext) FROM mailbox_messages
-                     WHERE room_id = ?1 AND to_device_id = '' ORDER BY seq ASC",
-                )
-                .map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map(rusqlite::params![room_id], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?;
-            rows
-        };
-        let mut remaining = total;
-        let mut evicted_rows = 0usize;
-        let mut evicted_bytes = 0i64;
-        for (seq, len) in rows {
-            if remaining <= max_bytes as i64 {
-                break;
-            }
-            conn.execute(
-                "DELETE FROM mailbox_messages WHERE seq = ?1",
-                rusqlite::params![seq],
-            )
-            .map_err(|e| e.to_string())?;
-            remaining -= len;
-            evicted_rows += 1;
-            evicted_bytes += len;
-        }
-        if evicted_rows > 0 {
-            tracing::warn!(
-                room_id = %room_id,
-                evicted_rows,
-                evicted_bytes,
-                remaining_bytes = remaining,
-                "account archive byte quota evicted oldest messages (possibly unseen by some devices)"
-            );
-        }
-        Ok(())
+    /// Total stored bytes for a room: summed `LENGTH(ciphertext) +
+    /// LENGTH(nonce)` across the account archive AND every per-device queue.
+    /// This is the quota accounting unit reported by `GET /api/storage`.
+    pub fn usage_bytes(&self, room_id: &str) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(ciphertext) + LENGTH(nonce)), 0)
+             FROM mailbox_messages WHERE room_id = ?1",
+            rusqlite::params![room_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
     }
 
     /// Deposit a ciphertext message. An empty `to_device_id` stores it in the
@@ -269,6 +215,13 @@ impl Mailbox {
     /// the stored id, and re-depositing the same id is an idempotent no-op —
     /// this is what makes "retry until acknowledged" safe. Returns the stored
     /// message id.
+    ///
+    /// `quota_bytes` caps the room's total stored bytes: a NEW message that
+    /// would push usage past the quota is rejected with
+    /// `Err("quota_exceeded")` (existing data is never deleted — it ages out
+    /// via TTL or ack). Idempotent replays bypass the quota check: they add
+    /// no bytes, and rejecting them would wedge the client's outbox on its
+    /// first message once the quota is full.
     pub fn deposit(
         &self,
         room_id: &str,
@@ -278,6 +231,7 @@ impl Mailbox {
         nonce: String,
         ttl_seconds: Option<u64>,
         message_id: Option<String>,
+        quota_bytes: i64,
     ) -> Result<String, String> {
         let id = message_id
             .filter(|s| !s.is_empty())
@@ -295,6 +249,33 @@ impl Mailbox {
 
         let mut conn = self.conn.lock().unwrap();
         Self::prune(&mut conn, ts);
+
+        // Idempotent replay: the id is already stored, acknowledge without
+        // touching the quota (no new bytes are added).
+        let already_stored: bool = conn
+            .query_row(
+                "SELECT 1 FROM mailbox_messages WHERE id = ?1",
+                rusqlite::params![id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if already_stored {
+            return Ok(id);
+        }
+
+        // Quota check inside the lock so concurrent deposits cannot both pass.
+        let usage: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(ciphertext) + LENGTH(nonce)), 0)
+                 FROM mailbox_messages WHERE room_id = ?1",
+                rusqlite::params![room_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let incoming = (ciphertext.len() + nonce.len()) as i64;
+        if usage + incoming > quota_bytes {
+            return Err("quota_exceeded".to_string());
+        }
 
         let inserted = conn
             .execute(
@@ -323,7 +304,6 @@ impl Mailbox {
             // The depositor has already "seen" it (they created it).
             Self::append_seen(&conn, &id, from_device_id);
             Self::trim(&mut conn, room_id, ACCOUNT_LEVEL_TARGET, MAX_ACCOUNT_MESSAGES)?;
-            Self::enforce_account_archive_quota(&mut conn, room_id, ACCOUNT_ARCHIVE_MAX_BYTES)?;
         } else {
             Self::trim(&mut conn, room_id, to_device_id, MAX_MESSAGES_PER_DEVICE)?;
         }
@@ -493,6 +473,9 @@ mod tests {
         (dir, mb)
     }
 
+    /// Generous quota for tests that do not exercise quota rejection.
+    const TEST_QUOTA: i64 = 1 << 30;
+
     /// Rows stored for one (room, device) queue — the ground truth a poll must
     /// NOT reduce on its own.
     fn row_count(mb: &Mailbox, room_id: &str, device_id: &str) -> i64 {
@@ -517,7 +500,7 @@ mod tests {
             mb.ensure_device("room-a", "dev-b");
 
             id = mb
-                .deposit("room-a", "dev-a", "dev-b", "cipher-1".into(), "nonce-1".into(), None, None)
+                .deposit("room-a", "dev-a", "dev-b", "cipher-1".into(), "nonce-1".into(), None, None, TEST_QUOTA)
                 .unwrap();
             assert!(!id.is_empty(), "deposit must return the stored message id");
 
@@ -547,7 +530,7 @@ mod tests {
         let (_dir, mb) = temp_mailbox("unknown");
         mb.ensure_device("room-a", "dev-a");
         let err = mb
-            .deposit("room-a", "dev-a", "ghost", "c".into(), "n".into(), None, None)
+            .deposit("room-a", "dev-a", "ghost", "c".into(), "n".into(), None, None, TEST_QUOTA)
             .unwrap_err();
         assert!(err.contains("not in room"));
     }
@@ -558,7 +541,7 @@ mod tests {
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
         for i in 0..600 {
-            mb.deposit("room-a", "dev-a", "dev-b", format!("c{i}"), "n".into(), None, None)
+            mb.deposit("room-a", "dev-a", "dev-b", format!("c{i}"), "n".into(), None, None, TEST_QUOTA)
                 .unwrap();
         }
         let msgs = mb.poll("room-a", "dev-b", Some(1000));
@@ -571,9 +554,9 @@ mod tests {
         let (_dir, mb) = temp_mailbox("ack");
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
-        mb.deposit("room-a", "dev-a", "dev-b", "c1".into(), "n1".into(), None, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c1".into(), "n1".into(), None, None, TEST_QUOTA)
             .unwrap();
-        mb.deposit("room-a", "dev-a", "dev-b", "c2".into(), "n2".into(), None, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c2".into(), "n2".into(), None, None, TEST_QUOTA)
             .unwrap();
 
         let msgs = mb.poll("room-a", "dev-b", None);
@@ -581,7 +564,7 @@ mod tests {
         mb.ack("room-a", "dev-b", &[msgs[0].id.clone()]);
         // ack deletes the delivered row; the other delivered-but-unacked
         // message is not re-polled inside the redelivery window
-        mb.deposit("room-a", "dev-a", "dev-b", "c3".into(), "n3".into(), None, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c3".into(), "n3".into(), None, None, TEST_QUOTA)
             .unwrap();
         let msgs2 = mb.poll("room-a", "dev-b", None);
         assert_eq!(msgs2.len(), 1);
@@ -604,6 +587,7 @@ mod tests {
             "nonce".into(),
             None,
             None,
+            TEST_QUOTA,
         )
         .unwrap();
 
@@ -642,6 +626,7 @@ mod tests {
                 "n".into(),
                 None,
                 None,
+                TEST_QUOTA,
             )
             .unwrap();
         }
@@ -673,9 +658,9 @@ mod tests {
         let (_dir, mb) = temp_mailbox("mix");
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
-        mb.deposit("room-a", "dev-a", "dev-b", "device-msg".into(), "n".into(), None, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "device-msg".into(), "n".into(), None, None, TEST_QUOTA)
             .unwrap();
-        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "account-msg".into(), "n".into(), None, None)
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "account-msg".into(), "n".into(), None, None, TEST_QUOTA)
             .unwrap();
 
         let msgs = mb.poll("room-a", "dev-b", None);
@@ -692,7 +677,7 @@ mod tests {
 
         {
             let mb = Mailbox::open(&path).unwrap();
-            mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "durable".into(), "n".into(), None, None)
+            mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "durable".into(), "n".into(), None, None, TEST_QUOTA)
                 .unwrap();
         } // dropped = "relay restarted"
         {
@@ -712,10 +697,10 @@ mod tests {
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
         let client_id = "client-msg-1".to_string();
-        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, Some(client_id.clone()))
+        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, Some(client_id.clone()), TEST_QUOTA)
             .unwrap();
         let id2 = mb
-            .deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, Some(client_id.clone()))
+            .deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, Some(client_id.clone()), TEST_QUOTA)
             .unwrap();
         assert_eq!(id2, client_id);
         assert_eq!(mb.poll("room-a", "dev-b", None).len(), 1, "duplicate id must not double-store");
@@ -727,7 +712,7 @@ mod tests {
         let (_dir, mb) = temp_mailbox("expiry");
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
-        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), Some(1), None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), Some(1), None, TEST_QUOTA)
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(mb.poll("room-a", "dev-b", None).is_empty(), "expired message must be pruned");
@@ -740,7 +725,7 @@ mod tests {
         let (_dir, mb) = temp_mailbox("markonly");
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
-        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None, TEST_QUOTA)
             .unwrap();
 
         let msgs = mb.poll("room-a", "dev-b", None);
@@ -766,7 +751,7 @@ mod tests {
         let (_dir, mb) = temp_mailbox("ackdel");
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
-        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None, TEST_QUOTA)
             .unwrap();
 
         let msgs = mb.poll("room-a", "dev-b", None);
@@ -787,7 +772,7 @@ mod tests {
         let (_dir, mb) = temp_mailbox("redeliver");
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
-        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None, TEST_QUOTA)
             .unwrap();
 
         let msgs = mb.poll("room-a", "dev-b", None);
@@ -823,7 +808,7 @@ mod tests {
             mb.ensure_device("room-a", "dev-a");
             mb.ensure_device("room-a", "dev-b");
             id = mb
-                .deposit("room-a", "dev-a", "dev-b", "durable".into(), "n".into(), None, None)
+                .deposit("room-a", "dev-a", "dev-b", "durable".into(), "n".into(), None, None, TEST_QUOTA)
                 .unwrap();
             assert_eq!(mb.poll("room-a", "dev-b", None).len(), 1);
         } // dropped = "relay restarted" after poll, before the client's ack
@@ -846,10 +831,10 @@ mod tests {
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
         let id1 = mb
-            .deposit("room-a", "dev-a", "dev-b", "c1".into(), "n".into(), None, Some(String::new()))
+            .deposit("room-a", "dev-a", "dev-b", "c1".into(), "n".into(), None, Some(String::new()), TEST_QUOTA)
             .unwrap();
         let id2 = mb
-            .deposit("room-a", "dev-a", "dev-b", "c2".into(), "n".into(), None, Some(String::new()))
+            .deposit("room-a", "dev-a", "dev-b", "c2".into(), "n".into(), None, Some(String::new()), TEST_QUOTA)
             .unwrap();
         assert!(!id1.is_empty() && !id2.is_empty());
         assert_ne!(id1, id2, "empty message_id must not collapse deposits into one row");
@@ -861,7 +846,7 @@ mod tests {
     #[test]
     fn seen_list_is_capped() {
         let (_dir, mb) = temp_mailbox("seencap");
-        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c".into(), "n".into(), None, None)
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c".into(), "n".into(), None, None, TEST_QUOTA)
             .unwrap();
 
         for i in 0..(MAX_SEEN_ENTRIES + 20) {
@@ -891,7 +876,7 @@ mod tests {
     #[test]
     fn poll_does_not_mark_account_messages_seen() {
         let (_dir, mb) = temp_mailbox("pollseen");
-        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c1".into(), "n".into(), None, None)
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c1".into(), "n".into(), None, None, TEST_QUOTA)
             .unwrap();
         mb.ensure_device("room-a", "dev-b");
 
@@ -920,7 +905,7 @@ mod tests {
     #[test]
     fn ack_marks_account_message_seen_for_that_device_only() {
         let (_dir, mb) = temp_mailbox("ackseen");
-        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c1".into(), "n".into(), None, None)
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c1".into(), "n".into(), None, None, TEST_QUOTA)
             .unwrap();
         mb.ensure_device("room-a", "dev-b");
         mb.ensure_device("room-a", "dev-c");
@@ -946,9 +931,9 @@ mod tests {
         let (_dir, mb) = temp_mailbox("ackmixed");
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
-        mb.deposit("room-a", "dev-a", "dev-b", "device-c".into(), "n".into(), None, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "device-c".into(), "n".into(), None, None, TEST_QUOTA)
             .unwrap();
-        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "account-c".into(), "n".into(), None, None)
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "account-c".into(), "n".into(), None, None, TEST_QUOTA)
             .unwrap();
 
         let msgs = mb.poll("room-a", "dev-b", None);
@@ -961,40 +946,72 @@ mod tests {
         assert!(mb.poll("room-a", "dev-b", None).is_empty(), "both must be gone from dev-b's polls");
     }
 
-    /// The account archive byte quota evicts the oldest rows once the summed
-    /// ciphertext length exceeds it, converging back under the quota.
+    /// A new deposit that would push the room's usage past its quota is
+    /// rejected with "quota_exceeded"; existing data is left untouched.
     #[test]
-    fn account_archive_byte_quota_evicts_oldest() {
-        let (_dir, mb) = temp_mailbox("bytequota");
-        // 3 × 40MB > 100MB quota → the oldest 40MB row is evicted.
-        let chunk = "x".repeat(40 * 1024 * 1024);
-        let id1 = mb
-            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, chunk.clone(), "n".into(), None, None)
+    fn deposit_over_quota_is_rejected_without_eviction() {
+        let (_dir, mb) = temp_mailbox("quota");
+        let quota: i64 = 100;
+        // Each message costs ciphertext + nonce bytes (5 + 1 = 6).
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "aaaaa".into(), "n".into(), None, None, quota)
             .unwrap();
-        let id2 = mb
-            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, chunk.clone(), "n".into(), None, None)
-            .unwrap();
-        let id3 = mb
-            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, chunk, "n".into(), None, None)
-            .unwrap();
-
-        let (count, total): (i64, i64) = {
-            let conn = mb.conn.lock().unwrap();
-            conn.query_row(
-                "SELECT count(*), COALESCE(SUM(LENGTH(ciphertext)), 0) FROM mailbox_messages
-                 WHERE room_id = 'room-a' AND to_device_id = ''",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap()
-        };
-        assert!(total <= ACCOUNT_ARCHIVE_MAX_BYTES as i64, "archive must converge under the quota");
-        assert_eq!(count, 2, "exactly the oldest row must be evicted");
-
-        // The survivors are the two newest deposits.
+        let err = mb
+            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "x".repeat(200), "n".into(), None, None, quota)
+            .unwrap_err();
+        assert_eq!(err, "quota_exceeded");
+        // The oversized message was NOT stored and the old one survived.
+        assert_eq!(mb.usage_bytes("room-a"), 6);
         mb.ensure_device("room-a", "dev-b");
-        let msgs = mb.poll("room-a", "dev-b", Some(10));
-        let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, [id2.as_str(), id3.as_str()], "evicted row must be the oldest: {id1}");
+        let msgs = mb.poll("room-a", "dev-b", None);
+        assert_eq!(msgs.len(), 1, "existing data must survive quota rejection");
+        assert_eq!(msgs[0].ciphertext, "aaaaa");
+    }
+
+    /// Idempotent replay of an already-stored message succeeds even when the
+    /// room is over quota — it adds no bytes, and rejecting it would wedge
+    /// the client's outbox on its first message.
+    #[test]
+    fn idempotent_replay_bypasses_quota() {
+        let (_dir, mb) = temp_mailbox("quota-replay");
+        let quota: i64 = 10;
+        let id = mb
+            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "aaaaa".into(), "n".into(), None, Some("m-1".into()), quota)
+            .unwrap();
+        assert_eq!(id, "m-1");
+        // Usage (6) is already over a tighter quota of 1: a fresh deposit is
+        // rejected, but replaying the stored id still succeeds.
+        let err = mb
+            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "b".into(), "n".into(), None, Some("m-2".into()), 1)
+            .unwrap_err();
+        assert_eq!(err, "quota_exceeded");
+        let replayed = mb
+            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "aaaaa".into(), "n".into(), None, Some("m-1".into()), 1)
+            .unwrap();
+        assert_eq!(replayed, "m-1");
+        assert_eq!(mb.usage_bytes("room-a"), 6, "replay must not double-store");
+    }
+
+    /// Quota accounting spans the account archive AND every per-device queue:
+    /// `usage_bytes` sums both, and per-device deposits count against it.
+    #[test]
+    fn usage_bytes_counts_archive_and_device_queues() {
+        let (_dir, mb) = temp_mailbox("usage");
+        mb.ensure_device("room-a", "dev-a");
+        mb.ensure_device("room-a", "dev-b");
+        assert_eq!(mb.usage_bytes("room-a"), 0);
+        // Archive: 2 + 1 = 3 bytes.
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "aa".into(), "n".into(), None, None, TEST_QUOTA)
+            .unwrap();
+        // Per-device queue: 3 + 1 = 4 bytes.
+        mb.deposit("room-a", "dev-a", "dev-b", "bbb".into(), "n".into(), None, None, TEST_QUOTA)
+            .unwrap();
+        assert_eq!(mb.usage_bytes("room-a"), 7);
+        // A per-device deposit is rejected once usage + incoming > quota.
+        let err = mb
+            .deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None, 8)
+            .unwrap_err();
+        assert_eq!(err, "quota_exceeded", "per-device queues count against the quota");
+        // Other rooms are unaffected.
+        assert_eq!(mb.usage_bytes("room-b"), 0);
     }
 }

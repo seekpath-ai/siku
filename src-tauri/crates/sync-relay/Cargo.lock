@@ -995,6 +995,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-tungstenite",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",

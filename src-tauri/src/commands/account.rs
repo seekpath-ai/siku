@@ -428,3 +428,113 @@ pub async fn device_rename(
     .await?;
     Ok(())
 }
+
+// ── 云端存储配额 / 扩容订单 ────────────────────────────────────────────────
+
+/// 云端存储用量与配额（GET /api/storage 的响应）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageStatus {
+    pub used_bytes: i64,
+    pub quota_bytes: i64,
+    /// 当前套餐 id（free/plus/pro/max；管理员直调配额时为 "custom"）。
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    /// 配额到期时间（RFC3339）；None = 默认免费额度或永久配额。
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+/// 可选购的扩容套餐（GET /api/plans 的数组元素）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoragePlan {
+    pub id: String,
+    pub name: String,
+    pub quota_bytes: i64,
+    pub monthly_cny: f64,
+    pub yearly_cny: f64,
+}
+
+/// 创建扩容订单的结果（POST /api/storage/orders 的响应）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageOrderCreateResult {
+    pub order_id: String,
+    pub plan_id: String,
+    pub quota_bytes: i64,
+    pub duration_days: u32,
+    pub amount_cny: f64,
+    /// 订单状态：pending / paid / rejected / cancelled。
+    pub status: String,
+    /// 收款说明（relay 的 RELAY_PAYMENT_INFO），前端随订单号一起展示，
+    /// 提示用户转账备注填订单号。
+    pub payment_info: String,
+}
+
+/// 扩容订单（GET /api/storage/orders 的数组元素）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageOrder {
+    pub id: String,
+    pub plan_id: String,
+    pub quota_bytes: i64,
+    pub duration_days: u32,
+    pub amount_cny: f64,
+    /// 订单状态：pending / paid / rejected / cancelled。
+    pub status: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub paid_at: Option<String>,
+    #[serde(default)]
+    pub admin_note: Option<String>,
+}
+
+/// 查询当前账号的云端存储用量与配额。
+#[tauri::command]
+pub async fn storage_status(
+    state: State<'_, AppState>,
+    relay_url: String,
+) -> Result<StorageStatus, String> {
+    let (_, text) =
+        auth_request(&state, &relay_url, reqwest::Method::GET, "api/storage", None).await?;
+    serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
+}
+
+/// 列出可选购的扩容套餐。
+#[tauri::command]
+pub async fn storage_plans(
+    state: State<'_, AppState>,
+    relay_url: String,
+) -> Result<Vec<StoragePlan>, String> {
+    let (_, text) =
+        auth_request(&state, &relay_url, reqwest::Method::GET, "api/plans", None).await?;
+    serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
+}
+
+/// 提交扩容申请（创建 pending 订单）。period 为 "month" 或 "year"；同账号
+/// 已有 pending 订单时 relay 幂等返回原订单，不会重复创建。
+#[tauri::command]
+pub async fn storage_order_create(
+    state: State<'_, AppState>,
+    relay_url: String,
+    plan_id: String,
+    period: String,
+) -> Result<StorageOrderCreateResult, String> {
+    let (_, text) = auth_request(
+        &state,
+        &relay_url,
+        reqwest::Method::POST,
+        "api/storage/orders",
+        Some(serde_json::json!({ "plan_id": plan_id, "period": period })),
+    )
+    .await?;
+    serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
+}
+
+/// 列出当前账号的扩容订单（含审核状态）。
+#[tauri::command]
+pub async fn storage_order_list(
+    state: State<'_, AppState>,
+    relay_url: String,
+) -> Result<Vec<StorageOrder>, String> {
+    let (_, text) =
+        auth_request(&state, &relay_url, reqwest::Method::GET, "api/storage/orders", None).await?;
+    serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
+}

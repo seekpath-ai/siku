@@ -53,6 +53,63 @@ fn heartbeat_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Admin API token. When unset, all /api/admin/* endpoints return 404.
+fn admin_token() -> Option<String> {
+    std::env::var("RELAY_ADMIN_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+/// Default per-account mailbox quota (1 GiB) for users without an active
+/// custom quota.
+fn default_quota_bytes() -> i64 {
+    std::env::var("RELAY_DEFAULT_QUOTA_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1 << 30)
+}
+
+/// Out-of-band payment instructions shown to the user when they create an
+/// upgrade order (e.g. "Alipay 158xxxx, note your order id").
+fn payment_info() -> String {
+    std::env::var("RELAY_PAYMENT_INFO").unwrap_or_default()
+}
+
+// ── Storage plans ──────────────────────────────────────────────────────────
+//
+// Pricing is hardcoded here and served via GET /api/plans. Yearly = 10 ×
+// monthly; a paid period lasts 30 days (month) or 365 days (year).
+
+#[derive(Clone, Serialize)]
+struct Plan {
+    id: &'static str,
+    name: &'static str,
+    quota_bytes: i64,
+    monthly_cny: f64,
+    yearly_cny: f64,
+}
+
+const PLANS: &[Plan] = &[
+    Plan { id: "free", name: "Free", quota_bytes: 1 << 30, monthly_cny: 0.0, yearly_cny: 0.0 },
+    Plan { id: "plus", name: "Plus", quota_bytes: 10 << 30, monthly_cny: 6.0, yearly_cny: 60.0 },
+    Plan { id: "pro", name: "Pro", quota_bytes: 50 << 30, monthly_cny: 15.0, yearly_cny: 150.0 },
+    Plan { id: "max", name: "Max", quota_bytes: 200 << 30, monthly_cny: 30.0, yearly_cny: 300.0 },
+];
+
+fn find_plan(id: &str) -> Option<&'static Plan> {
+    PLANS.iter().find(|p| p.id == id)
+}
+
+/// Best-effort label for the plan a quota corresponds to; "custom" when it
+/// matches no plan (admin-adjusted quota).
+fn plan_id_for_quota(quota_bytes: i64) -> &'static str {
+    PLANS
+        .iter()
+        .find(|p| p.quota_bytes == quota_bytes)
+        .map(|p| p.id)
+        .unwrap_or("custom")
+}
+
 // ── Shared protocol types (mirror of the Siku client) ──────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,6 +352,9 @@ struct AppState {
     db: db::Db,
     auth: auth::Auth,
     mailboxes: mailbox::Mailbox,
+    admin_token: Option<String>,
+    default_quota: i64,
+    payment_info: String,
 }
 
 impl AppState {
@@ -315,7 +375,30 @@ impl AppState {
             auth: auth::Auth::new(jwt_secret()),
             mailboxes: mailbox::Mailbox::open(std::path::Path::new(&mailbox_db_path))
                 .expect("mailbox db"),
+            admin_token: admin_token(),
+            default_quota: default_quota_bytes(),
+            payment_info: payment_info(),
         }
+    }
+
+    /// The quota currently in force for a user: their custom quota while it
+    /// has not expired (None expiry = permanent, admin-granted), otherwise
+    /// the relay default. Computed on use — no expiry sweeper needed, and a
+    /// lapsed subscription only rejects NEW writes (existing rows age out
+    /// via TTL or ack).
+    fn effective_quota(&self, user_id: &str) -> (i64, Option<String>) {
+        if let Some((Some(quota), expires_at)) = self.db.get_user_quota(user_id) {
+            let active = match &expires_at {
+                None => true,
+                Some(ts) => chrono::DateTime::parse_from_rfc3339(ts)
+                    .map(|t| t > chrono::Utc::now())
+                    .unwrap_or(false),
+            };
+            if active {
+                return (quota, expires_at);
+            }
+        }
+        (self.default_quota, None)
     }
 
     fn is_online(&self, device_id: &str) -> bool {
@@ -711,6 +794,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                             });
                             continue;
                         };
+                        let (quota_bytes, _) = state.effective_quota(room);
                         match state.mailboxes.deposit(
                             room,
                             &device_id,
@@ -719,6 +803,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                             nonce,
                             ttl_seconds,
                             message_id,
+                            quota_bytes,
                         ) {
                             Ok(id) => {
                                 info!(
@@ -736,7 +821,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                                 });
                             }
                             Err(e) => {
-                                warn!(from = %device_id, to = %to_device_id, error = %e, "mailbox deposit rejected");
+                                if e == "quota_exceeded" {
+                                    let usage_bytes = state.mailboxes.usage_bytes(room);
+                                    warn!(
+                                        from = %device_id,
+                                        room = %room,
+                                        usage_bytes,
+                                        quota_bytes,
+                                        "mailbox deposit rejected: quota exceeded"
+                                    );
+                                } else {
+                                    warn!(from = %device_id, to = %to_device_id, error = %e, "mailbox deposit rejected");
+                                }
                                 let _ = tx.send(RelayServerMsg::MailboxDepositAck {
                                     payload: MailboxDepositAckPayload {
                                         id: ack_id,
@@ -828,7 +924,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
 // ── Application builder (also used by tests) ───────────────────────────────
 
 fn app(state: Arc<AppState>) -> Router {
-    use axum::routing::{patch, post};
+    use axum::routing::{patch, post, put};
     Router::new()
         .route("/v1/signaling", get(signaling_handler))
         .route("/healthz", get(|| async { "ok" }))
@@ -837,6 +933,17 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/api/refresh", post(api_refresh))
         .route("/api/devices", get(api_list_devices))
         .route("/api/devices/:id", patch(api_rename_device).delete(api_remove_device))
+        .route("/api/plans", get(api_plans))
+        .route("/api/storage", get(api_storage))
+        .route(
+            "/api/storage/orders",
+            post(api_create_storage_order).get(api_list_my_storage_orders),
+        )
+        .route("/api/admin/users", get(api_admin_list_users))
+        .route("/api/admin/users/:id/quota", put(api_admin_set_quota))
+        .route("/api/admin/orders", get(api_admin_list_orders))
+        .route("/api/admin/orders/:id/confirm", post(api_admin_confirm_order))
+        .route("/api/admin/orders/:id/reject", post(api_admin_reject_order))
         .with_state(state)
 }
 
@@ -1025,6 +1132,294 @@ async fn api_remove_device(
     }
     info!(device_id = %id, "device removed");
     Ok(StatusCode::OK)
+}
+
+// ── Storage quota / subscription HTTP API ──────────────────────────────────
+
+/// Admin endpoints stay hidden (404) unless RELAY_ADMIN_TOKEN is configured;
+/// with a token set, a missing or wrong bearer gets 401.
+fn require_admin(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), (StatusCode, String)> {
+    let Some(expected) = &state.admin_token else {
+        return Err((StatusCode::NOT_FOUND, "not found".to_string()));
+    };
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match token {
+        Some(t) if t == expected => Ok(()),
+        _ => Err((StatusCode::UNAUTHORIZED, "invalid admin token".to_string())),
+    }
+}
+
+async fn api_plans(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::Json<Vec<Plan>>, (StatusCode, String)> {
+    bearer_claims(&state, &headers)?;
+    Ok(axum::Json(PLANS.to_vec()))
+}
+
+#[derive(Serialize)]
+struct StorageResponse {
+    used_bytes: i64,
+    quota_bytes: i64,
+    plan_id: String,
+    expires_at: Option<String>,
+}
+
+async fn api_storage(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::Json<StorageResponse>, (StatusCode, String)> {
+    let claims = bearer_claims(&state, &headers)?;
+    let (quota_bytes, expires_at) = state.effective_quota(&claims.sub);
+    Ok(axum::Json(StorageResponse {
+        used_bytes: state.mailboxes.usage_bytes(&claims.sub),
+        quota_bytes,
+        plan_id: plan_id_for_quota(quota_bytes).to_string(),
+        expires_at,
+    }))
+}
+
+#[derive(Deserialize)]
+struct CreateOrderRequest {
+    plan_id: String,
+    /// "month" (30 days) or "year" (365 days).
+    period: String,
+}
+
+#[derive(Serialize)]
+struct CreateOrderResponse {
+    order_id: String,
+    plan_id: String,
+    quota_bytes: i64,
+    duration_days: u32,
+    amount_cny: f64,
+    status: db::OrderStatus,
+    /// Out-of-band payment instructions (RELAY_PAYMENT_INFO) for the client
+    /// to display alongside the order id.
+    payment_info: String,
+}
+
+fn order_response(order: &db::Order, state: &AppState) -> CreateOrderResponse {
+    CreateOrderResponse {
+        order_id: order.id.clone(),
+        plan_id: order.plan_id.clone(),
+        quota_bytes: order.quota_bytes,
+        duration_days: order.duration_days,
+        amount_cny: order.amount_cny,
+        status: order.status,
+        payment_info: state.payment_info.clone(),
+    }
+}
+
+async fn api_create_storage_order(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<CreateOrderRequest>,
+) -> Result<axum::Json<CreateOrderResponse>, (StatusCode, String)> {
+    let claims = bearer_claims(&state, &headers)?;
+    let plan = find_plan(&req.plan_id)
+        .filter(|p| p.quota_bytes > state.default_quota)
+        .ok_or((StatusCode::BAD_REQUEST, "unknown plan".to_string()))?;
+    let (duration_days, amount_cny) = match req.period.as_str() {
+        "month" => (30, plan.monthly_cny),
+        "year" => (365, plan.yearly_cny),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "period must be \"month\" or \"year\"".to_string(),
+            ))
+        }
+    };
+    // Idempotent: an existing pending order is returned as-is so repeated
+    // applications never pile up for the admin to review.
+    if let Some(existing) = state.db.pending_order_for_user(&claims.sub) {
+        return Ok(axum::Json(order_response(&existing, &state)));
+    }
+    let order = db::Order {
+        id: uuid::Uuid::new_v4().to_string(),
+        user_id: claims.sub.clone(),
+        plan_id: plan.id.to_string(),
+        quota_bytes: plan.quota_bytes,
+        duration_days,
+        amount_cny,
+        status: db::OrderStatus::Pending,
+        created_at: now_iso(),
+        paid_at: None,
+        admin_note: None,
+    };
+    state
+        .db
+        .create_order(order.clone())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    info!(user_id = %claims.sub, order_id = %order.id, plan = %plan.id, "storage order created");
+    Ok(axum::Json(order_response(&order, &state)))
+}
+
+async fn api_list_my_storage_orders(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::Json<Vec<db::Order>>, (StatusCode, String)> {
+    let claims = bearer_claims(&state, &headers)?;
+    let orders = state
+        .db
+        .list_orders(None)
+        .into_iter()
+        .filter(|o| o.user_id == claims.sub)
+        .collect();
+    Ok(axum::Json(orders))
+}
+
+#[derive(Serialize)]
+struct AdminUserRow {
+    user_id: String,
+    email: String,
+    quota_bytes: i64,
+    used_bytes: i64,
+    expires_at: Option<String>,
+    device_count: usize,
+}
+
+async fn api_admin_list_users(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::Json<Vec<AdminUserRow>>, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
+    let users = state
+        .db
+        .list_users()
+        .into_iter()
+        .map(|u| {
+            let (quota_bytes, expires_at) = state.effective_quota(&u.id);
+            AdminUserRow {
+                used_bytes: state.mailboxes.usage_bytes(&u.id),
+                device_count: state.db.list_devices(&u.id).len(),
+                user_id: u.id,
+                email: u.email,
+                quota_bytes,
+                expires_at,
+            }
+        })
+        .collect();
+    Ok(axum::Json(users))
+}
+
+#[derive(Deserialize)]
+struct SetQuotaRequest {
+    quota_bytes: i64,
+    /// RFC3339; omitted = permanent (gifts, test accounts).
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+async fn api_admin_set_quota(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(req): axum::Json<SetQuotaRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
+    state
+        .db
+        .set_user_quota(&id, Some(req.quota_bytes), req.expires_at.clone())
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    info!(user_id = %id, quota_bytes = req.quota_bytes, expires_at = ?req.expires_at, "admin set user quota");
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct AdminOrdersQuery {
+    status: Option<String>,
+}
+
+async fn api_admin_list_orders(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<AdminOrdersQuery>,
+) -> Result<axum::Json<Vec<db::Order>>, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
+    let status = match query.status.as_deref() {
+        None => None,
+        Some("pending") => Some(db::OrderStatus::Pending),
+        Some("paid") => Some(db::OrderStatus::Paid),
+        Some("rejected") => Some(db::OrderStatus::Rejected),
+        Some("cancelled") => Some(db::OrderStatus::Cancelled),
+        Some(_) => return Err((StatusCode::BAD_REQUEST, "unknown status".to_string())),
+    };
+    Ok(axum::Json(state.db.list_orders(status)))
+}
+
+/// Confirm payment: activate the order's quota. When the user's current
+/// subscription is still live the new period stacks onto its expiry
+/// (renewal), otherwise it starts from now.
+async fn api_admin_confirm_order(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<axum::Json<db::Order>, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
+    let order = state
+        .db
+        .get_order(&id)
+        .ok_or((StatusCode::NOT_FOUND, "order not found".to_string()))?;
+    if order.status != db::OrderStatus::Pending {
+        return Err((StatusCode::CONFLICT, "order is not pending".to_string()));
+    }
+    let now = chrono::Utc::now();
+    let base = state
+        .db
+        .get_user_quota(&order.user_id)
+        .and_then(|(_, exp)| exp)
+        .and_then(|exp| chrono::DateTime::parse_from_rfc3339(&exp).ok())
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .filter(|t| *t > now)
+        .unwrap_or(now);
+    let expires = base + chrono::Duration::days(order.duration_days as i64);
+    let expires_at = expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    state
+        .db
+        .set_user_quota(&order.user_id, Some(order.quota_bytes), Some(expires_at))
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let order = state
+        .db
+        .update_order_status(&id, db::OrderStatus::Paid, Some(now_iso()), None)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    info!(order_id = %id, user_id = %order.user_id, quota_bytes = order.quota_bytes, "storage order confirmed");
+    Ok(axum::Json(order))
+}
+
+#[derive(Deserialize)]
+struct RejectOrderRequest {
+    #[serde(default)]
+    note: Option<String>,
+}
+
+async fn api_admin_reject_order(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    body: Option<axum::Json<RejectOrderRequest>>,
+) -> Result<axum::Json<db::Order>, (StatusCode, String)> {
+    require_admin(&state, &headers)?;
+    let order = state
+        .db
+        .get_order(&id)
+        .ok_or((StatusCode::NOT_FOUND, "order not found".to_string()))?;
+    if order.status != db::OrderStatus::Pending {
+        return Err((StatusCode::CONFLICT, "order is not pending".to_string()));
+    }
+    let note = body.and_then(|b| b.0.note);
+    let order = state
+        .db
+        .update_order_status(&id, db::OrderStatus::Rejected, None, note)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    info!(order_id = %id, user_id = %order.user_id, "storage order rejected");
+    Ok(axum::Json(order))
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -1535,5 +1930,252 @@ mod tests {
             hello.contains(r#""protocol":2"#),
             "join must be answered by server_hello with protocol 2, got: {hello}"
         );
+    }
+
+    // ── Storage quota / order API ──────────────────────────────────────────
+
+    /// Minimal HTTP client over the in-process router (no TCP listener).
+    async fn http_json(
+        state: Arc<AppState>,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(t) = token {
+            builder = builder.header("Authorization", format!("Bearer {t}"));
+        }
+        let req = match body {
+            Some(b) => builder
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&b).unwrap()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        };
+        let resp = app(state).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            // Error responses are plain text (StatusCode, String); keep them
+            // as a string so status assertions can still run.
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+        };
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn storage_endpoint_reports_usage_and_default_quota() {
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let state = Arc::new(AppState::new());
+        seed_account(&state);
+        let token = state.auth.issue_device_token("user-1", "device-a").unwrap();
+
+        // 5 (ciphertext) + 1 (nonce) bytes in the account archive.
+        state
+            .mailboxes
+            .deposit(
+                "user-1",
+                "device-a",
+                mailbox::ACCOUNT_LEVEL_TARGET,
+                "aaaaa".into(),
+                "n".into(),
+                None,
+                None,
+                1 << 30,
+            )
+            .unwrap();
+
+        let (status, json) = http_json(state.clone(), "GET", "/api/storage", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["used_bytes"], 6);
+        assert_eq!(json["quota_bytes"], 1i64 << 30);
+        assert_eq!(json["plan_id"], "free");
+        assert!(json["expires_at"].is_null());
+
+        // The plan table is served to logged-in users.
+        let (status, json) = http_json(state.clone(), "GET", "/api/plans", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let plans = json.as_array().unwrap();
+        assert_eq!(plans.len(), 4);
+        assert!(plans
+            .iter()
+            .any(|p| p["id"] == "plus" && p["quota_bytes"] == 10i64 << 30));
+
+        // Unauthenticated requests are rejected.
+        let (status, _) = http_json(state.clone(), "GET", "/api/storage", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn storage_order_creation_is_idempotent() {
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let mut state = AppState::new();
+        state.payment_info = "pay to alipay 158xxxx, note order id".to_string();
+        let state = Arc::new(state);
+        seed_account(&state);
+        let token = state.auth.issue_device_token("user-1", "device-a").unwrap();
+
+        let body = serde_json::json!({"plan_id": "plus", "period": "month"});
+        let (status, first) =
+            http_json(state.clone(), "POST", "/api/storage/orders", Some(&token), Some(body.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first["amount_cny"], 6.0);
+        assert_eq!(first["status"], "pending");
+        assert_eq!(first["duration_days"], 30);
+        assert_eq!(first["payment_info"], "pay to alipay 158xxxx, note order id");
+
+        // A second application returns the same pending order, not a new one.
+        let (status, second) =
+            http_json(state.clone(), "POST", "/api/storage/orders", Some(&token), Some(body)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(second["order_id"], first["order_id"]);
+
+        // The user sees exactly one order.
+        let (status, orders) =
+            http_json(state.clone(), "GET", "/api/storage/orders", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let orders = orders.as_array().unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0]["id"], first["order_id"]);
+
+        // Unknown plan / bad period are rejected.
+        let (status, _) = http_json(
+            state.clone(),
+            "POST",
+            "/api/storage/orders",
+            Some(&token),
+            Some(serde_json::json!({"plan_id": "nope", "period": "month"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = http_json(
+            state.clone(),
+            "POST",
+            "/api/storage/orders",
+            Some(&token),
+            Some(serde_json::json!({"plan_id": "pro", "period": "decade"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn admin_confirm_activates_quota_stacks_renewals_and_expiry_falls_back() {
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let mut state = AppState::new();
+        state.admin_token = Some("test-admin-token".to_string());
+        let state = Arc::new(state);
+        seed_account(&state);
+        let token = state.auth.issue_device_token("user-1", "device-a").unwrap();
+        let order_body = serde_json::json!({"plan_id": "plus", "period": "month"});
+
+        let (status, order) =
+            http_json(state.clone(), "POST", "/api/storage/orders", Some(&token), Some(order_body.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        let order_id = order["order_id"].as_str().unwrap().to_string();
+
+        // The admin sees the pending order.
+        let (status, orders) = http_json(
+            state.clone(),
+            "GET",
+            "/api/admin/orders?status=pending",
+            Some("test-admin-token"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(orders.as_array().unwrap().len(), 1);
+
+        // Confirm activates the quota with an expiry ~30 days out.
+        let (status, confirmed) = http_json(
+            state.clone(),
+            "POST",
+            &format!("/api/admin/orders/{order_id}/confirm"),
+            Some("test-admin-token"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(confirmed["status"], "paid");
+        let (status, storage) = http_json(state.clone(), "GET", "/api/storage", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(storage["quota_bytes"], 10i64 << 30);
+        assert_eq!(storage["plan_id"], "plus");
+        let expiry = chrono::DateTime::parse_from_rfc3339(storage["expires_at"].as_str().unwrap()).unwrap();
+        let days = (expiry.timestamp() - chrono::Utc::now().timestamp()) / 86400;
+        assert!((29..=30).contains(&days), "expiry should be ~30 days out, got {days}");
+
+        // Re-confirming a paid order is a conflict.
+        let (status, _) = http_json(
+            state.clone(),
+            "POST",
+            &format!("/api/admin/orders/{order_id}/confirm"),
+            Some("test-admin-token"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // Renewing while the subscription is live stacks onto the old expiry.
+        let (_, order2) =
+            http_json(state.clone(), "POST", "/api/storage/orders", Some(&token), Some(order_body)).await;
+        let order2_id = order2["order_id"].as_str().unwrap().to_string();
+        assert_ne!(order2_id, order_id);
+        let (status, _) = http_json(
+            state.clone(),
+            "POST",
+            &format!("/api/admin/orders/{order2_id}/confirm"),
+            Some("test-admin-token"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, storage2) = http_json(state.clone(), "GET", "/api/storage", Some(&token), None).await;
+        let expiry2 =
+            chrono::DateTime::parse_from_rfc3339(storage2["expires_at"].as_str().unwrap()).unwrap();
+        let stacked = (expiry2.timestamp() - expiry.timestamp()) / 86400;
+        assert!((29..=30).contains(&stacked), "renewal must stack ~30 days, got {stacked}");
+
+        // Once the subscription lapses the effective quota falls back to the
+        // default (existing data is kept; only new writes are rejected).
+        state
+            .db
+            .set_user_quota("user-1", Some(10i64 << 30), Some("2020-01-01T00:00:00Z".to_string()))
+            .unwrap();
+        let (status, storage3) = http_json(state.clone(), "GET", "/api/storage", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(storage3["quota_bytes"], 1i64 << 30);
+        assert_eq!(storage3["plan_id"], "free");
+    }
+
+    #[tokio::test]
+    async fn admin_endpoints_require_configured_token() {
+        std::env::set_var("JWT_SECRET", "test-secret");
+        // No RELAY_ADMIN_TOKEN configured → admin routes are hidden (404).
+        let state = Arc::new(AppState::new());
+        let (status, _) = http_json(state.clone(), "GET", "/api/admin/users", Some("anything"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Configured: missing or wrong bearer → 401; correct → 200.
+        let mut state = AppState::new();
+        state.admin_token = Some("test-admin-token".to_string());
+        let state = Arc::new(state);
+        let (status, _) = http_json(state.clone(), "GET", "/api/admin/users", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = http_json(state.clone(), "GET", "/api/admin/users", Some("wrong"), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, users) =
+            http_json(state.clone(), "GET", "/api/admin/users", Some("test-admin-token"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(users.as_array().unwrap().len(), 0);
     }
 }

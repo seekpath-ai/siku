@@ -1,7 +1,7 @@
 use crate::sync::attachments::{
     blob_fits_mailbox, collect_missing_blob_hashes, read_blob_base64, write_blob_from_base64,
 };
-use crate::sync::crdt::{apply_changes, export_changes_since, ChangesetMessage};
+use crate::sync::crdt::{apply_changes, export_changes_since, export_own_changes_since, ChangesetMessage};
 use crate::sync::mailbox_client::MailboxClient;
 use crate::sync::types::MailboxMessage;
 use crate::sync::webrtc_peer::SyncSession;
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Snapshot of the current sync session status for the UI.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -85,8 +85,9 @@ const MAX_WIRE_MSG: usize = 16_000;
 const SYNC_PUSH_INTERVAL_SECS: u64 = 15;
 
 /// How long to wait for the relay's `MailboxDepositAck` before treating a
-/// deposit as unconfirmed (queued to the outbox / retried). Short enough that
-/// a dead relay cannot stall the sync loop for long.
+/// deposit as unconfirmed (queued to the outbox / retried). This is only the
+/// floor: `deposit_await_ack` scales the wait with the payload size (large
+/// frames take seconds just to transmit), capped at 60s.
 const MAILBOX_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// device_settings keys persisting sync progress per peer. Progress must be
@@ -349,7 +350,9 @@ impl SyncEngine {
     /// Send the current local changeset to the peer.
     pub async fn push(&self) -> Result<()> {
         let since = *self.last_sent_db_version.lock().await;
-        let msg = export_changes_since(&self.db, since).await?;
+        // Incremental pushes export own-site rows only: foreign-site rows in
+        // range are echoes of what we just received and must not bounce back.
+        let msg = export_own_changes_since(&self.db, since).await?;
         if msg.changes.is_empty() {
             info!("no local changes to push");
             return Ok(());
@@ -556,7 +559,9 @@ impl SyncEngine {
         };
 
         let since = *self.last_sent_db_version.lock().await;
-        let msg = export_changes_since(&self.db, since).await?;
+        // Own-site only: incremental mailbox delivery must not echo back
+        // changes we just applied from the peer.
+        let msg = export_own_changes_since(&self.db, since).await?;
         if msg.changes.is_empty() {
             return Ok(());
         }
@@ -971,6 +976,54 @@ impl SyncEngine {
 /// would let the outbox grow without bound while the relay is unreachable.
 const MAX_OUTBOX_RETRIES: i64 = 50;
 
+/// Process-level outbox-flush backoff. When a flush hits a transport-level
+/// failure (ack timeout / send failure), the next flush is held off for a
+/// growing window (10s, doubling on each consecutive failure, capped at 5
+/// minutes) instead of retransmitting the whole backlog on every proxy tick —
+/// production burned ~1GB of uplink re-sending a 13.4MB outbox every 10s
+/// while the relay was congested. In-memory only: there is a single relay
+/// connection per process and congestion is a property of the connection,
+/// not of any outbox row. Reset as soon as any row is acked (or a flush
+/// completes without transport failures).
+static FLUSH_BACKOFF: std::sync::Mutex<Option<FlushBackoff>> = std::sync::Mutex::new(None);
+
+struct FlushBackoff {
+    next_flush_at: std::time::Instant,
+    current: std::time::Duration,
+}
+
+const FLUSH_BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_secs(10);
+const FLUSH_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Whether the outbox flush is currently held off by the backoff window.
+fn flush_backoff_active() -> bool {
+    let guard = FLUSH_BACKOFF.lock().unwrap();
+    match &*guard {
+        Some(b) => std::time::Instant::now() < b.next_flush_at,
+        None => false,
+    }
+}
+
+/// Record a transport-level flush failure: start the backoff, or double it on
+/// consecutive failures (capped at FLUSH_BACKOFF_MAX).
+fn flush_backoff_record_failure() {
+    let mut guard = FLUSH_BACKOFF.lock().unwrap();
+    let current = guard
+        .as_ref()
+        .map(|b| (b.current * 2).min(FLUSH_BACKOFF_MAX))
+        .unwrap_or(FLUSH_BACKOFF_INITIAL);
+    *guard = Some(FlushBackoff {
+        next_flush_at: std::time::Instant::now() + current,
+        current,
+    });
+}
+
+/// Clear the backoff (any acknowledged row, or a flush without transport
+/// failures, proves the connection is healthy again).
+fn flush_backoff_reset() {
+    *FLUSH_BACKOFF.lock().unwrap() = None;
+}
+
 /// Drop outbox rows that can never be delivered: poison messages (too many
 /// retries) and expired ones (the relay keeps mailbox messages for the same
 /// TTL anyway, so older payloads would be dropped on arrival).
@@ -1022,6 +1075,12 @@ pub async fn flush_outbox_with(
     db: &SqlitePool,
     relay: &crate::sync::relay_client::RelayClient,
 ) -> Result<()> {
+    // Backoff window after a transport-level failure: fast-return instead of
+    // re-sending the whole backlog on every tick while the relay is down.
+    if flush_backoff_active() {
+        debug!("outbox flush skipped: transport backoff active");
+        return Ok(());
+    }
     prune_outbox(db).await?;
     let rows: Vec<(String, String, String, String, i64, Option<String>, i64)> = sqlx::query_as(
         "SELECT id, to_device_id, ciphertext, nonce, ttl_seconds, message_id, retry_count FROM sync_outbox ORDER BY created_at LIMIT 50",
@@ -1029,6 +1088,8 @@ pub async fn flush_outbox_with(
     .fetch_all(db)
     .await
     .context("read outbox")?;
+    let mut any_acked = false;
+    let mut transport_failed = false;
     for (id, to_device_id, ciphertext, nonce, ttl_seconds, message_id, _retries) in rows {
         if base64::engine::general_purpose::STANDARD.decode(&ciphertext).is_err()
             || base64::engine::general_purpose::STANDARD.decode(&nonce).is_err()
@@ -1072,6 +1133,7 @@ pub async fn flush_outbox_with(
                     .bind(&id)
                     .execute(db)
                     .await?;
+                any_acked = true;
                 info!(id = %id, to = %to_device_id, "outbox message delivered (acked)");
             }
             Err(crate::sync::relay_client::AckError::Rejected(e)) => {
@@ -1088,11 +1150,19 @@ pub async fn flush_outbox_with(
                 // Unconfirmed: the transport is likely down. Stop the flush —
                 // every remaining row would only time out again, and stalling
                 // here blocks the sync loop. The retry count is NOT bumped:
-                // a transport outage does not make the message poison.
+                // a transport outage does not make the message poison. The
+                // process-level backoff below keeps the next flush from
+                // re-sending the whole backlog on the very next tick.
                 warn!(id = %id, error = %e, "outbox deposit unconfirmed; pausing flush");
+                transport_failed = true;
                 break;
             }
         }
+    }
+    if any_acked || !transport_failed {
+        flush_backoff_reset();
+    } else {
+        flush_backoff_record_failure();
     }
     Ok(())
 }
@@ -1124,7 +1194,7 @@ pub async fn deliver_changes_mailbox(
     if pending > 0 {
         return Ok(since);
     }
-    let changes = export_changes_since(db, since).await?;
+    let changes = export_own_changes_since(db, since).await?;
     if changes.changes.is_empty() {
         return Ok(since);
     }
@@ -1531,6 +1601,11 @@ mod tests {
     use webrtc::peer_connection::configuration::RTCConfiguration;
     use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
     use webrtc::peer_connection::RTCPeerConnection;
+
+    /// Serializes tests that call `flush_outbox_with`: the flush backoff is
+    /// process-global state, so a test that engages it must not overlap with
+    /// other tests' flushes (they would fast-return and never deliver).
+    static FLUSH_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     async fn create_test_db() -> anyhow::Result<(SqlitePool, PathBuf)> {
         let dir = std::env::temp_dir().join(format!(
@@ -2826,6 +2901,8 @@ mod tests {
     /// rejected re-deposit keeps the row (retry later).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn outbox_row_dropped_only_after_ack() -> anyhow::Result<()> {
+        let _guard = FLUSH_TEST_MUTEX.lock().unwrap();
+        flush_backoff_reset();
         let dir = std::env::temp_dir().join(format!(
             "siku-outbox-ack-test-{}-{}",
             std::process::id(),
@@ -2984,6 +3061,8 @@ mod tests {
     /// stored (idempotent retry after a lost ack).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn flush_outbox_reuses_stored_message_id() -> anyhow::Result<()> {
+        let _guard = FLUSH_TEST_MUTEX.lock().unwrap();
+        flush_backoff_reset();
         let (db, _dir) = create_test_db().await?;
         write_outbox_row(&db, "dev-b", b"cipher", &[7u8; 12], "mid-fixed-1").await?;
 
@@ -3013,6 +3092,97 @@ mod tests {
             .fetch_one(&db)
             .await?;
         assert_eq!(remaining.0, 0, "acked outbox row must be dropped");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Backoff growth: 10s initial, doubling on consecutive failures, capped
+    /// at 5 minutes; reset clears it entirely.
+    #[test]
+    fn flush_backoff_doubles_and_caps() {
+        let _guard = FLUSH_TEST_MUTEX.lock().unwrap();
+        flush_backoff_reset();
+        flush_backoff_record_failure();
+        assert_eq!(
+            FLUSH_BACKOFF.lock().unwrap().as_ref().unwrap().current,
+            FLUSH_BACKOFF_INITIAL
+        );
+        flush_backoff_record_failure();
+        assert_eq!(
+            FLUSH_BACKOFF.lock().unwrap().as_ref().unwrap().current,
+            FLUSH_BACKOFF_INITIAL * 2
+        );
+        for _ in 0..10 {
+            flush_backoff_record_failure();
+        }
+        assert_eq!(
+            FLUSH_BACKOFF.lock().unwrap().as_ref().unwrap().current,
+            FLUSH_BACKOFF_MAX
+        );
+        flush_backoff_reset();
+        assert!(FLUSH_BACKOFF.lock().unwrap().is_none());
+    }
+
+    /// After a transport-level flush failure (ack timeout), the process-level
+    /// backoff holds off subsequent flushes instead of re-sending the whole
+    /// backlog on the next proxy tick (production: a 13.4MB outbox
+    /// retransmitted every 10s for 8 minutes). A successful ack clears it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_outbox_backs_off_after_timeout_until_ack() -> anyhow::Result<()> {
+        let _guard = FLUSH_TEST_MUTEX.lock().unwrap();
+        flush_backoff_reset();
+        let (db, _dir) = create_test_db().await?;
+        write_outbox_row(&db, "dev-b", b"cipher", &[7u8; 12], "mid-backoff-1").await?;
+
+        // No ack arrives → the deposit times out (ack-timeout floor, ~3s) and
+        // the flush engages the backoff.
+        let (tx, _rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+        flush_outbox_with(&db, &relay).await?;
+        assert!(flush_backoff_active(), "a timed-out flush must engage the backoff");
+        let kept: (i64,) = sqlx::query_as("SELECT count(*) FROM sync_outbox")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(kept.0, 1, "an unconfirmed row stays queued (retry count untouched)");
+
+        // Inside the backoff window the flush fast-returns without sending.
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay2 = crate::sync::relay_client::RelayClient::new_for_test(tx2);
+        let start = std::time::Instant::now();
+        flush_outbox_with(&db, &relay2).await?;
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "a backed-off flush must fast-return, took {:?}",
+            start.elapsed()
+        );
+        assert!(rx2.try_recv().is_err(), "no deposit may be sent during the backoff");
+
+        // Once the window clears, a successful ack delivers the row and the
+        // backoff stays reset.
+        flush_backoff_reset();
+        let (tx3, mut rx3) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay3 = crate::sync::relay_client::RelayClient::new_for_test(tx3);
+        let relay_for_ack = relay3.clone();
+        let ack_task = tokio::spawn(async move {
+            let msg = rx3.recv().await.expect("deposit must be sent");
+            let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = msg else {
+                panic!("expected mailbox deposit");
+            };
+            relay_for_ack.route_ack(crate::sync::types::MailboxDepositAckPayload {
+                id: payload.message_id.unwrap(),
+                ok: true,
+                error: None,
+            });
+        });
+        flush_outbox_with(&db, &relay3).await?;
+        ack_task.await?;
+        let remaining: (i64,) = sqlx::query_as("SELECT count(*) FROM sync_outbox")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(remaining.0, 0, "the row is delivered once the transport recovers");
+        assert!(!flush_backoff_active(), "a successful ack must clear the backoff");
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;

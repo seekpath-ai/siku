@@ -78,8 +78,41 @@ pub struct ChangesetMessage {
 }
 
 /// Export changes from `crsql_changes` since the given db_version (exclusive).
+/// Includes rows from EVERY site — full-history snapshots must carry
+/// foreign-site rows so a fresh device bootstraps the complete library
+/// (including the "A's snapshot relays B's changes to C" case).
 #[instrument(skip(db))]
 pub async fn export_changes_since(db: &SqlitePool, since_db_version: i64) -> Result<ChangesetMessage> {
+    export_changes_since_impl(db, since_db_version, false).await
+}
+
+/// Export only rows authored by THIS device (`site_id = crsql_site_id()`).
+/// Used for incremental pushes: rows applied from a peer keep the original
+/// author's site_id in `crsql_changes`, but applying them still bumps the
+/// local db_version — an unfiltered incremental export would then re-send the
+/// just-received changes back to the relay (production: an 8598-row / 13.4MB
+/// echo re-deposited every tick). The watermark still advances over the
+/// filtered-out echo rows, so they are never re-scanned.
+#[instrument(skip(db))]
+pub async fn export_own_changes_since(db: &SqlitePool, since_db_version: i64) -> Result<ChangesetMessage> {
+    export_changes_since_impl(db, since_db_version, true).await
+}
+
+async fn export_changes_since_impl(
+    db: &SqlitePool,
+    since_db_version: i64,
+    own_site_only: bool,
+) -> Result<ChangesetMessage> {
+    let own_site_id: Option<Vec<u8>> = if own_site_only {
+        Some(
+            sqlx::query_scalar("SELECT crsql_site_id()")
+                .fetch_one(db)
+                .await
+                .context("read crsql_site_id")?,
+        )
+    } else {
+        None
+    };
     let rows = sqlx::query(
         r#"SELECT "table", "pk", "cid", CAST("val" AS TEXT) AS "val", "col_version", "db_version", "site_id", "cl", "seq"
            FROM crsql_changes
@@ -96,14 +129,24 @@ pub async fn export_changes_since(db: &SqlitePool, since_db_version: i64) -> Res
 
     for row in rows {
         // Advance the export watermark for EVERY row in range — including
-        // filtered-out ones (disabled optional tables, non-syncable settings).
-        // Otherwise a range containing only filtered rows leaves
-        // `to_db_version` stuck and every push re-scans the same rows.
+        // filtered-out ones (disabled optional tables, non-syncable settings,
+        // foreign-site echo rows). Otherwise a range containing only filtered
+        // rows leaves `to_db_version` stuck and every push re-scans the same
+        // rows.
         let db_version: i64 = row.try_get("db_version").unwrap_or_default();
         max_db_version = max_db_version.max(db_version);
         let table: String = row.try_get("table").unwrap_or_default();
         if !table_sync_enabled(&table) {
             continue;
+        }
+        // Echo suppression: rows this device applied from a peer keep the
+        // peer's site_id; skip them in own-site exports (after the watermark
+        // advance above, so they never block it).
+        if let Some(own) = &own_site_id {
+            let site_id: Vec<u8> = row.try_get("site_id").unwrap_or_default();
+            if site_id != *own {
+                continue;
+            }
         }
         let cid: String = row.try_get::<String, _>("cid").unwrap_or_default();
         if non_syncable_column(&table, &cid) {
@@ -857,6 +900,92 @@ mod tests {
                 .fetch_one(&db_b)
                 .await?;
         assert_eq!(annotation_count.0, 1);
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
+    /// Echo suppression: rows applied from a peer keep the ORIGINAL author's
+    /// site_id in crsql_changes, but still bump the local db_version. An
+    /// own-site-only incremental export must skip them (re-sending them would
+    /// echo a just-received changeset back to the relay — production saw an
+    /// 8598-row / 13.4MB echo), while the watermark still advances past them.
+    /// The all-sites export (full snapshots) must keep including them so new
+    /// devices bootstrap the complete library.
+    #[tokio::test]
+    async fn own_site_export_filters_echo_rows_but_advances_watermark() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-crdt-echo-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        // Device A authors a note.
+        let db_a = connect_with_crsqlite(&dir.join("a.db")).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db_a).await?;
+        register_crr_tables(&db_a, CORE_SYNC_TABLES).await?;
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, content, content_plain, created_at, updated_at) \
+             VALUES ('n1', 1, 'Note One', 'body', 'body', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+        .execute(&db_a)
+        .await?;
+        let site_a: Vec<u8> = sqlx::query_scalar("SELECT crsql_site_id()")
+            .fetch_one(&db_a)
+            .await?;
+
+        // Device B applies A's changeset: B's crsql_changes now carries A's
+        // rows under A's site_id, at fresh local db_versions.
+        let db_b = connect_with_crsqlite(&dir.join("b.db")).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db_b).await?;
+        register_crr_tables(&db_b, CORE_SYNC_TABLES).await?;
+        let from_a = export_changes_since(&db_a, 0).await?;
+        apply_changes(&db_b, &from_a).await?;
+        let site_b: Vec<u8> = sqlx::query_scalar("SELECT crsql_site_id()")
+            .fetch_one(&db_b)
+            .await?;
+        assert_ne!(site_a, site_b);
+
+        // B has authored nothing yet: the own-site export is empty (the echo
+        // is suppressed), but the watermark still covers the applied rows.
+        let own = export_own_changes_since(&db_b, 0).await?;
+        let full = export_changes_since(&db_b, 0).await?;
+        assert!(own.changes.is_empty(), "echo rows must not be re-exported");
+        assert!(!full.changes.is_empty(), "all-sites export keeps foreign rows");
+        assert!(full.changes.iter().all(|c| c.site_id == site_a));
+        assert_eq!(
+            own.to_db_version, full.to_db_version,
+            "filtered echo rows must still advance the watermark"
+        );
+        assert!(own.to_db_version > 0);
+
+        // After a local edit on B, the own-site export contains only B's
+        // rows; the all-sites export still includes A's.
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, content, content_plain, created_at, updated_at) \
+             VALUES ('n2', 1, 'Note Two', 'body', 'body', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+        .execute(&db_b)
+        .await?;
+        let own2 = export_own_changes_since(&db_b, 0).await?;
+        assert!(!own2.changes.is_empty());
+        assert!(
+            own2.changes.iter().all(|c| c.site_id == site_b),
+            "own-site export must contain only locally authored rows"
+        );
+        let full2 = export_changes_since(&db_b, 0).await?;
+        assert!(
+            full2.changes.iter().any(|c| c.site_id == site_a),
+            "all-sites export must keep foreign-site rows for bootstrap"
+        );
 
         sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
         sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;

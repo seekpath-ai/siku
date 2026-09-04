@@ -174,6 +174,45 @@ enum RelayServerMsg {
 /// mailbox with `MailboxDepositAck`.
 const RELAY_PROTOCOL_VERSION: u32 = 2;
 
+/// Byte budget for one `MailboxBatch` frame. The websocket has no explicit
+/// max_message_size (tungstenite's 64MB default applies); a single frame
+/// carrying the whole poll result once exceeded that on accounts with large
+/// snapshot backlogs, killing delivery. Payload size is approximated by
+/// ciphertext + nonce lengths, which dominate the serialized frame.
+const MAILBOX_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Group mailbox messages into batches whose cumulative payload stays within
+/// `max_bytes`, preserving order. A single message larger than the budget
+/// gets its own frame — it must still be deliverable (a ~10MB snapshot is
+/// ~16MB base64, well under the 64MB websocket cap).
+fn chunk_mailbox_messages(messages: Vec<MailboxMessage>, max_bytes: usize) -> Vec<Vec<MailboxMessage>> {
+    let mut batches: Vec<Vec<MailboxMessage>> = Vec::new();
+    let mut current: Vec<MailboxMessage> = Vec::new();
+    let mut current_bytes = 0usize;
+    for m in messages {
+        let size = m.ciphertext.len() + m.nonce.len();
+        if !current.is_empty() && current_bytes + size > max_bytes {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += size;
+        current.push(m);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Send a poll result as one or more byte-budgeted `MailboxBatch` frames.
+fn send_mailbox_batches(tx: &mpsc::UnboundedSender<RelayServerMsg>, messages: Vec<MailboxMessage>) {
+    for batch in chunk_mailbox_messages(messages, MAILBOX_BATCH_MAX_BYTES) {
+        let _ = tx.send(RelayServerMsg::MailboxBatch {
+            payload: MailboxBatchPayload { messages: batch },
+        });
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ServerHelloPayload {
     protocol: u32,
@@ -555,9 +594,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                                 .mailboxes
                                 .poll(&room_id, &join_device_id, Some(100));
                             if !pending.is_empty() {
-                                let _ = tx.send(RelayServerMsg::MailboxBatch {
-                                    payload: MailboxBatchPayload { messages: pending },
-                                });
+                                send_mailbox_batches(&tx, pending);
                                 info!(device_id = %join_device_id, "delivered pending mailbox batch");
                             }
                         }
@@ -721,11 +758,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                             continue;
                         };
                         let pending = state.mailboxes.poll(room, &device_id, payload.max_count);
-                        if !pending.is_empty() {
-                            let _ = tx.send(RelayServerMsg::MailboxBatch {
-                                payload: MailboxBatchPayload { messages: pending },
-                            });
-                        }
+                        send_mailbox_batches(&tx, pending);
                     }
                     RelayClientMsg::MailboxAck { payload } => {
                         let Some(room) = joined_room.as_ref() else {
@@ -1018,6 +1051,55 @@ async fn main() {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn mailbox_msg(id: &str, ciphertext_len: usize) -> MailboxMessage {
+        MailboxMessage {
+            id: id.to_string(),
+            from_device_id: "dev".to_string(),
+            ciphertext: "x".repeat(ciphertext_len),
+            nonce: "n".to_string(),
+            account_level: false,
+        }
+    }
+
+    /// Mixed-size messages are grouped so each frame's cumulative
+    /// ciphertext+nonce stays within the budget, preserving order.
+    #[test]
+    fn mailbox_batch_chunking_groups_by_byte_budget() {
+        // Sizes (ciphertext+nonce): 41, 41, 41, 11 — budget 90.
+        let msgs = vec![
+            mailbox_msg("a", 40),
+            mailbox_msg("b", 40),
+            mailbox_msg("c", 40),
+            mailbox_msg("d", 10),
+        ];
+        let batches = chunk_mailbox_messages(msgs, 90);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(batches[1].iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["c", "d"]);
+    }
+
+    /// A message larger than the budget still gets delivered: it occupies its
+    /// own frame and does not merge with neighbours.
+    #[test]
+    fn mailbox_batch_chunking_oversized_message_gets_own_frame() {
+        let msgs = vec![
+            mailbox_msg("small-1", 10),
+            mailbox_msg("huge", 1024),
+            mailbox_msg("small-2", 10),
+        ];
+        let batches = chunk_mailbox_messages(msgs, 90);
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0][0].id, "small-1");
+        assert_eq!(batches[1].len(), 1);
+        assert_eq!(batches[1][0].id, "huge");
+        assert_eq!(batches[2][0].id, "small-2");
+    }
+
+    #[test]
+    fn mailbox_batch_chunking_empty_input() {
+        assert!(chunk_mailbox_messages(Vec::new(), 90).is_empty());
+    }
 
     fn make_token(sub: &str, device_id: &str) -> String {
         use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};

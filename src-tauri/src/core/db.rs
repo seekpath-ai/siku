@@ -248,6 +248,22 @@ async fn apply_pending_seed_import(app_data_dir: &Path) -> anyhow::Result<SeedIm
     Ok(SeedImportOutcome::Applied(old_device_id))
 }
 
+/// Mint a fresh cr-sqlite site_id after a seed import onto a NEW machine.
+/// The seed is a copy of the source machine's whole database, site identity
+/// included; keeping it would make both machines share one site_id — their
+/// version vectors collide and sync breaks in both directions. Same-machine
+/// restores keep the existing identity (this function is not called there).
+/// Must run on a connection whose CRR tables are already registered — the
+/// call site in `init` sits after `register_crr_tables`, so this holds.
+async fn recast_crr_site_id(db: &Db) -> anyhow::Result<()> {
+    sqlx::query("UPDATE crsql_site_id SET site_id = randomblob(16) WHERE ordinal = 0")
+        .execute(db)
+        .await
+        .context("recast crsql site_id after seed import")?;
+    info!("recast cr-sqlite site_id after seed import on a fresh machine");
+    Ok(())
+}
+
 #[instrument]
 pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     let app_data_dir = app_handle
@@ -802,7 +818,9 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     //   machine's device_id so its sync identity is preserved.
     // - Fresh install / new device (no old database): the seed carries the
     //   source device's id — that must NOT be reused, or both machines would
-    //   collide in sync. Always mint a brand-new id instead.
+    //   collide in sync. Always mint a brand-new id instead, AND recast the
+    //   cr-sqlite site_id for the same reason (a shared site_id collides
+    //   version vectors and breaks sync in both directions).
     // - Normal startup (no import): only generate when the setting is empty.
     match &seed_import_outcome {
         SeedImportOutcome::Applied(Some(old_id)) => {
@@ -821,6 +839,7 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
                 "fresh machine after seed import — minting new device_id"
             );
             device_settings.device_id = uuid::Uuid::new_v4().to_string();
+            recast_crr_site_id(&db).await?;
         }
         SeedImportOutcome::None => {
             if device_settings.device_id.is_empty() {
@@ -1966,6 +1985,62 @@ pub(crate) mod tests {
             .await
             .map_err(|_| anyhow::anyhow!("finalize_db did not complete in time"))??;
 
+        Ok(())
+    }
+
+    /// A seed imported onto a NEW machine must recast the cr-sqlite site_id.
+    /// The seed is a byte copy of the source machine's database — site
+    /// identity included — so without the recast both machines share one
+    /// site_id, their version vectors collide, and sync breaks in both
+    /// directions (production incident; fixed live by hand at the time).
+    #[tokio::test]
+    async fn seed_import_recast_site_id_differs_from_source() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-seed-siteid-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        // Source machine's database.
+        let src_path = dir.join("source.db");
+        let src = connect_with_crsqlite(&src_path).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&src).await?;
+        register_crr_tables(&src, CORE_SYNC_TABLES).await?;
+        let src_site: Vec<u8> =
+            sqlx::query_scalar("SELECT site_id FROM crsql_site_id WHERE ordinal = 0")
+                .fetch_one(&src)
+                .await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&src).await?;
+        src.close().await;
+
+        // The seed lands on the fresh machine as a copy of that database file.
+        let imported_path = dir.join("imported.db");
+        std::fs::copy(&src_path, &imported_path)?;
+        let imported = connect_with_crsqlite(&imported_path).await?;
+        let before: Vec<u8> =
+            sqlx::query_scalar("SELECT site_id FROM crsql_site_id WHERE ordinal = 0")
+                .fetch_one(&imported)
+                .await?;
+        assert_eq!(
+            before, src_site,
+            "an imported seed initially carries the source machine's site_id"
+        );
+
+        recast_crr_site_id(&imported).await?;
+        let after: Vec<u8> =
+            sqlx::query_scalar("SELECT site_id FROM crsql_site_id WHERE ordinal = 0")
+                .fetch_one(&imported)
+                .await?;
+        assert_ne!(after, src_site, "a fresh machine must mint its own site_id");
+        assert_eq!(after.len(), 16, "site_id is a 16-byte blob");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&imported).await?;
+        imported.close().await;
         Ok(())
     }
 }

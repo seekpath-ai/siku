@@ -33,6 +33,23 @@ pub enum AckError {
 /// (protocol 1, no mailbox deposit acks).
 const SERVER_HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Floor for the deposit-ack wait, scaled by payload size. The relay can only
+/// ack after it has received the WHOLE frame, and a large frame takes
+/// non-negligible time just to cross the wire — production: a 13.4MB mailbox
+/// deposit at ~4.5MB/s needs ~3s of pure transmission, so a fixed 3s timeout
+/// aborted every large deposit and made the outbox retransmit the full payload
+/// on every tick. Scales as `max(3s, 2s + ciphertext_bytes / 2MB/s)`, capped
+/// at 60s.
+fn payload_scaled_ack_timeout(ciphertext_b64_len: usize) -> Duration {
+    // The payload ciphertext is base64 (4:3); the decoded byte count is what
+    // costs bandwidth.
+    let payload_bytes = (ciphertext_b64_len as u64).saturating_mul(3) / 4;
+    let transfer_secs = payload_bytes / (2 * 1024 * 1024);
+    Duration::from_secs(2)
+        .saturating_add(Duration::from_secs(transfer_secs))
+        .clamp(Duration::from_secs(3), Duration::from_secs(60))
+}
+
 /// Detected relay capability, learned from the `ServerHello` handshake (or
 /// its absence within `SERVER_HELLO_TIMEOUT` of joining).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +255,12 @@ impl RelayClient {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         payload.message_id = Some(message_id.clone());
+
+        // The caller-supplied timeout is only a floor: scale the wait with the
+        // payload size so a multi-MB frame gets enough time to reach the relay
+        // (which acks only after receiving the whole frame) before the deposit
+        // is declared unconfirmed.
+        let timeout = timeout.max(payload_scaled_ack_timeout(payload.ciphertext.len()));
 
         let (ack_tx, ack_rx) = oneshot::channel();
         self.pending_acks
@@ -476,6 +499,25 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// The ack-timeout floor scales with payload size: small deposits keep
+    /// the 3s floor, a ~13.4MB deposit (the production incident) gets ~8s,
+    /// and huge payloads are capped at 60s.
+    #[test]
+    fn ack_timeout_scales_with_payload() {
+        // Tiny payload → 3s floor.
+        assert_eq!(payload_scaled_ack_timeout(8), Duration::from_secs(3));
+        // Boundary: 2MB of ciphertext → 2s + 1s = 3s (still the floor).
+        let two_mb_b64 = (2 * 1024 * 1024) * 4 / 3;
+        assert_eq!(payload_scaled_ack_timeout(two_mb_b64), Duration::from_secs(3));
+        // 13.4MB ciphertext → 2s + ~6s = ~8s.
+        let thirteen_mb_b64 = (13_400_000u64 * 4 / 3) as usize;
+        let t = payload_scaled_ack_timeout(thirteen_mb_b64);
+        assert!(t >= Duration::from_secs(7) && t <= Duration::from_secs(9), "got {t:?}");
+        // Huge payload → capped at 60s.
+        let huge_b64 = (200 * 1024 * 1024) * 4 / 3;
+        assert_eq!(payload_scaled_ack_timeout(huge_b64), Duration::from_secs(60));
     }
 
     /// Once the relay is known to be legacy (no/unsupported ServerHello),

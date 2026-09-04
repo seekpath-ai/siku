@@ -25,6 +25,13 @@ pub const DEFAULT_TTL_SECONDS: u64 = 7 * 24 * 3600; // 7 days
 const MAX_MESSAGES_PER_DEVICE: usize = 500;
 const MAX_ACCOUNT_MESSAGES: usize = 2000;
 
+/// Byte quota for the account-level archive (summed `length(ciphertext)` per
+/// room). Full-snapshot sync messages run to ~10MB each, so the 2000-row cap
+/// alone allowed hundreds of MB to accumulate — more than a single WebSocket
+/// frame can ever deliver. Oldest rows are evicted first; eviction is logged
+/// because a dropped row may never have been seen by some device.
+pub const ACCOUNT_ARCHIVE_MAX_BYTES: usize = 100 * 1024 * 1024;
+
 /// Per-device messages are re-delivered when a poll's delivery was never
 /// acked within this window (the relay or client may have died between poll
 /// and the client's apply + ack). Redelivery is safe: clients dedupe by
@@ -194,6 +201,67 @@ impl Mailbox {
         );
     }
 
+    /// Enforce the account archive byte quota: while the summed ciphertext
+    /// length exceeds `max_bytes`, delete rows oldest-first. Evictions are
+    /// logged — an evicted row may be a message some device never saw.
+    fn enforce_account_archive_quota(
+        conn: &mut rusqlite::Connection,
+        room_id: &str,
+        max_bytes: usize,
+    ) -> Result<(), String> {
+        let total: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(ciphertext)), 0) FROM mailbox_messages
+                 WHERE room_id = ?1 AND to_device_id = ''",
+                rusqlite::params![room_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if total <= max_bytes as i64 {
+            return Ok(());
+        }
+        let rows: Vec<(i64, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT seq, LENGTH(ciphertext) FROM mailbox_messages
+                     WHERE room_id = ?1 AND to_device_id = '' ORDER BY seq ASC",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(rusqlite::params![room_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            rows
+        };
+        let mut remaining = total;
+        let mut evicted_rows = 0usize;
+        let mut evicted_bytes = 0i64;
+        for (seq, len) in rows {
+            if remaining <= max_bytes as i64 {
+                break;
+            }
+            conn.execute(
+                "DELETE FROM mailbox_messages WHERE seq = ?1",
+                rusqlite::params![seq],
+            )
+            .map_err(|e| e.to_string())?;
+            remaining -= len;
+            evicted_rows += 1;
+            evicted_bytes += len;
+        }
+        if evicted_rows > 0 {
+            tracing::warn!(
+                room_id = %room_id,
+                evicted_rows,
+                evicted_bytes,
+                remaining_bytes = remaining,
+                "account archive byte quota evicted oldest messages (possibly unseen by some devices)"
+            );
+        }
+        Ok(())
+    }
+
     /// Deposit a ciphertext message. An empty `to_device_id` stores it in the
     /// account-level archive (no target device needs to exist or be online);
     /// otherwise it goes to that device's queue (target must have joined).
@@ -255,6 +323,7 @@ impl Mailbox {
             // The depositor has already "seen" it (they created it).
             Self::append_seen(&conn, &id, from_device_id);
             Self::trim(&mut conn, room_id, ACCOUNT_LEVEL_TARGET, MAX_ACCOUNT_MESSAGES)?;
+            Self::enforce_account_archive_quota(&mut conn, room_id, ACCOUNT_ARCHIVE_MAX_BYTES)?;
         } else {
             Self::trim(&mut conn, room_id, to_device_id, MAX_MESSAGES_PER_DEVICE)?;
         }
@@ -264,8 +333,11 @@ impl Mailbox {
     /// Take up to `max_count` pending messages for `device_id`: its own queue
     /// (stamped `delivered_at`, deleted only on ack — redelivered after
     /// `REDELIVERY_WINDOW_SECS` if never acked) plus account-level messages it
-    /// has not seen yet (marked seen). Account-level messages are shared, so a
-    /// device can page through them by polling repeatedly.
+    /// has not seen yet. Account-level rows are NOT marked seen here: the
+    /// batch can still be lost after the poll (oversized WS frame,
+    /// disconnect), so `seen` is recorded only when the client acks. Until
+    /// then a repeated poll returns the same archive messages; clients dedupe
+    /// by message id.
     pub fn poll(&self, room_id: &str, device_id: &str, max_count: Option<usize>) -> Vec<MailboxMessage> {
         let limit = max_count.unwrap_or(100);
         let ts = now();
@@ -312,7 +384,9 @@ impl Mailbox {
             return out;
         }
 
-        // 2) Account-level archive (shared; mark seen, don't remove).
+        // 2) Account-level archive (shared; never removed or marked seen by
+        // poll — seen is recorded on ack, so an undelivered batch is simply
+        // returned again by the next poll).
         let remaining = limit - out.len();
         {
             let mut stmt = match conn.prepare(
@@ -335,24 +409,36 @@ impl Mailbox {
                 .ok()
                 .and_then(|m| m.collect::<Result<Vec<_>, _>>().ok())
                 .unwrap_or_default();
-            drop(stmt);
-            for m in &rows {
-                Self::append_seen(&conn, &m.id, device_id);
-            }
             out.extend(rows);
         }
         out
     }
 
-    /// Acknowledge per-device messages (removes them from the device queue).
-    /// Account-level messages are shared and never removed by ack.
+    /// Acknowledge messages. A per-device row owned by `device_id` is deleted
+    /// from its queue. An account-level archive row is shared and never
+    /// deleted; the ack marks it seen for this device so later polls skip it.
+    /// Message ids are globally unique, so the row's `to_device_id` decides
+    /// which case applies.
     pub fn ack(&self, room_id: &str, device_id: &str, message_ids: &[String]) {
         let conn = self.conn.lock().unwrap();
         for id in message_ids {
-            let _ = conn.execute(
-                "DELETE FROM mailbox_messages WHERE room_id = ?1 AND to_device_id = ?2 AND id = ?3",
-                rusqlite::params![room_id, device_id, id],
-            );
+            let target: Option<String> = conn
+                .query_row(
+                    "SELECT to_device_id FROM mailbox_messages WHERE room_id = ?1 AND id = ?2",
+                    rusqlite::params![room_id, id],
+                    |r| r.get(0),
+                )
+                .ok();
+            match target.as_deref() {
+                Some(ACCOUNT_LEVEL_TARGET) => Self::append_seen(&conn, id, device_id),
+                Some(t) if t == device_id => {
+                    let _ = conn.execute(
+                        "DELETE FROM mailbox_messages WHERE id = ?1",
+                        rusqlite::params![id],
+                    );
+                }
+                _ => {}
+            }
         }
     }
 
@@ -533,12 +619,17 @@ mod tests {
         let msgs_c = mb.poll("room-a", "dev-c", None);
         assert_eq!(msgs_c.len(), 1, "dev-c should also see it (shared archive)");
 
-        // dev-b already consumed it (marked seen) → second poll is empty.
+        // dev-b has not acked: the message is still delivered again (poll no
+        // longer marks seen — a lost batch must be retried).
+        assert_eq!(mb.poll("room-a", "dev-b", None).len(), 1);
+        // After the ack, dev-b's polls skip it.
+        mb.ack("room-a", "dev-b", &[msgs[0].id.clone()]);
         assert!(mb.poll("room-a", "dev-b", None).is_empty());
     }
 
     /// Polling pages through a large account archive: each poll returns the
-    /// next unseen slice; devices can drain the whole archive by polling.
+    /// next unseen slice once the previous batch is acked; devices can drain
+    /// the whole archive by polling + acking.
     #[test]
     fn account_level_archive_pages_across_polls() {
         let (_dir, mb) = temp_mailbox("paging");
@@ -556,12 +647,22 @@ mod tests {
         }
         mb.ensure_device("room-a", "dev-b");
 
+        let ack_all = |mb: &Mailbox, msgs: &[MailboxMessage]| {
+            let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+            mb.ack("room-a", "dev-b", &ids);
+        };
         let first = mb.poll("room-a", "dev-b", Some(100));
         assert_eq!(first.len(), 100);
+        // Without an ack the same slice comes back (poll no longer marks seen).
+        assert_eq!(mb.poll("room-a", "dev-b", Some(100))[0].id, first[0].id);
+        ack_all(&mb, &first);
         let second = mb.poll("room-a", "dev-b", Some(100));
         assert_eq!(second.len(), 100);
+        assert_ne!(second[0].id, first[0].id);
+        ack_all(&mb, &second);
         let third = mb.poll("room-a", "dev-b", Some(100));
         assert_eq!(third.len(), 50);
+        ack_all(&mb, &third);
         assert!(mb.poll("room-a", "dev-b", Some(100)).is_empty());
     }
 
@@ -766,7 +867,10 @@ mod tests {
         for i in 0..(MAX_SEEN_ENTRIES + 20) {
             let dev = format!("dev-{i}");
             mb.ensure_device("room-a", &dev);
-            assert_eq!(mb.poll("room-a", &dev, None).len(), 1, "every device still gets the message");
+            let msgs = mb.poll("room-a", &dev, None);
+            assert_eq!(msgs.len(), 1, "every device still gets the message");
+            let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+            mb.ack("room-a", &dev, &ids);
         }
         let seen: String = {
             let conn = mb.conn.lock().unwrap();
@@ -779,5 +883,118 @@ mod tests {
         };
         let count = seen.split(',').filter(|s| !s.is_empty()).count();
         assert_eq!(count, MAX_SEEN_ENTRIES, "seen list must stop growing at the cap");
+    }
+
+    /// Poll must NOT mark account-level messages seen: if the batch is lost
+    /// after the poll (oversized WS frame, disconnect), the next poll from the
+    /// same device returns the same messages again.
+    #[test]
+    fn poll_does_not_mark_account_messages_seen() {
+        let (_dir, mb) = temp_mailbox("pollseen");
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c1".into(), "n".into(), None, None)
+            .unwrap();
+        mb.ensure_device("room-a", "dev-b");
+
+        let first = mb.poll("room-a", "dev-b", None);
+        assert_eq!(first.len(), 1);
+        let second = mb.poll("room-a", "dev-b", None);
+        assert_eq!(second.len(), 1, "un-acked account message must be re-polled");
+        assert_eq!(second[0].id, first[0].id);
+
+        // The `seen` column still only names the depositor.
+        let seen: String = {
+            let conn = mb.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT seen FROM mailbox_messages WHERE id = ?1",
+                rusqlite::params![&first[0].id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(!seen.contains("dev-b"), "poll must not append to seen");
+    }
+
+    /// Ack on an account-level message marks it seen for the acking device
+    /// only: that device's polls skip it, another device still receives it,
+    /// and the shared row is never deleted.
+    #[test]
+    fn ack_marks_account_message_seen_for_that_device_only() {
+        let (_dir, mb) = temp_mailbox("ackseen");
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c1".into(), "n".into(), None, None)
+            .unwrap();
+        mb.ensure_device("room-a", "dev-b");
+        mb.ensure_device("room-a", "dev-c");
+
+        let msgs = mb.poll("room-a", "dev-b", None);
+        assert_eq!(msgs.len(), 1);
+        mb.ack("room-a", "dev-b", &[msgs[0].id.clone()]);
+
+        assert!(mb.poll("room-a", "dev-b", None).is_empty(), "acked device must not re-receive");
+        assert_eq!(mb.poll("room-a", "dev-c", None).len(), 1, "other devices still receive it");
+        assert_eq!(row_count(&mb, "room-a", ACCOUNT_LEVEL_TARGET), 1, "ack must not delete the shared row");
+
+        // Repeated ack is an idempotent no-op.
+        mb.ack("room-a", "dev-b", &[msgs[0].id.clone()]);
+        assert_eq!(row_count(&mb, "room-a", ACCOUNT_LEVEL_TARGET), 1);
+    }
+
+    /// Mixed ack in one call: the per-device row is deleted, the account-level
+    /// row is marked seen — matching the client, which acks every message id
+    /// of an applied batch.
+    #[test]
+    fn ack_handles_mixed_device_and_account_ids() {
+        let (_dir, mb) = temp_mailbox("ackmixed");
+        mb.ensure_device("room-a", "dev-a");
+        mb.ensure_device("room-a", "dev-b");
+        mb.deposit("room-a", "dev-a", "dev-b", "device-c".into(), "n".into(), None, None)
+            .unwrap();
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "account-c".into(), "n".into(), None, None)
+            .unwrap();
+
+        let msgs = mb.poll("room-a", "dev-b", None);
+        assert_eq!(msgs.len(), 2);
+        let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
+        mb.ack("room-a", "dev-b", &ids);
+
+        assert_eq!(row_count(&mb, "room-a", "dev-b"), 0, "per-device row must be deleted");
+        assert_eq!(row_count(&mb, "room-a", ACCOUNT_LEVEL_TARGET), 1, "account row must survive");
+        assert!(mb.poll("room-a", "dev-b", None).is_empty(), "both must be gone from dev-b's polls");
+    }
+
+    /// The account archive byte quota evicts the oldest rows once the summed
+    /// ciphertext length exceeds it, converging back under the quota.
+    #[test]
+    fn account_archive_byte_quota_evicts_oldest() {
+        let (_dir, mb) = temp_mailbox("bytequota");
+        // 3 × 40MB > 100MB quota → the oldest 40MB row is evicted.
+        let chunk = "x".repeat(40 * 1024 * 1024);
+        let id1 = mb
+            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, chunk.clone(), "n".into(), None, None)
+            .unwrap();
+        let id2 = mb
+            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, chunk.clone(), "n".into(), None, None)
+            .unwrap();
+        let id3 = mb
+            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, chunk, "n".into(), None, None)
+            .unwrap();
+
+        let (count, total): (i64, i64) = {
+            let conn = mb.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT count(*), COALESCE(SUM(LENGTH(ciphertext)), 0) FROM mailbox_messages
+                 WHERE room_id = 'room-a' AND to_device_id = ''",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert!(total <= ACCOUNT_ARCHIVE_MAX_BYTES as i64, "archive must converge under the quota");
+        assert_eq!(count, 2, "exactly the oldest row must be evicted");
+
+        // The survivors are the two newest deposits.
+        mb.ensure_device("room-a", "dev-b");
+        let msgs = mb.poll("room-a", "dev-b", Some(10));
+        let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, [id2.as_str(), id3.as_str()], "evicted row must be the oldest: {id1}");
     }
 }

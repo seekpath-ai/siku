@@ -373,7 +373,10 @@ impl AgentEngine {
                     result = &mut llm_fut => {
                         if let Err(e) = result {
                             error!(error = %e, "LLM stream failed");
-                            self.emit(&event_tx, "error", Some(step_index), Some(format!("LLM error: {e}")), None, None, None, None, None, None);
+                            // Do NOT emit an "error" event here: the outer
+                            // caller (commands/agent.rs) reports the returned
+                            // Err, and emitting both renders two assistant
+                            // error bubbles for one failure.
                             return Err(format!("LLM: {e}"));
                         }
                         info!(stream_text_len = stream_text.len(), tool_calls = tool_call_buf.len(), "LLM stream finished");

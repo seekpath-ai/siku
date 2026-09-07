@@ -163,7 +163,46 @@ fn guess_image_mime(path: &str) -> &'static str {
     }
 }
 
+/// Extensions whose formats vLLM-style vision backends decode reliably
+/// (verified against the production endpoint: png/jpeg/gif/bmp pass, webp
+/// fails with "Failed to load image or audio file"). Anything else is
+/// transcoded to PNG before upload.
+fn is_api_safe_image_ext(path: &std::path::Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp")
+}
+
+/// Decode `bytes` and re-encode as PNG. Returns None when decoding fails.
+fn transcode_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    crate::ai::llm::transcode_image_to_png(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn transcodes_webp_to_png() {
+        // 8x8 red webp (the format vLLM backends reject with "Failed to load
+        // image or audio file").
+        use base64::Engine;
+        let webp = base64::engine::general_purpose::STANDARD
+            .decode("UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoIAAgAAgA0JaACdLoB+AADsAD+8MQL/yC5YXXI1/8gP+QH/ID/+PIAAAA=")
+            .unwrap();
+        let png = super::transcode_to_png(&webp).expect("webp should decode");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "output must be a PNG");
+        // And the PNG must itself decode back to an 8x8 image.
+        let img = image::load_from_memory(&png).expect("png should decode");
+        assert_eq!((img.width(), img.height()), (8, 8));
+    }
+}
+
 /// Read a local image file and return it as a base64-encoded ImageAttachment.
+/// WebP and other exotic formats are transcoded to PNG: several OpenAI-
+/// compatible vision backends (vLLM without webp support) reject them with
+/// "Failed to load image or audio file".
 #[tauri::command]
 #[instrument]
 pub async fn read_image_file(path: String) -> Result<ImageAttachment, String> {
@@ -176,11 +215,20 @@ pub async fn read_image_file(path: String) -> Result<ImageAttachment, String> {
     let bytes = tokio::fs::read(&resolved)
         .await
         .map_err(|e| format!("read failed: {e}"))?;
-    let mime = guess_image_mime(&resolved.to_string_lossy());
-    let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     let name = resolved
         .file_name()
         .and_then(|n| n.to_str())
         .map(|n| n.to_string());
+    let (bytes, mime) = if is_api_safe_image_ext(&resolved) {
+        (bytes, guess_image_mime(&resolved.to_string_lossy()))
+    } else {
+        match transcode_to_png(&bytes) {
+            Some(png) => (png, "image/png"),
+            // Decode failed (or the format needs a codec we don't ship): send
+            // the original and let the API judge it.
+            None => (bytes, guess_image_mime(&resolved.to_string_lossy())),
+        }
+    };
+    let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(ImageAttachment { mime: mime.to_string(), base64, name })
 }

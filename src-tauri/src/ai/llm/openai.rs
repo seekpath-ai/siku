@@ -106,7 +106,11 @@ fn message_to_openai_json(msg: &ChatMessage) -> serde_json::Value {
             content_blocks.push(serde_json::json!({"type": "text", "text": msg.content}));
         }
         if let Ok(attachments) = serde_json::from_str::<Vec<crate::ai::llm::ImageAttachment>>(attachments_json) {
-            for att in attachments {
+            for att in &attachments {
+                // History may carry formats the backend cannot decode (webp
+                // was saved before the transcode fix); sanitize at build time
+                // so one bad legacy image does not poison every later turn.
+                let att = crate::ai::llm::sanitize_attachment_for_vision(att);
                 content_blocks.push(serde_json::json!({
                     "type": "image_url",
                     "image_url": { "url": format!("data:{};base64,{}", att.mime, att.base64) },

@@ -114,6 +114,47 @@ pub struct ImageAttachment {
     pub name: Option<String>,
 }
 
+/// MIME types that OpenAI-compatible vision backends decode reliably
+/// (verified against production: png/jpeg/gif/bmp pass; webp is rejected
+/// with "Failed to load image or audio file" on vLLM builds without webp
+/// support).
+pub fn is_vision_safe_mime(mime: &str) -> bool {
+    matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/bmp")
+}
+
+/// Decode an image and re-encode it as PNG. Returns None when decoding
+/// fails (unknown format or codec not compiled in).
+pub fn transcode_image_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(out)
+}
+
+/// Transcode an attachment to PNG when its format is not vision-safe. This
+/// runs at request-build time so legacy messages stored with webp (or other
+/// exotic) attachments keep working — without it every later message in the
+/// session re-sends the bad image and fails with the same 400 forever.
+pub fn sanitize_attachment_for_vision(att: &ImageAttachment) -> ImageAttachment {
+    if is_vision_safe_mime(&att.mime) {
+        return att.clone();
+    }
+    use base64::Engine;
+    let raw = match base64::engine::general_purpose::STANDARD.decode(&att.base64) {
+        Ok(b) => b,
+        Err(_) => return att.clone(),
+    };
+    match transcode_image_to_png(&raw) {
+        Some(png) => ImageAttachment {
+            mime: "image/png".to_string(),
+            base64: base64::engine::general_purpose::STANDARD.encode(png),
+            name: att.name.clone(),
+        },
+        None => att.clone(),
+    }
+}
+
 /// A tool call from the LLM
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {

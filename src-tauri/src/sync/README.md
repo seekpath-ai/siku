@@ -17,7 +17,20 @@
 - `crypto.rs`：AES-256-GCM（每条消息随机 nonce）。
 - `webrtc_peer.rs`：PeerConnection / DataChannel 封装。
 - `relay_client.rs` / `mailbox_client.rs`：relay WebSocket 客户端 / 加密信箱存取。
-- `attachments.rs`：扫描 `papers.file_path`、`attachments.file_path`、`files.blob_path` 及笔记正文中的 `blobs/<hash>` 引用，按需向 peer 请求缺失 blob，写入前 sha256 校验。
+- `attachments.rs`：扫描 `papers.file_path`、`attachments.file_path`、`files.blob_path` 及笔记正文中的 `blobs/<hash>` 引用，按需向 peer 请求缺失 blob，写入前 sha256 校验；大 blob 的 3MB 分片暂存/重组（`blobs/.incoming/<hash>/`）、relay 去重键 `blob_dedup_key`、主动推标记（`device_settings` 的 `sync.blob_push.pending./done.`）。
+
+## Blob（PDF/图片等文件）同步分层
+
+blob 内容寻址存于 `<app_data>/blobs/<sha256>.<ext>`，按大小走不同通道（常量见 `attachments.rs`）：
+
+- **≤10MB（`PROACTIVE_PUSH_MAX_BYTES`）**：本地写入时（导入论文、粘贴图片、vault 文件）打 `sync.blob_push.pending.*` 标记，auto-sync 的 mailbox tick 由 `flush_pending_blob_pushes` 主动推到账号存档（`to_device_id=""`，ack 确认后才清标记；失败把标记改写成 `ext@retry_after_epoch`，5 分钟退避重试）——对端无需请求即可拉到。
+- **≤20MB（`MAX_MAILBOX_BLOB_BYTES`）**：请求-拉，单条 `AttachmentPayload` 信箱消息。
+- **20MB~200MB（`MAX_CHUNKED_BLOB_BYTES`）**：请求-拉 + 3MB 分片（`CHUNK_RAW_BYTES`）。每片一条 `AttachmentChunk`（自描述 `index`/`total`，可乱序、跨会话到达）；接收侧暂存于 `blobs/.incoming/<hash>/`（`<index>.part` + `total` 文件），齐片后 `try_assemble_blob` 校验 sha256 再落 blob 库（hash 不符则丢弃暂存重新请求）。中断后由 `AttachmentChunkRequest { missing_indices }` 断点续传——请求侧按暂存情况只补缺的片。
+- **>200MB**：仅 P2P DataChannel（`send_message` 的既有 wire 分片），不进 mailbox。
+
+**relay 去重（`dedup_key`）**：blob 载荷/分片的 mailbox deposit 携带 `dedup_key = HMAC(sync_key, hash)`（分片为 `HMAC(sync_key, "hash:index")`）。同账号重复推送同一 blob 时 relay 只存一份（不重复计配额）；relay 只见 HMAC 输出，无法关联具体文件。changeset/请求类消息不带 dedup_key。
+
+**请求/应答节流**：请求按 peer 冷却 5 分钟，应答按 hash（分片按 `hash:index`）冷却 10 分钟，防止 changeset 批量到达引发请求风暴放大（见 `attachments.rs` 节流段注释）。
 - `onboarding.rs`：配对种子导出/导入、JWT 解析。
 - `commands/sync.rs`：Tauri 命令层（LAN/cloud 各一个 engine 槽位、配对码流程、状态查询、outbox flush）。
 

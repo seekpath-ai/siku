@@ -1,7 +1,9 @@
 use crate::sync::attachments::{
-    blob_answer_on_cooldown, blob_fits_mailbox, blob_request_on_cooldown,
-    collect_missing_blob_hashes, note_blob_answered, note_blob_request_sent, read_blob_base64,
-    write_blob_from_base64,
+    blob_answer_on_cooldown, blob_dedup_key, blob_request_on_cooldown, chunk_count,
+    collect_missing_blob_hashes, mark_blob_pushed, mark_push_retry, missing_chunk_indices,
+    note_blob_answered, note_blob_request_sent, pending_blob_pushes, read_blob_base64,
+    read_blob_chunk_base64, try_assemble_blob, write_blob_from_base64, write_incoming_chunk,
+    MAX_CHUNKED_BLOB_BYTES, MAX_MAILBOX_BLOB_BYTES,
 };
 use crate::sync::crdt::{apply_changes, export_changes_since, export_own_changes_since, ChangesetMessage};
 use crate::sync::mailbox_client::MailboxClient;
@@ -129,6 +131,26 @@ pub enum SyncMessage {
         hash: String,
         ext: String,
         data: String, // base64
+    },
+    /// Resume request for a partially received chunked blob: the answerer
+    /// deposits only the listed chunk indices.
+    #[serde(rename = "attachment_chunk_request")]
+    AttachmentChunkRequest {
+        hash: String,
+        ext: String,
+        missing_indices: Vec<u32>,
+    },
+    /// One slice of a large blob (> MAX_MAILBOX_BLOB_BYTES). Self-describing
+    /// (`index`/`total`) so chunks may arrive out of order and across
+    /// sessions; the receiver stages them and assembles once all `total`
+    /// slices are present.
+    #[serde(rename = "attachment_chunk")]
+    AttachmentChunk {
+        hash: String,
+        ext: String,
+        index: u32,
+        total: u32,
+        data: String, // base64 slice
     },
 }
 
@@ -435,7 +457,9 @@ impl SyncEngine {
     ///
     /// Tries the live DataChannel first; if that fails and a mailbox transport
     /// is attached, deposits the request into the peer's mailbox so offline
-    /// devices can fetch PDFs/attachments when they come back online.
+    /// devices can fetch PDFs/attachments when they come back online. Blobs
+    /// with partial chunk staging are requested as `AttachmentChunkRequest`
+    /// (resume: only the missing indices), the rest as one `AttachmentRequest`.
     async fn request_missing_blobs(&self) -> Result<()> {
         let missing = collect_missing_blob_hashes(&self.db, &self.app_data_dir).await?;
         if missing.is_empty() {
@@ -454,31 +478,37 @@ impl SyncEngine {
         if blob_request_on_cooldown(&peer_key) {
             return Ok(());
         }
+        let msgs = blob_request_messages(&self.app_data_dir, missing);
+        if msgs.is_empty() {
+            return Ok(());
+        }
         note_blob_request_sent(&peer_key);
-        info!(count = missing.len(), "requesting missing blobs");
-        let msg = SyncMessage::AttachmentRequest { hashes: missing };
-        if let Err(e) = self.send_message(&msg).await {
-            if let Some(peer) = self.status.lock().await.peer_device_id.clone() {
-                if self.mailbox.is_some() {
-                    if let Err(e2) = self.deposit_message_to(&peer, &msg).await {
-                        return Err(e2).with_context(|| {
+        info!(count = msgs.len(), "requesting missing blobs");
+        for msg in &msgs {
+            if let Err(e) = self.send_message(msg).await {
+                if let Some(peer) = self.status.lock().await.peer_device_id.clone() {
+                    if self.mailbox.is_some() {
+                        self.deposit_message_to(&peer, msg, None).await.with_context(|| {
                             format!("data channel failed ({e}) and mailbox deposit failed")
-                        });
+                        })?;
+                        info!(to = %peer, "deposited attachment request to mailbox");
+                        continue;
                     }
-                    info!(to = %peer, "deposited attachment request to mailbox");
-                    return Ok(());
                 }
+                return Err(e).context("send attachment request");
             }
-            return Err(e).context("send attachment request");
         }
         Ok(())
     }
 
     /// Encrypt and deposit a sync message for a specific peer device.
+    /// `dedup_key` (blob payloads/chunks only) lets the relay skip storing a
+    /// second copy of content another device of the account already deposited.
     async fn deposit_message_to(
         &self,
         to_device_id: &str,
         msg: &SyncMessage,
+        dedup_key: Option<String>,
     ) -> Result<()> {
         let Some(mailbox) = &self.mailbox else {
             anyhow::bail!("mailbox transport not available");
@@ -486,13 +516,7 @@ impl SyncEngine {
         let Some(key) = &self.sync_key else {
             anyhow::bail!("sync key not available");
         };
-        let json = serde_json::to_string(msg).context("serialize mailbox sync message")?;
-        let (ciphertext, nonce) =
-            crate::sync::crypto::encrypt_bytes(key, json.as_bytes()).map_err(anyhow::Error::msg)?;
-        mailbox
-            .deposit_encrypted(to_device_id, ciphertext, nonce, None)
-            .await
-            .context("deposit sync message to mailbox")
+        deposit_sync_message_to(mailbox.relay(), key, to_device_id, msg, dedup_key).await
     }
 
     /// Receive and apply a changeset from the peer.
@@ -534,33 +558,26 @@ impl SyncEngine {
                             };
                             let mut answered = false;
                             if let Err(e) = self.send_message(&payload).await {
-                                // DataChannel unavailable: try mailbox fallback
-                                // when we know which peer asked. Oversized blobs
-                                // are not mailbox-eligible (single-frame limit);
-                                // they only sync while P2P is up.
-                                if !blob_fits_mailbox(&self.app_data_dir, &hash, &ext) {
-                                    warn!(
-                                        error = %e,
-                                        hash = %hash,
-                                        "failed to send blob payload; too large for mailbox fallback"
-                                    );
-                                } else if let Some(peer) =
-                                    self.status.lock().await.peer_device_id.clone()
-                                {
-                                    if let Err(e2) = self.deposit_message_to(&peer, &payload).await
-                                    {
-                                        warn!(
-                                            error = %e,
-                                            error2 = %e2,
-                                            hash = %hash,
-                                            "failed to send blob payload over data channel and mailbox"
-                                        );
-                                    } else {
-                                        info!(to = %peer, hash = %hash, "deposited blob payload to mailbox");
+                                // DataChannel unavailable: fall back to the
+                                // mailbox (chunked when oversized) when we know
+                                // which peer asked and have a mailbox transport.
+                                let peer = self.status.lock().await.peer_device_id.clone();
+                                match (&self.mailbox, &self.sync_key, peer) {
+                                    (Some(mailbox), Some(key), Some(peer)) => {
+                                        warn!(error = %e, hash = %hash, "data channel failed; serving blob over mailbox");
+                                        serve_blob_over_mailbox(
+                                            &self.app_data_dir,
+                                            key,
+                                            mailbox.relay(),
+                                            &peer,
+                                            &hash,
+                                            &ext,
+                                            None,
+                                        )
+                                        .await;
                                         answered = true;
                                     }
-                                } else {
-                                    warn!(error = %e, hash = %hash, "failed to send blob payload");
+                                    _ => warn!(error = %e, hash = %hash, "failed to send blob payload"),
                                 }
                             } else {
                                 answered = true;
@@ -574,10 +591,42 @@ impl SyncEngine {
                     }
                 }
             }
+            SyncMessage::AttachmentChunkRequest {
+                hash,
+                ext,
+                missing_indices,
+            } => {
+                // Resume request: serve only the missing slices over the mailbox.
+                let peer = self.status.lock().await.peer_device_id.clone();
+                match (&self.mailbox, &self.sync_key, peer) {
+                    (Some(mailbox), Some(key), Some(peer)) => {
+                        serve_blob_over_mailbox(
+                            &self.app_data_dir,
+                            key,
+                            mailbox.relay(),
+                            &peer,
+                            &hash,
+                            &ext,
+                            Some(missing_indices),
+                        )
+                        .await;
+                    }
+                    _ => warn!(hash = %hash, "chunk request without mailbox transport; ignored"),
+                }
+            }
             SyncMessage::AttachmentPayload { hash, ext, data } => {
                 if let Err(e) = write_blob_from_base64(&self.app_data_dir, &hash, &ext, &data) {
                     warn!(error = %e, hash = %hash, "failed to write received blob");
                 }
+            }
+            SyncMessage::AttachmentChunk {
+                hash,
+                ext,
+                index,
+                total,
+                data,
+            } => {
+                receive_blob_chunk(&self.app_data_dir, &hash, &ext, index, total, &data);
             }
             _ => {}
         }
@@ -758,7 +807,10 @@ impl SyncEngine {
                     Err(e) => warn!(error = %e, "apply mailbox full snapshot failed"),
                 }
             }
-            attachment_msg @ (SyncMessage::AttachmentRequest { .. } | SyncMessage::AttachmentPayload { .. }) => {
+            attachment_msg @ (SyncMessage::AttachmentRequest { .. }
+            | SyncMessage::AttachmentPayload { .. }
+            | SyncMessage::AttachmentChunkRequest { .. }
+            | SyncMessage::AttachmentChunk { .. }) => {
                 if let Err(e) = self.handle_attachment_message_for(&mb_msg.from_device_id, attachment_msg).await {
                     warn!(error = %e, from = %mb_msg.from_device_id, "mailbox attachment message failed");
                 }
@@ -770,7 +822,9 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// Request missing blobs from a specific peer via mailbox.
+    /// Request missing blobs from a specific peer via mailbox. Blobs with
+    /// partial chunk staging resume via `AttachmentChunkRequest` (only the
+    /// missing indices); the rest go in one `AttachmentRequest`.
     async fn request_missing_blobs_from(&self, peer_device_id: &str) -> Result<()> {
         if blob_request_on_cooldown(peer_device_id) {
             return Ok(());
@@ -779,14 +833,21 @@ impl SyncEngine {
         if missing.is_empty() {
             return Ok(());
         }
+        let msgs = blob_request_messages(&self.app_data_dir, missing);
+        if msgs.is_empty() {
+            return Ok(());
+        }
         note_blob_request_sent(peer_device_id);
-        info!(count = missing.len(), to = %peer_device_id, "requesting missing blobs over mailbox");
-        let msg = SyncMessage::AttachmentRequest { hashes: missing };
-        self.deposit_message_to(peer_device_id, &msg).await
+        info!(count = msgs.len(), to = %peer_device_id, "requesting missing blobs over mailbox");
+        for msg in &msgs {
+            self.deposit_message_to(peer_device_id, msg, None).await?;
+        }
+        Ok(())
     }
 
     /// Handle an attachment message that arrived over mailbox: answer requests
-    /// by depositing payloads back to the sender, and write received payloads.
+    /// by depositing payloads (or chunks, for large blobs) back to the sender,
+    /// and write received payloads / stage received chunks.
     async fn handle_attachment_message_for(
         &self,
         from_device_id: &str,
@@ -795,35 +856,52 @@ impl SyncEngine {
         match msg {
             SyncMessage::AttachmentRequest { hashes } => {
                 info!(count = hashes.len(), from = %from_device_id, "received mailbox blob request");
+                let (Some(mailbox), Some(key)) = (&self.mailbox, &self.sync_key) else {
+                    return Ok(());
+                };
                 for (hash, ext) in hashes {
-                    if blob_answer_on_cooldown(&hash) {
-                        continue;
-                    }
-                    if !blob_fits_mailbox(&self.app_data_dir, &hash, &ext) {
-                        warn!(hash = %hash, "blob exceeds mailbox size limit; only P2P will carry it");
-                        continue;
-                    }
-                    match read_blob_base64(&self.app_data_dir, &hash, &ext) {
-                        Ok(Some(data)) => {
-                            let payload = SyncMessage::AttachmentPayload {
-                                hash: hash.clone(),
-                                ext: ext.clone(),
-                                data,
-                            };
-                            if let Err(e) = self.deposit_message_to(from_device_id, &payload).await
-                            {
-                                warn!(error = %e, hash = %hash, "failed to deposit blob payload");
-                            } else {
-                                note_blob_answered(&hash);
-                            }
-                        }
-                        Ok(None) => warn!(hash = %hash, "peer requested blob we do not have"),
-                        Err(e) => warn!(error = %e, hash = %hash, "failed to read blob"),
-                    }
+                    serve_blob_over_mailbox(
+                        &self.app_data_dir,
+                        key,
+                        mailbox.relay(),
+                        from_device_id,
+                        &hash,
+                        &ext,
+                        None,
+                    )
+                    .await;
                 }
+            }
+            SyncMessage::AttachmentChunkRequest {
+                hash,
+                ext,
+                missing_indices,
+            } => {
+                let (Some(mailbox), Some(key)) = (&self.mailbox, &self.sync_key) else {
+                    return Ok(());
+                };
+                serve_blob_over_mailbox(
+                    &self.app_data_dir,
+                    key,
+                    mailbox.relay(),
+                    from_device_id,
+                    &hash,
+                    &ext,
+                    Some(missing_indices),
+                )
+                .await;
             }
             SyncMessage::AttachmentPayload { hash, ext, data } => {
                 write_blob_from_base64(&self.app_data_dir, &hash, &ext, &data)?;
+            }
+            SyncMessage::AttachmentChunk {
+                hash,
+                ext,
+                index,
+                total,
+                data,
+            } => {
+                receive_blob_chunk(&self.app_data_dir, &hash, &ext, index, total, &data);
             }
             _ => {}
         }
@@ -936,7 +1014,9 @@ impl SyncEngine {
                                 }
                                 Ok(
                                     msg @ (SyncMessage::AttachmentRequest { .. }
-                                    | SyncMessage::AttachmentPayload { .. }),
+                                    | SyncMessage::AttachmentPayload { .. }
+                                    | SyncMessage::AttachmentChunkRequest { .. }
+                                    | SyncMessage::AttachmentChunk { .. }),
                                 ) => {
                                     if let Err(e) = engine.handle_attachment_message(msg).await {
                                         warn!(error = %e, "handle chunked attachment message failed");
@@ -973,7 +1053,9 @@ impl SyncEngine {
                     }
                     Ok(
                         msg @ (SyncMessage::AttachmentRequest { .. }
-                        | SyncMessage::AttachmentPayload { .. }),
+                        | SyncMessage::AttachmentPayload { .. }
+                        | SyncMessage::AttachmentChunkRequest { .. }
+                        | SyncMessage::AttachmentChunk { .. }),
                     ) => {
                         if let Err(e) = engine.handle_attachment_message(msg).await {
                             warn!(error = %e, "handle attachment message failed");
@@ -1227,6 +1309,7 @@ pub async fn flush_outbox_with(
                     nonce,
                     ttl_seconds: Some(ttl_seconds.max(0) as u64),
                     message_id: Some(message_id),
+                    dedup_key: None,
                 },
                 MAILBOX_ACK_TIMEOUT,
             )
@@ -1331,6 +1414,7 @@ pub async fn deliver_changes_mailbox(
         nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
         ttl_seconds: Some(7 * 24 * 3600),
         message_id: Some(message_id.clone()),
+        dedup_key: None,
     };
     // Advance the cursor ONLY after the relay acknowledges the deposit is
     // durably stored. A rejected deposit (e.g. per-device target not in room)
@@ -1405,6 +1489,7 @@ pub async fn deliver_full_snapshot_mailbox(
                 nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
                 ttl_seconds: Some(7 * 24 * 3600),
                 message_id: Some(uuid::Uuid::new_v4().to_string()),
+                dedup_key: None,
             },
         })
         .context("deposit full-history changeset to account archive")?;
@@ -1451,11 +1536,14 @@ pub fn account_applied_cursor_key(from_device_id: &str) -> String {
 
 /// Encrypt and deposit a sync message for a specific peer through a relay
 /// connection. Used by the mailbox-only path (no live P2P DataChannel).
+/// `dedup_key` (blob payloads/chunks only) lets the relay skip storing a
+/// second copy of content another device of the account already deposited.
 async fn deposit_sync_message_to(
     relay: &crate::sync::relay_client::RelayClient,
     key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
     to_device_id: &str,
     msg: &SyncMessage,
+    dedup_key: Option<String>,
 ) -> Result<()> {
     use base64::Engine as _;
     let json = serde_json::to_string(msg).context("serialize mailbox sync message")?;
@@ -1469,6 +1557,7 @@ async fn deposit_sync_message_to(
                 nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
                 ttl_seconds: Some(7 * 24 * 3600),
                 message_id: Some(uuid::Uuid::new_v4().to_string()),
+                dedup_key,
             },
         })
         .context("deposit sync message to mailbox")
@@ -1580,7 +1669,10 @@ pub async fn handle_mailbox_batch(
                     Err(e) => warn!(error = %e, "apply account-level full snapshot failed"),
                 }
             }
-            attachment_msg @ (SyncMessage::AttachmentRequest { .. } | SyncMessage::AttachmentPayload { .. }) => {
+            attachment_msg @ (SyncMessage::AttachmentRequest { .. }
+            | SyncMessage::AttachmentPayload { .. }
+            | SyncMessage::AttachmentChunkRequest { .. }
+            | SyncMessage::AttachmentChunk { .. }) => {
                 if let Err(e) = handle_mailbox_attachment_message(
                     app_data_dir,
                     key,
@@ -1630,9 +1722,15 @@ async fn request_missing_blobs_over_relay(
         return Ok(());
     }
     note_blob_request_sent(peer_device_id);
-    info!(count = missing.len(), to = %peer_device_id, "requesting missing blobs over mailbox");
-    let msg = SyncMessage::AttachmentRequest { hashes: missing };
-    deposit_sync_message_to(relay, key, peer_device_id, &msg).await
+    let msgs = blob_request_messages(app_data_dir, missing);
+    if msgs.is_empty() {
+        return Ok(());
+    }
+    info!(count = msgs.len(), to = %peer_device_id, "requesting missing blobs over mailbox");
+    for msg in &msgs {
+        deposit_sync_message_to(relay, key, peer_device_id, msg, None).await?;
+    }
+    Ok(())
 }
 
 /// Startup self-heal: rows applied long ago may reference blobs whose
@@ -1699,7 +1797,8 @@ async fn list_account_device_ids(relay_url: &str, token: &str) -> Result<Vec<Str
         .collect())
 }
 
-/// Handle an attachment request/payload that arrived over the mailbox path.
+/// Handle an attachment request/payload/chunk that arrived over the mailbox
+/// path (auto-sync proxy, no live engine).
 async fn handle_mailbox_attachment_message(
     app_data_dir: &std::path::Path,
     key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
@@ -1711,40 +1810,245 @@ async fn handle_mailbox_attachment_message(
         SyncMessage::AttachmentRequest { hashes } => {
             info!(count = hashes.len(), from = %from_device_id, "received mailbox blob request");
             for (hash, ext) in hashes {
-                // Dedup: identical requests queued before the throttle existed
-                // (or sent by several devices) must not each trigger a full
-                // payload deposit.
-                if blob_answer_on_cooldown(&hash) {
-                    continue;
-                }
-                if !blob_fits_mailbox(app_data_dir, &hash, &ext) {
-                    warn!(hash = %hash, "blob exceeds mailbox size limit; only P2P will carry it");
-                    continue;
-                }
-                match read_blob_base64(app_data_dir, &hash, &ext) {
-                    Ok(Some(data)) => {
-                        let payload = SyncMessage::AttachmentPayload {
-                            hash: hash.clone(),
-                            ext: ext.clone(),
-                            data,
-                        };
-                        if let Err(e) =
-                            deposit_sync_message_to(relay, key, from_device_id, &payload).await
-                        {
-                            warn!(error = %e, hash = %hash, "failed to deposit blob payload");
-                        } else {
-                            note_blob_answered(&hash);
-                        }
-                    }
-                    Ok(None) => warn!(hash = %hash, "peer requested blob we do not have"),
-                    Err(e) => warn!(error = %e, hash = %hash, "failed to read blob"),
-                }
+                serve_blob_over_mailbox(app_data_dir, key, relay, from_device_id, &hash, &ext, None)
+                    .await;
             }
+        }
+        SyncMessage::AttachmentChunkRequest {
+            hash,
+            ext,
+            missing_indices,
+        } => {
+            serve_blob_over_mailbox(
+                app_data_dir,
+                key,
+                relay,
+                from_device_id,
+                &hash,
+                &ext,
+                Some(missing_indices),
+            )
+            .await;
         }
         SyncMessage::AttachmentPayload { hash, ext, data } => {
             write_blob_from_base64(app_data_dir, &hash, &ext, &data)?;
         }
+        SyncMessage::AttachmentChunk {
+            hash,
+            ext,
+            index,
+            total,
+            data,
+        } => {
+            receive_blob_chunk(app_data_dir, &hash, &ext, index, total, &data);
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Stage one received blob chunk and assemble the blob once every slice is
+/// present. Out-of-order and duplicate chunks are fine (staging is
+/// idempotent); a hash mismatch discards the staging dir so the next request
+/// starts clean.
+fn receive_blob_chunk(
+    app_data_dir: &std::path::Path,
+    hash: &str,
+    ext: &str,
+    index: u32,
+    total: u32,
+    data: &str,
+) {
+    if let Err(e) = write_incoming_chunk(app_data_dir, hash, index, total, data) {
+        warn!(error = %e, hash = %hash, index, "failed to stage blob chunk");
+        return;
+    }
+    match try_assemble_blob(app_data_dir, hash, ext, total) {
+        Ok(true) => info!(hash = %hash, ext = %ext, "chunked blob assembled and stored"),
+        Ok(false) => debug!(hash = %hash, index, total, "blob chunk staged; more slices pending"),
+        Err(e) => warn!(error = %e, hash = %hash, "assembled blob failed verification; staging discarded"),
+    }
+}
+
+/// Serve one blob to a requesting peer over the mailbox. Whole payload when
+/// the blob fits a single message (`MAX_MAILBOX_BLOB_BYTES`) and no resume
+/// list was given; otherwise 3MB `AttachmentChunk` slices (all of them, or
+/// only `only_indices` for a resume request). Blobs beyond
+/// `MAX_CHUNKED_BLOB_BYTES` are P2P-only. Answer throttling applies per hash
+/// (whole payload) or per `hash:index` (chunks).
+async fn serve_blob_over_mailbox(
+    app_data_dir: &std::path::Path,
+    key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
+    relay: &crate::sync::relay_client::RelayClient,
+    to_device_id: &str,
+    hash: &str,
+    ext: &str,
+    only_indices: Option<Vec<u32>>,
+) {
+    let size = match std::fs::metadata(crate::file_store::blob_path(app_data_dir, hash, ext)) {
+        Ok(m) => m.len(),
+        Err(_) => {
+            warn!(hash = %hash, "peer requested blob we do not have");
+            return;
+        }
+    };
+    if size <= MAX_MAILBOX_BLOB_BYTES && only_indices.is_none() {
+        if blob_answer_on_cooldown(hash) {
+            return;
+        }
+        match read_blob_base64(app_data_dir, hash, ext) {
+            Ok(Some(data)) => {
+                let payload = SyncMessage::AttachmentPayload {
+                    hash: hash.to_string(),
+                    ext: ext.to_string(),
+                    data,
+                };
+                let dedup = Some(blob_dedup_key(key, hash));
+                match deposit_sync_message_to(relay, key, to_device_id, &payload, dedup).await {
+                    Ok(()) => {
+                        note_blob_answered(hash);
+                        info!(to = %to_device_id, hash = %hash, "deposited blob payload to mailbox");
+                    }
+                    Err(e) => warn!(error = %e, hash = %hash, "failed to deposit blob payload"),
+                }
+            }
+            Ok(None) => warn!(hash = %hash, "peer requested blob we do not have"),
+            Err(e) => warn!(error = %e, hash = %hash, "failed to read blob"),
+        }
+        return;
+    }
+    if size > MAX_CHUNKED_BLOB_BYTES {
+        warn!(hash = %hash, size, "blob exceeds mailbox size limit; only P2P will carry it");
+        return;
+    }
+    let total = chunk_count(size);
+    let indices: Vec<u32> = match only_indices {
+        Some(v) => v,
+        None => (0..total).collect(),
+    };
+    for index in indices {
+        if index >= total {
+            continue;
+        }
+        let cooldown_key = format!("{hash}:{index}");
+        if blob_answer_on_cooldown(&cooldown_key) {
+            continue;
+        }
+        match read_blob_chunk_base64(app_data_dir, hash, ext, index) {
+            Ok(Some(data)) => {
+                let chunk = SyncMessage::AttachmentChunk {
+                    hash: hash.to_string(),
+                    ext: ext.to_string(),
+                    index,
+                    total,
+                    data,
+                };
+                let dedup = Some(blob_dedup_key(key, &cooldown_key));
+                match deposit_sync_message_to(relay, key, to_device_id, &chunk, dedup).await {
+                    Ok(()) => note_blob_answered(&cooldown_key),
+                    Err(e) => {
+                        warn!(error = %e, hash = %hash, index, "failed to deposit blob chunk")
+                    }
+                }
+            }
+            Ok(None) => {
+                warn!(hash = %hash, "peer requested blob we do not have");
+                return;
+            }
+            Err(e) => warn!(error = %e, hash = %hash, index, "failed to read blob chunk"),
+        }
+    }
+}
+
+/// Split the missing-blob list into request messages: blobs with partial
+/// chunk staging resume via per-hash `AttachmentChunkRequest` (only the
+/// missing indices), the rest merge into one `AttachmentRequest`.
+fn blob_request_messages(
+    app_data_dir: &std::path::Path,
+    missing: Vec<(String, String)>,
+) -> Vec<SyncMessage> {
+    let mut whole = Vec::new();
+    let mut msgs = Vec::new();
+    for (hash, ext) in missing {
+        match missing_chunk_indices(app_data_dir, &hash) {
+            Some(indices) if !indices.is_empty() => {
+                msgs.push(SyncMessage::AttachmentChunkRequest {
+                    hash,
+                    ext,
+                    missing_indices: indices,
+                });
+            }
+            _ => whole.push((hash, ext)),
+        }
+    }
+    if !whole.is_empty() {
+        msgs.insert(0, SyncMessage::AttachmentRequest { hashes: whole });
+    }
+    msgs
+}
+
+/// Push locally written blobs (marked via `mark_blob_pending_push`) into the
+/// account-level mailbox archive, so peers receive them without a request
+/// round-trip. Deposits are acked (`deposit_await_ack` scales the wait with
+/// payload size); on success the mark is cleared, on failure the mark is
+/// re-armed with a 5-minute backoff. Missing local files just clear the mark.
+/// Per-blob failures never abort the batch.
+pub async fn flush_pending_blob_pushes(
+    db: &SqlitePool,
+    app_data_dir: &std::path::Path,
+    key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
+    relay: &crate::sync::relay_client::RelayClient,
+) -> Result<()> {
+    use base64::Engine as _;
+    const PUSH_RETRY_DELAY_SECS: u64 = 300;
+    for (hash, ext) in pending_blob_pushes(db).await {
+        if !crate::file_store::has_blob(app_data_dir, &hash) {
+            // The blob was deleted locally; nothing to push, clear the mark.
+            mark_blob_pushed(db, &hash).await;
+            continue;
+        }
+        let data = match read_blob_base64(app_data_dir, &hash, &ext) {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                mark_blob_pushed(db, &hash).await;
+                continue;
+            }
+            Err(e) => {
+                warn!(error = %e, hash = %hash, "blob push: read failed");
+                mark_push_retry(db, &hash, &ext, PUSH_RETRY_DELAY_SECS).await;
+                continue;
+            }
+        };
+        let json = serde_json::to_string(&SyncMessage::AttachmentPayload {
+            hash: hash.clone(),
+            ext: ext.clone(),
+            data,
+        })
+        .context("serialize blob push payload")?;
+        let (ciphertext, nonce) = crate::sync::crypto::encrypt_bytes(key, json.as_bytes())
+            .map_err(anyhow::Error::msg)?;
+        let payload = crate::sync::types::MailboxDepositPayload {
+            to_device_id: String::new(), // account-level archive
+            ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+            nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
+            ttl_seconds: Some(7 * 24 * 3600),
+            message_id: None,
+            dedup_key: Some(blob_dedup_key(key, &hash)),
+        };
+        match relay.deposit_await_ack(payload, MAILBOX_ACK_TIMEOUT).await {
+            Ok(()) => {
+                mark_blob_pushed(db, &hash).await;
+                set_quota_exceeded(false);
+                info!(hash = %hash, ext = %ext, "pushed blob to account archive");
+            }
+            Err(e) => {
+                if e.is_quota_exceeded() {
+                    set_quota_exceeded(true);
+                }
+                warn!(error = %e, hash = %hash, "blob push failed; backing off");
+                mark_push_retry(db, &hash, &ext, PUSH_RETRY_DELAY_SECS).await;
+            }
+        }
     }
     Ok(())
 }
@@ -3389,6 +3693,338 @@ mod tests {
             .await?;
         assert_eq!(remaining.0, 0, "the row is delivered once the transport recovers");
         assert!(!flush_backoff_active(), "a successful ack must clear the backoff");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Encrypt a wire message into a mailbox message the way a peer would
+    /// have deposited it.
+    fn to_mailbox_msg(
+        key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
+        msg: &SyncMessage,
+        id: &str,
+        from: &str,
+    ) -> anyhow::Result<crate::sync::types::MailboxMessage> {
+        use base64::Engine as _;
+        let json = serde_json::to_string(msg)?;
+        let (ct, nonce) = crate::sync::crypto::encrypt_bytes(key, json.as_bytes())
+            .map_err(anyhow::Error::msg)?;
+        Ok(crate::sync::types::MailboxMessage {
+            id: id.to_string(),
+            from_device_id: from.to_string(),
+            ciphertext: base64::engine::general_purpose::STANDARD.encode(&ct),
+            nonce: base64::engine::general_purpose::STANDARD.encode(nonce),
+            account_level: false,
+        })
+    }
+
+    /// Decrypt a captured mailbox deposit back into its wire envelope.
+    async fn decrypt_deposit(
+        key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
+        payload: &crate::sync::types::MailboxDepositPayload,
+    ) -> anyhow::Result<SyncMessage> {
+        decrypt_mailbox_message(
+            key,
+            &crate::sync::types::MailboxMessage {
+                id: "captured".to_string(),
+                from_device_id: "captured".to_string(),
+                ciphertext: payload.ciphertext.clone(),
+                nonce: payload.nonce.clone(),
+                account_level: false,
+            },
+        )
+        .await
+    }
+
+    /// Receive the next mailbox deposit from a fake relay, skipping other
+    /// frames (notably the `MailboxAck` a processed batch leaves behind).
+    async fn recv_deposit(
+        rx: &mut mpsc::UnboundedReceiver<crate::sync::types::RelayClientMsg>,
+    ) -> anyhow::Result<crate::sync::types::MailboxDepositPayload> {
+        loop {
+            match rx.recv().await.context("relay channel closed")? {
+                crate::sync::types::RelayClientMsg::MailboxDeposit { payload } => {
+                    return Ok(payload)
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// A blob too large for a single mailbox message arrives as
+    /// `AttachmentChunk` slices: the receiver stages them under
+    /// `blobs/.incoming/` and assembles the file once every slice is present
+    /// — byte-identical, out-of-order delivery included. (A real >20MB blob
+    /// would take too long in a test; the chunk messages are self-describing,
+    /// so small synthetic slices exercise the same staging/assembly path.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mailbox_batch_assembles_chunked_blob() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-mailbox-chunk-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db = crate::core::db::tests::connect_with_crsqlite(&dir.join("b.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db).await?;
+        crate::core::db::register_crr_tables(&db, crate::core::db::CORE_SYNC_TABLES).await?;
+
+        use base64::Engine as _;
+        let parts: [&[u8]; 3] = [b"chunk-zero", b"chunk-one", b"chunk-two"];
+        let full: Vec<u8> = parts.concat();
+        let hash = crate::file_store::sha256_hex(&full);
+        let key = crate::sync::crypto::generate_sync_key();
+
+        // Out-of-order delivery: 1, 2, then 0.
+        let mut msgs = Vec::new();
+        for (i, id) in [(1u32, "c1"), (2, "c2"), (0, "c0")] {
+            msgs.push(to_mailbox_msg(
+                &key,
+                &SyncMessage::AttachmentChunk {
+                    hash: hash.clone(),
+                    ext: "pdf".to_string(),
+                    index: i,
+                    total: 3,
+                    data: base64::engine::general_purpose::STANDARD.encode(parts[i as usize]),
+                },
+                id,
+                "device-a",
+            )?);
+        }
+        let (tx, _rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+        handle_mailbox_batch(&db, &dir, &key, &relay, msgs).await?;
+
+        assert!(
+            crate::file_store::has_blob(&dir, &hash),
+            "chunks must assemble into the blob store"
+        );
+        let received = std::fs::read(crate::file_store::blob_path(&dir, &hash, "pdf"))?;
+        assert_eq!(received, full, "assembled blob must be byte-identical");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Resume: with some chunks already staged, the blob request goes out as
+    /// an `AttachmentChunkRequest` carrying only the missing indices — not a
+    /// full re-request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mailbox_blob_resume_requests_only_missing_chunks() -> anyhow::Result<()> {
+        let (db, dir) = create_test_db().await?;
+        let hash = "c".repeat(64);
+        sqlx::query(
+            "INSERT INTO papers (id, title, file_path, created_at, updated_at, imported_at) \
+             VALUES ('p-resume', 'Resume Paper', ?, ?, ?, ?)",
+        )
+        .bind(format!("blobs/{hash}.pdf"))
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&db)
+        .await?;
+
+        // Stage chunks 0 and 2 of 4; 1 and 3 are still missing.
+        use base64::Engine as _;
+        crate::sync::attachments::write_incoming_chunk(
+            &dir,
+            &hash,
+            0,
+            4,
+            &base64::engine::general_purpose::STANDARD.encode(b"aa"),
+        )?;
+        crate::sync::attachments::write_incoming_chunk(
+            &dir,
+            &hash,
+            2,
+            4,
+            &base64::engine::general_purpose::STANDARD.encode(b"cc"),
+        )?;
+
+        let key = crate::sync::crypto::generate_sync_key();
+        let (tx, mut rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+        request_missing_blobs_over_relay(&db, &dir, &key, &relay, "dev-resume-peer").await?;
+
+        let deposit = rx.recv().await.context("resume request must be deposited")?;
+        let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = deposit else {
+            anyhow::bail!("expected mailbox deposit, got {deposit:?}");
+        };
+        let envelope = decrypt_deposit(&key, &payload).await?;
+        let SyncMessage::AttachmentChunkRequest {
+            hash: h,
+            ext,
+            missing_indices,
+        } = envelope
+        else {
+            anyhow::bail!("expected chunk request, got {envelope:?}");
+        };
+        assert_eq!(h, hash);
+        assert_eq!(ext, "pdf");
+        assert_eq!(missing_indices, vec![1, 3], "only the missing slices may be requested");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Serving a blob over the mailbox attaches the relay dedup key: the
+    /// whole-blob key for a single `AttachmentPayload`, `hash:index` keys for
+    /// chunks. A chunk resume request is answered with only the requested
+    /// slices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mailbox_blob_answers_carry_dedup_keys() -> anyhow::Result<()> {
+        let (db, dir) = create_test_db().await?;
+        let blob_bytes = b"small blob served whole or by slice".to_vec();
+        let rel = crate::file_store::write_blob(&dir, &blob_bytes, "pdf")?;
+        let (hash, ext) = crate::file_store::parse_blob_path(&rel).unwrap();
+        let key = crate::sync::crypto::generate_sync_key();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+
+        // 1) Whole-blob request → one AttachmentPayload with dedup_key = HMAC(key, hash).
+        let req = to_mailbox_msg(
+            &key,
+            &SyncMessage::AttachmentRequest {
+                hashes: vec![(hash.clone(), ext.clone())],
+            },
+            "r1",
+            "device-b",
+        )?;
+        handle_mailbox_batch(&db, &dir, &key, &relay, vec![req]).await?;
+        let payload = recv_deposit(&mut rx).await?;
+        assert_eq!(
+            payload.dedup_key.as_deref(),
+            Some(crate::sync::attachments::blob_dedup_key(&key, &hash).as_str()),
+            "whole-blob deposits must carry the blob dedup key"
+        );
+        let envelope = decrypt_deposit(&key, &payload).await?;
+        assert!(
+            matches!(envelope, SyncMessage::AttachmentPayload { .. }),
+            "small blob must be served whole, got {envelope:?}"
+        );
+
+        // 2) Chunk resume request → one AttachmentChunk with dedup_key = HMAC(key, "hash:0").
+        let req = to_mailbox_msg(
+            &key,
+            &SyncMessage::AttachmentChunkRequest {
+                hash: hash.clone(),
+                ext: ext.clone(),
+                missing_indices: vec![0],
+            },
+            "r2",
+            "device-b",
+        )?;
+        handle_mailbox_batch(&db, &dir, &key, &relay, vec![req]).await?;
+        let payload = recv_deposit(&mut rx).await?;
+        assert_eq!(
+            payload.dedup_key.as_deref(),
+            Some(crate::sync::attachments::blob_dedup_key(&key, &format!("{hash}:0")).as_str()),
+            "chunk deposits must carry the hash:index dedup key"
+        );
+        let envelope = decrypt_deposit(&key, &payload).await?;
+        let SyncMessage::AttachmentChunk { index, total, data, .. } = envelope else {
+            anyhow::bail!("expected attachment chunk, got {envelope:?}");
+        };
+        assert_eq!((index, total), (0, 1));
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD.decode(data)?;
+        assert_eq!(decoded, blob_bytes, "single-slice chunk must carry the whole blob");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Proactive push: a blob marked pending at write time is deposited into
+    /// the account-level archive (to_device_id "") with its dedup key, and the
+    /// mark is cleared only after the relay acks. A rejected push re-arms the
+    /// mark with a backoff instead of failing the flush.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_pending_blob_pushes_deposits_and_backs_off() -> anyhow::Result<()> {
+        let (db, dir) = create_test_db().await?;
+        let blob_bytes = b"push me to the archive".to_vec();
+        let rel = crate::file_store::write_blob(&dir, &blob_bytes, "pdf")?;
+        let (hash, ext) = crate::file_store::parse_blob_path(&rel).unwrap();
+        crate::sync::attachments::mark_blob_pending_push(&db, &dir, &hash, &ext).await;
+        let key = crate::sync::crypto::generate_sync_key();
+
+        // 1) Rejected push → mark re-armed with a backoff (skipped right now).
+        {
+            let (tx, mut rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+            let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+            let relay_ack = relay.clone();
+            let ack_task = tokio::spawn(async move {
+                let msg = rx.recv().await.expect("deposit must be sent");
+                let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = msg else {
+                    panic!("expected mailbox deposit");
+                };
+                relay_ack.route_ack(crate::sync::types::MailboxDepositAckPayload {
+                    id: payload.message_id.clone().unwrap(),
+                    ok: false,
+                    error: Some("relay overloaded".to_string()),
+                });
+            });
+            flush_pending_blob_pushes(&db, &dir, &key, &relay).await?;
+            ack_task.await?;
+            assert!(
+                crate::sync::attachments::pending_blob_pushes(&db).await.is_empty(),
+                "a failed push must back off, not retry immediately"
+            );
+        }
+
+        // 2) Acked push → archive deposit with dedup key, mark cleared.
+        crate::sync::attachments::mark_push_retry(&db, &hash, &ext, 0).await;
+        {
+            let (tx, mut rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+            let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+            let relay_ack = relay.clone();
+            let ack_task = tokio::spawn(async move {
+                let msg = rx.recv().await.expect("deposit must be sent");
+                let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = msg else {
+                    panic!("expected mailbox deposit");
+                };
+                relay_ack.route_ack(crate::sync::types::MailboxDepositAckPayload {
+                    id: payload.message_id.clone().unwrap(),
+                    ok: true,
+                    error: None,
+                });
+                payload
+            });
+            flush_pending_blob_pushes(&db, &dir, &key, &relay).await?;
+            let payload = ack_task.await?;
+            assert_eq!(payload.to_device_id, "", "pushes target the account archive");
+            assert_eq!(
+                payload.dedup_key.as_deref(),
+                Some(crate::sync::attachments::blob_dedup_key(&key, &hash).as_str())
+            );
+            let envelope = decrypt_deposit(&key, &payload).await?;
+            let SyncMessage::AttachmentPayload { data, .. } = envelope else {
+                anyhow::bail!("expected attachment payload, got {envelope:?}");
+            };
+            use base64::Engine as _;
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD.decode(data)?,
+                blob_bytes,
+                "the archive copy must be byte-identical"
+            );
+            assert!(
+                crate::sync::attachments::pending_blob_pushes(&db).await.is_empty(),
+                "an acked push must clear the pending mark"
+            );
+            // And it must not be re-pended afterwards.
+            crate::sync::attachments::mark_blob_pending_push(&db, &dir, &hash, &ext).await;
+            assert!(crate::sync::attachments::pending_blob_pushes(&db).await.is_empty());
+        }
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;

@@ -588,6 +588,7 @@ pub async fn import_vault(
             .unwrap_or_default();
         let parent_id = folder_of(&rel);
         // Ok(false) = unchanged (already imported with identical content).
+        let mut written_blob: Option<(String, String)> = None;
         let outcome: Result<bool, String> = 'blk: {
             if let Some((fid, old_blob)) = existing_files.get(&(parent_id.clone(), name.clone())) {
                 let bytes = match std::fs::read(&abs) {
@@ -606,6 +607,7 @@ pub async fn import_vault(
                     Ok(b) => b,
                     Err(e) => break 'blk Err(format!("copy to blob store: {e}")),
                 };
+                written_blob = crate::file_store::parse_blob_path(&blob);
                 if let Err(e) = sqlx::query(
                     "UPDATE files SET blob_path = ?, size = ?, mime_type = ?, updated_at = ? WHERE id = ?",
                 )
@@ -634,6 +636,11 @@ pub async fn import_vault(
                 Err(e) => Err(e),
             }
         };
+        if matches!(outcome, Ok(true)) {
+            if let Some((hash, ext)) = &written_blob {
+                crate::sync::attachments::mark_blob_pending_push(db, app_data_dir, hash, ext).await;
+            }
+        }
         match outcome {
             Ok(true) => files_imported += 1,
             Ok(false) => unchanged += 1,

@@ -50,6 +50,16 @@ pub async fn save_clipboard_image(
     let rel_path = file_store::write_blob(&state.app_data_dir, &bytes, "png")
         .map_err(|e| format!("write blob failed: {e}"))?;
 
+    if let Some((hash, ext)) = file_store::parse_blob_path(&rel_path) {
+        crate::sync::attachments::mark_blob_pending_push(
+            &state.db,
+            &state.app_data_dir,
+            &hash,
+            &ext,
+        )
+        .await;
+    }
+
     Ok(rel_path)
 }
 
@@ -94,6 +104,16 @@ pub async fn save_attachment_bytes(
 
     let rel_path = file_store::write_blob(&state.app_data_dir, &bytes, ext)
         .map_err(|e| format!("write blob failed: {e}"))?;
+
+    if let Some((hash, ext)) = file_store::parse_blob_path(&rel_path) {
+        crate::sync::attachments::mark_blob_pending_push(
+            &state.db,
+            &state.app_data_dir,
+            &hash,
+            &ext,
+        )
+        .await;
+    }
 
     Ok(rel_path)
 }

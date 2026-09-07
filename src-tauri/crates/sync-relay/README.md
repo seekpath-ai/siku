@@ -23,6 +23,7 @@ Siku 多端同步的官方中继服务。职责三块：**WebRTC 信令转发**�
   - **账号存储配额**：按账号统计 mailbox 占用（密文+nonce 字节），超出生效配额时拒收新 deposit（`quota_exceeded`），客户端消息留在本地 outbox 重试，不丢数据；幂等重投（同 message_id）不受配额限制
   - 投递确认：每个 `mailbox_deposit` 落库后回 `mailbox_deposit_ack`（含拒绝，携带客户端 `message_id`；同 id 重投为幂等 no-op）
   - per-device 消息：poll 只标记 `delivered_at` 不删除，**ack 才删**；60 秒未 ack 自动重投（客户端按游标/幂等键去重）
+  - **内容级去重（`dedup_key`）**：deposit 可携带不透明内容键（客户端对 blob 载荷用 `HMAC(sync_key, blob_hash)`，分片为 `HMAC(sync_key, "hash:index")`——relay 无法据此关联任何已知文件）。同房间内相同 `dedup_key` 的重复投递正常 ack 但**不落第二份存储**（不计配额），两台设备推同一文件不会双倍占用账号空间。协议向后兼容：不带该字段的客户端行为不变，无视该字段的旧 relay 也照常工作（只是不去重）
 - 心跳保活：服务端按间隔发 `ping`，超过接收超时未收到任何消息即断开
 - 健康检查：`/healthz`
 - **存储配额与付费扩容**：默认每账号 1GB；套餐订阅（`GET /api/plans`）、用户下单申请（`POST /api/storage/orders`）、管理员审核开通（`/api/admin/*`，Bearer `RELAY_ADMIN_TOKEN`）；到期未续费自动回落默认配额（存量数据不删，只拒新写入）

@@ -786,6 +786,20 @@ pub async fn spawn_auto_sync_proxy(
                             if let Err(e) = flush_outbox_with(&db, &relay).await {
                                 tracing::warn!(error = %e, "auto-sync: outbox flush failed");
                             }
+                            // Push locally written blobs (≤10MB, marked at write
+                            // time) into the account archive so peers receive
+                            // them without a request round-trip. Relay-side
+                            // dedup_key absorbs cross-device duplicates.
+                            if let Err(e) = crate::sync::engine::flush_pending_blob_pushes(
+                                &db,
+                                &app_data_dir,
+                                key,
+                                &relay,
+                            )
+                            .await
+                            {
+                                tracing::warn!(error = %e, "auto-sync: pending blob push failed");
+                            }
                         }
                         // Periodically drain the mailbox (account archive +
                         // this device's per-device queue). The relay only

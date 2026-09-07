@@ -107,6 +107,12 @@ pub struct MailboxDepositPayload {
     /// durably stored. Re-depositing the same id is an idempotent retry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
+    /// Opaque content key for blob payloads: `HMAC(sync_key, blob_hash)`. The
+    /// relay dedupes deposits carrying the same key within the account (no
+    /// double storage), but cannot correlate the key with any known file.
+    /// Ignored by relays that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

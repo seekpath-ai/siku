@@ -451,6 +451,7 @@ mod tests {
                         nonce: "nn".to_string(),
                         ttl_seconds: None,
                         message_id: None,
+                        dedup_key: None,
                     },
                     Duration::from_secs(2),
                 )
@@ -483,6 +484,7 @@ mod tests {
                         nonce: "nn".to_string(),
                         ttl_seconds: None,
                         message_id: None,
+                        dedup_key: None,
                     },
                     Duration::from_secs(2),
                 )
@@ -503,6 +505,7 @@ mod tests {
                         nonce: "nn".to_string(),
                         ttl_seconds: None,
                         message_id: None,
+                        dedup_key: None,
                     },
                     Duration::from_millis(150),
                 )
@@ -552,6 +555,7 @@ mod tests {
                     nonce: "nn".to_string(),
                     ttl_seconds: None,
                     message_id: None,
+                    dedup_key: None,
                 },
                 Duration::from_secs(3),
             )
@@ -605,6 +609,7 @@ mod tests {
                     nonce: "nn".to_string(),
                     ttl_seconds: None,
                     message_id: None,
+                    dedup_key: None,
                 },
                 Duration::from_secs(3),
             )

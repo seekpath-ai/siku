@@ -139,6 +139,13 @@ struct MailboxDepositPayload {
     /// an ack the client ignores.
     #[serde(default)]
     message_id: Option<String>,
+    /// Opaque content key for blob payloads (`HMAC(sync_key, blob_hash)` — the
+    /// relay cannot correlate it with any known file). A second deposit with
+    /// the same key in this room is acknowledged without double-storing, so
+    /// two devices pushing the same file don't double-spend the quota.
+    /// Legacy clients omit it and are never deduped.
+    #[serde(default)]
+    dedup_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -797,6 +804,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                             nonce,
                             ttl_seconds,
                             message_id,
+                            dedup_key,
                         } = payload;
                         let ack_id = message_id.clone().unwrap_or_default();
                         let Some(room) = joined_room.as_ref() else {
@@ -819,6 +827,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                             ttl_seconds,
                             message_id,
                             quota_bytes,
+                            dedup_key,
                         ) {
                             Ok(id) => {
                                 info!(
@@ -2127,6 +2136,7 @@ mod tests {
                 None,
                 None,
                 1 << 30,
+                None,
             )
             .unwrap();
 

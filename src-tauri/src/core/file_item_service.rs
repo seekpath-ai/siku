@@ -46,6 +46,12 @@ pub async fn import_file(
     let blob_path = crate::file_store::copy_file_to_blob(app_data_dir, source)
         .map_err(|e| format!("copy to blob store: {e}"))?;
 
+    // Locally authored blob: mark for proactive push to the account archive
+    // (no-op above the proactive size limit).
+    if let Some((hash, ext)) = crate::file_store::parse_blob_path(&blob_path) {
+        crate::sync::attachments::mark_blob_pending_push(db, app_data_dir, &hash, &ext).await;
+    }
+
     let id = uuid::Uuid::new_v4().to_string();
     let now = time::now_iso();
     let mime_type = crate::core::file_service::mime_guess(&name);

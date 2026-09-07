@@ -219,6 +219,9 @@ pub async fn import_paper(
 
     // Copy PDF to content-addressed blob storage
     let blob_rel_path = file_store::copy_file_to_blob(app_data_dir, source_path)?;
+    if let Some((hash, ext)) = file_store::parse_blob_path(&blob_rel_path) {
+        crate::sync::attachments::mark_blob_pending_push(db, app_data_dir, &hash, &ext).await;
+    }
     let file_size = std::fs::metadata(source_path)
         .map(|m| m.len() as i64)
         .unwrap_or(0);

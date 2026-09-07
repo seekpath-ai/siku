@@ -90,13 +90,16 @@ impl MailboxClient {
     }
 
     /// Encrypt `plaintext` with the account sync key and deposit it for
-    /// `to_device_id`.
+    /// `to_device_id`. `dedup_key` (blob payloads only) lets the relay skip
+    /// storing a second copy of content another device already deposited.
+    #[allow(dead_code)]
     pub async fn deposit_encrypted(
         &self,
         to_device_id: &str,
         ciphertext: Vec<u8>,
         nonce: [u8; crate::sync::crypto::NONCE_LEN],
         ttl_seconds: Option<u64>,
+        dedup_key: Option<String>,
     ) -> Result<()> {
         use base64::Engine;
         self.relay
@@ -107,6 +110,7 @@ impl MailboxClient {
                     nonce: base64::engine::general_purpose::STANDARD.encode(nonce),
                     ttl_seconds: ttl_seconds.or(Some(DEFAULT_TTL_SECONDS)),
                     message_id: None,
+                    dedup_key,
                 },
             })
             .context("send mailbox deposit")
@@ -136,6 +140,7 @@ impl MailboxClient {
                     nonce: base64::engine::general_purpose::STANDARD.encode(nonce),
                     ttl_seconds: ttl_seconds.or(Some(DEFAULT_TTL_SECONDS)),
                     message_id,
+                    dedup_key: None,
                 },
                 timeout,
             )

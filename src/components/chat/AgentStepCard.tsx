@@ -1,20 +1,11 @@
 import { useState } from 'react';
 import { Brain, ChevronDown, ChevronRight, Wrench } from 'lucide-react';
-import type { AgentStep, ToolCallInfo } from '@/lib/types';
+import type { AgentStep } from '@/lib/types';
+import { parseToolCalls } from '@/lib/agentPhases';
 import { ToolCallCard } from './ToolCallCard';
 
 interface Props {
   step: AgentStep;
-}
-
-function parseToolCalls(json: string | null): ToolCallInfo[] {
-  if (!json) return [];
-  try {
-    const parsed = JSON.parse(json);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
 }
 
 export function AgentStepCard({ step }: Props) {

@@ -1,18 +1,44 @@
-import { useState } from 'react';
-import { Bot } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Bot, Timer } from 'lucide-react';
 import type { AskAnswer } from '@/lib/types';
 import { useChatStore } from '@/stores/chatStore';
 import { agentAnswerUser } from '@/lib/tauri';
 
+/** Backend wait for AskUserQuestion answers (mirrors the approval timeout). */
+const ASK_USER_TIMEOUT_SEC = 300;
+
+/** Display-only countdown: the backend still enforces its own timeout. */
+function TimeoutCountdown() {
+  const [remaining, setRemaining] = useState(ASK_USER_TIMEOUT_SEC);
+  useEffect(() => {
+    const t = setInterval(() => setRemaining((r) => Math.max(0, r - 1)), 1000);
+    return () => clearInterval(t);
+  }, []);
+  if (remaining <= 0) {
+    return <span className="text-[11px] text-codex-danger">已超时</span>;
+  }
+  const mm = Math.floor(remaining / 60);
+  const ss = String(remaining % 60).padStart(2, '0');
+  return (
+    <span className="flex items-center gap-1 text-[11px] text-codex-muted">
+      <Timer size={11} />
+      {mm}:{ss}
+    </span>
+  );
+}
+
 /** Dialog for the agent's AskUserQuestion tool. */
 export function AskUserDialog() {
   const questions = useChatStore((s) => s.pendingQuestions);
+  const questionsSessionId = useChatStore((s) => s.pendingQuestionsSessionId);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const setPendingQuestions = useChatStore((s) => s.setPendingQuestions);
   const [answers, setAnswers] = useState<Record<number, string[]>>({});
   const [submitting, setSubmitting] = useState(false);
 
-  if (!questions || questions.length === 0) return null;
+  // Only render for the session the questions were raised in; they survive
+  // session switches and re-appear when switching back.
+  if (!questions || questions.length === 0 || questionsSessionId !== activeSessionId) return null;
 
   const toggle = (qi: number, label: string) => {
     setAnswers((prev) => {
@@ -48,15 +74,31 @@ export function AskUserDialog() {
     }
   };
 
+  // Closing without answering must still unblock the backend — otherwise it
+  // waits out the full 300s timeout with the whole turn frozen.
+  const dismiss = () => {
+    if (activeSessionId) {
+      agentAnswerUser(
+        activeSessionId,
+        questions.map((q) => ({ question: q.question, answer: '用户暂不回答' }))
+      ).catch((err) => console.error('Failed to dismiss ask_user:', err));
+    }
+    setPendingQuestions(null);
+    setAnswers({});
+  };
+
   return (
     <div
       className="fixed inset-0 z-[5000] flex items-center justify-center bg-black/60"
-      onClick={(e) => e.target === e.currentTarget && setPendingQuestions(null)}
+      onClick={(e) => e.target === e.currentTarget && dismiss()}
     >
       <div className="w-[480px] max-w-[92vw] max-h-[80vh] overflow-y-auto rounded-2xl bg-codex-surface border border-codex-border shadow-2xl p-5">
         <div className="flex items-center gap-2 mb-4">
           <Bot size={18} className="text-codex-accent" />
           <h3 className="text-base font-semibold text-codex-primary">智能体需要确认</h3>
+          <span className="ml-auto">
+            <TimeoutCountdown />
+          </span>
         </div>
         <div className="space-y-5">
           {questions.map((q, qi) => (
@@ -89,7 +131,7 @@ export function AskUserDialog() {
         </div>
         <div className="flex justify-end gap-2 mt-5">
           <button
-            onClick={() => setPendingQuestions(null)}
+            onClick={dismiss}
             className="px-3 py-1.5 rounded-lg border border-codex-border text-[13px] text-codex-secondary hover:bg-codex-hover"
           >
             暂不回答

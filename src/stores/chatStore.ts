@@ -8,11 +8,19 @@ interface ChatState {
   agentSteps: AgentStep[];
   isLoading: boolean;
   isStreaming: boolean;
+  /** Streaming flag per session — the single source of truth; `isStreaming`
+   * mirrors the active session's entry and is restored on session switch. */
+  streamingById: Record<string, boolean>;
+  /** Loading (awaiting first token) flag per session, same mirroring rule. */
+  loadingById: Record<string, boolean>;
   streamContent: string;
   streamingSteps: StreamingStep[];
   currentStreamingStep: StreamingStep | null;
   /** Questions the agent is waiting on the user to answer (AskUserQuestion). */
   pendingQuestions: AskQuestion[] | null;
+  /** Session the pending questions belong to; the dialog only renders while
+   * that session is active and re-appears when switching back to it. */
+  pendingQuestionsSessionId: string | null;
 
   setSessions: (sessions: AgentSession[]) => void;
   setActiveSession: (id: string | null) => void;
@@ -24,6 +32,8 @@ interface ChatState {
   linkAgentSteps: (messageId: string, sessionId: string) => void;
   setLoading: (v: boolean) => void;
   setStreaming: (v: boolean) => void;
+  setSessionLoading: (sessionId: string, v: boolean) => void;
+  setSessionStreaming: (sessionId: string, v: boolean) => void;
   appendStreamContent: (text: string) => void;
   clearStreamContent: () => void;
   ensureStreamingStep: (stepIndex: number) => void;
@@ -34,7 +44,7 @@ interface ChatState {
   finalizeStreamingStep: (stepIndex: number) => void;
   clearStreamingSteps: () => void;
   removeSession: (id: string) => void;
-  setPendingQuestions: (q: AskQuestion[] | null) => void;
+  setPendingQuestions: (q: AskQuestion[] | null, sessionId?: string | null) => void;
 }
 
 export const useChatStore = create<ChatState>((set) => ({
@@ -44,10 +54,13 @@ export const useChatStore = create<ChatState>((set) => ({
   agentSteps: [],
   isLoading: false,
   isStreaming: false,
+  streamingById: {},
+  loadingById: {},
   streamContent: '',
   streamingSteps: [],
   currentStreamingStep: null,
   pendingQuestions: null,
+  pendingQuestionsSessionId: null,
 
   setSessions: (sessions) => set({ sessions }),
   setActiveSession: (id) =>
@@ -61,7 +74,12 @@ export const useChatStore = create<ChatState>((set) => ({
         streamContent: '',
         streamingSteps: [],
         currentStreamingStep: null,
-        pendingQuestions: null,
+        // Restore the target session's streaming/loading flags so the input
+        // is only disabled while THAT session is actually generating.
+        isStreaming: id ? !!s.streamingById[id] : false,
+        isLoading: id ? !!s.loadingById[id] : false,
+        // pendingQuestions intentionally kept: they belong to their origin
+        // session (pendingQuestionsSessionId) and re-appear on switch-back.
       };
     }),
   setMessages: (messages) => set({ messages }),
@@ -78,8 +96,28 @@ export const useChatStore = create<ChatState>((set) => ({
         st.message_id === null && st.session_id === sessionId ? { ...st, message_id: messageId } : st
       ),
     })),
-  setLoading: (v) => set({ isLoading: v }),
-  setStreaming: (v) => set({ isStreaming: v }),
+  setLoading: (v) =>
+    set((s) =>
+      s.activeSessionId
+        ? { loadingById: { ...s.loadingById, [s.activeSessionId]: v }, isLoading: v }
+        : { isLoading: v }
+    ),
+  setStreaming: (v) =>
+    set((s) =>
+      s.activeSessionId
+        ? { streamingById: { ...s.streamingById, [s.activeSessionId]: v }, isStreaming: v }
+        : { isStreaming: v }
+    ),
+  setSessionLoading: (sessionId, v) =>
+    set((s) => ({
+      loadingById: { ...s.loadingById, [sessionId]: v },
+      ...(sessionId === s.activeSessionId ? { isLoading: v } : {}),
+    })),
+  setSessionStreaming: (sessionId, v) =>
+    set((s) => ({
+      streamingById: { ...s.streamingById, [sessionId]: v },
+      ...(sessionId === s.activeSessionId ? { isStreaming: v } : {}),
+    })),
   appendStreamContent: (text) => set((s) => ({ streamContent: s.streamContent + text })),
   clearStreamContent: () => set({ streamContent: '' }),
 
@@ -156,12 +194,30 @@ export const useChatStore = create<ChatState>((set) => ({
   clearStreamingSteps: () => set({ streamingSteps: [], currentStreamingStep: null }),
 
   removeSession: (id) =>
-    set((s) => ({
-      sessions: s.sessions.filter((ses) => ses.id !== id),
-      activeSessionId: s.activeSessionId === id ? null : s.activeSessionId,
-      messages: s.activeSessionId === id ? [] : s.messages,
-      agentSteps: s.activeSessionId === id ? [] : s.agentSteps,
-    })),
+    set((s) => {
+      const streamingById = { ...s.streamingById };
+      const loadingById = { ...s.loadingById };
+      delete streamingById[id];
+      delete loadingById[id];
+      const wasActive = s.activeSessionId === id;
+      return {
+        sessions: s.sessions.filter((ses) => ses.id !== id),
+        activeSessionId: wasActive ? null : s.activeSessionId,
+        messages: wasActive ? [] : s.messages,
+        agentSteps: wasActive ? [] : s.agentSteps,
+        streamingById,
+        loadingById,
+        isStreaming: wasActive ? false : s.isStreaming,
+        isLoading: wasActive ? false : s.isLoading,
+        pendingQuestions: s.pendingQuestionsSessionId === id ? null : s.pendingQuestions,
+        pendingQuestionsSessionId: s.pendingQuestionsSessionId === id ? null : s.pendingQuestionsSessionId,
+      };
+    }),
 
-  setPendingQuestions: (pendingQuestions) => set({ pendingQuestions }),
+  setPendingQuestions: (q, sessionId) =>
+    set((s) =>
+      q
+        ? { pendingQuestions: q, pendingQuestionsSessionId: sessionId ?? s.activeSessionId }
+        : { pendingQuestions: null, pendingQuestionsSessionId: null }
+    ),
 }));

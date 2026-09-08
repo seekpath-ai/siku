@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { memo, useEffect, useMemo, useRef } from 'react';
 import { useChatStore } from '@/stores/chatStore';
-import type { AgentPhase, StreamingStep } from '@/lib/types';
+import type { AgentStep, ChatMessage } from '@/lib/types';
+import { streamingToPhases } from '@/lib/agentPhases';
 import { MessageBubble } from './MessageBubble';
 import { StreamingContent } from './StreamingContent';
 import { ReasoningProcessCard } from './ReasoningProcessCard';
@@ -9,32 +10,85 @@ import { Brain } from 'lucide-react';
 
 const NEAR_BOTTOM_THRESHOLD = 120; // px
 
-function streamingToPhases(steps: StreamingStep[], current: StreamingStep | null): AgentPhase[] {
-  const phases: AgentPhase[] = [];
-  for (const step of steps) {
-    if (step.reasoning_content.trim()) {
-      phases.push({ kind: 'reasoning', step_index: step.step_index, content: step.reasoning_content });
-    }
-    for (const tc of step.tool_calls) {
-      phases.push({ kind: 'tool_call', step_index: step.step_index, toolCall: tc });
-    }
-  }
-  if (current) {
-    if (current.reasoning_content.trim()) {
-      phases.push({ kind: 'reasoning', step_index: current.step_index, content: current.reasoning_content });
-    }
-    for (const tc of current.tool_calls) {
-      phases.push({ kind: 'tool_call', step_index: current.step_index, toolCall: tc });
-    }
-  }
-  return phases;
+const assistantAvatar = (
+  <div className="w-8 h-8 rounded-full shrink-0 flex items-center justify-center text-[14px] font-semibold bg-gradient-to-br from-codex-accent to-emerald-700 text-black">
+    S
+  </div>
+);
+
+/** Persisted history. Memoized so streaming updates (which re-render the
+ * parent for auto-scroll) never re-render — and re-parse — old bubbles. */
+const HistoryMessages = memo(function HistoryMessages({
+  messages,
+  stepsByMessageId,
+}: {
+  messages: ChatMessage[];
+  stepsByMessageId: Map<string, AgentStep[]>;
+}) {
+  return (
+    <>
+      {messages.map((msg) => (
+        <MessageBubble
+          key={msg.id}
+          message={msg}
+          agentSteps={msg.role === 'assistant' ? stepsByMessageId.get(msg.id) : undefined}
+        />
+      ))}
+    </>
+  );
+});
+
+/** The live turn: subscribes to the streaming slice on its own, so the
+ * history list above is fully isolated from per-flush updates. */
+function StreamingBubble() {
+  const agentName = useActiveAgentName();
+  const isStreaming = useChatStore((s) => s.isStreaming);
+  const streamContent = useChatStore((s) => s.streamContent);
+  const streamingSteps = useChatStore((s) => s.streamingSteps);
+  const currentStreamingStep = useChatStore((s) => s.currentStreamingStep);
+
+  if (!isStreaming) return null;
+
+  return (
+    <div className="flex gap-3 flex-row">
+      {assistantAvatar}
+      <div className="flex-1 min-w-0 pt-1">
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-[13px] font-semibold text-codex-primary">{agentName}</span>
+        </div>
+
+        {streamingToPhases(streamingSteps, currentStreamingStep).length > 0 && (
+          <ReasoningProcessCard
+            phases={streamingToPhases(streamingSteps, currentStreamingStep)}
+            streaming
+          />
+        )}
+
+        {streamContent && (
+          <div className="mt-2 inline-block text-left max-w-[85%] rounded-2xl px-4 py-2.5 bg-codex-surface/60 border border-codex-border/60 text-[14px] leading-relaxed text-codex-primary">
+            <StreamingContent content={streamContent} />
+          </div>
+        )}
+
+        {!streamContent && streamingSteps.length === 0 && !currentStreamingStep && (
+          <div className="inline-flex items-center gap-2.5 rounded-xl px-3.5 py-2 bg-codex-surface border border-codex-border text-[13px] text-codex-secondary">
+            <Brain size={14} className="text-codex-accent animate-pulse" />
+            <span>正在思考…</span>
+            <span className="flex gap-1 ml-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-codex-accent animate-bounce" />
+              <span className="w-1.5 h-1.5 rounded-full bg-codex-accent animate-bounce" style={{ animationDelay: '0.15s' }} />
+              <span className="w-1.5 h-1.5 rounded-full bg-codex-accent animate-bounce" style={{ animationDelay: '0.3s' }} />
+            </span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 export function MessageList() {
-  const agentName = useActiveAgentName();
   const messages = useChatStore((s) => s.messages);
   const agentSteps = useChatStore((s) => s.agentSteps);
-  const isStreaming = useChatStore((s) => s.isStreaming);
   const streamContent = useChatStore((s) => s.streamContent);
   const streamingSteps = useChatStore((s) => s.streamingSteps);
   const currentStreamingStep = useChatStore((s) => s.currentStreamingStep);
@@ -106,12 +160,6 @@ export function MessageList() {
     }
   }, [messages, streamContent, streamingSteps, currentStreamingStep, activeSessionId]);
 
-  const assistantAvatar = (
-    <div className="w-8 h-8 rounded-full shrink-0 flex items-center justify-center text-[14px] font-semibold bg-gradient-to-br from-codex-accent to-emerald-700 text-black">
-      S
-    </div>
-  );
-
   return (
     <div
       ref={containerRef}
@@ -119,50 +167,8 @@ export function MessageList() {
       className="h-full overflow-y-auto px-6 py-8"
     >
       <div className="max-w-[800px] mx-auto space-y-7">
-        {messages.map((msg) => (
-          <MessageBubble
-            key={msg.id}
-            message={msg}
-            agentSteps={msg.role === 'assistant' ? stepsByMessageId.get(msg.id) : undefined}
-          />
-        ))}
-
-        {isStreaming && (
-          <div className="flex gap-3 flex-row">
-            {assistantAvatar}
-            <div className="flex-1 min-w-0 pt-1">
-              <div className="flex items-center gap-2 mb-1">
-                <span className="text-[13px] font-semibold text-codex-primary">{agentName}</span>
-              </div>
-
-              {streamingToPhases(streamingSteps, currentStreamingStep).length > 0 && (
-                <ReasoningProcessCard
-                  phases={streamingToPhases(streamingSteps, currentStreamingStep)}
-                  streaming
-                />
-              )}
-
-              {streamContent && (
-                <div className="mt-2 inline-block text-left max-w-[85%] rounded-2xl px-4 py-2.5 bg-codex-surface/60 border border-codex-border/60 text-[14px] leading-relaxed text-codex-primary">
-                  <StreamingContent content={streamContent} />
-                </div>
-              )}
-
-              {!streamContent && streamingSteps.length === 0 && !currentStreamingStep && (
-                <div className="inline-flex items-center gap-2.5 rounded-xl px-3.5 py-2 bg-codex-surface border border-codex-border text-[13px] text-codex-secondary">
-                  <Brain size={14} className="text-codex-accent animate-pulse" />
-                  <span>正在思考…</span>
-                  <span className="flex gap-1 ml-1">
-                    <span className="w-1.5 h-1.5 rounded-full bg-codex-accent animate-bounce" />
-                    <span className="w-1.5 h-1.5 rounded-full bg-codex-accent animate-bounce" style={{ animationDelay: '0.15s' }} />
-                    <span className="w-1.5 h-1.5 rounded-full bg-codex-accent animate-bounce" style={{ animationDelay: '0.3s' }} />
-                  </span>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-
+        <HistoryMessages messages={messages} stepsByMessageId={stepsByMessageId} />
+        <StreamingBubble />
         <div ref={bottomRef} />
       </div>
     </div>

@@ -3,7 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
-import { listen, emit } from '@tauri-apps/api/event';
+import { emit } from '@tauri-apps/api/event';
 import { useNavigate } from '@tanstack/react-router';
 import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus, CheckCircle2, AlertCircle } from 'lucide-react';
 import { usePetStore } from '@/stores/petStore';
@@ -19,42 +19,9 @@ import { parseAttachments } from '@/lib/attachments';
 import { ReasoningProcessCard } from '@/components/chat/ReasoningProcessCard';
 import { ExternalLink } from '@/components/ui/ExternalLink';
 import { useImageAttachments } from '@/hooks/useImageAttachments';
-import type { AgentStreamEvent, AgentPhase, AgentStep, ApprovalConfig, ChatAttachment, ChatMessage, StreamingStep, ToolCallInfo } from '@/lib/types';
-
-// Flatten streaming steps into reasoning / tool-call phases (same as chat).
-function streamingToPhases(steps: StreamingStep[], current: StreamingStep | null): AgentPhase[] {
-  const phases: AgentPhase[] = [];
-  for (const step of [...steps, ...(current ? [current] : [])]) {
-    if (step.reasoning_content.trim()) {
-      phases.push({ kind: 'reasoning', step_index: step.step_index, content: step.reasoning_content });
-    }
-    for (const tc of step.tool_calls) {
-      phases.push({ kind: 'tool_call', step_index: step.step_index, toolCall: tc });
-    }
-  }
-  return phases;
-}
-
-// Flatten PERSISTED agent steps (history) into the same phase shape, so
-// earlier turns keep their tool-call cards after later turns start.
-function stepsToPhases(steps: AgentStep[]): AgentPhase[] {
-  const phases: AgentPhase[] = [];
-  for (const step of steps) {
-    if (step.reasoning_content?.trim()) {
-      phases.push({ kind: 'reasoning', step_index: step.step_index, content: step.reasoning_content });
-    }
-    let toolCalls: ToolCallInfo[] = [];
-    try {
-      toolCalls = step.tool_calls ? JSON.parse(step.tool_calls) : [];
-    } catch {
-      toolCalls = [];
-    }
-    for (const tc of toolCalls) {
-      phases.push({ kind: 'tool_call', step_index: step.step_index, toolCall: tc });
-    }
-  }
-  return phases;
-}
+import { useAgentEventStream } from '@/hooks/useAgentEventStream';
+import { streamingToPhases, stepsToPhases } from '@/lib/agentPhases';
+import type { AgentStreamEvent, AgentStep, ApprovalConfig, ChatAttachment, ChatMessage, ToolCallInfo } from '@/lib/types';
 
 // ── Evidence citations ([^n] → clickable badge that highlights the PDF) ──
 // Parsing/conversion helpers live in @/lib/evidence (shared with notes).
@@ -467,174 +434,172 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
     emit('pet:bubble', body).catch(() => {});
   }, []);
 
-  // Stream agent events for the pet session.
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
-    const setup = async () => {
-      unlisten = await listen<AgentStreamEvent>('agent:event', (event) => {
-        if (cancelled) return;
-        const e = event.payload;
-        const st = usePetStore.getState();
-        if (!st.session || e.session_id !== st.session.id) return;
-        switch (e.type) {
-          case 'thinking':
-            st.setStreaming(true);
-            break;
-          case 'delta':
-            st.setStreaming(true);
-            if (e.content) st.appendDelta(e.content);
-            break;
-          case 'reasoning': {
-            st.setStreaming(true);
-            if (!e.content || e.step_index === undefined) break;
-            st.ensureStreamingStep(e.step_index);
-            st.appendStreamingReasoning(e.step_index, e.content);
-            break;
-          }
-          case 'tool_call':
-            st.setStreaming(true);
-            if (e.tool_call_id && e.tool_name && e.step_index !== undefined) {
-              st.ensureStreamingStep(e.step_index);
-              st.addStreamingToolCall(e.step_index, {
-                id: e.tool_call_id,
-                name: e.tool_name,
-                arguments: e.tool_args || {},
-                status: 'running',
-              });
-            }
-            break;
-          case 'tool_result':
-            if (e.tool_call_id && e.step_index !== undefined) {
-              st.ensureStreamingStep(e.step_index);
-              st.updateStreamingToolCall(e.step_index, e.tool_call_id, {
-                result: e.tool_result,
-                status: (e.status as ToolCallInfo['status']) || 'completed',
-                duration_ms: e.duration_ms,
-              });
-            }
-            break;
-          case 'step_complete':
-            if (e.step_index !== undefined) {
-              const cur = st.currentStreamingStep;
-              if (cur && cur.step_index === e.step_index) st.finalizeStreamingStep(e.step_index);
-            }
-            break;
-          case 'tool_approval_required': {
-            const stepIndex = e.step_index;
-            st.setPendingApproval({
-              toolCallId: e.tool_call_id ?? '',
-              toolName: e.tool_name ?? '',
-              args: e.tool_args ? JSON.stringify(e.tool_args, null, 1) : '',
-              stepIndex,
-            });
-            if (e.tool_call_id && e.tool_name && stepIndex !== undefined) {
-              st.ensureStreamingStep(stepIndex);
-              st.updateStreamingToolCall(stepIndex, e.tool_call_id, { status: 'pending' });
-              st.addStreamingToolCall(stepIndex, {
-                id: e.tool_call_id,
-                name: e.tool_name,
-                arguments: e.tool_args || {},
-                status: 'pending',
-              });
-            }
-            break;
-          }
-          case 'done':
-          case 'cancelled': {
-            st.setStreaming(false);
-            st.setPendingApproval(null);
-            const cur = st.currentStreamingStep;
-            if (cur) st.finalizeStreamingStep(cur.step_index);
-            if (st.session) {
-              const sid = st.session.id;
-              const reload = () => Promise.all([getChatMessages(sid), getAgentSteps(sid)]);
-              const applyReloaded = ([msgs, steps]: [ChatMessage[], AgentStep[]]) => {
-                // Attribute steps the backend left unlinked to the latest
-                // assistant reply so their card still renders in history.
-                const lastAssistant = [...msgs].reverse().find((m) => m.role === 'assistant');
-                const linked = lastAssistant
-                  ? steps.map((s) => (s.message_id === null ? { ...s, message_id: lastAssistant.id } : s))
-                  : steps;
-                usePetStore.setState({ messages: msgs, agentSteps: linked, streamContent: '' });
-                // History cards now come from persisted steps; drop the
-                // live copy so it is not rendered twice.
-                usePetStore.getState().clearStreamingSteps();
-                // Signal completion so the panel lands on the final reply
-                // (handled by the completionNonce effect below). The
-                // completion swap collapses the live reasoning card, and
-                // the smooth auto-scroll may have disengaged mid-run (its
-                // own scroll events flip isNearBottomRef), so without this
-                // the view can stay stranded with the reply off-screen.
-                usePetStore.setState((s) => ({ completionNonce: s.completionNonce + 1 }));
-              };
-              (async () => {
-                try {
-                  applyReloaded(await reload());
-                } catch (err) {
-                  // Retry once after a short delay — transient failures
-                  // (e.g. the DB briefly locked by a concurrent sync write)
-                  // usually clear immediately.
-                  console.error('pet reload messages:', err);
-                  try {
-                    await new Promise((r) => setTimeout(r, 800));
-                    applyReloaded(await reload());
-                  } catch (err2) {
-                    // Never lose the reply: fall back to the streamed content
-                    // as a local-only message. A later successful reload
-                    // replaces the whole list, so this cannot duplicate.
-                    console.error('pet reload retry failed:', err2);
-                    const streamed = usePetStore.getState().streamContent;
-                    if (streamed.trim()) {
-                      const localMsg: ChatMessage = {
-                        id: `local-${Date.now()}`,
-                        session_id: sid,
-                        role: 'assistant',
-                        content: streamed,
-                        reasoning_content: null,
-                        tool_calls: null,
-                        citations: null,
-                        model: null,
-                        tokens_used: null,
-                        tokens_in: null,
-                        tokens_in_hit: null,
-                        tokens_out: null,
-                        attachments: null,
-                        created_at: new Date().toISOString(),
-                      };
-                      usePetStore.setState((s) => ({ messages: [...s.messages, localMsg], streamContent: '' }));
-                      // Keep the live streaming steps — without persisted
-                      // steps they are the only copy of the reasoning chain.
-                      usePetStore.setState((s) => ({ completionNonce: s.completionNonce + 1 }));
-                    } else {
-                      usePetStore.setState({ streamContent: '' });
-                    }
-                  }
-                }
-              })();
-            }
-            if (e.type === 'done') {
-              notify('任务已完成，可在面板中查看结果');
-            }
-            break;
-          }
-          case 'error':
-            st.setStreaming(false);
-            st.setPendingApproval(null);
-            st.clearStreamingSteps();
-            st.setError(e.content || '调用失败');
-            break;
-          default:
-            break;
+  // Stream agent events for the pet session via the shared listener hook.
+  // flushIntervalMs: 0 keeps the panel's per-event rendering (the backend
+  // already merges deltas into ~40ms windows); the pet-specific semantics
+  // (pending approval, post-done reload, bubble notify) stay in the
+  // handlers below.
+  const petSessionId = usePetStore((s) => s.session?.id ?? null);
+  const onPetDelta = useCallback((content: string) => {
+    const st = usePetStore.getState();
+    st.setStreaming(true);
+    st.appendDelta(content);
+  }, []);
+  const onPetReasoning = useCallback((stepIndex: number, content: string) => {
+    const st = usePetStore.getState();
+    st.setStreaming(true);
+    st.ensureStreamingStep(stepIndex);
+    st.appendStreamingReasoning(stepIndex, content);
+  }, []);
+  const onPetEvent = useCallback((e: AgentStreamEvent) => {
+    const st = usePetStore.getState();
+    switch (e.type) {
+      case 'thinking':
+        st.setStreaming(true);
+        break;
+      case 'tool_call':
+        st.setStreaming(true);
+        if (e.tool_call_id && e.tool_name && e.step_index !== undefined) {
+          st.ensureStreamingStep(e.step_index);
+          st.addStreamingToolCall(e.step_index, {
+            id: e.tool_call_id,
+            name: e.tool_name,
+            arguments: e.tool_args || {},
+            status: 'running',
+          });
         }
-      });
-    };
-    setup();
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
+        break;
+      case 'tool_result':
+        if (e.tool_call_id && e.step_index !== undefined) {
+          st.ensureStreamingStep(e.step_index);
+          st.updateStreamingToolCall(e.step_index, e.tool_call_id, {
+            result: e.tool_result,
+            status: (e.status as ToolCallInfo['status']) || 'completed',
+            duration_ms: e.duration_ms,
+          });
+        }
+        break;
+      case 'step_complete':
+        if (e.step_index !== undefined) {
+          const cur = st.currentStreamingStep;
+          if (cur && cur.step_index === e.step_index) st.finalizeStreamingStep(e.step_index);
+        }
+        break;
+      case 'tool_approval_required': {
+        const stepIndex = e.step_index;
+        st.setPendingApproval({
+          toolCallId: e.tool_call_id ?? '',
+          toolName: e.tool_name ?? '',
+          args: e.tool_args ? JSON.stringify(e.tool_args, null, 1) : '',
+          stepIndex,
+        });
+        if (e.tool_call_id && e.tool_name && stepIndex !== undefined) {
+          st.ensureStreamingStep(stepIndex);
+          st.updateStreamingToolCall(stepIndex, e.tool_call_id, { status: 'pending' });
+          st.addStreamingToolCall(stepIndex, {
+            id: e.tool_call_id,
+            name: e.tool_name,
+            arguments: e.tool_args || {},
+            status: 'pending',
+          });
+        }
+        break;
+      }
+      case 'done':
+      case 'cancelled': {
+        st.setStreaming(false);
+        st.setPendingApproval(null);
+        const cur = st.currentStreamingStep;
+        if (cur) st.finalizeStreamingStep(cur.step_index);
+        if (st.session) {
+          const sid = st.session.id;
+          const reload = () => Promise.all([getChatMessages(sid), getAgentSteps(sid)]);
+          const applyReloaded = ([msgs, steps]: [ChatMessage[], AgentStep[]]) => {
+            // Attribute steps the backend left unlinked to the latest
+            // assistant reply so their card still renders in history.
+            const lastAssistant = [...msgs].reverse().find((m) => m.role === 'assistant');
+            const linked = lastAssistant
+              ? steps.map((s) => (s.message_id === null ? { ...s, message_id: lastAssistant.id } : s))
+              : steps;
+            usePetStore.setState({ messages: msgs, agentSteps: linked, streamContent: '' });
+            // History cards now come from persisted steps; drop the
+            // live copy so it is not rendered twice.
+            usePetStore.getState().clearStreamingSteps();
+            // Signal completion so the panel lands on the final reply
+            // (handled by the completionNonce effect below). The
+            // completion swap collapses the live reasoning card, and
+            // the smooth auto-scroll may have disengaged mid-run (its
+            // own scroll events flip isNearBottomRef), so without this
+            // the view can stay stranded with the reply off-screen.
+            usePetStore.setState((s) => ({ completionNonce: s.completionNonce + 1 }));
+          };
+          (async () => {
+            try {
+              applyReloaded(await reload());
+            } catch (err) {
+              // Retry once after a short delay — transient failures
+              // (e.g. the DB briefly locked by a concurrent sync write)
+              // usually clear immediately.
+              console.error('pet reload messages:', err);
+              try {
+                await new Promise((r) => setTimeout(r, 800));
+                applyReloaded(await reload());
+              } catch (err2) {
+                // Never lose the reply: fall back to the streamed content
+                // as a local-only message. A later successful reload
+                // replaces the whole list, so this cannot duplicate.
+                console.error('pet reload retry failed:', err2);
+                const streamed = usePetStore.getState().streamContent;
+                if (streamed.trim()) {
+                  const localMsg: ChatMessage = {
+                    id: `local-${Date.now()}`,
+                    session_id: sid,
+                    role: 'assistant',
+                    content: streamed,
+                    reasoning_content: null,
+                    tool_calls: null,
+                    citations: null,
+                    model: null,
+                    tokens_used: null,
+                    tokens_in: null,
+                    tokens_in_hit: null,
+                    tokens_out: null,
+                    attachments: null,
+                    created_at: new Date().toISOString(),
+                  };
+                  usePetStore.setState((s) => ({ messages: [...s.messages, localMsg], streamContent: '' }));
+                  // Keep the live streaming steps — without persisted
+                  // steps they are the only copy of the reasoning chain.
+                  usePetStore.setState((s) => ({ completionNonce: s.completionNonce + 1 }));
+                } else {
+                  usePetStore.setState({ streamContent: '' });
+                }
+              }
+            }
+          })();
+        }
+        if (e.type === 'done') {
+          notify('任务已完成，可在面板中查看结果');
+        }
+        break;
+      }
+      case 'error':
+        st.setStreaming(false);
+        st.setPendingApproval(null);
+        st.clearStreamingSteps();
+        st.setError(e.content || '调用失败');
+        break;
+      default:
+        break;
+    }
   }, [notify]);
+  useAgentEventStream({
+    sessionId: petSessionId,
+    flushIntervalMs: 0,
+    onDelta: onPetDelta,
+    onReasoning: onPetReasoning,
+    onEvent: onPetEvent,
+  });
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior) => {
     bottomRef.current?.scrollIntoView({ behavior });

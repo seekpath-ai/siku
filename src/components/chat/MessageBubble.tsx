@@ -3,8 +3,9 @@ import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import { User, Copy, Check, Paperclip, ChevronDown, ChevronUp } from 'lucide-react';
-import { useMemo, useState } from 'react';
-import type { AgentPhase, AgentStep, ChatMessage, ToolCallInfo } from '@/lib/types';
+import { memo, useMemo, useState } from 'react';
+import type { AgentStep, ChatMessage } from '@/lib/types';
+import { parseToolCalls, stepsToPhases } from '@/lib/agentPhases';
 import { parseAttachments } from '@/lib/attachments';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
 import { MarkdownCode, MarkdownPre } from './CodeBlock';
@@ -37,16 +38,6 @@ function formatTokenUsage(message: ChatMessage): string {
     return `${message.tokens_used} tokens`;
   }
   return '';
-}
-
-function parseToolCalls(json: string | null): ToolCallInfo[] {
-  if (!json) return [];
-  try {
-    const parsed = JSON.parse(json);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
 }
 
 interface ContentBlock {
@@ -110,20 +101,11 @@ function UserText({ content }: { content: string }) {
   );
 }
 
-function stepsToPhases(steps: AgentStep[]): AgentPhase[] {
-  const phases: AgentPhase[] = [];
-  for (const step of steps) {
-    if (step.reasoning_content?.trim()) {
-      phases.push({ kind: 'reasoning', step_index: step.step_index, content: step.reasoning_content });
-    }
-    for (const tc of parseToolCalls(step.tool_calls)) {
-      phases.push({ kind: 'tool_call', step_index: step.step_index, toolCall: tc });
-    }
-  }
-  return phases;
-}
-
-export function MessageBubble({ message, agentSteps = [] }: Props) {
+// Memoized: during streaming the parent re-renders on every batched flush,
+// and each history bubble re-parses ReactMarkdown/KaTeX on re-render. Props
+// (message object, steps array from the memoized map) are referentially
+// stable, so history bubbles skip those renders entirely.
+function MessageBubbleInner({ message, agentSteps = [] }: Props) {
   const agentName = useActiveAgentName();
   const [copied, setCopied] = useState(false);
   const isUser = message.role === 'user';
@@ -291,3 +273,5 @@ export function MessageBubble({ message, agentSteps = [] }: Props) {
     </div>
   );
 }
+
+export const MessageBubble = memo(MessageBubbleInner);

@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Wrench, ChevronDown, ChevronRight, Loader2, CheckCircle2, XCircle, Clock } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Wrench, ChevronDown, ChevronRight, Loader2, CheckCircle2, XCircle, Clock, Timer } from 'lucide-react';
 import type { ToolCallInfo } from '@/lib/types';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
 import { ApprovalCard } from './ApprovalCard';
@@ -7,6 +7,29 @@ import { TerminalOutput } from './TerminalOutput';
 
 interface Props {
   toolCall: ToolCallInfo;
+}
+
+/** Backend approval wait; the countdown is display-only. */
+const APPROVAL_TIMEOUT_SEC = 300;
+
+/** Remaining-time hint for a pending approval (5:00 → 已超时). */
+function ApprovalCountdown() {
+  const [remaining, setRemaining] = useState(APPROVAL_TIMEOUT_SEC);
+  useEffect(() => {
+    const t = setInterval(() => setRemaining((r) => Math.max(0, r - 1)), 1000);
+    return () => clearInterval(t);
+  }, []);
+  if (remaining <= 0) {
+    return <span className="text-[11px] text-codex-danger">已超时</span>;
+  }
+  const mm = Math.floor(remaining / 60);
+  const ss = String(remaining % 60).padStart(2, '0');
+  return (
+    <span className="flex items-center gap-1 text-[11px] text-codex-muted">
+      <Timer size={11} />
+      {mm}:{ss}
+    </span>
+  );
 }
 
 const statusConfig: Record<string, { icon: React.ReactNode; label: string; color: string }> = {
@@ -37,6 +60,7 @@ export function ToolCallCard({ toolCall }: Props) {
         <div className="flex-1 min-w-0 pt-1">
           <div className="flex items-center gap-2 mb-1">
             <span className="text-[13px] font-semibold text-codex-primary">{agentName}</span>
+            <ApprovalCountdown />
           </div>
           <ApprovalCard toolCallId={toolCall.id} toolName={toolCall.name} command={command} args={toolCall.arguments} />
         </div>
@@ -94,6 +118,7 @@ export function ToolCallCard({ toolCall }: Props) {
               output={toolCall.result}
               status={toolCall.status}
               command={toolCall.name}
+              collapsed
             />
           )}
         </div>

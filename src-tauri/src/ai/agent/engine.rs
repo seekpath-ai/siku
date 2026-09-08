@@ -1,5 +1,5 @@
 use sqlx::SqlitePool;
-use tracing::{error, info, info_span};
+use tracing::{error, info, info_span, warn};
 
 use crate::ai::agent::config::AgentConfig;
 use crate::ai::agent::memory::ConversationMemory;
@@ -9,28 +9,95 @@ use crate::ai::llm::{self, ChatMessage, LlmClient, StreamEvent, ToolCall};
 use crate::core::models::AgentStep;
 use crate::core::time;
 
+/// One event of an agent turn, streamed to the frontend over "agent:event".
+/// Internally tagged: the wire shape is `{"type": "<variant>", "session_id":
+/// ..., ...variant fields}` — the same keys the old all-Option struct
+/// produced, except absent fields are omitted instead of serialized as null
+/// (the frontend reads every field as optional, so both decode alike).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AgentEvent {
-    #[serde(rename = "type")]
-    pub event_type: String,
-    pub session_id: String,
-    pub step_index: Option<i32>,
-    pub content: Option<String>,
-    pub tool_call_id: Option<String>,
-    pub tool_name: Option<String>,
-    pub tool_args: Option<serde_json::Value>,
-    pub tool_result: Option<String>,
-    pub status: Option<String>,
-    pub duration_ms: Option<i32>,
-    /// Token usage breakdown for terminal done/cancelled events.
-    pub tokens_used: Option<i32>,
-    pub tokens_in: Option<i32>,
-    pub tokens_in_hit: Option<i32>,
-    pub tokens_out: Option<i32>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentEvent {
+    Thinking {
+        session_id: String,
+        content: String,
+    },
+    Delta {
+        session_id: String,
+        step_index: i32,
+        content: String,
+    },
+    Reasoning {
+        session_id: String,
+        step_index: i32,
+        content: String,
+    },
+    ToolCall {
+        session_id: String,
+        step_index: i32,
+        tool_call_id: String,
+        tool_name: String,
+        tool_args: serde_json::Value,
+    },
+    ToolResult {
+        session_id: String,
+        step_index: i32,
+        tool_call_id: String,
+        tool_name: String,
+        tool_result: String,
+        status: String,
+        /// Absent for results that never ran (approval timeout).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<i32>,
+    },
+    ToolApprovalRequired {
+        session_id: String,
+        step_index: i32,
+        tool_call_id: String,
+        tool_name: String,
+        tool_args: serde_json::Value,
+    },
+    StepComplete {
+        session_id: String,
+        step_index: i32,
+    },
+    /// The agent is waiting for structured answers (AskUserQuestion);
+    /// `content` is the questions JSON.
+    AskUser {
+        session_id: String,
+        content: String,
+    },
+    Done {
+        session_id: String,
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens_used: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens_in: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens_in_hit: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens_out: Option<i32>,
+    },
+    Cancelled {
+        session_id: String,
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens_used: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens_in: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens_in_hit: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens_out: Option<i32>,
+    },
+    Error {
+        session_id: String,
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone)]
-pub enum ApprovalResponse {
+pub enum ApprovalDecision {
     Approved,
     Declined,
     /// Declined, with user feedback handed to the agent so it can adjust
@@ -39,6 +106,75 @@ pub enum ApprovalResponse {
     /// Declined and the whole turn ends (agent was on the wrong track).
     DeclinedStop,
     ModifiedArgs(serde_json::Value),
+}
+
+/// A user's answer to a tool-approval prompt. `tool_call_id` tags which
+/// pending call it answers so a late response (arriving after the 300s
+/// timeout of an earlier prompt) can be dropped instead of being consumed
+/// by the next tool's wait.
+#[derive(Debug, Clone)]
+pub struct ApprovalResponse {
+    pub decision: ApprovalDecision,
+    pub tool_call_id: Option<String>,
+}
+
+/// Batches delta/reasoning stream fragments so the frontend receives one
+/// merged event per ~40ms window instead of one per token. The wire protocol
+/// is unchanged: same event types, `content` is the concatenated string and
+/// the frontend keeps accumulating.
+struct StreamBatcher {
+    delta: String,
+    reasoning: String,
+    last_emit: std::time::Instant,
+}
+
+impl StreamBatcher {
+    const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+
+    fn new() -> Self {
+        Self {
+            delta: String::new(),
+            reasoning: String::new(),
+            last_emit: std::time::Instant::now(),
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.delta.is_empty() || !self.reasoning.is_empty()
+    }
+
+    /// Whether the current 40ms window has elapsed with fragments pending.
+    fn due(&self) -> bool {
+        self.has_pending() && self.last_emit.elapsed() >= Self::FLUSH_INTERVAL
+    }
+
+    /// Next instant at which pending fragments must go out.
+    fn deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::from_std(self.last_emit + Self::FLUSH_INTERVAL)
+    }
+
+    fn push_delta(&mut self, c: &str) {
+        self.delta.push_str(c);
+    }
+
+    fn push_reasoning(&mut self, c: &str) {
+        self.reasoning.push_str(c);
+    }
+
+    /// Take all pending fragments, starting a new batching window.
+    fn take(&mut self) -> (Option<String>, Option<String>) {
+        self.last_emit = std::time::Instant::now();
+        let delta = if self.delta.is_empty() { None } else { Some(std::mem::take(&mut self.delta)) };
+        let reasoning = if self.reasoning.is_empty() { None } else { Some(std::mem::take(&mut self.reasoning)) };
+        (delta, reasoning)
+    }
+}
+
+/// Extract the tool_call id an approval response refers to. Id-less responses
+/// (legacy callers) are treated as matching the pending call; tagged responses
+/// for a different tool_call are dropped by the approval waiter.
+fn approval_tool_call_id(resp: &ApprovalResponse) -> Option<&str> {
+    resp.tool_call_id.as_deref()
 }
 
 /// Record of a tool call executed during an agent turn, suitable for persistence.
@@ -54,6 +190,10 @@ pub struct ToolCallRecord {
 
 pub struct AgentEngine {
     llm: Box<dyn LlmClient>,
+    /// The effective config the client was built with (post vision-switch,
+    /// post output-cap). Kept so a mid-turn retry can rebuild a client with a
+    /// bumped max_tokens without losing the routing decisions.
+    llm_config: crate::ai::llm::LlmConfig,
     tool_registry: ToolRegistry,
     memory: ConversationMemory,
     memory_store: MemoryStore,
@@ -71,6 +211,7 @@ pub struct AgentEngine {
 impl AgentEngine {
     pub fn new(
         llm: Box<dyn LlmClient>,
+        llm_config: crate::ai::llm::LlmConfig,
         tool_registry: ToolRegistry,
         session_id: String,
         db: SqlitePool,
@@ -86,6 +227,7 @@ impl AgentEngine {
         let memory = ConversationMemory::new(max_tokens, system_prompt);
         Self {
             llm,
+            llm_config,
             tool_registry,
             memory,
             memory_store,
@@ -134,18 +276,14 @@ impl AgentEngine {
         } else {
             &args["questions"]
         };
-        self.emit(
-            event_tx,
-            "ask_user",
-            None,
-            Some(questions.to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        // Drop stale answers left in the channel by earlier (timed-out or
+        // cancelled) prompts, so a late reply can never be consumed as the
+        // answer to a different question.
+        while ask_rx.try_recv().is_ok() {}
+        self.emit(event_tx, |session_id| AgentEvent::AskUser {
+            session_id,
+            content: questions.to_string(),
+        });
         match tokio::select! {
             biased;
             _ = self.cancel_token.cancelled() => None,
@@ -169,35 +307,34 @@ impl AgentEngine {
         }
     }
 
+    /// Send one event, filling in this engine's session id. The closure
+    /// builds the concrete `AgentEvent` variant, so call sites name their
+    /// fields instead of passing a positional `None` list.
     fn emit(
         &self,
         event_tx: &tokio::sync::mpsc::UnboundedSender<AgentEvent>,
-        event_type: &str,
-        step_index: Option<i32>,
-        content: Option<String>,
-        tool_call_id: Option<String>,
-        tool_name: Option<String>,
-        tool_args: Option<serde_json::Value>,
-        tool_result: Option<String>,
-        status: Option<String>,
-        duration_ms: Option<i32>,
+        build: impl FnOnce(String) -> AgentEvent,
     ) {
-        let _ = event_tx.send(AgentEvent {
-            event_type: event_type.into(),
-            session_id: self.session_id.clone(),
-            step_index,
-            content,
-            tool_call_id,
-            tool_name,
-            tool_args,
-            tool_result,
-            status,
-            duration_ms,
-            tokens_used: None,
-            tokens_in: None,
-            tokens_in_hit: None,
-            tokens_out: None,
-        });
+        let _ = event_tx.send(build(self.session_id.clone()));
+    }
+
+    /// Flush pending batched stream fragments as merged delta/reasoning
+    /// events. Must run before any non-stream event (tool_call, tool_result,
+    /// ask_user, tool_approval_required, step_complete, turn end) so event
+    /// ordering matches what the model actually produced.
+    fn flush_batcher(
+        &self,
+        event_tx: &tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+        step_index: i32,
+        batcher: &mut StreamBatcher,
+    ) {
+        let (delta, reasoning) = batcher.take();
+        if let Some(c) = delta {
+            self.emit(event_tx, |session_id| AgentEvent::Delta { session_id, step_index, content: c });
+        }
+        if let Some(c) = reasoning {
+            self.emit(event_tx, |session_id| AgentEvent::Reasoning { session_id, step_index, content: c });
+        }
     }
 
     /// Process a user message with streaming output via event channel.
@@ -221,7 +358,10 @@ impl AgentEngine {
         info!(user_message_len = user_message.len(), history_len = history.len(), "starting agent turn");
 
         // Emit thinking
-        self.emit(&event_tx, "thinking", None, Some("Analyzing request...".into()), None, None, None, None, None, None);
+        self.emit(&event_tx, |session_id| AgentEvent::Thinking {
+            session_id,
+            content: "Analyzing request...".into(),
+        });
 
         // Build messages
         let mut messages: Vec<ChatMessage> = Vec::new();
@@ -253,6 +393,15 @@ impl AgentEngine {
         let tool_defs = self.tool_registry.get_definitions();
         let max_loops = self.config.effective_max_loops();
 
+        // Per-round output cap currently in effect. Starts at the configured
+        // value; a truncation retry (ask_user) rebuilds the client with a
+        // bumped cap and updates this.
+        let mut output_cap = self.llm_config.max_tokens;
+        // Retry client built on a cap bump; when present it serves all later
+        // rounds of this turn (kept local so the turn stays &self).
+        let mut retry_llm: Option<Box<dyn LlmClient>> = None;
+        let mut cap_bumps = 0u32;
+
         // — ReAct loop with streaming —
         let mut final_content = String::new();
         // Every round's visible text, concatenated. The frontend streams ALL
@@ -282,10 +431,11 @@ impl AgentEngine {
                 break;
             }
             if max_loops > 0 && round >= max_loops {
+                let active_llm: &dyn LlmClient = retry_llm.as_deref().unwrap_or(&*self.llm);
                 messages.push(ChatMessage { role: "system".into(),
                     content: "Max tool calls reached. Provide your final answer now based on gathered information.".into(),
                     attachments: None, tool_calls: None, tool_call_id: None, name: None });
-                let resp = self.llm.chat_completion(&messages, &[]).await.map_err(|e| format!("LLM: {e}"))?;
+                let resp = active_llm.chat_completion(&messages, &[]).await.map_err(|e| format!("LLM: {e}"))?;
                 final_content = resp.content;
                 if !final_content.trim().is_empty() {
                     if !full_text.is_empty() { full_text.push_str("\n\n"); }
@@ -296,24 +446,34 @@ impl AgentEngine {
             round += 1;
             let step_index = round as i32;
 
-            // Truncate if needed
-            if ConversationMemory::estimate_messages_tokens(&messages) > 100_000 {
-                let budget = self.config.effective_context_budget();
-                messages = self.memory.truncate(&messages, budget);
+            // Truncate when the estimated INPUT exceeds the context budget.
+            // `reserved` is headroom for the model's OUTPUT — the per-round
+            // output cap — NOT the context budget itself: reserving the full
+            // budget zeroed the inner budget and dropped the entire history,
+            // including the current user message.
+            let context_budget = self.config.effective_context_budget();
+            if ConversationMemory::estimate_messages_tokens(&messages) > context_budget {
+                messages = self.memory.truncate(&messages, output_cap as usize);
             }
-
-            // Accumulate streaming response + tool call deltas
-            let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
-            let msgs_clone = messages.clone();
-            let llm_fut = self.llm.chat_completion_stream(&msgs_clone, &tool_defs, stream_tx);
 
             let mut stream_text = String::new();
             let mut round_reasoning = String::new();
             let mut round_finish: Option<String> = None;
+            let mut batcher = StreamBatcher::new();
             let mut tool_call_buf: std::collections::HashMap<u32, (String, String, String)> = std::collections::HashMap::new();
 
-            tokio::pin!(llm_fut);
-            loop {
+            // Stream one round. The borrow of retry_llm (via active_llm) is
+            // scoped to this block so the truncation-retry below may replace
+            // retry_llm with a bumped-cap client.
+            {
+                let active_llm: &dyn LlmClient = retry_llm.as_deref().unwrap_or(&*self.llm);
+                // Accumulate streaming response + tool call deltas
+                let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
+                let msgs_clone = messages.clone();
+                let llm_fut = active_llm.chat_completion_stream(&msgs_clone, &tool_defs, stream_tx);
+
+                tokio::pin!(llm_fut);
+                loop {
                 tokio::select! {
                     biased;
                     _ = self.cancel_token.cancelled() => {
@@ -333,13 +493,19 @@ impl AgentEngine {
                                     "delta" => {
                                         if let Some(ref c) = content {
                                             stream_text.push_str(c);
-                                            self.emit(&event_tx, "delta", Some(step_index), Some(c.clone()), None, None, None, None, None, None);
+                                            batcher.push_delta(c);
+                                        }
+                                        if batcher.due() {
+                                            self.flush_batcher(&event_tx, step_index, &mut batcher);
                                         }
                                     }
                                     "reasoning" => {
                                         if let Some(ref c) = content {
                                             round_reasoning.push_str(c);
-                                            self.emit(&event_tx, "reasoning", Some(step_index), Some(c.clone()), None, None, None, None, None, None);
+                                            batcher.push_reasoning(c);
+                                        }
+                                        if batcher.due() {
+                                            self.flush_batcher(&event_tx, step_index, &mut batcher);
                                         }
                                     }
                                     "tool_call_delta" => {
@@ -370,6 +536,11 @@ impl AgentEngine {
                             None => break,
                         }
                     }
+                    // Flush batched delta/reasoning fragments once per
+                    // 40ms window instead of emitting one event per token.
+                    _ = tokio::time::sleep_until(batcher.deadline()), if batcher.has_pending() => {
+                        self.flush_batcher(&event_tx, step_index, &mut batcher);
+                    }
                     result = &mut llm_fut => {
                         if let Err(e) = result {
                             error!(error = %e, "LLM stream failed");
@@ -395,13 +566,13 @@ impl AgentEngine {
                     "delta" => {
                         if let Some(ref c) = event.content {
                             stream_text.push_str(c);
-                            self.emit(&event_tx, "delta", Some(step_index), Some(c.clone()), None, None, None, None, None, None);
+                            batcher.push_delta(c);
                         }
                     }
                     "reasoning" => {
                         if let Some(ref c) = event.content {
                             round_reasoning.push_str(c);
-                            self.emit(&event_tx, "reasoning", Some(step_index), Some(c.clone()), None, None, None, None, None, None);
+                            batcher.push_reasoning(c);
                         }
                     }
                     "tool_call_delta" => {
@@ -429,6 +600,14 @@ impl AgentEngine {
                     _ => {}
                 }
             }
+            } // end scoped stream block (drops the retry_llm borrow)
+
+            // Force-flush any buffered stream fragments before anything else
+            // is emitted this round (ask_user, tool_call, tool_result,
+            // tool_approval_required, step_complete). The batcher is only fed
+            // during streaming, so this single flush keeps every later event
+            // of the round correctly ordered.
+            self.flush_batcher(&event_tx, step_index, &mut batcher);
 
             // Fold this round's visible text into the full reply (see
             // full_text above).
@@ -438,6 +617,41 @@ impl AgentEngine {
             }
             if stream_text.trim().is_empty() && round_finish.as_deref() == Some("length") {
                 truncated_empty = true;
+                // Reasoning exhausted the completion budget with no visible
+                // output. Offer the user a one-off cap bump and continue the
+                // ReAct loop with the rebuilt client — never replay the turn
+                // (earlier tool side effects must not repeat). The model
+                // cannot ask this itself: in this failure mode it produced no
+                // tool call at all, so the engine asks on its behalf.
+                if !cancelled && cap_bumps < 3 {
+                    let next = output_cap.saturating_mul(2);
+                    let questions = serde_json::json!({ "questions": [{
+                        "question": format!("模型的思考过程占满了单轮输出额度（当前 max_tokens={output_cap}），没有生成正文。要调大额度重试吗？"),
+                        "header": "输出额度不足",
+                        "options": [
+                            { "label": format!("调大到 {next} 重试"), "description": "仅本轮对话生效；长期调整请改会话设置或模型配置" },
+                            { "label": "不重试" }
+                        ]
+                    }]});
+                    let answers = self.handle_ask_user(&event_tx, &questions, ask_rx).await;
+                    if answers.contains("调大到") {
+                        let mut cfg = self.llm_config.clone();
+                        cfg.max_tokens = next;
+                        match llm::client::create_llm_client(&cfg) {
+                            Ok(client) => {
+                                info!(old_cap = output_cap, new_cap = next, round, "retrying round with bumped max_tokens");
+                                retry_llm = Some(client);
+                                output_cap = next;
+                                cap_bumps += 1;
+                                truncated_empty = false;
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to rebuild LLM client for cap bump");
+                            }
+                        }
+                    }
+                }
             }
 
             if cancelled {
@@ -497,12 +711,143 @@ impl AgentEngine {
             // Execute each tool call and collect records for this step.
             let mut step_tool_records: Vec<ToolCallRecord> = Vec::new();
             info!(approval_mode=?self.config.approval.mode, "starting tool execution round");
-            for tc in &tool_calls {
+            let mut call_idx = 0;
+            while call_idx < tool_calls.len() {
                 if self.is_cancelled() {
                     info!(round, "agent cancelled during tool execution");
                     cancelled = true;
                     break;
                 }
+
+                // Collect a run of consecutive calls eligible for PARALLEL
+                // execution: read-only, approval-exempt, not ask_user, and
+                // well-formed args. Approval-gated/write/ask_user/malformed
+                // calls fall through to the serial path below. ToolRegistry
+                // is Send+Sync, so its execute futures can be driven together
+                // with join_all while results are written back in the
+                // original tool_calls order.
+                let mut batch: Vec<(usize, String, serde_json::Value)> = Vec::new();
+                while call_idx < tool_calls.len() {
+                    let tc = &tool_calls[call_idx];
+                    let readonly_tool = self.tool_registry.is_readonly(&tc.function.name);
+                    let requires_approval = match self.config.approval.mode {
+                        crate::ai::agent::config::ApprovalMode::Auto => false,
+                        crate::ai::agent::config::ApprovalMode::ManualAll => true,
+                        _ => !readonly_tool,
+                    };
+                    let parsed = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                        .ok()
+                        .map(Self::normalize_args);
+                    if tc.function.name == "ask_user" || !readonly_tool || requires_approval || parsed.is_none() {
+                        break;
+                    }
+                    let args = parsed.unwrap();
+                    let tool_id = format!("tool_{}", uuid::Uuid::new_v4());
+                    self.emit(&event_tx, |session_id| AgentEvent::ToolCall {
+                        session_id,
+                        step_index,
+                        tool_call_id: tool_id.clone(),
+                        tool_name: tc.function.name.clone(),
+                        tool_args: args.clone(),
+                    });
+                    batch.push((call_idx, tool_id, args));
+                    call_idx += 1;
+                }
+
+                if !batch.is_empty() {
+                    info!(batch_size = batch.len(), "executing read-only tools in parallel");
+                    let futs: Vec<_> = batch
+                        .iter()
+                        .map(|(i, _, args)| {
+                            let tc = &tool_calls[*i];
+                            async move {
+                                let start = std::time::Instant::now();
+                                let result = tokio::time::timeout(
+                                    std::time::Duration::from_secs(320),
+                                    self.tool_registry.execute(&tc.function.name, args.clone()),
+                                )
+                                .await;
+                                (result, start.elapsed().as_millis() as i32)
+                            }
+                        })
+                        .collect();
+                    let results = tokio::select! {
+                        biased;
+                        _ = self.cancel_token.cancelled() => {
+                            info!(round, "agent cancelled during parallel tool execution");
+                            cancelled = true;
+                            None
+                        }
+                        r = futures::future::join_all(futs) => Some(r),
+                    };
+                    let Some(results) = results else { break };
+                    for ((i, tool_id, args), (result, duration_ms)) in batch.iter().zip(results) {
+                        let tc = &tool_calls[*i];
+                        let (tool_result, tool_status) = match result {
+                            Ok(Ok(output)) => {
+                                self.emit(&event_tx, |session_id| AgentEvent::ToolResult {
+                                    session_id,
+                                    step_index,
+                                    tool_call_id: tool_id.clone(),
+                                    tool_name: tc.function.name.clone(),
+                                    tool_result: output.clone(),
+                                    status: "completed".into(),
+                                    duration_ms: Some(duration_ms),
+                                });
+                                (output, "completed")
+                            }
+                            Ok(Err(e)) => {
+                                error!("tool error: {e}");
+                                let msg = format!("Error: {e}");
+                                self.emit(&event_tx, |session_id| AgentEvent::ToolResult {
+                                    session_id,
+                                    step_index,
+                                    tool_call_id: tool_id.clone(),
+                                    tool_name: tc.function.name.clone(),
+                                    tool_result: msg.clone(),
+                                    status: "error".into(),
+                                    duration_ms: Some(duration_ms),
+                                });
+                                (msg, "error")
+                            }
+                            Err(_) => {
+                                let msg = "Error: timeout".to_string();
+                                self.emit(&event_tx, |session_id| AgentEvent::ToolResult {
+                                    session_id,
+                                    step_index,
+                                    tool_call_id: tool_id.clone(),
+                                    tool_name: tc.function.name.clone(),
+                                    tool_result: msg.clone(),
+                                    status: "timeout".into(),
+                                    duration_ms: Some(duration_ms),
+                                });
+                                (msg, "timeout")
+                            }
+                        };
+                        step_tool_records.push(ToolCallRecord {
+                            id: tool_id.clone(),
+                            name: tc.function.name.clone(),
+                            arguments: args.clone(),
+                            result: tool_result.clone(),
+                            status: tool_status.into(),
+                            duration_ms,
+                        });
+                        let exec_id = uuid::Uuid::new_v4().to_string();
+                        let now = time::now_iso();
+                        let _ = sqlx::query(
+                            "INSERT INTO tool_executions (id, session_id, tool_name, tool_input, tool_output, status, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                        ).bind(&exec_id).bind(&self.session_id).bind(&tc.function.name).bind(&tc.function.arguments).bind(&tool_result).bind(tool_status).bind(duration_ms).bind(&now).execute(&self.db).await;
+                        messages.push(ChatMessage {
+                            role: "tool".into(), content: tool_result.clone(),
+                            attachments: None, tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some(tc.function.name.clone()),
+                        });
+                    }
+                    continue;
+                }
+
+                // — Serial path: approval-gated, write, ask_user, or malformed
+                // args; semantics unchanged from the original per-call loop. —
+                let tc = &tool_calls[call_idx];
                 let tool_id = format!("tool_{}", uuid::Uuid::new_v4());
                 // 参数 JSON 本身非法时不能拿 Value::Null 硬跑——工具只会报
                 // "path required" 之类的错,模型误以为参数缺失而原样重发。
@@ -513,8 +858,22 @@ impl AgentEngine {
                     Err(e) => {
                         let prefix: String = tc.function.arguments.chars().take(200).collect();
                         let tool_result = format!("参数 JSON 解析失败:{e};原始参数前缀:{prefix}");
-                        self.emit(&event_tx, "tool_call", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), Some(serde_json::Value::Null), None, None, None);
-                        self.emit(&event_tx, "tool_result", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), None, Some(tool_result.clone()), Some("error".into()), Some(0));
+                        self.emit(&event_tx, |session_id| AgentEvent::ToolCall {
+                            session_id,
+                            step_index,
+                            tool_call_id: tool_id.clone(),
+                            tool_name: tc.function.name.clone(),
+                            tool_args: serde_json::Value::Null,
+                        });
+                        self.emit(&event_tx, |session_id| AgentEvent::ToolResult {
+                            session_id,
+                            step_index,
+                            tool_call_id: tool_id.clone(),
+                            tool_name: tc.function.name.clone(),
+                            tool_result: tool_result.clone(),
+                            status: "error".into(),
+                            duration_ms: Some(0),
+                        });
                         step_tool_records.push(ToolCallRecord {
                             id: tool_id.clone(),
                             name: tc.function.name.clone(),
@@ -527,11 +886,18 @@ impl AgentEngine {
                             role: "tool".into(), content: tool_result,
                             attachments: None, tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some(tc.function.name.clone()),
                         });
+                        call_idx += 1;
                         continue;
                     }
                 };
 
-                self.emit(&event_tx, "tool_call", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), Some(args.clone()), None, None, None);
+                self.emit(&event_tx, |session_id| AgentEvent::ToolCall {
+                    session_id,
+                    step_index,
+                    tool_call_id: tool_id.clone(),
+                    tool_name: tc.function.name.clone(),
+                    tool_args: args.clone(),
+                });
 
                 // AskUserQuestion: handled inline by the engine — emit an
                 // `ask_user` event and wait for the user's answers.
@@ -539,7 +905,15 @@ impl AgentEngine {
                     let answers = self.handle_ask_user(&event_tx, &args, ask_rx).await;
                     let failed = answers.starts_with("AskUserQuestion") || answers.contains("timed out");
                     let status = if failed { "error" } else { "completed" };
-                    self.emit(&event_tx, "tool_result", Some(step_index), None, Some(tool_id.clone()), Some("ask_user".into()), None, Some(answers.clone()), Some(status.into()), Some(0));
+                    self.emit(&event_tx, |session_id| AgentEvent::ToolResult {
+                        session_id,
+                        step_index,
+                        tool_call_id: tool_id.clone(),
+                        tool_name: "ask_user".into(),
+                        tool_result: answers.clone(),
+                        status: status.into(),
+                        duration_ms: Some(0),
+                    });
                     step_tool_records.push(ToolCallRecord {
                         id: tool_id.clone(),
                         name: "ask_user".into(),
@@ -552,6 +926,7 @@ impl AgentEngine {
                         role: "tool".into(), content: answers,
                         attachments: None, tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some("ask_user".into()),
                     });
+                    call_idx += 1;
                     continue;
                 }
 
@@ -575,36 +950,91 @@ impl AgentEngine {
                     if auto_approved {
                         true
                     } else {
-                        self.emit(&event_tx, "tool_approval_required", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), Some(args.clone()), None, None, None);
+                        self.emit(&event_tx, |session_id| AgentEvent::ToolApprovalRequired {
+                            session_id,
+                            step_index,
+                            tool_call_id: tool_id.clone(),
+                            tool_name: tc.function.name.clone(),
+                            tool_args: args.clone(),
+                        });
 
-                        match tokio::select! {
+                        // Drain stale responses left in the channel by earlier
+                        // waits (e.g. a click that landed after the 300s
+                        // timeout), so an "allow" meant for tool A can never
+                        // be consumed as the answer for tool B.
+                        while approval_rx.try_recv().is_ok() {}
+
+                        enum ApprovalWait {
+                            Response(Option<ApprovalResponse>),
+                            TimedOut,
+                        }
+
+                        // Wait up to 300s. Responses tagged with a tool_call_id
+                        // that does not match the pending call are dropped and
+                        // the wait continues; id-less responses (legacy
+                        // callers) always match.
+                        let wait = tokio::select! {
                             biased;
                             _ = self.cancel_token.cancelled() => None,
-                            result = tokio::time::timeout(
-                                std::time::Duration::from_secs(300),
-                                approval_rx.recv(),
-                            ) => Some(result),
-                        } {
-                            Some(Ok(Some(ApprovalResponse::Approved))) => {
-                                last_approval_at = Some(std::time::Instant::now());
-                                true
+                            outcome = async {
+                                let deadline = tokio::time::sleep(std::time::Duration::from_secs(300));
+                                tokio::pin!(deadline);
+                                loop {
+                                    tokio::select! {
+                                        resp = approval_rx.recv() => {
+                                            match resp {
+                                                Some(resp) => {
+                                                    let matches = match approval_tool_call_id(&resp) {
+                                                        Some(id) => id == tool_id || (!tc.id.is_empty() && id == tc.id),
+                                                        None => true,
+                                                    };
+                                                    if matches {
+                                                        break ApprovalWait::Response(Some(resp));
+                                                    }
+                                                    warn!(tool_name=%tc.function.name, tool_id=%tool_id, "dropping approval response tagged for a different tool_call");
+                                                }
+                                                None => break ApprovalWait::Response(None),
+                                            }
+                                        }
+                                        _ = &mut deadline => break ApprovalWait::TimedOut,
+                                    }
+                                }
+                            } => Some(outcome),
+                        };
+                        match wait {
+                            Some(ApprovalWait::Response(Some(resp))) => {
+                                match resp.decision {
+                                    ApprovalDecision::Approved => {
+                                        last_approval_at = Some(std::time::Instant::now());
+                                        true
+                                    }
+                                    ApprovalDecision::ModifiedArgs(new_args) => {
+                                        args = new_args;
+                                        last_approval_at = Some(std::time::Instant::now());
+                                        true
+                                    }
+                                    ApprovalDecision::DeclinedWithGuidance(g) => {
+                                        decline_guidance = Some(g);
+                                        false
+                                    }
+                                    ApprovalDecision::DeclinedStop => {
+                                        decline_stop = true;
+                                        false
+                                    }
+                                    ApprovalDecision::Declined => false,
+                                }
                             }
-                            Some(Ok(Some(ApprovalResponse::ModifiedArgs(new_args)))) => {
-                                args = new_args;
-                                last_approval_at = Some(std::time::Instant::now());
-                                true
-                            }
-                            Some(Ok(Some(ApprovalResponse::DeclinedWithGuidance(g)))) => {
-                                decline_guidance = Some(g);
-                                false
-                            }
-                            Some(Ok(Some(ApprovalResponse::DeclinedStop))) => {
-                                decline_stop = true;
-                                false
-                            }
-                            Some(Ok(Some(ApprovalResponse::Declined))) | Some(Ok(None)) | None => false,
-                            Some(Err(_)) => {
-                                self.emit(&event_tx, "tool_result", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), None, Some("Error: approval timeout".into()), Some("timeout".into()), None);
+                            Some(ApprovalWait::Response(None)) | None => false,
+                            Some(ApprovalWait::TimedOut) => {
+                                self.emit(&event_tx, |session_id| AgentEvent::ToolResult {
+                                    session_id,
+                                    step_index,
+                                    tool_call_id: tool_id.clone(),
+                                    tool_name: tc.function.name.clone(),
+                                    tool_result: "Error: approval timeout".into(),
+                                    status: "timeout".into(),
+                                    duration_ms: None,
+                                });
                                 false
                             }
                         }
@@ -620,7 +1050,15 @@ impl AgentEngine {
                         }
                         _ => "User declined the operation".to_string(),
                     };
-                    self.emit(&event_tx, "tool_result", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), None, Some(tool_result.clone()), Some("error".into()), Some(0));
+                    self.emit(&event_tx, |session_id| AgentEvent::ToolResult {
+                        session_id,
+                        step_index,
+                        tool_call_id: tool_id.clone(),
+                        tool_name: tc.function.name.clone(),
+                        tool_result: tool_result.clone(),
+                        status: "error".into(),
+                        duration_ms: Some(0),
+                    });
                     step_tool_records.push(ToolCallRecord {
                         id: tool_id.clone(),
                         name: tc.function.name.clone(),
@@ -638,6 +1076,7 @@ impl AgentEngine {
                         cancelled = true;
                         break;
                     }
+                    call_idx += 1;
                     continue;
                 }
 
@@ -660,18 +1099,42 @@ impl AgentEngine {
                 let duration_ms = start.elapsed().as_millis() as i32;
                 let (tool_result, tool_status) = match result {
                     Ok(Ok(output)) => {
-                        self.emit(&event_tx, "tool_result", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), None, Some(output.clone()), Some("completed".into()), Some(duration_ms));
+                        self.emit(&event_tx, |session_id| AgentEvent::ToolResult {
+                            session_id,
+                            step_index,
+                            tool_call_id: tool_id.clone(),
+                            tool_name: tc.function.name.clone(),
+                            tool_result: output.clone(),
+                            status: "completed".into(),
+                            duration_ms: Some(duration_ms),
+                        });
                         (output, "completed")
                     }
                     Ok(Err(e)) => {
                         error!("tool error: {e}");
                         let msg = format!("Error: {e}");
-                        self.emit(&event_tx, "tool_result", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), None, Some(msg.clone()), Some("error".into()), Some(duration_ms));
+                        self.emit(&event_tx, |session_id| AgentEvent::ToolResult {
+                            session_id,
+                            step_index,
+                            tool_call_id: tool_id.clone(),
+                            tool_name: tc.function.name.clone(),
+                            tool_result: msg.clone(),
+                            status: "error".into(),
+                            duration_ms: Some(duration_ms),
+                        });
                         (msg, "error")
                     }
                     Err(_) => {
                         let msg = "Error: timeout".to_string();
-                        self.emit(&event_tx, "tool_result", Some(step_index), None, Some(tool_id.clone()), Some(tc.function.name.clone()), None, Some(msg.clone()), Some("timeout".into()), Some(duration_ms));
+                        self.emit(&event_tx, |session_id| AgentEvent::ToolResult {
+                            session_id,
+                            step_index,
+                            tool_call_id: tool_id.clone(),
+                            tool_name: tc.function.name.clone(),
+                            tool_result: msg.clone(),
+                            status: "timeout".into(),
+                            duration_ms: Some(duration_ms),
+                        });
                         (msg, "timeout")
                     }
                 };
@@ -696,6 +1159,7 @@ impl AgentEngine {
                     role: "tool".into(), content: tool_result.clone(),
                     attachments: None, tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some(tc.function.name.clone()),
                 });
+                call_idx += 1;
             }
 
             // Persist this ReAct step.
@@ -713,7 +1177,7 @@ impl AgentEngine {
             steps.push(step.clone());
 
             // Notify frontend that a full step is complete.
-            self.emit(&event_tx, "step_complete", Some(step_index), None, None, None, None, None, None, None);
+            self.emit(&event_tx, |session_id| AgentEvent::StepComplete { session_id, step_index });
 
             // Decline-and-stop (or a cancel that arrived mid-step) ends the
             // turn here; token cancels are also caught at the loop head.
@@ -734,7 +1198,7 @@ impl AgentEngine {
         } else if !final_content.trim().is_empty() {
             final_content
         } else if truncated_empty {
-            "（输出被截断：模型的思考过程占满了单轮输出额度（max_tokens），没有生成正文。请调大该智能体的 max_tokens（会话设置）或模型的 max_tokens（设置 → 模型）后重试。）".to_string()
+            format!("输出被截断：模型的思考过程占满了单轮输出额度（max_tokens={output_cap}），没有生成正文。请调大该智能体的 max_tokens（会话设置）或模型的 max_tokens（设置 → 模型）后重试。")
         } else {
             final_content
         };

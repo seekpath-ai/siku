@@ -6,7 +6,7 @@ use tracing::{error, info, instrument, warn};
 
 use crate::AppState;
 use crate::ai::agent::config::{AgentConfig, ApprovalConfig, LlmConfigBlock};
-use crate::ai::agent::engine::{AgentEngine, AgentEvent, ApprovalResponse};
+use crate::ai::agent::engine::{AgentEngine, AgentEvent, ApprovalDecision, ApprovalResponse};
 use crate::ai::agent::memory_store::MemoryStore;
 use crate::ai::agent::tool_registry::ToolRegistry;
 use crate::ai::llm::{self, ChatMessage};
@@ -17,6 +17,56 @@ use crate::core::time;
 
 fn now_iso() -> String {
     time::now_iso()
+}
+
+/// Per-session turn mutex. cancel_tokens / approval_senders / ask_senders
+/// are all single-slot per session_id, so a second concurrent turn for the
+/// same session would clobber the first turn's channels, and the first
+/// turn's cleanup would delete the second turn's registrations. The guard
+/// is acquired at turn entry and held until the spawned task's cleanup has
+/// finished, which also proves cleanup ownership: while a turn holds its
+/// session, no other turn can have registered channels for that session.
+static RUNNING_TURNS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+struct RunningTurnGuard {
+    session_id: String,
+}
+
+impl RunningTurnGuard {
+    fn acquire(session_id: &str) -> Option<Self> {
+        let set = RUNNING_TURNS.get_or_init(Default::default);
+        let mut set = set.lock().ok()?;
+        if set.insert(session_id.to_string()) {
+            Some(Self {
+                session_id: session_id.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for RunningTurnGuard {
+    fn drop(&mut self) {
+        if let Some(set) = RUNNING_TURNS.get() {
+            if let Ok(mut set) = set.lock() {
+                set.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+/// Latest tool_call_id awaiting approval per session, fed from the engine's
+/// `tool_approval_required` events. Provides the approval-request context
+/// for resolving responses that don't name the approved call.
+static PENDING_APPROVALS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+fn pending_approvals() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    PENDING_APPROVALS.get_or_init(Default::default)
 }
 
 async fn ensure_agent_config(
@@ -529,6 +579,12 @@ pub(crate) async fn run_agent_turn(
     content: String,
     attachments: Option<Vec<crate::ai::llm::ImageAttachment>>,
 ) -> Result<(), String> {
+    // Reject a second concurrent turn for the same session (user double-send,
+    // cron firing mid-turn, pet windows). The guard lives until the spawned
+    // task's cleanup completes, so channel cleanup below is ownership-safe.
+    let turn_guard = RunningTurnGuard::acquire(&session_id)
+        .ok_or_else(|| "该会话正在生成中，请等待当前回复完成".to_string())?;
+
     let session = sqlx::query_as::<_, ChatSession>(
         "SELECT id, title, mode, project_id, working_dir, vision_provider_id, web_proxy, agent_mode, tools_enabled, system_prompt,
                 llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, context_budget, max_memory_rounds,
@@ -554,7 +610,6 @@ pub(crate) async fn run_agent_turn(
             .await,
         );
     }
-    let _app_settings = settings_service::load_app_settings(&state.db).await?;
     let device_settings = settings_service::load_device_settings(&state.db).await?;
 
     // Resolve the session's project directory (Codex-style project context).
@@ -705,7 +760,7 @@ pub(crate) async fn run_agent_turn(
     // messages; intermediate tool calls / tool results live in the DB (agent_steps).
     let history_records = memory.load_recent(config.effective_max_memory_rounds());
     info!(session_id=%session_id, records=%history_records.len(), "loading agent history from memory");
-    let history: Vec<ChatMessage> = history_records
+    let mut history: Vec<ChatMessage> = history_records
         .into_iter()
         .map(|r| ChatMessage {
             role: r.role,
@@ -716,6 +771,17 @@ pub(crate) async fn run_agent_turn(
             name: None,
         })
         .collect();
+    // Attachments are base64 blobs; keeping them on every historical message
+    // resends every past image on every turn. Keep them only on the most
+    // recent message that carried any — older turns' images have already
+    // been described in the conversation. The JSONL memory file is untouched.
+    if let Some(last_idx) = history.iter().rposition(|m| m.attachments.is_some()) {
+        for (i, m) in history.iter_mut().enumerate() {
+            if i != last_idx {
+                m.attachments = None;
+            }
+        }
+    }
 
     memory.append("user", &content, None, None, None, attachments_json.as_deref());
 
@@ -755,6 +821,7 @@ pub(crate) async fn run_agent_turn(
 
     let engine = AgentEngine::new(
         llm_client,
+        llm_config.clone(),
         registry,
         session_id.clone(),
         state.db.clone(),
@@ -774,12 +841,13 @@ pub(crate) async fn run_agent_turn(
     // ordered behind the run's delta/reasoning events.
     let done_tx = event_tx.clone();
 
-    // Create approval channel
+    // Create approval channel. Keep a sender handle for the cleanup
+    // ownership check below (the map only holds a clone).
     let (approval_tx, mut approval_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalResponse>();
     let approval_senders = state.approval_senders.clone();
     {
         let mut senders = approval_senders.lock().await;
-        senders.insert(session_id.clone(), approval_tx);
+        senders.insert(session_id.clone(), approval_tx.clone());
     }
 
     // Create ask-user channel (AskUserQuestion tool)
@@ -787,7 +855,7 @@ pub(crate) async fn run_agent_turn(
     let ask_senders = state.ask_senders.clone();
     {
         let mut senders = ask_senders.lock().await;
-        senders.insert(session_id.clone(), ask_tx);
+        senders.insert(session_id.clone(), ask_tx.clone());
     }
 
     // Spawn agent processing
@@ -799,22 +867,43 @@ pub(crate) async fn run_agent_turn(
     let tracked = state.background_tasks.clone();
 
     crate::spawn_tracked(&tracked, async move {
+        // Held until cleanup below is done: guarantees no other turn for this
+        // session registered channels that this cleanup could delete.
+        let _turn_guard = turn_guard;
         let engine_ref = Arc::new(engine);
         let result = engine_ref
             .process_message(&content, attachments_json.as_deref(), &history, event_tx, &mut approval_rx, &mut ask_rx)
             .await;
 
+        // Only remove registrations that belong to this turn. The turn guard
+        // already serializes turns per session; same_channel is the explicit
+        // ownership check, and the cancel token slot is equally guard-protected.
         {
             let mut senders = approval_senders.lock().await;
-            senders.remove(&sid);
+            if senders
+                .get(&sid)
+                .map(|tx| tx.same_channel(&approval_tx))
+                .unwrap_or(false)
+            {
+                senders.remove(&sid);
+            }
         }
         {
             let mut senders = ask_senders.lock().await;
-            senders.remove(&sid);
+            if senders
+                .get(&sid)
+                .map(|tx| tx.same_channel(&ask_tx))
+                .unwrap_or(false)
+            {
+                senders.remove(&sid);
+            }
         }
         {
             let mut tokens = cancel_tokens.lock().await;
             tokens.remove(&sid);
+        }
+        if let Ok(mut m) = pending_approvals().lock() {
+            m.remove(&sid);
         }
 
         let mem = MemoryStore::new(spawn_memory_path);
@@ -822,11 +911,24 @@ pub(crate) async fn run_agent_turn(
             Ok((final_content, steps, cancelled, total_tokens)) => {
                 // Never persist an empty reply — an empty assistant row
                 // renders as a blank bubble after the frontend reloads on
-                // done. Fall back to a visible placeholder.
+                // done. Fall back to a visible placeholder. A cancelled turn
+                // is persisted with the same stop marker the frontend
+                // appends locally, so the marker survives a history reload.
+                // The terminal event keeps the un-marked content: the
+                // frontend's cancelled handler appends the marker itself.
                 let display_content = if final_content.trim().is_empty() {
                     "（模型未返回文本内容）".to_string()
                 } else {
                     final_content.clone()
+                };
+                let persist_content = if cancelled {
+                    if final_content.trim().is_empty() {
+                        "> ⏹ 已停止生成".to_string()
+                    } else {
+                        format!("{final_content}\n\n> ⏹ 已停止生成")
+                    }
+                } else {
+                    display_content.clone()
                 };
                 // Save final assistant message without reasoning/tool_calls (steps hold those).
                 let tokens_used = if total_tokens.total() > 0 { Some(total_tokens.total() as i32) } else { None };
@@ -834,7 +936,7 @@ pub(crate) async fn run_agent_turn(
                 let tokens_in_hit = if total_tokens.tokens_in_hit > 0 { Some(total_tokens.tokens_in_hit as i32) } else { None };
                 let tokens_out = if total_tokens.tokens_out > 0 { Some(total_tokens.tokens_out as i32) } else { None };
                 let message_id = match chat::save_chat_message(
-                    &db, &sid, "assistant", &display_content, None, tokens_used, tokens_in, tokens_in_hit, tokens_out, None, None, None, None, None,
+                    &db, &sid, "assistant", &persist_content, None, tokens_used, tokens_in, tokens_in_hit, tokens_out, None, None, None, None, None,
                 ).await {
                     Ok(id) => Some(id),
                     Err(e) => {
@@ -866,42 +968,63 @@ pub(crate) async fn run_agent_turn(
                     }
                 }
 
-                mem.append("assistant", &display_content, None, None, None, None);
+                mem.append("assistant", &persist_content, None, None, None, None);
 
                 // Terminal event goes last: the frontend reloads the session
                 // history on done/cancelled, so it must observe committed rows.
-                let _ = done_tx.send(AgentEvent {
-                    event_type: if cancelled { "cancelled".into() } else { "done".into() },
-                    session_id: sid.clone(),
-                    step_index: None,
-                    content: Some(display_content),
-                    tool_call_id: None,
-                    tool_name: None,
-                    tool_args: None,
-                    tool_result: None,
-                    status: None,
-                    duration_ms: None,
-                    tokens_used,
-                    tokens_in,
-                    tokens_in_hit,
-                    tokens_out,
-                });
+                let terminal = if cancelled {
+                    AgentEvent::Cancelled {
+                        session_id: sid.clone(),
+                        content: display_content,
+                        tokens_used,
+                        tokens_in,
+                        tokens_in_hit,
+                        tokens_out,
+                    }
+                } else {
+                    AgentEvent::Done {
+                        session_id: sid.clone(),
+                        content: display_content,
+                        tokens_used,
+                        tokens_in,
+                        tokens_in_hit,
+                        tokens_out,
+                    }
+                };
+                let _ = done_tx.send(terminal);
             }
             Err(e) => {
                 error!("agent error: {e}");
-                let _ = app_clone.emit("agent:event", serde_json::json!({
-                    "type": "error",
-                    "session_id": sid,
-                    "content": e,
-                }));
+                // Persist the failure as an assistant message (same ❌ prefix
+                // the frontend shows) so a history reload keeps the error
+                // trace, and append it to the JSONL memory so the file does
+                // not end on a dangling user message.
+                let error_content = format!("❌ {e}");
+                if let Err(db_err) = chat::save_chat_message(
+                    &db, &sid, "assistant", &error_content, None, None, None, None, None, None, None, None, None, None,
+                ).await {
+                    error!(error = %db_err, "failed to persist agent error message");
+                }
+                mem.append("assistant", &error_content, None, None, None, None);
+                let _ = app_clone.emit("agent:event", &AgentEvent::Error {
+                    session_id: sid.clone(),
+                    content: e,
+                });
             }
         }
     });
 
-    // Forward events to the frontend
+    // Forward events to the frontend. Also track pending approvals so
+    // agent_approve_tool can resolve the tool_call id from context.
     let app_clone2 = app_handle.clone();
+    let fwd_sid = session_id.clone();
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
+            if let AgentEvent::ToolApprovalRequired { tool_call_id, .. } = &event {
+                if let Ok(mut m) = pending_approvals().lock() {
+                    m.insert(fwd_sid.clone(), tool_call_id.clone());
+                }
+            }
             let _ = app_clone2.emit("agent:event", &event);
         }
     });
@@ -1101,34 +1224,70 @@ pub async fn agent_list_sessions(
 
     let mut sessions = Vec::with_capacity(rows.len());
     for session in rows {
-        let config = match build_agent_config(&state, &session).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!(session_id=%session.id, error=%e, "failed to build agent config");
-                continue;
-            }
-        };
-        sessions.push(session_to_json(
-            session.id,
-            config,
-            session.mode,
-            session.agent_mode,
-            session.is_pinned.unwrap_or(0) != 0,
-            session.sort_order.unwrap_or(0),
-            session.paper_ids,
-            session.llm_provider_ids,
-            session.project_id,
-            session.working_dir,
-            session.vision_provider_id,
-            session.web_proxy,
-            session.domain,
-            session.context,
-            session.created_at,
-            session.updated_at,
-        ));
+        sessions.push(session_to_list_json(session));
     }
 
     Ok(sessions)
+}
+
+/// Lightweight projection for the session list. Unlike `session_to_json`
+/// (which resolves the full runtime config via `build_agent_config` — a
+/// settings load plus a provider resolve per session), this uses only the
+/// raw row: no per-session DB round-trips, the system prompt is withheld,
+/// and inline `llm_models` api keys are masked out. Field shape matches
+/// `session_to_json` so the frontend list keeps every field it consumes.
+fn session_to_list_json(session: ChatSession) -> serde_json::Value {
+    let tools: Option<Vec<String>> =
+        serde_json::from_str(&session.tools_enabled).unwrap_or(None);
+    let approval: Option<ApprovalConfig> = session
+        .approval_config
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let llm_models: Option<Vec<LlmConfigBlock>> = session
+        .llm_models
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<LlmConfigBlock>>(s).ok())
+        .map(|models| {
+            models
+                .into_iter()
+                .map(|mut m| {
+                    m.api_key.clear();
+                    m
+                })
+                .collect()
+        });
+    let title = session.title;
+    serde_json::json!({
+        "id": session.id,
+        "title": title,
+        "mode": session.mode,
+        "agent_mode": session.agent_mode,
+        "project_id": session.project_id,
+        "working_dir": session.working_dir,
+        "vision_provider_id": session.vision_provider_id,
+        "web_proxy": session.web_proxy,
+        "tools_enabled": tools,
+        "system_prompt": None::<String>,
+        "llm_models": llm_models,
+        "llm_provider_ids": session.llm_provider_ids,
+        "approval_config": approval,
+        "max_loops": session.max_loops,
+        "max_tokens": session.max_tokens,
+        "context_budget": session.context_budget,
+        "max_memory_rounds": session.max_memory_rounds,
+        "memory_file_path": session.memory_file_path,
+        "memory_dir": session.memory_dir,
+        "skills_dir": session.skills_dir,
+        "is_pinned": session.is_pinned.unwrap_or(0) != 0,
+        "sort_order": session.sort_order.unwrap_or(0),
+        "icon": session.icon.or_else(|| title.chars().next().map(|c| c.to_string())),
+        "color": session.color,
+        "domain": session.domain,
+        "context": session.context,
+        "paper_ids": session.paper_ids,
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
+    })
 }
 
 /// Delete an agent session
@@ -1140,9 +1299,24 @@ pub async fn agent_delete_session(
 ) -> Result<(), String> {
     let device_settings = settings_service::load_device_settings(&state.db).await.unwrap_or_default();
     let data_dir = device_settings.data_dir.as_deref().map(std::path::Path::new);
-    // Try to delete JSONL memory file using default paths. Per-agent override is not
-    // available here without fetching the session; fall back to defaults.
-    let memory_path = agent_memory_path(&state.app_data_dir, data_dir, None, device_settings.memory_dir.as_deref(), None, &session_id);
+    // Resolve the session's actual memory file with the same path logic the
+    // turn runner uses, so per-agent custom memory_dir / memory_file_path
+    // sessions get their JSONL deleted too. Fetched before the row is gone.
+    let session_paths: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT memory_dir, memory_file_path FROM chat_sessions WHERE id = ?")
+            .bind(&session_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| format!("db: {e}"))?;
+    let (session_memory_dir, session_memory_file) = session_paths.unwrap_or((None, None));
+    let memory_path = agent_memory_path(
+        &state.app_data_dir,
+        data_dir,
+        session_memory_dir.as_deref(),
+        device_settings.memory_dir.as_deref(),
+        session_memory_file.as_deref(),
+        &session_id,
+    );
     let _ = std::fs::remove_file(&memory_path);
     let _ = std::fs::remove_file(memory_path.with_extension("jsonl.meta"));
 
@@ -1171,7 +1345,7 @@ pub async fn agent_delete_session(
 pub async fn agent_approve_tool(
     state: State<'_, AppState>,
     session_id: String,
-    _tool_call_id: String,
+    tool_call_id: String,
     decision: String,
     guidance: Option<String>,
     modified_args: Option<serde_json::Value>,
@@ -1181,14 +1355,32 @@ pub async fn agent_approve_tool(
         .get(&session_id)
         .ok_or_else(|| "no pending approval for this session".to_string())?;
 
-    let response = match decision.as_str() {
+    // Resolve the approved tool_call id: prefer the id carried by the
+    // frontend response; fall back to the approval-request context (the
+    // latest tool_approval_required event for this session); None when no
+    // correspondence exists — the engine handles None compatibly.
+    let resolved_tool_call_id = if !tool_call_id.is_empty() {
+        Some(tool_call_id)
+    } else {
+        pending_approvals()
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&session_id).cloned())
+    };
+    info!(session_id=%session_id, tool_call_id=?resolved_tool_call_id, decision=%decision, "tool approval response");
+
+    let decision = match decision.as_str() {
         "approve" => match modified_args {
-            Some(args) => ApprovalResponse::ModifiedArgs(args),
-            None => ApprovalResponse::Approved,
+            Some(args) => ApprovalDecision::ModifiedArgs(args),
+            None => ApprovalDecision::Approved,
         },
-        "decline_guide" => ApprovalResponse::DeclinedWithGuidance(guidance.unwrap_or_default()),
-        "decline_stop" => ApprovalResponse::DeclinedStop,
-        _ => ApprovalResponse::Declined,
+        "decline_guide" => ApprovalDecision::DeclinedWithGuidance(guidance.unwrap_or_default()),
+        "decline_stop" => ApprovalDecision::DeclinedStop,
+        _ => ApprovalDecision::Declined,
+    };
+    let response = ApprovalResponse {
+        decision,
+        tool_call_id: resolved_tool_call_id,
     };
 
     tx.send(response)

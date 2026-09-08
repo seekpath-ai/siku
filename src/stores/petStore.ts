@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import type { AgentSession, AgentStep, ChatAttachment, ChatMessage, StreamingStep, ToolCallInfo } from '@/lib/types';
-import { petCreateSession, getChatMessages, getAgentSteps, agentGetSession, agentSendMessage } from '@/lib/tauri';
+import { petCreateSession, getChatMessages, getAgentSteps, agentGetSession, agentSendMessage, agentListSessions } from '@/lib/tauri';
 import type { PetContext } from './petContextStore';
 
 /** Map a page type to its built-in pet domain agent. */
@@ -12,6 +12,26 @@ export const PAGE_DOMAIN: Record<string, string> = {
   knowledge: 'knowledge_curator',
   chat: 'chat_summarizer',
 };
+
+/** The context a pet session was created with (stored as JSON by the backend). */
+function parseSessionContext(session: AgentSession): { page?: string; objectId?: string } {
+  if (!session.context) return {};
+  try {
+    const parsed = JSON.parse(session.context);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** A session is reusable when it is the same domain agent bound to the same
+ * page context and object — reopening the panel then continues the existing
+ * conversation instead of spawning a fresh session (and memory file). */
+function sessionMatchesContext(session: AgentSession, domain: string, ctx: PetContext): boolean {
+  if (session.domain !== domain) return false;
+  const c = parseSessionContext(session);
+  return c.page === ctx.page && (c.objectId ?? null) === (ctx.objectId ?? null);
+}
 
 export interface PetApproval {
   toolCallId: string;
@@ -39,7 +59,8 @@ interface PetState {
    *  completion — the panel scrolls to the final reply in response. */
   completionNonce: number;
   setOpen: (o: boolean) => void;
-  /** Create a fresh domain session for the current context and open the panel. */
+  /** Open the panel on the session for the current context, reusing an
+   * existing (domain, context) session when one exists. */
   start: (ctx: PetContext) => Promise<void>;
   /** Attach to an EXISTING session (detached chat window) and load history. */
   attach: (sessionId: string) => Promise<void>;
@@ -80,18 +101,39 @@ export const usePetStore = create<PetState>((set, get) => ({
   setOpen: (open) => set({ open }),
 
   start: async (ctx) => {
+    const domain = PAGE_DOMAIN[ctx.page] || 'note_organizer';
+    // Already attached to this exact context: just reopen the panel.
+    const current = get().session;
+    if (current && sessionMatchesContext(current, domain, ctx)) {
+      set({ open: true });
+      return;
+    }
     set({
       loading: true, open: true, session: null, messages: [], agentSteps: [], streamContent: '',
       streaming: false, pendingApproval: null, error: null,
       streamingSteps: [], currentStreamingStep: null,
     });
-    const domain = PAGE_DOMAIN[ctx.page] || 'note_organizer';
     try {
-      const session = await petCreateSession(domain, {
-        page: ctx.page,
-        objectId: ctx.objectId,
-        title: ctx.title,
-      });
+      // Prefer an existing session for this (domain, context) — created
+      // sessions are kept server-side for history, so reopening the same
+      // context must reuse one instead of accumulating new sessions.
+      let session: AgentSession | null = null;
+      try {
+        const sessions = await agentListSessions();
+        session =
+          sessions
+            .filter((s) => sessionMatchesContext(s, domain, ctx))
+            .sort((a, b) => b.updated_at.localeCompare(a.updated_at))[0] ?? null;
+      } catch (err) {
+        console.error('pet list sessions (falling back to create):', err);
+      }
+      if (!session) {
+        session = await petCreateSession(domain, {
+          page: ctx.page,
+          objectId: ctx.objectId,
+          title: ctx.title,
+        });
+      }
       const [messages, agentSteps] = await Promise.all([
         getChatMessages(session.id),
         getAgentSteps(session.id),

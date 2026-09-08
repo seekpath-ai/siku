@@ -652,6 +652,7 @@ pub fn run() {
             commands::greet,
             // Library
             commands::library::import_paper,
+            commands::library::import_file_to_library,
             commands::library::list_papers,
             commands::library::get_paper,
             commands::library::open_paper_in_system,

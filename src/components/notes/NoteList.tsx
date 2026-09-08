@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useCallback, useRef, type MouseEvent } fr
 import {
   Plus, Folder, FileText, ChevronRight, ChevronsUpDown, ChevronsDownUp, Search, Trash2,
   MoreHorizontal, FolderPlus, FilePlus, ArrowUpToLine, X, Crosshair,
-  Settings, HelpCircle, Database, Move, Bookmark, Copy,
+  Settings, HelpCircle, Database, Move, Bookmark, Copy, BookOpen,
   File as FileIcon, Image as ImageIcon, FileSpreadsheet, ExternalLink,
 } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -49,6 +49,8 @@ interface Props {
   onFileRename?: (id: string, name: string) => void;
   onFileDelete?: (id: string) => void;
   onFileOpen?: (id: string) => void;
+  /** Import a vault file (PDF) into the paper library. */
+  onFileImportToLibrary?: (id: string) => void;
   /** Current vault id — tree UI state (expanded/scroll) is persisted per vault. */
   vaultId?: string;
   onClose?: () => void;
@@ -116,6 +118,7 @@ export function NoteList({
   onFileRename,
   onFileDelete,
   onFileOpen,
+  onFileImportToLibrary,
   vaultId,
   onClose,
   title = '文件列表',
@@ -821,6 +824,13 @@ export function NoteList({
         label: '移出文件夹',
         icon: <ArrowUpToLine size={12} />,
         onClick: () => onFileMove(file.id, null),
+      });
+    }
+    if (file.name.toLowerCase().endsWith('.pdf') && onFileImportToLibrary) {
+      items.push({
+        label: '导入论文库',
+        icon: <BookOpen size={12} />,
+        onClick: () => onFileImportToLibrary(file.id),
       });
     }
     items.push({

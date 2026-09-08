@@ -509,3 +509,51 @@ body.in-tauri {
 .flash-success {
   animation: flash-success 0.9s ease-in-out 1;
 }
+
+/* ── Print-to-PDF (notes) ─────────────────────────────────────────────
+ * PrintNotePortal renders the note into #siku-print-root (a direct child of
+ * body). On screen it stays hidden; when printing, the app shell is hidden
+ * and only the print copy is laid out, on white with dark text. */
+#siku-print-root {
+  display: none;
+}
+@media print {
+  html,
+  body {
+    background: #fff !important;
+  }
+  #root {
+    display: none !important;
+  }
+  #siku-print-root {
+    display: block !important;
+    color: #111;
+    background: #fff;
+    font-size: 12pt;
+    line-height: 1.7;
+  }
+  #siku-print-root .siku-print-title {
+    font-size: 20pt;
+    font-weight: 700;
+    margin: 0 0 14pt;
+    padding-bottom: 6pt;
+    border-bottom: 1px solid #ddd;
+  }
+  #siku-print-root a {
+    color: #111;
+    text-decoration: none;
+  }
+  #siku-print-root img {
+    max-width: 100%;
+  }
+  #siku-print-root pre,
+  #siku-print-root table,
+  #siku-print-root img,
+  #siku-print-root blockquote,
+  #siku-print-root .katex-display {
+    break-inside: avoid;
+  }
+}
+@page {
+  margin: 2cm;
+}

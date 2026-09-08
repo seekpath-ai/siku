@@ -19,6 +19,35 @@ pub async fn import_paper(
         .map_err(|e| e.to_string())
 }
 
+/// Import a vault-managed file (from the notes file list) into the paper
+/// library. The blob store is content-addressed and shared, so no bytes are
+/// copied. Idempotent: if a paper already points at the same blob it is
+/// returned instead of creating a duplicate.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn import_file_to_library(
+    state: State<'_, AppState>,
+    file_id: String,
+) -> Result<Paper, String> {
+    let file = crate::core::file_item_service::get_file(&state.db, &file_id).await?;
+    let existing: Option<(String,)> = sqlx::query_as("SELECT id FROM papers WHERE file_path = ? LIMIT 1")
+        .bind(&file.blob_path)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| format!("db: {e}"))?;
+    if let Some((paper_id,)) = existing {
+        return paper_service::get_paper(&state.db, &paper_id)
+            .await
+            .map_err(|e| e.to_string());
+    }
+    // Fails with "file blob missing on disk" when the blob has not synced to
+    // this device yet — surfaced to the user as-is.
+    let path = crate::core::file_item_service::resolve_file_path(&state.db, &state.app_data_dir, &file_id).await?;
+    paper_service::import_paper(&state.db, &state.app_data_dir, &path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn preview_paper_from_link(

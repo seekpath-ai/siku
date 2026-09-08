@@ -34,6 +34,7 @@ import {
   vaultImport,
   filesList,
   filesImport,
+  filesImportToLibrary,
   filesMove,
   filesRename,
   filesDelete,
@@ -573,6 +574,18 @@ function NotesPage() {
     }
   };
 
+  /** 右键「导入论文库」：把 vault 里的 PDF 文件登记为图书馆论文（blob 共享，
+   *  同一内容重复导入时返回已有论文）。 */
+  const handleFileImportToLibrary = async (id: string) => {
+    try {
+      const paper = await filesImportToLibrary(id);
+      await alert(`已导入论文库：${paper.title || '未命名论文'}`, '导入成功');
+    } catch (err) {
+      console.error('import to library:', err);
+      await alert(`导入论文库失败：${err}`, '导入失败');
+    }
+  };
+
   /** Single-click a file: inline preview in the right pane (tree stays put). */
   const handleFileSelect = (id: string) => {
     setActiveFileId(id);
@@ -649,6 +662,7 @@ function NotesPage() {
           onFileRename={handleFileRename}
           onFileDelete={handleFileDelete}
           onFileOpen={handleFileOpen}
+          onFileImportToLibrary={handleFileImportToLibrary}
           onClose={() => setSidePanelCollapsed(true)}
           currentVaultName={currentVault?.name ?? 'cognitive-archive'}
           onOpenVault={() => setVaultOpen(true)}

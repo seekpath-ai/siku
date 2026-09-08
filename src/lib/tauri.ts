@@ -878,6 +878,11 @@ export async function filesRename(id: string, name: string): Promise<FileItem> {
 export async function filesDelete(id: string): Promise<void> {
   return invoke<void>('files_delete', { id });
 }
+/** Import a vault-managed file (e.g. a PDF in the notes file list) into the
+ *  paper library. Idempotent: returns the existing paper for the same blob. */
+export async function filesImportToLibrary(id: string): Promise<Paper> {
+  return invoke<Paper>('import_file_to_library', { fileId: id });
+}
 /** Open a managed file with the system default application. */
 export async function filesOpen(id: string): Promise<void> {
   return invoke<void>('files_open', { id });

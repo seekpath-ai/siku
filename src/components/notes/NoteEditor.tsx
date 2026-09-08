@@ -20,6 +20,7 @@ import {
   Code,
 } from 'lucide-react';
 import { WikiMarkdown } from './WikiMarkdown';
+import { PrintNotePortal } from './PrintNotePortal';
 import { BacklinksPanel } from './BacklinksPanel';
 import { VersionHistoryDialog } from './VersionHistoryDialog';
 import { saveTextFile, fileBrowserRevealInSystem, noteVersionRestore, vaultAttachmentsDir } from '@/lib/tauri';
@@ -258,7 +259,12 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
     });
   }, []);
 
-  // "导出为 PDF" — currently exports the note as Markdown (.md).
+  // 导出为 PDF：渲染打印副本并打开系统打印对话框（GTK/WebView2 均支持
+  // 另存为 PDF）。Markdown 原文导出见 handleExport。
+  const [printing, setPrinting] = useState(false);
+  const handleExportPdf = useCallback(() => setPrinting(true), []);
+  const handlePrintDone = useCallback(() => setPrinting(false), []);
+
   // Restore a note from a version snapshot, then let the parent refresh.
   const handleVersionRestore = useCallback(
     async (version: NoteVersion) => {
@@ -551,10 +557,19 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
                   className="flex items-center gap-2 px-3 py-1.5 text-[12px] text-text-secondary hover:bg-surface-hover hover:text-text-primary w-full text-left"
                   onClick={() => {
                     setMenuOpen(false);
-                    handleExport();
+                    handleExportPdf();
                   }}
                 >
                   <FileDown size={13} /> 导出为PDF
+                </button>
+                <button
+                  className="flex items-center gap-2 px-3 py-1.5 text-[12px] text-text-secondary hover:bg-surface-hover hover:text-text-primary w-full text-left"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    handleExport();
+                  }}
+                >
+                  <FileDown size={13} /> 导出为 Markdown
                 </button>
                 <button
                   className="flex items-center gap-2 px-3 py-1.5 text-[12px] text-text-secondary hover:bg-surface-hover hover:text-text-primary w-full text-left"
@@ -564,6 +579,15 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
                   }}
                 >
                   <History size={13} /> 版本历史
+                </button>
+                <button
+                  className="flex items-center gap-2 px-3 py-1.5 text-[12px] text-text-secondary hover:bg-surface-hover hover:text-text-primary w-full text-left"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    handleReveal();
+                  }}
+                >
+                  <FolderOpen size={13} /> 在系统资源管理器中显示
                 </button>
                 <button
                   className="flex items-center gap-2 px-3 py-1.5 text-[12px] text-red-400 hover:bg-red-500/10 w-full text-left"
@@ -587,15 +611,6 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
                   }}
                 >
                   <Trash2 size={13} /> 删除
-                </button>
-                <button
-                  className="flex items-center gap-2 px-3 py-1.5 text-[12px] text-text-secondary hover:bg-surface-hover hover:text-text-primary w-full text-left"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    handleReveal();
-                  }}
-                >
-                  <FolderOpen size={13} /> 在系统资源管理器中显示
                 </button>
               </div>
             )}
@@ -731,6 +746,16 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
           current={note}
           onRestore={handleVersionRestore}
           onClose={() => setVersionOpen(false)}
+        />
+      )}
+
+      {printing && (
+        <PrintNotePortal
+          note={note}
+          content={content}
+          notes={notes}
+          attachmentsDir={attachmentsDir}
+          onDone={handlePrintDone}
         />
       )}
     </div>

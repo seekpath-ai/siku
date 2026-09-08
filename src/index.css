@@ -521,6 +521,11 @@ body.in-tauri {
   html,
   body {
     background: #fff !important;
+    /* pet-window.css sets html/body/#root to height:100% + overflow:hidden
+       (Vite bundles it into every window); left in place the printed
+       document is clipped to one viewport and the PDF comes out 1 page. */
+    height: auto !important;
+    overflow: visible !important;
   }
   #root {
     display: none !important;

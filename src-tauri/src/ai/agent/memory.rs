@@ -23,13 +23,27 @@ impl ConversationMemory {
         (latin_count / 4) + (cjk_count * 2 / 3)
     }
 
+    /// Flat per-image estimate used for truncation budgeting. Vision APIs
+    /// bill an image at a few hundred to ~2k tokens regardless of the base64
+    /// payload size, so counting base64 chars (raw_bytes/3 per "token")
+    /// overestimates by two orders of magnitude — and worse, a single large
+    /// pasted screenshot then exceeds the whole input budget and truncate()
+    /// would drop the CURRENT user message entirely, leaving the model with
+    /// an empty human turn.
+    const IMAGE_TOKEN_ESTIMATE: usize = 1200;
+
     /// Estimate tokens for a single message, counting everything the provider
-    /// bills for: content, attachment payloads (base64 images are huge), and
+    /// bills for: content, attachment images (flat per-image estimate), and
     /// tool-call names + argument JSON. +10 covers role/framing overhead.
     pub fn estimate_message_tokens(m: &crate::ai::llm::ChatMessage) -> usize {
         let mut tokens = Self::estimate_tokens(&m.content) + 10;
         if let Some(attachments) = &m.attachments {
-            tokens += Self::estimate_tokens(attachments);
+            tokens += match serde_json::from_str::<Vec<crate::ai::llm::ImageAttachment>>(attachments) {
+                Ok(list) => list.len() * Self::IMAGE_TOKEN_ESTIMATE,
+                // Unparsable payloads fall back to the char heuristic, capped
+                // so a corrupt blob can never nuke the whole budget either.
+                Err(_) => Self::estimate_tokens(attachments).min(4 * Self::IMAGE_TOKEN_ESTIMATE),
+            };
         }
         if let Some(tool_calls) = &m.tool_calls {
             for tc in tool_calls {
@@ -120,6 +134,16 @@ impl ConversationMemory {
                 i += 1;
             } else {
                 break;
+            }
+        }
+
+        // Safety net: the most recent message (the current turn) must survive
+        // even when it alone exceeds the budget — dropping it leaves the model
+        // staring at an empty human turn (or pure system prompt) and it will
+        // hallucinate from the system prompt instead of answering.
+        if kept_recent.is_empty() {
+            if let Some(newest) = recent.last() {
+                kept_recent.push(newest);
             }
         }
 
@@ -245,5 +269,69 @@ mod tests {
         let sane = memory.truncate(&messages, 200);
         assert!(sane.len() > truncated.len());
         assert_eq!(sane.last().unwrap().content, "current question");
+    }
+
+    #[test]
+    fn test_image_attachment_estimated_flat_not_by_base64_len() {
+        // A 300k-char base64 payload is ~1-2k tokens to a vision API, not
+        // 75k. Char-counting it once exceeded the whole input budget and got
+        // the current user message dropped (model saw an empty human turn).
+        let attachments = serde_json::json!([{
+            "mime": "image/png",
+            "base64": "A".repeat(300_000),
+        }])
+        .to_string();
+        let msg = crate::ai::llm::ChatMessage {
+            role: "user".to_string(),
+            content: "描述图片".to_string(),
+            attachments: Some(attachments),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let est = ConversationMemory::estimate_message_tokens(&msg);
+        assert!(
+            est < 2_000,
+            "image estimate should be flat (~1200), got {est}"
+        );
+    }
+
+    #[test]
+    fn test_truncate_never_drops_current_message() {
+        // Even if the newest message alone exceeds the input budget, it must
+        // survive — otherwise the model receives system prompt only and
+        // hallucinates instead of answering.
+        let memory = ConversationMemory::new(1000, Some("sys".into()));
+        let attachments = serde_json::json!([{
+            "mime": "image/png",
+            "base64": "A".repeat(50_000),
+        }])
+        .to_string();
+        let messages = vec![
+            crate::ai::llm::ChatMessage {
+                role: "user".to_string(),
+                content: "old question".to_string(),
+                attachments: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            crate::ai::llm::ChatMessage {
+                role: "user".to_string(),
+                content: "描述图片".to_string(),
+                attachments: Some(attachments),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+        ];
+
+        // reserved=800 → input budget 200; the image message (~1200+) cannot
+        // fit, but must still be kept.
+        let truncated = memory.truncate(&messages, 800);
+        let last = truncated.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert_eq!(last.content, "描述图片");
+        assert!(last.attachments.is_some());
     }
 }

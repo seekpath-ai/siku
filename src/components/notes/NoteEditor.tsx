@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback, useDeferredValue } from 'react';
 import { useDialog } from '@/hooks/useDialog';
 import {
   Check,
@@ -363,6 +363,25 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
     return { line: lines.length, col: lines[lines.length - 1].length + 1 };
   }, [content, cursorPos]);
 
+  // The preview pipeline (react-markdown + KaTeX) re-parses the whole document
+  // on every render; defer it so typing in split/reading view stays responsive.
+  const previewContent = useDeferredValue(content);
+
+  // Stable editor callbacks: inline closures here used to rebuild
+  // MarkdownEditor's extensions array on every render (cursor moves included),
+  // forcing a full CodeMirror reconfigure per keystroke.
+  const handleEditorRef = useCallback((view: EditorView | null) => {
+    viewRef.current = view;
+  }, []);
+  const handleEditorScroll = useCallback(() => {
+    syncScroll('editor');
+    const top = viewRef.current?.scrollDOM.scrollTop;
+    if (top != null) {
+      useNoteEditorStore.getState().setState(noteIdRef.current, { scroll: top });
+    }
+  }, [syncScroll]);
+  const editorExtensions = useMemo(() => [cursorListener], [cursorListener]);
+
   const saveIndicator = {
     saved: { icon: Check, text: '已保存', class: 'text-accent' },
     saving: { icon: Loader2, text: '保存中', class: 'text-primary animate-spin' },
@@ -372,24 +391,16 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   const editorEl = (
     <MarkdownEditor
       value={content}
-      onChange={(value) => handleContentChange(value)}
+      onChange={handleContentChange}
       notes={notes}
       currentNoteId={note.id}
       onNavigate={onNavigate}
       onCreateLink={onCreateLink}
       // Source mode (Obsidian-style): raw markdown, no live-preview rendering.
       livePreview={mode !== 'source'}
-      editorRef={(view) => {
-        viewRef.current = view;
-      }}
-      onEditorScroll={() => {
-        syncScroll('editor');
-        const top = viewRef.current?.scrollDOM.scrollTop;
-        if (top != null) {
-          useNoteEditorStore.getState().setState(noteIdRef.current, { scroll: top });
-        }
-      }}
-      extensions={[cursorListener]}
+      editorRef={handleEditorRef}
+      onEditorScroll={handleEditorScroll}
+      extensions={editorExtensions}
       vaultId={note.vault_id}
       attachmentsDir={attachmentsDir}
     />
@@ -401,7 +412,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
       className="h-full overflow-y-auto p-8 md:px-16 prose prose-base prose-invert max-w-none"
     >
       <WikiMarkdown
-        content={content || ' '}
+        content={previewContent || ' '}
         notes={notes}
         onNavigate={onNavigate}
         onCreateLink={onCreateLink}

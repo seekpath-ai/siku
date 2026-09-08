@@ -135,7 +135,7 @@ export function TitleBar() {
     if (creatingNoteRef.current) return;
     creatingNoteRef.current = true;
     try {
-      const note = await notesCreate('Untitled.md', '', undefined, undefined, false);
+      const note = await notesCreate('新笔记', '', undefined, undefined, false);
       openNoteTab(navigate, note);
       window.dispatchEvent(new CustomEvent('siku:note-created', { detail: note.id }));
     } catch (err) {

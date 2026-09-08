@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
 
 export interface ReaderState {
   page: number;
@@ -14,19 +15,28 @@ interface ReaderStoreState {
 
 const DEFAULT_STATE: ReaderState = { page: 1, zoom: 1 };
 
-export const useReaderStore = create<ReaderStoreState>((set, get) => ({
-  states: {},
+export const useReaderStore = create<ReaderStoreState>()(
+  persist(
+    (set, get) => ({
+      states: {},
 
-  setState: (paperId, patch) => {
-    set((s) => ({
-      states: {
-        ...s.states,
-        [paperId]: { ...(s.states[paperId] ?? DEFAULT_STATE), ...patch },
+      setState: (paperId, patch) => {
+        set((s) => ({
+          states: {
+            ...s.states,
+            [paperId]: { ...(s.states[paperId] ?? DEFAULT_STATE), ...patch },
+          },
+        }));
       },
-    }));
-  },
 
-  getState: (paperId) => {
-    return get().states[paperId] ?? DEFAULT_STATE;
-  },
-}));
+      getState: (paperId) => {
+        return get().states[paperId] ?? DEFAULT_STATE;
+      },
+    }),
+    {
+      name: 'siku.reader',
+      version: 1,
+      partialize: (state) => ({ states: state.states }),
+    }
+  )
+);

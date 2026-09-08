@@ -51,8 +51,7 @@ const ZOOM_MODE_LABELS: Record<ZoomMode, string> = {
   'custom': '自定义',
 };
 
-function ReaderPage() {
-  const { paperId } = Route.useParams();
+function ReaderView({ paperId }: { paperId: string }) {
   const navigate = Route.useNavigate();
   const { data: paper, isLoading: paperLoading } = usePaper(paperId);
 
@@ -78,6 +77,9 @@ function ReaderPage() {
   }, [paper]);
 
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  const [pdfError, setPdfError] = useState<string | null>(null);
+  // Bump to re-run the PDF byte load after a failure (the "重试" button).
+  const [pdfReloadKey, setPdfReloadKey] = useState(0);
   const savedReaderState = useReaderStore((s) => s.getState(paperId));
   const setReaderState = useReaderStore((s) => s.setState);
   const [currentPage, setCurrentPage] = useState(savedReaderState.page);
@@ -100,6 +102,9 @@ function ReaderPage() {
   const [regionDetectProgress, setRegionDetectProgress] = useState('');
   const [moreOpen, setMoreOpen] = useState(false);
   const moreRef = useRef<HTMLDivElement>(null);
+  // Left sidebar picker (目录/缩略图) kebab menu.
+  const [sideMenuOpen, setSideMenuOpen] = useState(false);
+  const sideMenuRef = useRef<HTMLDivElement>(null);
   const [drawingTool, setDrawingTool] = useState<DrawingTool | null>(null);
   const [drawingColor, setDrawingColor] = useState(DEFAULT_PEN_COLOR);
   const { confirm } = useDialog();
@@ -112,6 +117,15 @@ function ReaderPage() {
   const [zoomMode, setZoomMode] = useState<ZoomMode>('fit-width');
   const [zoomMenuOpen, setZoomMenuOpen] = useState(false);
   const zoomMenuRef = useRef<HTMLDivElement>(null);
+  // Rotation is only changed via the toolbar buttons below, so mirror the
+  // viewer's internal rotation here to keep the thumbnails aligned.
+  const [rotation, setRotation] = useState(0);
+
+  // Editable page number in the top bar. Null = not editing (shows
+  // currentPage). The ref mirrors the state so Escape can cancel an edit
+  // without the subsequent blur committing the stale value.
+  const [pageInput, setPageInput] = useState<string | null>(null);
+  const pageInputRef = useRef<string | null>(null);
 
   // Password state
   const [password, setPassword] = useState<string | undefined>(undefined);
@@ -157,11 +171,10 @@ function ReaderPage() {
 
   const drawingStorageKey = `siku.reader.strokes.${paperId}`;
 
-  // Which paper the strokes state currently belongs to. TanStack Router
-  // reuses this component when navigating between /reader/A and /reader/B
-  // (same route, different params), so the useState initializer runs only
-  // once — we must detect paperId changes here and reload that paper's
-  // strokes, otherwise the previous paper's strokes leak into the new one.
+  // Which paper the strokes state currently belongs to. ReaderView is keyed
+  // by paperId (see ReaderPage below), so a paper switch remounts the whole
+  // tree and this never triggers in practice — it stays as a defensive guard
+  // against the strokes of one paper leaking into another.
   const strokesPaperRef = useRef(paperId);
 
   // Initialize strokes lazily from localStorage. Doing this in the useState
@@ -206,6 +219,18 @@ function ReaderPage() {
     return () => document.removeEventListener('click', onClick, true);
   }, [moreOpen]);
 
+  // Close the left-sidebar picker dropdown when clicking outside.
+  useEffect(() => {
+    if (!sideMenuOpen) return;
+    const onClick = (e: MouseEvent) => {
+      if (sideMenuRef.current && !sideMenuRef.current.contains(e.target as Node)) {
+        setSideMenuOpen(false);
+      }
+    };
+    document.addEventListener('click', onClick, true);
+    return () => document.removeEventListener('click', onClick, true);
+  }, [sideMenuOpen]);
+
   // Close zoom menu when clicking outside.
   useEffect(() => {
     if (!zoomMenuOpen) return;
@@ -231,7 +256,6 @@ function ReaderPage() {
     pdfViewerRef.current?.jumpToPage(snippet.pageIndex);
   };
   const pdfViewerRef = useRef<PdfViewerHandle>(null);
-  const blobUrlRef = useRef<string | null>(null);
   const addSnippet = useSnippetStore((s) => s.addSnippet);
 
   // Evidence citation requests from the pet panel or from note deep links:
@@ -504,26 +528,24 @@ function ReaderPage() {
     if (!paper?.id) return;
     let cancelled = false;
     setPdfLoading(true);
+    setPdfError(null);
     setPassword(undefined);
     (async () => {
       try {
         const url = await readPdfBytes(paper.id);
         if (cancelled) return;
-        // Clean up old blob URL
-        if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
-        blobUrlRef.current = url;
         setPdfUrl(url);
       } catch (e: unknown) {
+        if (cancelled) return;
         console.error('Failed to read PDF:', e);
+        setPdfUrl(null);
+        setPdfError(e instanceof Error ? e.message : String(e));
       } finally {
         if (!cancelled) setPdfLoading(false);
       }
     })();
-    return () => {
-      cancelled = true;
-      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
-    };
-  }, [paper?.id]);
+    return () => { cancelled = true; };
+  }, [paper?.id, pdfReloadKey]);
 
   const handleZoomModeChange = (mode: ZoomMode) => {
     setZoomMode(mode);
@@ -559,6 +581,27 @@ function ReaderPage() {
     setPassword(pw);
   };
 
+  // Real page count reported by PdfViewer once the document loads; the
+  // paper.page_count metadata is only a fallback (it may be missing/stale).
+  const effectiveTotalPages = totalPages > 0 ? totalPages : (paper?.page_count ?? 0);
+
+  const updatePageInput = (v: string | null) => {
+    pageInputRef.current = v;
+    setPageInput(v);
+  };
+
+  const commitPageInput = () => {
+    const raw = pageInputRef.current;
+    updatePageInput(null);
+    if (raw === null) return;
+    const n = parseInt(raw, 10);
+    if (Number.isNaN(n)) return;
+    const clamped = effectiveTotalPages > 0
+      ? Math.max(1, Math.min(effectiveTotalPages, n))
+      : Math.max(1, n);
+    pdfViewerRef.current?.jumpToPage(clamped);
+  };
+
   // Not found
   if (!paperLoading && !paper) {
     return (
@@ -577,30 +620,76 @@ function ReaderPage() {
     <div className="flex flex-col h-full">
       {/* Top bar — page controls + zoom */}
       <div className="flex items-center gap-2 px-3 py-1 border-b border-surface-hover bg-surface/30 shrink-0">
+        {/* Left sidebar picker: 目录/缩略图归一到竖三点菜单（标题左侧） */}
+        <div ref={sideMenuRef} className="relative">
+          <button
+            onClick={() => setSideMenuOpen((v) => !v)}
+            className={`p-0.5 rounded transition-colors ${
+              leftSidebar ? 'bg-primary/10 text-primary' : 'text-text-secondary hover:bg-surface-hover'
+            }`}
+            title="侧栏"
+            aria-label="侧栏"
+          >
+            <MoreVertical size={14} />
+          </button>
+          {sideMenuOpen && (
+            <div className="absolute left-0 top-full mt-1 z-40 bg-surface border border-surface-hover rounded-lg shadow-xl py-1 min-w-[120px]">
+              <button
+                onClick={() => {
+                  setLeftSidebar((s) => (s === 'outline' ? null : 'outline'));
+                  setSideMenuOpen(false);
+                }}
+                className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors ${
+                  leftSidebar === 'outline' ? 'text-primary hover:bg-primary/5' : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
+                }`}
+              >
+                <BookOpen size={13} />
+                <span className="flex-1 text-left">目录</span>
+                {leftSidebar === 'outline' && <Check size={13} />}
+              </button>
+              <button
+                onClick={() => {
+                  setLeftSidebar((s) => (s === 'thumbnails' ? null : 'thumbnails'));
+                  setSideMenuOpen(false);
+                }}
+                className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors ${
+                  leftSidebar === 'thumbnails' ? 'text-primary hover:bg-primary/5' : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
+                }`}
+              >
+                <LayoutGrid size={13} />
+                <span className="flex-1 text-left">缩略图</span>
+                {leftSidebar === 'thumbnails' && <Check size={13} />}
+              </button>
+            </div>
+          )}
+        </div>
         <span className="text-xs text-text-primary font-medium truncate flex-1">
           {paper?.title || '加载中...'}
         </span>
-        <span className="text-xs text-text-secondary tabular-nums">{currentPage} / {paper?.page_count ?? '?'}</span>
-
-        {/* Left sidebar toggles */}
-        <button
-          onClick={() => setLeftSidebar((s) => (s === 'outline' ? null : 'outline'))}
-          className={`p-0.5 rounded transition-colors ${
-            leftSidebar === 'outline' ? 'bg-primary/10 text-primary' : 'text-text-secondary hover:bg-surface-hover'
-          }`}
-          title="目录"
-        >
-          <BookOpen size={14} />
-        </button>
-        <button
-          onClick={() => setLeftSidebar((s) => (s === 'thumbnails' ? null : 'thumbnails'))}
-          className={`p-0.5 rounded transition-colors ${
-            leftSidebar === 'thumbnails' ? 'bg-primary/10 text-primary' : 'text-text-secondary hover:bg-surface-hover'
-          }`}
-          title="缩略图"
-        >
-          <LayoutGrid size={14} />
-        </button>
+        <span className="text-xs text-text-secondary tabular-nums flex items-center gap-1">
+          <input
+            value={pageInput ?? String(currentPage)}
+            onChange={(e) => updatePageInput(e.target.value.replace(/[^0-9]/g, ''))}
+            onFocus={(e) => {
+              updatePageInput(String(currentPage));
+              e.target.select();
+            }}
+            onBlur={commitPageInput}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                commitPageInput();
+                e.currentTarget.blur();
+              } else if (e.key === 'Escape') {
+                updatePageInput(null);
+                e.currentTarget.blur();
+              }
+            }}
+            className="w-9 text-center bg-transparent border border-transparent rounded outline-none text-xs text-text-secondary tabular-nums hover:border-surface-hover focus:border-primary/50 focus:text-text-primary transition-colors"
+            title="输入页码后回车跳转"
+          />
+          <span>/ {effectiveTotalPages > 0 ? effectiveTotalPages : '?'}</span>
+        </span>
 
         <button
           onClick={() => pdfViewerRef.current?.zoomOut()}
@@ -745,14 +834,14 @@ function ReaderPage() {
                 结构
               </button>
               <button
-                onClick={() => { setMoreOpen(false); pdfViewerRef.current?.rotateCcw(); }}
+                onClick={() => { setMoreOpen(false); setRotation((r) => (r + 270) % 360); pdfViewerRef.current?.rotateCcw(); }}
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-text-secondary hover:bg-surface-hover hover:text-text-primary transition-colors"
               >
                 <RotateCcw size={13} />
                 向左旋转
               </button>
               <button
-                onClick={() => { setMoreOpen(false); pdfViewerRef.current?.rotateCw(); }}
+                onClick={() => { setMoreOpen(false); setRotation((r) => (r + 90) % 360); pdfViewerRef.current?.rotateCw(); }}
                 className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-text-secondary hover:bg-surface-hover hover:text-text-primary transition-colors"
               >
                 <RotateCw size={13} />
@@ -807,6 +896,7 @@ function ReaderPage() {
                 <PdfThumbnails
                   doc={pdfDoc}
                   currentPage={currentPage}
+                  rotation={rotation}
                   onSelect={(p) => pdfViewerRef.current?.jumpToPage(p)}
                 />
               )}
@@ -896,6 +986,17 @@ function ReaderPage() {
                 progress={regionDetectProgress}
               />
             </>
+          ) : pdfError ? (
+            <div className="flex flex-col items-center justify-center h-full text-text-secondary text-sm gap-2 px-6">
+              <p>PDF 加载失败</p>
+              <p className="text-xs text-text-secondary/50 break-all text-center max-w-md">{pdfError}</p>
+              <button
+                onClick={() => setPdfReloadKey((k) => k + 1)}
+                className="mt-1 px-3 py-1.5 bg-surface border border-surface-hover rounded-lg text-xs hover:bg-surface-hover transition-colors"
+              >
+                重试
+              </button>
+            </div>
           ) : (
             <div className="flex items-center justify-center h-full text-text-secondary/60 text-sm">
               无 PDF 文件
@@ -928,6 +1029,15 @@ function ReaderPage() {
       </div>
     </div>
   );
+}
+
+// The root route renders a bare Outlet, so TanStack Router reuses the route
+// component when navigating /reader/A → /reader/B. Keying the view by paperId
+// forces a full remount per paper, so per-paper state (currentPage, zoom,
+// region cache, pdfDoc, strokes, …) can never leak across papers.
+function ReaderPage() {
+  const { paperId } = Route.useParams();
+  return <ReaderView key={paperId} paperId={paperId} />;
 }
 
 export const Route = createRoute({

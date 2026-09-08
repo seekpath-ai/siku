@@ -147,6 +147,9 @@ export interface PdfViewerHandle {
 
 const PAGE_GAP = 16;
 const BUFFER_PAGES = 2;
+/** Backing-store pixel cap for page canvases (same default as pdf.js).
+ *  Beyond it the effective DPR is reduced while the CSS size is kept. */
+const MAX_CANVAS_PIXELS = 16777216;
 
 interface PageSlot {
   pageNum: number;
@@ -406,11 +409,14 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
   const pageSlotsRef = useRef<PageSlot[]>([]);
   const wrapperMapRef = useRef<Map<number, HTMLDivElement>>(new Map());
   const textLayerMapRef = useRef<Map<number, any>>(new Map());
-  const renderingRef = useRef<Set<number>>(new Set()); // prevent duplicate renders
+  // pageNum → wrapper currently being rendered into. The wrapper identity
+  // lets a stale async render detect that a layout rebuild replaced it.
+  const renderingRef = useRef<Map<number, HTMLDivElement>>(new Map());
+  const renderTaskMapRef = useRef<Map<number, any>>(new Map()); // in-flight pdf.js RenderTasks
   const zoomRef = useRef(initialZoom ?? 1);
   const zoomModeRef = useRef<'fit-width' | 'fit-page' | 'actual' | 'custom'>('fit-width');
   const pagesRotationRef = useRef(0);
-  const containerWidthRef = useRef(800);
+  const containerSizeRef = useRef({ width: 800, height: 600 });
   const initialPageRef = useRef(initialPage);
   const didRestorePageRef = useRef(false);
   const pageThemeRef = useRef(pageTheme);
@@ -720,6 +726,8 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
 
   useEffect(() => {
     let cancelled = false;
+    let loadingTask: any = null;
+    const renderTaskMap = renderTaskMapRef.current;
     setLoading(true); setError(null); setReady(false); setTotalPages(0);
     setPasswordNeeded(false); setPasswordError(null);
     pdfDocRef.current = null;
@@ -727,6 +735,8 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     pdfViewerRef.current = null;
     currentPageRef.current = 1;
     pageSlotsRef.current = [];
+    for (const [, task] of renderTaskMap) { try { task.cancel(); } catch { /* ignore */ } }
+    renderTaskMap.clear();
     renderingRef.current.clear();
     for (const [, tl] of textLayerMapRef.current) tl.cancel?.();
     textLayerMapRef.current.clear();
@@ -753,7 +763,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
         const loadArgs: any = { url: src };
         if (password) loadArgs.password = password;
 
-        const doc = await pdfjs.getDocument(loadArgs).promise;
+        const doc = await (loadingTask = pdfjs.getDocument(loadArgs)).promise;
         if (cancelled) return;
         pdfDocRef.current = doc;
         setTotalPages(doc.numPages);
@@ -816,13 +826,50 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
         setLoading(false);
       }
     })();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      for (const [, task] of renderTaskMap) { try { task.cancel(); } catch { /* ignore */ } }
+      renderTaskMap.clear();
+      // Release the pdf.js document (destroy also terminates the worker).
+      // destroy() returns a promise; swallow rejections so the unawaited
+      // call cannot surface as an unhandled rejection during unmount.
+      try { loadingTask?.destroy()?.catch(() => { /* ignore */ }); } catch { /* ignore */ }
+    };
   }, [src, password]);
 
-  // ── Compute available width once on resize ──
+  // ── Compute available container size once on resize ──
   const computeAvailable = useCallback(() => {
-    return Math.max(200, scrollRef.current?.clientWidth ?? 800);
+    const el = scrollRef.current;
+    return {
+      width: Math.max(200, el?.clientWidth ?? 800),
+      height: Math.max(200, el?.clientHeight ?? 600),
+    };
   }, []);
+
+  // ── Shared fit-scale calculation (buildLayout / renderPageInto / doZoom) ──
+  const computeBaseScale = useCallback((
+    vp1: { width: number; height: number },
+    mode: 'fit-width' | 'fit-page' | 'actual' | 'custom',
+    available: { width: number; height: number },
+  ) => {
+    switch (mode) {
+      case 'fit-page':
+        return Math.min(available.width / vp1.width, available.height / vp1.height);
+      case 'actual':
+        return 1;
+      case 'custom':
+      case 'fit-width':
+      default:
+        return available.width / vp1.width;
+    }
+  }, []);
+
+  const computeFitScale = useCallback((
+    vp1: { width: number; height: number },
+    mode: 'fit-width' | 'fit-page' | 'actual' | 'custom',
+    zoom: number,
+    available: { width: number; height: number },
+  ) => Math.max(0.25, Math.min(4, computeBaseScale(vp1, mode, available) * zoom)), [computeBaseScale]);
 
   // ── Pre-calculate all page heights and create placeholder wrappers ──
   const buildLayout = useCallback(async () => {
@@ -837,6 +884,8 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     const slots: PageSlot[] = [];
 
     // Clear old wrappers, text layers, drawing overlays, annotations and pending renders
+    for (const [, task] of renderTaskMapRef.current) { try { task.cancel(); } catch { /* ignore */ } }
+    renderTaskMapRef.current.clear();
     renderingRef.current.clear();
     for (const [, tl] of textLayerMapRef.current) tl.cancel?.();
     textLayerMapRef.current.clear();
@@ -851,21 +900,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     for (let i = 1; i <= doc.numPages; i++) {
       const page = await doc.getPage(i);
       const vp1 = page.getViewport({ scale: 1, rotation });
-      let baseScale: number;
-      switch (mode) {
-        case 'fit-page':
-          baseScale = Math.min(available / vp1.width, available / vp1.height);
-          break;
-        case 'actual':
-          baseScale = 1;
-          break;
-        case 'custom':
-        case 'fit-width':
-        default:
-          baseScale = available / vp1.width;
-          break;
-      }
-      const fitScale = Math.max(0.25, Math.min(4, baseScale * zoom));
+      const fitScale = computeFitScale(vp1, mode, zoom, available);
       const height = Math.round(vp1.height * fitScale);
       slots.push({ pageNum: i, height });
 
@@ -888,9 +923,9 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     }
 
     pageSlotsRef.current = slots;
-    containerWidthRef.current = available;
+    containerSizeRef.current = available;
     setLayoutVersion(v => v + 1); // trigger overlay re-creation after layout rebuild
-  }, [computeAvailable]);
+  }, [computeAvailable, computeFitScale]);
 
   useEffect(() => {
     if (ready) buildLayout();
@@ -928,50 +963,60 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     // Already rendered or currently rendering
     if (wrapper.querySelector('canvas') || renderingRef.current.has(pageNum)) return;
 
-    renderingRef.current.add(pageNum);
+    renderingRef.current.set(pageNum, wrapper);
+    let renderTask: any = null;
     try {
-      const available = containerWidthRef.current;
-      const dpr = window.devicePixelRatio || 1;
+      const available = containerSizeRef.current;
       const zoom = zoomRef.current;
       const rotation = pagesRotationRef.current;
       const mode = zoomModeRef.current;
 
       const page = await doc.getPage(pageNum);
       const vp1 = page.getViewport({ scale: 1, rotation });
-      let baseScale: number;
-      switch (mode) {
-        case 'fit-page':
-          baseScale = Math.min(available / vp1.width, available / vp1.height);
-          break;
-        case 'actual':
-          baseScale = 1;
-          break;
-        case 'custom':
-        case 'fit-width':
-        default:
-          baseScale = available / vp1.width;
-          break;
-      }
-      const fitScale = Math.max(0.25, Math.min(4, baseScale * zoom));
+      const fitScale = computeFitScale(vp1, mode, zoom, available);
       const viewport = page.getViewport({ scale: fitScale, rotation });
+
+      // Cap the canvas backing store (pdf.js default maxCanvasPixels):
+      // extreme zoom × HiDPR would otherwise allocate ~90MB per page. The
+      // CSS size stays at the layout viewport, so only sharpness is reduced.
+      const dpr = window.devicePixelRatio || 1;
+      let effectiveDpr = dpr;
+      let canvasWidth = Math.floor(viewport.width * dpr);
+      let canvasHeight = Math.floor(viewport.height * dpr);
+      if (canvasWidth * canvasHeight > MAX_CANVAS_PIXELS) {
+        effectiveDpr = dpr * Math.sqrt(MAX_CANVAS_PIXELS / (canvasWidth * canvasHeight));
+        canvasWidth = Math.floor(viewport.width * effectiveDpr);
+        canvasHeight = Math.floor(viewport.height * effectiveDpr);
+      }
 
       const canvas = document.createElement('canvas');
       canvas.style.display = 'block';
       canvas.style.width = `${viewport.width}px`;
       canvas.style.height = `${viewport.height}px`;
-      canvas.width = Math.floor(viewport.width * dpr);
-      canvas.height = Math.floor(viewport.height * dpr);
+      canvas.width = canvasWidth;
+      canvas.height = canvasHeight;
       canvas.dataset.page = String(pageNum);
 
       // willReadFrequently when a page theme is active: we read the pixels
       // back for recoloring right after the render.
       const ctx = canvas.getContext('2d', pageThemeRef.current ? { willReadFrequently: true } : undefined)!;
-      ctx.scale(dpr, dpr);
+      ctx.scale(effectiveDpr, effectiveDpr);
       const renderParams: any = { canvasContext: ctx, viewport };
-      await page.render(renderParams).promise;
+      renderTask = page.render(renderParams);
+      renderTaskMapRef.current.set(pageNum, renderTask);
+      await renderTask.promise;
 
-      // Double-check still wanted (user may have scrolled past during render)
-      if (!wrapperMapRef.current.has(pageNum)) { renderingRef.current.delete(pageNum); return; }
+      // Identity check: buildLayout may have torn down and recreated this
+      // page's wrapper while the render was in flight. Landing the canvas
+      // in the detached wrapper caused blank pages, so discard the stale
+      // result and re-render into the current wrapper instead.
+      if (wrapperMapRef.current.get(pageNum) !== wrapper) {
+        if (wrapperMapRef.current.has(pageNum)) {
+          if (renderingRef.current.get(pageNum) === wrapper) renderingRef.current.delete(pageNum);
+          void renderPageInto(pageNum);
+        }
+        return;
+      }
 
       // Recolor for the active page theme AFTER rendering. pdf.js
       // `pageColors` is broken on HiDPI screens (it recolors in CSS pixels
@@ -1015,8 +1060,16 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
       // Keep drawing overlay on top of everything.
       const svg = svgMapRef.current.get(pageNum);
       if (svg) wrapper.appendChild(svg);
+    } catch (e: any) {
+      // Expected when a layout rebuild cancels the in-flight render.
+      if (e?.name !== 'RenderingCancelledException') {
+        console.error(`[renderPageInto] page ${pageNum} failed:`, e);
+      }
     } finally {
-      renderingRef.current.delete(pageNum);
+      // Only clear our own entries: a rebuild may already have started a
+      // fresh render for this page whose guards must stay in place.
+      if (renderTaskMapRef.current.get(pageNum) === renderTask) renderTaskMapRef.current.delete(pageNum);
+      if (renderingRef.current.get(pageNum) === wrapper) renderingRef.current.delete(pageNum);
     }
   }
 
@@ -1227,11 +1280,23 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     }
   }
 
-  // Create drawing overlays for all wrappers after layout builds.
+  // Create drawing overlays lazily: eagerly building an SVG + pointer
+  // listeners for every page costs ~5 listeners per page (2500 for a
+  // 500-page document). Overlays are only needed on pages that can receive
+  // drawing input (a tool is active) or that already display strokes.
+  // Deactivating the tool keeps existing overlays (and their strokes) but
+  // disables their pointer events below, so they no longer see input.
   useEffect(() => {
     if (!ready) return;
-    for (let i = 1; i <= (pdfDocRef.current?.numPages || 0); i++) {
-      ensureDrawingOverlay(i);
+    const numPages = pdfDocRef.current?.numPages || 0;
+    if (drawingTool) {
+      for (let i = 1; i <= numPages; i++) {
+        ensureDrawingOverlay(i);
+      }
+    } else {
+      for (const s of strokesRef.current) {
+        if (s.pageIndex >= 1 && s.pageIndex <= numPages) ensureDrawingOverlay(s.pageIndex);
+      }
     }
     renderStrokes();
     // Update pointer-events and cursor based on active tool.
@@ -1247,8 +1312,12 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     }
   }, [ready, layoutVersion, drawingTool]);
 
-  // Re-render strokes when they change.
+  // Re-render strokes when they change. Pages that gained strokes may not
+  // have an overlay yet (overlays are lazy), so create those first.
   useEffect(() => {
+    for (const s of strokes) {
+      if (!svgMapRef.current.has(s.pageIndex)) ensureDrawingOverlay(s.pageIndex);
+    }
     renderStrokes();
   }, [strokes]);
 
@@ -1341,10 +1410,34 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     repaintSelectionRef.current();
   }
 
-  // ── Determine visible page range using DOM positions (always accurate) ──
+  // ── Determine visible page range. Pure arithmetic on cached slot heights
+  //    (no per-frame layout reads); falls back to DOM rects before the
+  //    layout has been measured. ──
   const getVisibleRange = useCallback((): [number, number] => {
     const container = scrollRef.current;
     if (!container || wrapperMapRef.current.size === 0) return [1, 1];
+
+    const slots = pageSlotsRef.current;
+    if (slots.length > 0) {
+      const viewTop = container.scrollTop - container.clientHeight * BUFFER_PAGES;
+      const viewBottom = container.scrollTop + container.clientHeight * (1 + BUFFER_PAGES);
+      let firstVisible = 1;
+      let lastVisible = 1;
+      let foundFirst = false;
+      let offset = 0;
+      for (const slot of slots) {
+        const top = offset;
+        const bottom = offset + slot.height;
+        offset = bottom + PAGE_GAP;
+        if (bottom > viewTop && top < viewBottom) {
+          if (!foundFirst) { firstVisible = slot.pageNum; foundFirst = true; }
+          lastVisible = slot.pageNum;
+        } else if (foundFirst && top >= viewBottom) {
+          break;
+        }
+      }
+      return [firstVisible, lastVisible];
+    }
 
     const containerRect = container.getBoundingClientRect();
     const viewTop = containerRect.top - containerRect.height * BUFFER_PAGES;
@@ -1442,15 +1535,26 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
       requestAnimationFrame(() => {
         updateVisiblePages();
 
-        // Current page detection
-        const cr = container.getBoundingClientRect();
-        const vt = cr.top;
+        // Current page detection: arithmetic on cached slot heights when
+        // the layout is ready, DOM rects otherwise.
         let found = 1;
-        for (let i = 1; i <= totalPages; i++) {
-          const w = wrapperMapRef.current.get(i);
-          if (!w) continue;
-          const r = w.getBoundingClientRect();
-          if (r.bottom > vt + 10) { found = i; break; }
+        const slots = pageSlotsRef.current;
+        if (slots.length > 0) {
+          let offset = 0;
+          for (const slot of slots) {
+            const bottom = offset + slot.height;
+            offset = bottom + PAGE_GAP;
+            if (bottom > container.scrollTop + 10) { found = slot.pageNum; break; }
+          }
+        } else {
+          const cr = container.getBoundingClientRect();
+          const vt = cr.top;
+          for (let i = 1; i <= totalPages; i++) {
+            const w = wrapperMapRef.current.get(i);
+            if (!w) continue;
+            const r = w.getBoundingClientRect();
+            if (r.bottom > vt + 10) { found = i; break; }
+          }
         }
         if (found !== currentPageRef.current) {
           currentPageRef.current = found;
@@ -1699,25 +1803,33 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
       prev?.foreground !== pageTheme?.foreground;
     pageThemeRef.current = pageTheme;
     if (!ready || !changed) return;
-    for (const [pn, wrapper] of wrapperMapRef.current) {
-      if (wrapper.querySelector('canvas')) unrenderPage(pn);
-    }
-    updateVisiblePages();
-  }, [pageTheme, ready, updateVisiblePages]);
+    let cancelled = false;
+    (async () => {
+      for (const [pn, wrapper] of wrapperMapRef.current) {
+        if (wrapper.querySelector('canvas')) unrenderPage(pn);
+      }
+      // Re-render one page at a time, yielding to the main thread between
+      // pages: the per-pixel duotone recolor of several visible pages would
+      // otherwise block the UI in a single long frame.
+      const [first, last] = getVisibleRange();
+      for (let pn = first; pn <= last; pn++) {
+        if (cancelled) return;
+        await renderPageInto(pn);
+        await new Promise<void>((r) => setTimeout(r, 0));
+      }
+      if (!cancelled) updateVisiblePages();
+    })();
+    return () => { cancelled = true; };
+  }, [pageTheme, ready, updateVisiblePages, getVisibleRange]);
 
   // ── Zoom / rotation helpers ──
   const doZoom = useCallback(async (delta: number) => {
     const doc = pdfDocRef.current;
     if (!doc) return;
-    const available = containerWidthRef.current;
+    const available = containerSizeRef.current;
     const page = await doc.getPage(1);
     const vp1 = page.getViewport({ scale: 1, rotation: pagesRotationRef.current });
-    let baseScale = available / vp1.width;
-    if (zoomModeRef.current === 'fit-page') {
-      baseScale = Math.min(available / vp1.width, available / vp1.height);
-    } else if (zoomModeRef.current === 'actual') {
-      baseScale = 1;
-    }
+    const baseScale = computeBaseScale(vp1, zoomModeRef.current, available);
     const currentScale = baseScale * zoomRef.current;
     zoomModeRef.current = 'custom';
     zoomRef.current = Math.max(0.25, Math.min(4, (currentScale + delta) / baseScale));
@@ -1726,7 +1838,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     await buildLayout();
     if (anchor) restoreScrollAnchor(anchor);
     updateVisiblePages();
-  }, [buildLayout, updateVisiblePages, onZoomChange, getScrollAnchor, restoreScrollAnchor]);
+  }, [buildLayout, updateVisiblePages, onZoomChange, getScrollAnchor, restoreScrollAnchor, computeBaseScale]);
 
   const setZoomMode = useCallback(async (mode: 'fit-width' | 'fit-page' | 'actual' | 'custom') => {
     zoomModeRef.current = mode;
@@ -1763,6 +1875,99 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     if (anchor) restoreScrollAnchor(anchor);
     updateVisiblePages();
   }, [buildLayout, updateVisiblePages, getScrollAnchor, restoreScrollAnchor]);
+
+  // ── Keyboard & wheel navigation on the scroll container ──
+  // The container has tabIndex={0}, so keydown fires whenever focus is
+  // inside it. Ctrl/Cmd combos other than zoom are left untouched so the
+  // FindBar (Ctrl+F) and copy (Ctrl+C) handlers keep working.
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container || !ready) return;
+
+    const scrollToPage = (page: number) => {
+      const wrapper = wrapperMapRef.current.get(page);
+      if (wrapper) wrapper.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key === '=' || e.key === '+') {
+          e.preventDefault();
+          doZoom(0.25);
+        } else if (e.key === '-') {
+          e.preventDefault();
+          doZoom(-0.25);
+        }
+        return;
+      }
+      if (e.altKey) return;
+      const viewW = container.clientWidth;
+      const viewH = container.clientHeight;
+      switch (e.key) {
+        case 'ArrowUp':
+          e.preventDefault();
+          container.scrollBy({ top: -viewH, behavior: 'smooth' });
+          break;
+        case 'ArrowDown':
+          e.preventDefault();
+          container.scrollBy({ top: viewH, behavior: 'smooth' });
+          break;
+        case 'ArrowLeft':
+          e.preventDefault();
+          container.scrollBy({ left: -viewW, behavior: 'smooth' });
+          break;
+        case 'ArrowRight':
+          e.preventDefault();
+          container.scrollBy({ left: viewW, behavior: 'smooth' });
+          break;
+        case 'PageUp':
+          e.preventDefault();
+          container.scrollBy({ top: -viewH, behavior: 'smooth' });
+          break;
+        case 'PageDown':
+          e.preventDefault();
+          container.scrollBy({ top: viewH, behavior: 'smooth' });
+          break;
+        case 'Home':
+          e.preventDefault();
+          scrollToPage(1);
+          break;
+        case 'End':
+          e.preventDefault();
+          scrollToPage(pdfDocRef.current?.numPages || totalPages);
+          break;
+      }
+    };
+
+    // Ctrl+wheel: zoom anchored at the cursor — the content point under the
+    // cursor keeps its viewport position across the zoom. All page geometry
+    // scales by the zoom factor, so adjusting scroll offsets by the same
+    // factor re-centers that point.
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      const rect = container.getBoundingClientRect();
+      const offsetX = e.clientX - rect.left;
+      const offsetY = e.clientY - rect.top;
+      const contentX = container.scrollLeft + offsetX;
+      const contentY = container.scrollTop + offsetY;
+      const oldZoom = zoomRef.current;
+      void doZoom(e.deltaY < 0 ? 0.25 : -0.25).then(() => {
+        const factor = zoomRef.current / oldZoom;
+        container.scrollLeft = contentX * factor - offsetX;
+        container.scrollTop = contentY * factor - offsetY;
+      });
+    };
+
+    container.addEventListener('keydown', onKeyDown);
+    container.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      container.removeEventListener('keydown', onKeyDown);
+      container.removeEventListener('wheel', onWheel);
+    };
+  }, [ready, totalPages, doZoom]);
 
   // Expose controls to parent
   useImperativeHandle(ref, () => ({

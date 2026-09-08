@@ -16,6 +16,9 @@ export function PdfThumbnails({ doc, currentPage, rotation = 0, onSelect }: PdfT
   const [renderedPages, setRenderedPages] = useState<Set<number>>(new Set());
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasMapRef = useRef<Map<number, HTMLCanvasElement>>(new Map());
+  // dataURL encoded once per canvas; keyed by canvas so a rotation rebuild
+  // (new canvases) can never serve a stale image and old entries are GC'd.
+  const dataUrlCacheRef = useRef<WeakMap<HTMLCanvasElement, string>>(new WeakMap());
   const visibleRef = useRef<Set<number>>(new Set());
   const mountedRef = useRef(true);
 
@@ -36,6 +39,8 @@ export function PdfThumbnails({ doc, currentPage, rotation = 0, onSelect }: PdfT
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
       await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+      // Encode once here; the JSX reads the cached dataURL on every render.
+      dataUrlCacheRef.current.set(canvas, canvas.toDataURL('image/png'));
       canvasMapRef.current.set(pageNum, canvas);
       if (mountedRef.current) {
         setRenderedPages((prev) => {
@@ -89,11 +94,19 @@ export function PdfThumbnails({ doc, currentPage, rotation = 0, onSelect }: PdfT
     Array.from(container.children).forEach((el) => observer.observe(el));
     updateVisible();
 
-    const onScroll = () => updateVisible();
+    let scrollRaf = 0;
+    const onScroll = () => {
+      if (scrollRaf) return;
+      scrollRaf = requestAnimationFrame(() => {
+        scrollRaf = 0;
+        updateVisible();
+      });
+    };
     container.addEventListener('scroll', onScroll, { passive: true });
     return () => {
       observer.disconnect();
       container.removeEventListener('scroll', onScroll);
+      if (scrollRaf) cancelAnimationFrame(scrollRaf);
     };
   }, [pageCount, renderThumbnail]);
 
@@ -133,7 +146,7 @@ export function PdfThumbnails({ doc, currentPage, rotation = 0, onSelect }: PdfT
             <div className="flex h-[140px] items-center justify-center overflow-hidden rounded">
               {canvas ? (
                 <img
-                  src={canvas.toDataURL('image/png')}
+                  src={dataUrlCacheRef.current.get(canvas)}
                   alt={`第 ${pageNum} 页`}
                   className="max-h-full max-w-full object-contain"
                 />

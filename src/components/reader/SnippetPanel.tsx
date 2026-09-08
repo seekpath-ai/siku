@@ -602,8 +602,12 @@ function SnippetCard({
   const streamError = useTranslationStreamStore((s) => s.errors[snippet.id]);
   const isStreaming = streamText !== undefined;
 
+  // Whether the stored translation is hidden by the user. Purely local UI
+  // state — hiding never deletes the translation from the backend.
+  const [translationHidden, setTranslationHidden] = useState(false);
+
   const handleTranslate = async () => {
-    if (translation) { onUpdateTranslation(snippet.id, null); return; }
+    if (translation) { setTranslationHidden((h) => !h); return; }
     if (isStreaming) return;
     const stream = useTranslationStreamStore.getState();
     stream.begin(snippet.id);
@@ -629,6 +633,42 @@ function SnippetCard({
     setTransCopied(true);
     setTimeout(() => setTransCopied(false), 1500);
   };
+
+  // Note editing is local-first: the textarea reflects the draft immediately
+  // and the change is persisted (store + backend) after 500ms of idle typing,
+  // or immediately on blur / unmount. The annotation id and latest draft are
+  // pinned in refs so a pending flush can never write one card's text into
+  // another card's row.
+  const [noteDraft, setNoteDraft] = useState(snippet.note);
+  const noteAnnotationIdRef = useRef(snippet.id);
+  const noteDraftRef = useRef(noteDraft);
+  const noteDirtyRef = useRef(false);
+  const noteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onUpdateNoteRef = useRef(onUpdateNote);
+  onUpdateNoteRef.current = onUpdateNote;
+
+  const flushNote = useCallback(() => {
+    if (noteTimerRef.current) {
+      clearTimeout(noteTimerRef.current);
+      noteTimerRef.current = null;
+    }
+    if (noteDirtyRef.current) {
+      noteDirtyRef.current = false;
+      onUpdateNoteRef.current(noteAnnotationIdRef.current, noteDraftRef.current);
+    }
+  }, []);
+
+  const handleNoteChange = (value: string) => {
+    setNoteDraft(value);
+    noteDraftRef.current = value;
+    noteDirtyRef.current = true;
+    if (noteTimerRef.current) clearTimeout(noteTimerRef.current);
+    noteTimerRef.current = setTimeout(flushNote, 500);
+  };
+
+  // Flush any un-persisted draft when the card unmounts (e.g. switching
+  // snippet cards or closing the panel).
+  useEffect(() => flushNote, [flushNote]);
 
   const handleAddTag = () => {
     if (tagInput.trim()) {
@@ -690,8 +730,9 @@ function SnippetCard({
         style={{ fontSize }}
         rows={2}
         placeholder="添加笔记…"
-        value={snippet.note}
-        onChange={(e) => onUpdateNote(snippet.id, e.target.value)}
+        value={noteDraft}
+        onChange={(e) => handleNoteChange(e.target.value)}
+        onBlur={flushNote}
         onFocus={() => onJump?.(snippet)}
         onPaste={onPaste}
       />
@@ -721,7 +762,7 @@ function SnippetCard({
       </div>
 
       {/* Translation display */}
-      {(translation || isStreaming || streamError) && (
+      {((translation && !translationHidden) || isStreaming || streamError) && (
         <div className="mt-1.5 p-2 rounded bg-primary/5 border border-primary/10 text-text-primary leading-relaxed relative" style={{ fontSize }}>
           {streamError ? (
             <span className="block text-red-400 text-xs break-words" title={streamError}>
@@ -769,7 +810,7 @@ function SnippetCard({
             className={`shrink-0 p-0.5 rounded transition-colors ${
               translation ? 'text-primary bg-primary/10' : 'text-text-secondary/30 hover:text-primary hover:bg-primary/5'
             }`}
-            title={translation ? '隐藏译文' : '翻译'}
+            title={translation ? (translationHidden ? '显示译文' : '隐藏译文') : '翻译'}
           >
             {isStreaming ? <Loader2 size={11} className="animate-spin" /> : <Languages size={11} />}
           </button>

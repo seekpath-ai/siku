@@ -21,7 +21,12 @@ interface Props {
 export function PrintNotePortal({ note, content, notes, attachmentsDir, onDone }: Props) {
   useEffect(() => {
     let cancelled = false;
+    // The system "save as PDF" dialog suggests document.title as the file
+    // name — temporarily swap in the note title, restore after printing.
+    const prevTitle = document.title;
+    document.title = note.title || '未命名笔记';
     const finish = () => {
+      document.title = prevTitle;
       if (!cancelled) onDone();
     };
     window.addEventListener('afterprint', finish);
@@ -59,6 +64,7 @@ export function PrintNotePortal({ note, content, notes, attachmentsDir, onDone }
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
+      document.title = prevTitle;
       window.removeEventListener('afterprint', finish);
     };
   }, [onDone]);

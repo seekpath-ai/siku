@@ -48,6 +48,13 @@ body,
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
 }
 
+/* In the standalone bubble window the bubble hugs the top (the window
+   itself is positioned just below the ball). */
+.pet-bubble-window {
+  top: 4px;
+  bottom: auto;
+}
+
 /* Arrow at the bubble's top pointing up at the ball (ball center is at
    window x=24, bubble starts at left=8 → arrow at 16px). */
 .pet-bubble-arrow {

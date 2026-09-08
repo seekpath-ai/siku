@@ -6,40 +6,55 @@ import { EyeOff } from 'lucide-react';
 import { settingsAppGet, settingsAppSave } from '@/lib/tauri';
 import './pet-window.css';
 
-const BUBBLE_MS = 3200;
-
 /** Root component for the always-on-top pet window. Dragging the ball starts an
  *  OS-level window move (across all screens); a plain click emits `pet:click`
  *  so the main window opens the chat panel. Messages from the main window
- *  (`pet:bubble`) appear as a speech bubble next to the ball. */
+ *  (`pet:bubble`) appear as a speech bubble in a SEPARATE ephemeral window —
+ *  this window never resizes, because a transparent window still swallows
+ *  mouse events across its whole rectangle. */
 export function PetBallWindow() {
-  const [bubble, setBubble] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
-  const timerRef = useRef<number | null>(null);
   const downRef = useRef<{ x: number; y: number } | null>(null);
   const draggedRef = useRef(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
-  const showBubble = (text: string) => {
-    setBubble(text);
-    getCurrentWindow().setSize(new LogicalSize(260, 96)).catch(() => {});
-    if (timerRef.current) window.clearTimeout(timerRef.current);
-    timerRef.current = window.setTimeout(() => {
-      setBubble(null);
-      getCurrentWindow().setSize(new LogicalSize(48, 48)).catch(() => {});
-    }, BUBBLE_MS);
+  const showBubble = async (text: string) => {
+    try {
+      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+      const existing = await WebviewWindow.getByLabel('pet-bubble');
+      if (existing) await existing.close().catch(() => {});
+      // Created hidden; PetBubbleWindow positions itself under the ball,
+      // goes click-through, then shows and self-closes after a timeout.
+      new WebviewWindow('pet-bubble', {
+        url: `index.html?petBubble=1&text=${encodeURIComponent(text)}`,
+        title: '',
+        width: 260,
+        height: 96,
+        decorations: false,
+        transparent: true,
+        shadow: false,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        resizable: false,
+        focus: false,
+        visible: false,
+      });
+    } catch (err) {
+      console.error('show pet bubble:', err);
+    }
   };
 
   // Listen for messages from the main window (panel opened/closed, task done).
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     const setup = async () => {
-      unlisten = await listen<string>('pet:bubble', (event) => showBubble(event.payload));
+      unlisten = await listen<string>('pet:bubble', (event) => {
+        showBubble(event.payload);
+      });
     };
     setup();
     return () => {
       unlisten?.();
-      if (timerRef.current) window.clearTimeout(timerRef.current);
     };
   }, []);
 
@@ -134,12 +149,6 @@ export function PetBallWindow() {
           <div className="absolute bottom-0.5 left-1/2 -translate-x-1/2 w-3 h-1.5 rounded-b-full bg-background/80" />
         </div>
       </div>
-      {bubble && (
-        <div className="pet-bubble">
-          <span>{bubble}</span>
-          <div className="pet-bubble-arrow" />
-        </div>
-      )}
       {menuOpen && (
         <div
           ref={menuRef}

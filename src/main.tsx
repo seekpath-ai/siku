@@ -7,6 +7,7 @@ import { settingsGetAll, settingsSet } from './lib/tauri';
 import { openNoteTab } from './lib/openNote';
 import { OnboardingWizard } from './components/layout/OnboardingWizard';
 import { PetBallWindow } from './components/pet/PetBallWindow';
+import { PetBubbleWindow } from './components/pet/PetBubbleWindow';
 import { PetChatWindow } from './components/pet/PetChatWindow';
 import { NoteWindow } from './components/notes/NoteWindow';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -223,12 +224,14 @@ if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
 }
 
 // Window-specific entry points: the pet window renders only the floating
-// ball, pet-chat windows the popped-out conversation, note windows just the
-// opened note, everything else is the app.
-let windowKind: 'app' | 'pet' | 'pet-chat' | 'note' = 'app';
+// ball, pet-bubble the ephemeral speech bubble, pet-chat windows the
+// popped-out conversation, note windows just the opened note, everything
+// else is the app.
+let windowKind: 'app' | 'pet' | 'pet-bubble' | 'pet-chat' | 'note' = 'app';
 try {
   const label = getCurrentWindow().label;
   if (label === 'pet') windowKind = 'pet';
+  else if (label === 'pet-bubble') windowKind = 'pet-bubble';
   else if (label.startsWith('pet-chat-')) windowKind = 'pet-chat';
   else if (label.startsWith('note-')) windowKind = 'note';
 } catch {
@@ -238,6 +241,8 @@ try {
 ReactDOM.createRoot(document.getElementById('root')!).render(
   windowKind === 'pet' ? (
     <PetBallWindow />
+  ) : windowKind === 'pet-bubble' ? (
+    <PetBubbleWindow />
   ) : windowKind === 'pet-chat' ? (
     <PetChatWindow />
   ) : windowKind === 'note' ? (

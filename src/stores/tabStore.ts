@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
 
 export interface Tab {
   id: string;
@@ -63,7 +64,11 @@ function createHomeTab(route: string = DEFAULT_HOME_ROUTE): Tab {
 const recentlyClosed = new Set<string>();
 const BLOCK_MS = 150;
 
-export const useTabStore = create<TabState>((set, get) => ({
+const STORAGE_KEY = 'siku.tabs';
+
+export const useTabStore = create<TabState>()(
+  persist(
+    (set, get) => ({
   tabs: [createHomeTab()],
   activeTabId: HOME_TAB_ID,
 
@@ -199,4 +204,25 @@ export const useTabStore = create<TabState>((set, get) => ({
     if (!exists) return; // don't re-create a closed tab
     set({ tabs: tabs.map((t) => (t.id === id ? { ...t, ...patch } : t)) });
   },
-}));
+    }),
+    {
+      name: STORAGE_KEY,
+      version: 1,
+      // Only the tab list and the active tab survive a restart; the actions
+      // and the recentlyClosed blocklist are runtime-only.
+      partialize: (state) => ({ tabs: state.tabs, activeTabId: state.activeTabId }),
+      merge: (persisted, current) => {
+        const p = persisted as Partial<Pick<TabState, 'tabs' | 'activeTabId'>> | undefined;
+        const tabs = p?.tabs?.length ? [...p.tabs] : current.tabs;
+        // The home tab is not closable, but guard against a stale/corrupt
+        // persisted list that lacks it.
+        if (!tabs.find((t) => t.id === HOME_TAB_ID)) tabs.unshift(createHomeTab());
+        const activeTabId =
+          p?.activeTabId && tabs.find((t) => t.id === p.activeTabId)
+            ? p.activeTabId
+            : HOME_TAB_ID;
+        return { ...current, tabs, activeTabId };
+      },
+    }
+  )
+);

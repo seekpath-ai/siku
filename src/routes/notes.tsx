@@ -14,6 +14,7 @@ import { useShellStore } from '@/stores/shellStore';
 import { useDialog } from '@/hooks/useDialog';
 import { usePetContextStore } from '@/stores/petContextStore';
 import { useTabStore } from '@/stores/tabStore';
+import { useNoteEditorStore } from '@/stores/noteEditorStore';
 import type { Note, Vault, FileItem } from '@/lib/types';
 import {
   notesListAll,
@@ -326,9 +327,10 @@ function NotesPage() {
 
   const handleRename = async (id: string, title: string) => {
     try {
-      await notesUpdate(id, title, undefined, undefined, undefined, undefined, false);
+      const updated = await notesUpdate(id, title, undefined, undefined, undefined, undefined, false);
       useTabStore.getState().updateTab(`note_${id}`, { title });
-      await loadNotes();
+      // Patch the note in place instead of reloading the whole vault.
+      setNotes((prev) => prev.map((n) => (n.id === id ? updated : n)));
     } catch (err) {
       console.error('rename note:', err);
     }
@@ -336,9 +338,11 @@ function NotesPage() {
 
   const handleUpdate = async (id: string, title: string, content: string) => {
     try {
-      await notesUpdate(id, title, content, undefined);
+      const updated = await notesUpdate(id, title, content, undefined);
       if (title) useTabStore.getState().updateTab(`note_${id}`, { title });
-      await loadNotes();
+      // Patch the note in place: a full loadNotes() here would ship every
+      // note's entire content over IPC on every autosave (800ms debounce).
+      setNotes((prev) => prev.map((n) => (n.id === id ? updated : n)));
     } catch (err) {
       console.error('update note:', err);
       throw err;
@@ -347,8 +351,8 @@ function NotesPage() {
 
   const handleUpdateAliases = async (id: string, aliases: string[]) => {
     try {
-      await notesUpdate(id, undefined, undefined, undefined, JSON.stringify(aliases));
-      await loadNotes();
+      const updated = await notesUpdate(id, undefined, undefined, undefined, JSON.stringify(aliases));
+      setNotes((prev) => prev.map((n) => (n.id === id ? updated : n)));
     } catch (err) {
       console.error('update aliases:', err);
     }
@@ -388,6 +392,9 @@ function NotesPage() {
       // Close any open tabs for the deleted note and its descendants.
       const tabStore = useTabStore.getState();
       for (const nid of subtree) tabStore.close(`note_${nid}`);
+      // Drop the remembered editor state of deleted notes so it cannot pile up.
+      const editorStore = useNoteEditorStore.getState();
+      for (const nid of subtree) editorStore.remove(nid);
       // Deleting a folder also removes the managed files inside it.
       await Promise.all([loadNotes(), loadFiles()]);
     } catch (err) {
@@ -415,6 +422,8 @@ function NotesPage() {
       }
       const tabStore = useTabStore.getState();
       for (const nid of all) tabStore.close(`note_${nid}`);
+      const editorStore = useNoteEditorStore.getState();
+      for (const nid of all) editorStore.remove(nid);
       await Promise.all([loadNotes(), loadFiles()]);
     } catch (err) {
       console.error('bulk delete notes:', err);

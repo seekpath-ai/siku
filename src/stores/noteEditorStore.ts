@@ -15,6 +15,8 @@ interface NoteEditorStoreState {
   states: Record<string, NoteEditorState>;
   setState: (noteId: string, patch: Partial<NoteEditorState>) => void;
   getState: (noteId: string) => NoteEditorState;
+  /** Forget a note's state (called when the note is deleted). */
+  remove: (noteId: string) => void;
 }
 
 const DEFAULT_STATE: NoteEditorState = { mode: 'edit', scroll: 0, cursor: 0 };
@@ -33,5 +35,14 @@ export const useNoteEditorStore = create<NoteEditorStoreState>((set, get) => ({
 
   getState: (noteId) => {
     return get().states[noteId] ?? DEFAULT_STATE;
+  },
+
+  remove: (noteId) => {
+    set((s) => {
+      if (!(noteId in s.states)) return s;
+      const states = { ...s.states };
+      delete states[noteId];
+      return { states };
+    });
   },
 }));

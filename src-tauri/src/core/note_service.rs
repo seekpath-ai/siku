@@ -417,12 +417,24 @@ async fn update_note_links(db: &SqlitePool, source_id: &str, targets: &[String])
     sqlx::query("DELETE FROM note_links WHERE source_id = ?")
         .bind(source_id).execute(db).await.map_err(|e| format!("db: {e}"))?;
 
+    // Resolve targets by title within the source note's own vault only:
+    // titles are not unique across vaults, and a cross-vault match would
+    // silently link to the wrong note. Within a vault, prefer the most
+    // recently updated note on duplicate titles so the result is stable.
+    let vault_id: Option<String> =
+        sqlx::query_scalar("SELECT vault_id FROM notes WHERE id = ?")
+            .bind(source_id).fetch_optional(db).await.map_err(|e| format!("db: {e}"))?;
+
     // Find target note IDs by title
     for target in targets {
-        // Try exact title match first
-        let target_note: Option<(String,)> = sqlx::query_as(
-            "SELECT id FROM notes WHERE title = ? LIMIT 1"
-        ).bind(target).fetch_optional(db).await.map_err(|e| format!("db: {e}"))?;
+        let target_note: Option<(String,)> = match &vault_id {
+            Some(v) => sqlx::query_as(
+                "SELECT id FROM notes WHERE title = ? AND vault_id = ? ORDER BY updated_at DESC LIMIT 1"
+            ).bind(target).bind(v).fetch_optional(db).await.map_err(|e| format!("db: {e}"))?,
+            None => sqlx::query_as(
+                "SELECT id FROM notes WHERE title = ? ORDER BY updated_at DESC LIMIT 1"
+            ).bind(target).fetch_optional(db).await.map_err(|e| format!("db: {e}"))?,
+        };
 
         let now = time::now_iso();
         if let Some((target_id,)) = target_note {

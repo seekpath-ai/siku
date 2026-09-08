@@ -205,14 +205,17 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
     setEditingTitle(false);
     const t = titleInput.trim();
     if (t && t !== note.title) {
-      titleRef.current = t; // keep the flush-on-switch title up to date
-      onUpdate(note.id, t, content).catch((err) => console.error('笔记重命名失败:', err));
+      titleRef.current = t; // keep the autosave / flush-on-switch title up to date
+      onUpdate(note.id, t, contentRef.current).catch((err) => console.error('笔记重命名失败:', err));
     } else {
       setTitleInput(note.title);
     }
-  }, [titleInput, note.title, note.id, content, onUpdate]);
+  }, [titleInput, note.title, note.id, onUpdate]);
 
-  // Auto-save with debounce (the title row acts as the file name).
+  // Auto-save with debounce (the title row acts as the file name). The title
+  // comes from titleRef, not the note prop: the prop only refreshes after the
+  // parent reloads, so a rename followed within 800ms by more typing would
+  // otherwise write the stale title back over the new one.
   useEffect(() => {
     if (saveVersionRef.current === savedVersionRef.current) return;
 
@@ -221,7 +224,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
       setSaveStatus('saving');
       const version = saveVersionRef.current;
       try {
-        await onUpdateRef.current(note.id, note.title, content);
+        await onUpdateRef.current(note.id, titleRef.current, content);
         savedVersionRef.current = version;
         setSaveStatus(saveVersionRef.current === version ? 'saved' : 'unsaved');
       } catch (err) {
@@ -231,7 +234,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
     }, SAVE_DEBOUNCE_MS);
 
     return () => clearTimeout(timer);
-  }, [content, note.id, note.title]);
+  }, [content, note.id]);
 
   const addAlias = useCallback(() => {
     const v = aliasInput.trim();

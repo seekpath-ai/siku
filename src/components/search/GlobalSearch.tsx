@@ -59,7 +59,7 @@ export function GlobalSearch({ onImportPdf }: GlobalSearchProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const creatingNoteRef = useRef(false);
   const navigate = useNavigate();
-  const { openRoute, open: openTab } = useTabStore();
+  const { openRoute } = useTabStore();
 
   const goTo = useCallback((route: string, title: string, icon?: string) => {
     const tab = openRoute(route, { title, icon });
@@ -100,10 +100,10 @@ export function GlobalSearch({ onImportPdf }: GlobalSearchProps) {
           if (creatingNoteRef.current) return;
           creatingNoteRef.current = true;
           try {
-            const note = await notesCreate('Untitled.md', '', undefined, undefined, false);
-            const id = `note_${note.id}`;
-            openTab({ id, title: note.title || 'Untitled.md', route: '/notes', icon: 'note' });
-            navigate({ to: '/notes', search: { note: note.id } });
+            const note = await notesCreate('新笔记', '', undefined, undefined, false);
+            // Same entry point as the notes list: opens a tab carrying the
+            // ?note=<id> search param so re-activating the tab restores it.
+            openNoteTab(navigate, note);
             window.dispatchEvent(new CustomEvent('siku:note-created', { detail: note.id }));
           } catch (err) {
             console.error('新建笔记失败:', err);
@@ -199,7 +199,7 @@ export function GlobalSearch({ onImportPdf }: GlobalSearchProps) {
       },
     ];
     return cmds;
-  }, [navigate, goTo, openTab, onImportPdf]);
+  }, [navigate, goTo, onImportPdf]);
 
   // Load bookmarks once when search opens.
   useEffect(() => {

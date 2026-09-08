@@ -908,7 +908,7 @@ pub(crate) async fn run_agent_turn(
 
         let mem = MemoryStore::new(spawn_memory_path);
         match result {
-            Ok((final_content, steps, cancelled, total_tokens)) => {
+            Ok((final_content, steps, cancelled, total_tokens, turn_error)) => {
                 // Never persist an empty reply — an empty assistant row
                 // renders as a blank bubble after the frontend reloads on
                 // done. Fall back to a visible placeholder. A cancelled turn
@@ -916,12 +916,20 @@ pub(crate) async fn run_agent_turn(
                 // appends locally, so the marker survives a history reload.
                 // The terminal event keeps the un-marked content: the
                 // frontend's cancelled handler appends the marker itself.
+                // A turn that died on an LLM error keeps its partial text
+                // plus an ❌ marker (and its steps below), mirroring cancel.
                 let display_content = if final_content.trim().is_empty() {
                     "（模型未返回文本内容）".to_string()
                 } else {
                     final_content.clone()
                 };
-                let persist_content = if cancelled {
+                let persist_content = if let Some(ref err) = turn_error {
+                    if final_content.trim().is_empty() {
+                        format!("❌ {err}")
+                    } else {
+                        format!("{final_content}\n\n❌ {err}")
+                    }
+                } else if cancelled {
                     if final_content.trim().is_empty() {
                         "> ⏹ 已停止生成".to_string()
                     } else {
@@ -972,7 +980,12 @@ pub(crate) async fn run_agent_turn(
 
                 // Terminal event goes last: the frontend reloads the session
                 // history on done/cancelled, so it must observe committed rows.
-                let terminal = if cancelled {
+                let terminal = if let Some(err) = turn_error {
+                    AgentEvent::Error {
+                        session_id: sid.clone(),
+                        content: err,
+                    }
+                } else if cancelled {
                     AgentEvent::Cancelled {
                         session_id: sid.clone(),
                         content: display_content,

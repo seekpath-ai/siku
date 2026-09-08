@@ -239,20 +239,25 @@ export function useStreamingChat() {
         break;
       }
 
-      case 'error':
+      case 'error': {
         state.setSessionStreaming(e.session_id, false);
         state.setSessionLoading(e.session_id, false);
-        {
-          const currentStep = state.currentStreamingStep;
-          if (currentStep) {
-            finalizeStep(currentStep.step_index);
-          }
+        const currentStep = state.currentStreamingStep;
+        if (currentStep) {
+          finalizeStep(currentStep.step_index);
         }
+        // Mirror the cancelled path: a mid-turn failure (e.g. context-size
+        // 400 after several tool rounds) keeps the partial streamed text,
+        // and the accumulated steps stay attached as the 推理过程 card
+        // instead of vanishing with the stream buffers.
+        const partial = state.streamContent;
+        const errText = `❌ ${e.content || 'Unknown error'}`;
+        const messageId = `error_${Date.now()}`;
         state.addMessage({
-          id: `error_${Date.now()}`,
+          id: messageId,
           session_id: e.session_id,
           role: 'assistant',
-          content: `❌ ${e.content || 'Unknown error'}`,
+          content: partial.trim() ? `${partial}\n\n${errText}` : errText,
           reasoning_content: null,
           tool_calls: null,
           citations: null,
@@ -264,9 +269,11 @@ export function useStreamingChat() {
           attachments: null,
           created_at: new Date().toISOString(),
         });
+        state.linkAgentSteps(messageId, e.session_id);
         state.clearStreamContent();
         state.clearStreamingSteps();
         break;
+      }
     }
   }, [finalizeStep, reloadSessionHistory]);
 

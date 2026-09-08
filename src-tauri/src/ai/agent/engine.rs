@@ -350,7 +350,7 @@ impl AgentEngine {
         event_tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
         approval_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ApprovalResponse>,
         ask_rx: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
-    ) -> Result<(String, Vec<AgentStep>, bool, crate::ai::llm::LlmUsage), String> {
+    ) -> Result<(String, Vec<AgentStep>, bool, crate::ai::llm::LlmUsage, Option<String>), String> {
         let span = info_span!("agent_turn", session_id = %self.session_id);
         let _guard = span.enter();
         let sid = self.session_id.clone();
@@ -414,6 +414,12 @@ impl AgentEngine {
         // the completion budget was exhausted (thinking models count reasoning
         // tokens toward max_tokens) before any content was produced.
         let mut truncated_empty = false;
+        // Set when the LLM call itself fails mid-turn (e.g. a context-size
+        // 400 after several tool rounds). The turn then ends gracefully —
+        // accumulated steps/text/usage are returned so the caller can
+        // persist them exactly like a user-cancelled turn, instead of
+        // throwing the whole turn's work away via Err.
+        let mut turn_error: Option<String> = None;
         let mut steps: Vec<AgentStep> = Vec::new();
         let mut round = 0;
         let mut last_approval_at: Option<std::time::Instant> = None;
@@ -435,7 +441,14 @@ impl AgentEngine {
                 messages.push(ChatMessage { role: "system".into(),
                     content: "Max tool calls reached. Provide your final answer now based on gathered information.".into(),
                     attachments: None, tool_calls: None, tool_call_id: None, name: None });
-                let resp = active_llm.chat_completion(&messages, &[]).await.map_err(|e| format!("LLM: {e}"))?;
+                let resp = match active_llm.chat_completion(&messages, &[]).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!(error = %e, "LLM final-answer call failed");
+                        turn_error = Some(format!("LLM: {e}"));
+                        break;
+                    }
+                };
                 final_content = resp.content;
                 if !final_content.trim().is_empty() {
                     if !full_text.is_empty() { full_text.push_str("\n\n"); }
@@ -545,10 +558,14 @@ impl AgentEngine {
                         if let Err(e) = result {
                             error!(error = %e, "LLM stream failed");
                             // Do NOT emit an "error" event here: the outer
-                            // caller (commands/agent.rs) reports the returned
-                            // Err, and emitting both renders two assistant
-                            // error bubbles for one failure.
-                            return Err(format!("LLM: {e}"));
+                            // caller (commands/agent.rs) reports the failure,
+                            // and emitting both renders two assistant error
+                            // bubbles for one failure. Do NOT return Err
+                            // either: record it and end the turn gracefully so
+                            // the rounds/steps already produced are persisted
+                            // (same path as a user cancel).
+                            turn_error = Some(format!("LLM: {e}"));
+                            break;
                         }
                         info!(stream_text_len = stream_text.len(), tool_calls = tool_call_buf.len(), "LLM stream finished");
                         break;
@@ -614,6 +631,24 @@ impl AgentEngine {
             if !stream_text.trim().is_empty() {
                 if !full_text.is_empty() { full_text.push_str("\n\n"); }
                 full_text.push_str(stream_text.trim_end());
+            }
+            // Mid-turn LLM failure: stop the ReAct loop here (never execute
+            // tool calls or start another round against a failing backend).
+            // Keep the failed round's partial reasoning as a step so the
+            // 推理过程 card reflects everything the model did before dying.
+            if turn_error.is_some() {
+                if !round_reasoning.trim().is_empty() {
+                    steps.push(AgentStep {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        session_id: sid.clone(),
+                        message_id: None,
+                        step_index,
+                        reasoning_content: Some(round_reasoning.clone()),
+                        tool_calls: None,
+                        created_at: time::now_iso(),
+                    });
+                }
+                break;
             }
             if stream_text.trim().is_empty() && round_finish.as_deref() == Some("length") {
                 truncated_empty = true;
@@ -1204,10 +1239,12 @@ impl AgentEngine {
         };
         if cancelled {
             info!(content_len = reply.len(), "agent turn cancelled");
+        } else if turn_error.is_some() {
+            info!(content_len = reply.len(), "agent turn ended on LLM error (partial results kept)");
         } else {
             info!(content_len = reply.len(), "agent turn complete");
         }
 
-        Ok((reply, steps, cancelled, usage))
+        Ok((reply, steps, cancelled, usage, turn_error))
     }
 }

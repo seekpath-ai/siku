@@ -506,9 +506,17 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
         break;
       }
       case 'done':
-      case 'cancelled': {
+      case 'cancelled':
+      case 'error': {
         st.setStreaming(false);
         st.setPendingApproval(null);
+        // Mid-turn failures (e.g. context-size 400) are persisted server-side
+        // with their partial text and steps — same as a cancel — so fall
+        // into the same history reload below to render the 推理过程 card and
+        // the ❌ message, then surface the error banner.
+        if (e.type === 'error') {
+          st.setError(e.content || '调用失败');
+        }
         const cur = st.currentStreamingStep;
         if (cur) st.finalizeStreamingStep(cur.step_index);
         if (st.session) {
@@ -583,12 +591,6 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
         }
         break;
       }
-      case 'error':
-        st.setStreaming(false);
-        st.setPendingApproval(null);
-        st.clearStreamingSteps();
-        st.setError(e.content || '调用失败');
-        break;
       default:
         break;
     }

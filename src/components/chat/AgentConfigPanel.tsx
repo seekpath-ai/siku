@@ -70,7 +70,12 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
       .then((list) => {
         setProviders(list);
         // Heuristic: if agent has embedded llm_models, treat as custom.
-        const hasCustom = (agent.llm_models?.length ?? 0) > 0;
+        // A pool reference OUTRANKS the inline block at runtime (and legacy
+        // sessions can carry both), so only count inline-only sessions as
+        // custom — otherwise the panel shows a dead inline config while the
+        // pool model is the one actually serving.
+        const hasCustom =
+          (agent.llm_models?.length ?? 0) > 0 && !(agent.llm_provider_ids?.length);
         setUseCustomLlm(hasCustom);
         setCustomLlm(agent.llm_models?.[0] ?? defaultLlmBlock());
         // If not custom, restore the provider this agent actually uses —

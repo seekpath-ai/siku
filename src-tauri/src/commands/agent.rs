@@ -73,8 +73,14 @@ async fn ensure_agent_config(
     config: &mut AgentConfig,
     app_settings: &crate::core::models::AppSettings,
     db: &sqlx::SqlitePool,
+    has_pool_ref: bool,
 ) -> Result<(), String> {
-    if config.llm_models.is_empty() {
+    // When the session references the provider pool, do NOT materialize an
+    // inline llm_models block: the pool ref wins at runtime anyway, and a
+    // stored inline copy makes the config UI believe the session uses a
+    // custom LLM — reopening 个性设置 after switching to a pool model showed
+    // the stale default model as "自定义" instead of the picked provider.
+    if !has_pool_ref && config.llm_models.is_empty() {
         let mut block: Option<LlmConfigBlock> = None;
         if let Some(provider_id) = &app_settings.default_llm_provider_id {
             // The referenced provider may have been deleted since; fall back
@@ -221,7 +227,7 @@ async fn build_agent_config(
         memory_dir: session.memory_dir.clone(),
         skills_dir: session.skills_dir.clone(),
     };
-    ensure_agent_config(&mut config, &app_settings, &state.db).await?;
+    ensure_agent_config(&mut config, &app_settings, &state.db, false).await?;
     Ok(config)
 }
 
@@ -248,7 +254,7 @@ pub async fn agent_create_session(
         memory_dir: input.memory_dir.clone(),
         skills_dir: input.skills_dir.clone(),
     };
-    ensure_agent_config(&mut config, &app_settings, &state.db).await?;
+    ensure_agent_config(&mut config, &app_settings, &state.db, !input.llm_provider_ids.is_empty()).await?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_iso();
@@ -355,7 +361,7 @@ pub async fn agent_update_session(
         memory_dir: input.memory_dir.clone(),
         skills_dir: input.skills_dir.clone(),
     };
-    ensure_agent_config(&mut config, &app_settings, &state.db).await?;
+    ensure_agent_config(&mut config, &app_settings, &state.db, !input.llm_provider_ids.is_empty()).await?;
 
     let now = now_iso();
     let llm_json = serde_json::to_string(&config.llm_models).map_err(|e| format!("json: {e}"))?;

@@ -60,17 +60,18 @@ export function ChatHeader({ session, projectName, projectPath, onRename, onMode
     else setTitle(session.title);
   };
 
-  // Inline llm_models (resolved on get-session) wins; otherwise resolve the
-  // provider-pool reference to a real "provider / model" label. List-loaded
-  // sessions carry no resolved models, so without this the badge fell back
-  // to a literal "模型提供商" placeholder.
+  // Precedence must mirror the runtime (build_agent_config): the pool
+  // reference wins over inline llm_models when BOTH are stored (legacy
+  // sessions can carry a stale inline block next to the pool id). Showing
+  // the inline block first made the badge disagree with the menu's check
+  // mark — and with the model actually serving the turn.
   const llm = session.llm_models?.[0];
   const poolId = session.llm_provider_ids?.[0];
   const pool = poolId ? providers.find((p) => p.id === poolId) : undefined;
-  const modelLabel = llm
-    ? `${llm.provider} / ${llm.model}`
-    : pool
-      ? `${pool.provider} / ${pool.model}`
+  const modelLabel = pool
+    ? `${pool.provider} / ${pool.model}`
+    : llm
+      ? `${llm.provider} / ${llm.model}`
       : '';
 
   // Current selection in the switcher. A custom (inline) LLM that exactly

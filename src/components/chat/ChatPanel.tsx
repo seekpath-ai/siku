@@ -8,7 +8,7 @@ import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
 import { usePetContextStore } from '@/stores/petContextStore';
 import { useStreamingChat } from '@/hooks/useStreamingChat';
-import { getChatMessages, getAgentSteps, agentRenameSession } from '@/lib/tauri';
+import { getChatMessages, getAgentSteps, agentRenameSession, agentSetSessionModel } from '@/lib/tauri';
 
 export function ChatPanel() {
   useStreamingChat();
@@ -81,6 +81,25 @@ export function ChatPanel() {
     }
   };
 
+  // Header badge model switcher: pick a global provider → it becomes the
+  // session's model from the next turn (any inline custom llm is replaced,
+  // same semantics as the config dialog's 自定义 toggle).
+  const handleModelChange = async (providerId: string) => {
+    if (!activeSession) return;
+    try {
+      await agentSetSessionModel(activeSession.id, [providerId], []);
+      setSessions(
+        sessions.map((s) =>
+          s.id === activeSession.id
+            ? { ...s, llm_provider_ids: [providerId], llm_models: [] }
+            : s
+        )
+      );
+    } catch (err) {
+      console.error('Failed to switch model:', err);
+    }
+  };
+
   if (!activeSession) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-text-secondary">
@@ -100,6 +119,7 @@ export function ChatPanel() {
         projectName={sessionProject?.name}
         projectPath={sessionProject?.path}
         onRename={handleRename}
+        onModelChange={handleModelChange}
       />
       <div className="flex-1 overflow-hidden relative">
         <MessageList />

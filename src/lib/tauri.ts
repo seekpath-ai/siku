@@ -209,6 +209,17 @@ export async function agentGetSession(sessionId: string): Promise<AgentSession> 
   return invoke<AgentSession>('agent_get_session', { sessionId });
 }
 
+/** Quick-switch a session's model from the chat header badge. Writes ONLY
+ *  the llm columns (agentUpdateSession is a full-config overwrite); takes
+ *  effect on the next turn. */
+export async function agentSetSessionModel(
+  sessionId: string,
+  llmProviderIds: string[],
+  llmModels: LlmConfigBlock[],
+): Promise<void> {
+  return invoke<void>('agent_set_session_model', { sessionId, llmProviderIds, llmModels });
+}
+
 /** Create a pet (built-in domain agent) session bound to the current context. */
 export async function petCreateSession(domain: string, context: Record<string, unknown>): Promise<AgentSession> {
   return invoke<AgentSession>('pet_create_session', { domain, context });

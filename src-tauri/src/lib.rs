@@ -714,6 +714,7 @@ pub fn run() {
             // Agent
             commands::agent::agent_create_session,
             commands::agent::agent_update_session,
+            commands::agent::agent_set_session_model,
             commands::agent::agent_get_session,
             commands::agent::agent_send_message,
             commands::agent::agent_list_sessions,

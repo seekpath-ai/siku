@@ -428,6 +428,35 @@ pub async fn agent_update_session(
     ))
 }
 
+/// Quick model switch from the chat header badge. Updates ONLY the llm
+/// columns — agent_update_session is a full-config overwrite, so going
+/// through it here would force the frontend to round-trip every other field
+/// (and risk clobbering them with stale values). Takes effect on the next
+/// turn: run_agent_turn re-resolves the config every time.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn agent_set_session_model(
+    state: State<'_, AppState>,
+    session_id: String,
+    llm_provider_ids: Vec<String>,
+    llm_models: Vec<LlmConfigBlock>,
+) -> Result<(), String> {
+    let provider_ids_json =
+        serde_json::to_string(&llm_provider_ids).map_err(|e| format!("json: {e}"))?;
+    let llm_json = serde_json::to_string(&llm_models).map_err(|e| format!("json: {e}"))?;
+    sqlx::query(
+        "UPDATE chat_sessions SET llm_models = ?, llm_provider_ids = ?, updated_at = ? WHERE id = ?"
+    )
+    .bind(&llm_json)
+    .bind(&provider_ids_json)
+    .bind(now_iso())
+    .bind(&session_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| format!("db error: {e}"))?;
+    Ok(())
+}
+
 /// Get a single agent session with full config
 #[tauri::command]
 #[instrument(skip(state))]
@@ -537,6 +566,11 @@ fn session_to_json(
     created_at: String,
     updated_at: String,
 ) -> serde_json::Value {
+    // Emit as a real array to match the frontend type (string[] | null);
+    // the raw column is a JSON string and leaked through as one.
+    let llm_provider_ids: Option<Vec<String>> = llm_provider_ids
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
     serde_json::json!({
         "id": id,
         "title": config.display_name,
@@ -1270,6 +1304,11 @@ fn session_to_list_json(session: ChatSession) -> serde_json::Value {
                 .collect()
         });
     let title = session.title;
+    // Parse to a real array — see session_to_json.
+    let llm_provider_ids: Option<Vec<String>> = session
+        .llm_provider_ids
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
     serde_json::json!({
         "id": session.id,
         "title": title,
@@ -1282,7 +1321,7 @@ fn session_to_list_json(session: ChatSession) -> serde_json::Value {
         "tools_enabled": tools,
         "system_prompt": None::<String>,
         "llm_models": llm_models,
-        "llm_provider_ids": session.llm_provider_ids,
+        "llm_provider_ids": llm_provider_ids,
         "approval_config": approval,
         "max_loops": session.max_loops,
         "max_tokens": session.max_tokens,

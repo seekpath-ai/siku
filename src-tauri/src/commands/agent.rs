@@ -535,6 +535,17 @@ pub async fn agent_cancel(state: State<'_, AppState>, session_id: String) -> Res
     Ok(())
 }
 
+/// Whether a turn is currently running for the session. The frontend uses
+/// this to heal stale streaming flags: the agent:event listener lives inside
+/// ChatPanel, so terminal events fired while the chat route was unmounted
+/// are missed and the per-session streaming flag would otherwise stay true
+/// forever (a dead "stop" button with no token left to cancel).
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn agent_is_running(state: State<'_, AppState>, session_id: String) -> Result<bool, String> {
+    Ok(state.cancel_tokens.lock().await.contains_key(&session_id))
+}
+
 /// Rename a session (title only — avoids clobbering the agent config).
 #[tauri::command]
 #[instrument(skip(state))]

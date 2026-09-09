@@ -271,6 +271,13 @@ export async function agentCancel(sessionId: string): Promise<void> {
   return invoke<void>('agent_cancel', { sessionId });
 }
 
+/** Whether a turn is running for the session — used to heal stale
+ *  streaming/loading flags after terminal events were missed (the event
+ *  listener unmounts with the chat route). */
+export async function agentIsRunning(sessionId: string): Promise<boolean> {
+  return invoke<boolean>('agent_is_running', { sessionId });
+}
+
 /** Update only the session's approval config (chat-input quick switch). */
 export async function agentSetApprovalConfig(
   sessionId: string,

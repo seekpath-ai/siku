@@ -8,7 +8,7 @@ import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
 import { usePetContextStore } from '@/stores/petContextStore';
 import { useStreamingChat } from '@/hooks/useStreamingChat';
-import { getChatMessages, getAgentSteps, agentRenameSession, agentSetSessionModel } from '@/lib/tauri';
+import { getChatMessages, getAgentSteps, agentRenameSession, agentSetSessionModel, agentIsRunning } from '@/lib/tauri';
 
 export function ChatPanel() {
   useStreamingChat();
@@ -42,6 +42,19 @@ export function ChatPanel() {
 
     let cancelled = false;
     setLoadingMessages(true);
+
+    // Heal stale streaming/loading flags: the agent:event listener unmounts
+    // with the chat route, so a turn that finished while the user was on
+    // another module leaves streamingById stuck at true — with the cancel
+    // token long gone, the stop button becomes a no-op. Ask the backend.
+    agentIsRunning(activeSessionId)
+      .then((running) => {
+        if (cancelled || running) return;
+        const st = useChatStore.getState();
+        st.setSessionStreaming(activeSessionId, false);
+        st.setSessionLoading(activeSessionId, false);
+      })
+      .catch(() => {});
 
     Promise.all([
       getChatMessages(activeSessionId),

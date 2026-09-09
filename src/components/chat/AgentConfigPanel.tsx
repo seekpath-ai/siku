@@ -73,8 +73,14 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
         const hasCustom = (agent.llm_models?.length ?? 0) > 0;
         setUseCustomLlm(hasCustom);
         setCustomLlm(agent.llm_models?.[0] ?? defaultLlmBlock());
-        // If not custom, try to pick a provider. We don't store provider ids on AgentSession yet.
-        setSelectedProviderId(list.find((p) => p.is_default)?.id ?? list[0]?.id ?? '');
+        // If not custom, restore the provider this agent actually uses —
+        // llm_provider_ids IS stored on the session (falling back to the
+        // global default only for legacy sessions without one). Showing the
+        // default here regardless made every non-custom agent LOOK like it
+        // used the global default even after the user picked another model.
+        const stored = agent.llm_provider_ids?.[0];
+        const valid = stored && list.some((p) => p.id === stored) ? stored : undefined;
+        setSelectedProviderId(valid ?? list.find((p) => p.is_default)?.id ?? list[0]?.id ?? '');
       })
       .catch(() => {})
       .finally(() => setLoading(false));

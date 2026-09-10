@@ -33,7 +33,13 @@ pub struct OpenAiClient {
 
 impl OpenAiClient {
     pub fn new(config: LlmConfig) -> Result<Self, String> {
-        let mut builder = Client::builder().timeout(std::time::Duration::from_secs(120));
+        // No total timeout: it would kill long streaming generations mid-response
+        // (surfacing as "error decoding response body"). Time out on connect and
+        // on per-read stalls only, so generation may run as long as data flows.
+        let mut builder = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .read_timeout(std::time::Duration::from_secs(300))
+            .tcp_keepalive(std::time::Duration::from_secs(30));
 
         if let Some(ref proxy) = config.proxy {
             if !proxy.is_empty() {

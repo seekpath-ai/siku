@@ -12,7 +12,12 @@ pub struct OllamaClient {
 
 impl OllamaClient {
     pub fn new(config: LlmConfig) -> Result<Self, String> {
-        let builder = Client::builder().timeout(std::time::Duration::from_secs(300));
+        // No total timeout: see OpenAiClient::new — long local generations
+        // must not be cut off; time out on connect and per-read stalls only.
+        let builder = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .read_timeout(std::time::Duration::from_secs(300))
+            .tcp_keepalive(std::time::Duration::from_secs(30));
         let http = builder.build().map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
         Ok(Self { config, http })

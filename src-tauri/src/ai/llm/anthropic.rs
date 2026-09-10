@@ -12,7 +12,12 @@ pub struct AnthropicClient {
 
 impl AnthropicClient {
     pub fn new(config: LlmConfig) -> Result<Self, String> {
-        let mut builder = Client::builder().timeout(std::time::Duration::from_secs(120));
+        // No total timeout: see OpenAiClient::new — long streaming generations
+        // must not be cut off; time out on connect and per-read stalls only.
+        let mut builder = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .read_timeout(std::time::Duration::from_secs(300))
+            .tcp_keepalive(std::time::Duration::from_secs(30));
 
         if let Some(ref proxy) = config.proxy {
             if !proxy.is_empty() {

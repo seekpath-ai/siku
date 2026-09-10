@@ -456,9 +456,52 @@ fn strip_markdown(content: &str) -> String {
         .replace("[", "").replace("]", "").replace("(", "").replace(")", "")
 }
 
-/// Parse `#tags` from content. A tag is a `#` preceded by start-of-line or
-/// whitespace, followed by non-space/non-`#` characters. Fenced code blocks
-/// are skipped so `#tag` inside code is not collected.
+/// CJK punctuation that (like ASCII punctuation) both terminates a tag token
+/// and serves as a left boundary — `#阅读；#写作` must collect both tags.
+fn is_cjk_punct(c: char) -> bool {
+    matches!(
+        c,
+        '，' | '。' | '；' | '：' | '、' | '（' | '）' | '！' | '？' | '【' | '】' | '《' | '》'
+            | '“' | '”' | '‘' | '’' | '…' | '—'
+    )
+}
+
+/// A `#` starts a tag only at a word boundary: start-of-line, or after
+/// whitespace / punctuation (Twitter-style; Obsidian is stricter and requires
+/// whitespace, but CJK text commonly runs `#标签。` without spaces). `#` itself
+/// is excluded so the `##` heading marker never starts a tag.
+fn is_tag_boundary(c: char) -> bool {
+    c.is_whitespace() || (c != '#' && (c.is_ascii_punctuation() || is_cjk_punct(c)))
+}
+
+/// Characters that end a tag token. Punctuation terminates instead of being
+/// glued onto the token (`#tag。` collects `tag`), except `-`/`_`/`/` which
+/// are legal inside tags (kebab and nested tags like `#tag-1`, `#a/b`).
+fn is_tag_terminator(c: char) -> bool {
+    c.is_whitespace()
+        || c == '#'
+        || (c.is_ascii_punctuation() && !matches!(c, '-' | '_' | '/'))
+        || is_cjk_punct(c)
+}
+
+/// A `#token` only counts as a tag when it is unlikely to be something else:
+/// - it must contain at least one non-digit character (`#123` is not a tag —
+///   the Obsidian/Twitter rule);
+/// - it must not look like a hex color literal (`#RGB`/`#RGBA`/`#RRGGBB`/
+///   `#RRGGBBAA`), so color palettes in notes don't pollute the tag list.
+fn is_plausible_tag(token: &str) -> bool {
+    if !token.chars().any(|c| !c.is_ascii_digit()) {
+        return false;
+    }
+    let is_hex_color =
+        matches!(token.len(), 3 | 4 | 6 | 8) && token.bytes().all(|b| b.is_ascii_hexdigit());
+    !is_hex_color
+}
+
+/// Parse `#tags` from content. A tag is a `#` at a word boundary (see
+/// `is_tag_boundary`) followed by a plausible tag token (see
+/// `is_plausible_tag`). Fenced code blocks are skipped so `#tag` inside code
+/// is not collected.
 fn parse_tags(content: &str) -> String {
     let mut tags: Vec<String> = Vec::new();
     let mut in_code = false;
@@ -471,34 +514,28 @@ fn parse_tags(content: &str) -> String {
         if in_code {
             continue;
         }
-        // Scan for `#tag` at word boundaries.
-        let bytes = line.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'#' {
-                let preceded_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
-                let mut j = i + 1;
-                while j < bytes.len()
-                    && !bytes[j].is_ascii_whitespace()
-                    && bytes[j] != b'#'
-                    && bytes[j] != b'('
-                    && bytes[j] != b')'
-                    && bytes[j] != b','
-                    && bytes[j] != b']'
-                    && bytes[j] != b'['
-                {
-                    j += 1;
-                }
-                if preceded_ok && j > i + 1 {
-                    let tag = line[i + 1..j].to_string();
-                    if !tags.contains(&tag) {
-                        tags.push(tag);
-                    }
-                }
-                i = j;
-            } else {
-                i += 1;
+        // Scan for `#tag` at word boundaries (char_indices so multi-byte
+        // punctuation like `，` never splits a UTF-8 sequence).
+        let chars: Vec<(usize, char)> = line.char_indices().collect();
+        let mut k = 0;
+        while k < chars.len() {
+            if chars[k].1 != '#' {
+                k += 1;
+                continue;
             }
+            let preceded_ok = chars[k].0 == 0 || is_tag_boundary(chars[k - 1].1);
+            let mut m = k + 1;
+            while m < chars.len() && !is_tag_terminator(chars[m].1) {
+                m += 1;
+            }
+            let end = chars.get(m).map(|(b, _)| *b).unwrap_or(line.len());
+            if preceded_ok && m > k + 1 {
+                let tag = &line[chars[k].0 + 1..end];
+                if is_plausible_tag(tag) && !tags.iter().any(|t| t == tag) {
+                    tags.push(tag.to_string());
+                }
+            }
+            k = m.max(k + 1);
         }
     }
     serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string())
@@ -840,6 +877,42 @@ pub async fn merge_note_into_paper_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_tags_collects_word_boundary_tags() {
+        let content = "开头 #研究 中间\n正文#紧贴不算 #tag1,#tag2（#括号外）\n```\n#代码里的不算\n```";
+        let tags: Vec<String> = serde_json::from_str(&parse_tags(content)).unwrap();
+        assert_eq!(tags, vec!["研究", "tag1", "tag2", "括号外"]);
+    }
+
+    #[test]
+    fn parse_tags_rejects_pure_numeric() {
+        let content = "#123 不是标签 #2024计划 是标签";
+        let tags: Vec<String> = serde_json::from_str(&parse_tags(content)).unwrap();
+        assert_eq!(tags, vec!["2024计划"]);
+    }
+
+    #[test]
+    fn parse_tags_rejects_hex_colors() {
+        // 颜色表场景：整行十六进制颜色值一个都不该进标签列表。
+        let content = "| #4A90D9 | #C9E8F5 | #FFF | #FFB36B，浓度 |\n#E89AB8（暮光下） #8A9A5B, 0.9";
+        let tags: Vec<String> = serde_json::from_str(&parse_tags(content)).unwrap();
+        assert!(tags.is_empty(), "colors leaked into tags: {tags:?}");
+    }
+
+    #[test]
+    fn parse_tags_trailing_cjk_punctuation() {
+        let content = "#笔记方法。 #阅读；#写作：正文";
+        let tags: Vec<String> = serde_json::from_str(&parse_tags(content)).unwrap();
+        assert_eq!(tags, vec!["笔记方法", "阅读", "写作"]);
+    }
+
+    #[test]
+    fn parse_tags_keeps_kebab_and_nested_tags() {
+        let content = "#tag-1 #研究/阅读 #snake_case";
+        let tags: Vec<String> = serde_json::from_str(&parse_tags(content)).unwrap();
+        assert_eq!(tags, vec!["tag-1", "研究/阅读", "snake_case"]);
+    }
 
     #[test]
     fn parse_wiki_links_cjk() {

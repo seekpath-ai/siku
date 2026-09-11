@@ -1136,7 +1136,7 @@ pub async fn pet_create_session(
     state: State<'_, AppState>,
     domain: String,
     context: serde_json::Value,
-) -> Result<crate::core::models::ChatSession, String> {
+) -> Result<serde_json::Value, String> {
     if !crate::ai::agent::domain::is_enabled(&state.db, &domain).await {
         return Err(format!("domain agent not enabled: {domain}"));
     }
@@ -1210,7 +1210,11 @@ pub async fn pet_create_session(
             .fetch_one(&state.db)
             .await
             .map_err(|e| format!("db: {e}"))?;
-    Ok(session)
+    // Return the parsed projection, not the raw row: the row's llm_models /
+    // llm_provider_ids are JSON *strings*, and the frontend treats them as
+    // arrays — a fresh pet session's model badge otherwise rendered
+    // "undefined / undefined" until the next reload.
+    Ok(session_to_list_json(session))
 }
 
 /// Built-in pet domain agent info (used by the settings UI to show the

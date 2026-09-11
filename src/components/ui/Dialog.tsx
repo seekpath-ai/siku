@@ -56,7 +56,9 @@ export function Dialog() {
     );
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
+    // z above the floating pet panel (z-[4000]) and titlebar dropdowns
+    // (z-[5000]): a modal dialog must top everything else in the window.
+    <div className="fixed inset-0 z-[6000] flex items-center justify-center">
       <div
         className="absolute inset-0 bg-black/50 backdrop-blur-sm"
         onClick={() => close(type === 'alert' ? true : null)}

@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import type { AgentSession, AgentStep, ChatAttachment, ChatMessage, StreamingStep, ToolCallInfo } from '@/lib/types';
-import { petCreateSession, getChatMessages, getAgentSteps, agentGetSession, agentSendMessage, agentListSessions } from '@/lib/tauri';
+import { petCreateSession, getChatMessages, getAgentSteps, agentGetSession, agentSendMessage, agentListSessions, agentSetSessionModel, agentDeleteSession } from '@/lib/tauri';
 import type { PetContext } from './petContextStore';
 
 /** Map a page type to its built-in pet domain agent. */
@@ -69,6 +69,14 @@ interface PetState {
   setStreaming: (s: boolean) => void;
   setPendingApproval: (a: PetApproval | null) => void;
   setSession: (s: AgentSession | null) => void;
+  /** Switch the pet session to a global (provider-pool) model, next turn on
+   *  (same semantics as the chat header badge: any inline custom llm is
+   *  replaced by the pool reference). */
+  setSessionModel: (providerId: string) => Promise<void>;
+  /** Delete the current pet session entirely (messages, steps, memory —
+   *  agent_delete_session cascades) and reset local state; the next open in
+   *  the same context starts a fresh session. */
+  clearSession: () => Promise<void>;
   setError: (e: string | null) => void;
   // ── Streaming step machinery (mirrors chatStore) ──
   ensureStreamingStep: (stepIndex: number) => void;
@@ -199,6 +207,18 @@ export const usePetStore = create<PetState>((set, get) => ({
   setStreaming: (streaming) => set({ streaming }),
   setPendingApproval: (pendingApproval) => set({ pendingApproval }),
   setSession: (session) => set({ session }),
+  setSessionModel: async (providerId) => {
+    const { session } = get();
+    if (!session) return;
+    await agentSetSessionModel(session.id, [providerId], []);
+    set({ session: { ...session, llm_provider_ids: [providerId], llm_models: [] } });
+  },
+  clearSession: async () => {
+    const { session } = get();
+    if (!session) return;
+    await agentDeleteSession(session.id);
+    set({ ...initial });
+  },
   setError: (error) => set({ error }),
 
   // ── Streaming step machinery ──

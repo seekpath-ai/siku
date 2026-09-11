@@ -1,9 +1,12 @@
 import { useEffect, useState } from 'react';
 import { X, Bot } from 'lucide-react';
+import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { usePetStore } from '@/stores/petStore';
 import type { PetContext } from '@/stores/petContextStore';
 import { PetConversation, DOMAIN_ID_NAMES } from './PetConversation';
+import { PetSessionMenu } from './PetSessionMenu';
+import { Dialog } from '@/components/ui/Dialog';
 
 /** Standalone pet chat window ("pop the panel out of the main window").
  *  Reads the session id and display context from its URL
@@ -33,6 +36,18 @@ export function PetChatWindow() {
     usePetStore.getState().attach(sessionId);
   }, []);
 
+  // The session was cleared from another window: nothing left to show.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<string>('pet:session-cleared', (event) => {
+      const st = usePetStore.getState();
+      if (st.session?.id !== event.payload) return;
+      st.reset();
+      getCurrentWindow().close().catch(() => {});
+    }).then((u) => { unlisten = u; });
+    return () => unlisten?.();
+  }, []);
+
   return (
     <div className="h-screen w-screen rounded-xl overflow-hidden border border-surface-hover flex flex-col bg-background">
       {/* Mini title bar (drag + close) */}
@@ -48,6 +63,7 @@ export function PetChatWindow() {
             ? DOMAIN_ID_NAMES[store.session.domain ?? ''] || '智能助手'
             : '智能助手'}
         </span>
+        <PetSessionMenu onCleared={() => getCurrentWindow().close().catch(() => {})} />
         <button
           onClick={() => getCurrentWindow().close().catch(() => {})}
           className="w-8 h-8 flex items-center justify-center text-text-secondary hover:text-white hover:bg-red-500/80 transition-colors"
@@ -56,6 +72,10 @@ export function PetChatWindow() {
           <X size={16} strokeWidth={1.5} />
         </button>
       </div>
+
+      {/* Slim windows have no AppShell — mount the shared dialog host so the
+          session menu's confirm/alert dialogs render here too. */}
+      <Dialog />
 
       {paramError ? (
         <div className="flex-1 flex items-center justify-center text-xs text-red-400">

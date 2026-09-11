@@ -675,6 +675,29 @@ impl AgentEngine {
                         match llm::client::create_llm_client(&cfg) {
                             Ok(client) => {
                                 info!(old_cap = output_cap, new_cap = next, round, "retrying round with bumped max_tokens");
+                                // Keep the truncated round's reasoning as its
+                                // own step: it only ever streamed live, and
+                                // dropping it here made the whole first
+                                // thinking round vanish after stop/reload.
+                                if !round_reasoning.trim().is_empty() {
+                                    steps.push(AgentStep {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        session_id: sid.clone(),
+                                        message_id: None,
+                                        step_index,
+                                        reasoning_content: Some(round_reasoning.clone()),
+                                        tool_calls: None,
+                                        created_at: time::now_iso(),
+                                    });
+                                }
+                                // The retry is a brand-new completion (the API
+                                // cannot resume a truncated one and reasoning
+                                // must not be fed back), so give the model a
+                                // hint instead: otherwise it tends to re-burn
+                                // the enlarged budget on the same long think.
+                                messages.push(ChatMessage { role: "system".into(),
+                                    content: format!("Your previous reply exhausted the per-round output budget (max_tokens={output_cap}) during reasoning and produced no visible answer. The budget has been raised to {next}. Keep reasoning brief and produce the answer directly."),
+                                    attachments: None, tool_calls: None, tool_call_id: None, name: None });
                                 retry_llm = Some(client);
                                 output_cap = next;
                                 cap_bumps += 1;

@@ -1,5 +1,5 @@
 import { useState, type ReactElement, type ReactNode } from 'react';
-import { Check, Copy } from 'lucide-react';
+import { Check, Copy, WrapText } from 'lucide-react';
 
 interface CodeBlockProps {
   code: string;
@@ -58,6 +58,10 @@ function highlightCode(code: string): string {
 
 export function CodeBlock({ code, language = 'text', inline }: CodeBlockProps) {
   const [copied, setCopied] = useState(false);
+  // Long single-line code scrolls horizontally by default (indentation stays
+  // readable); the toggle wraps it instead — easier to read/copy in narrow
+  // panels. Per-block, matching GitHub's code view / VS Code Alt+Z.
+  const [wrapped, setWrapped] = useState(false);
 
   const handleCopy = async () => {
     try {
@@ -105,6 +109,17 @@ export function CodeBlock({ code, language = 'text', inline }: CodeBlockProps) {
       <div className="absolute top-1.5 right-2.5 z-10 flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity select-none">
         <span className="font-mono text-[10px] text-text-secondary">{language}</span>
         <button
+          onClick={() => setWrapped((w) => !w)}
+          title={wrapped ? '取消折行' : '自动折行'}
+          className={`flex items-center rounded px-1.5 py-0.5 border text-[10px] transition-colors ${
+            wrapped
+              ? 'border-primary/40 text-primary'
+              : 'border-white/15 text-text-secondary hover:text-text-primary hover:border-white/30'
+          }`}
+        >
+          <WrapText size={10} />
+        </button>
+        <button
           onClick={handleCopy}
           className="flex items-center gap-1 rounded px-1.5 py-0.5 border border-white/15 text-[10px] text-text-secondary hover:text-text-primary hover:border-white/30 transition-colors"
         >
@@ -112,8 +127,8 @@ export function CodeBlock({ code, language = 'text', inline }: CodeBlockProps) {
           {copied ? '已复制' : '复制'}
         </button>
       </div>
-      <div className="px-2.5 py-1.5 overflow-x-auto">
-        <pre className="font-mono text-[13px] leading-relaxed text-gray-200 whitespace-pre">
+      <div className={`px-2.5 py-1.5 ${wrapped ? '' : 'overflow-x-auto'}`}>
+        <pre className={`font-mono text-[13px] leading-relaxed text-gray-200 ${wrapped ? 'whitespace-pre-wrap [overflow-wrap:anywhere]' : 'whitespace-pre'}`}>
           <code dangerouslySetInnerHTML={{ __html: highlightCode(code) }} />
         </pre>
       </div>

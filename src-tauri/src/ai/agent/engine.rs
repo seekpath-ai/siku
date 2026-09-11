@@ -438,7 +438,11 @@ impl AgentEngine {
             }
             if max_loops > 0 && round >= max_loops {
                 let active_llm: &dyn LlmClient = retry_llm.as_deref().unwrap_or(&*self.llm);
-                messages.push(ChatMessage { role: "system".into(),
+                // Injected as `user`, not `system`: serving stacks render
+                // prompts through the model's chat template (e.g. Qwen's
+                // Jinja raises "System message must be at the beginning"),
+                // so a mid-conversation system message is a 500 there.
+                messages.push(ChatMessage { role: "user".into(),
                     content: "Max tool calls reached. Provide your final answer now based on gathered information.".into(),
                     attachments: None, tool_calls: None, tool_call_id: None, name: None });
                 let resp = match active_llm.chat_completion(&messages, &[]).await {
@@ -695,7 +699,11 @@ impl AgentEngine {
                                 // must not be fed back), so give the model a
                                 // hint instead: otherwise it tends to re-burn
                                 // the enlarged budget on the same long think.
-                                messages.push(ChatMessage { role: "system".into(),
+                                // Sent as `user` — a mid-conversation `system`
+                                // message breaks chat templates that require
+                                // the system message first (Qwen: 500 Jinja
+                                // "System message must be at the beginning").
+                                messages.push(ChatMessage { role: "user".into(),
                                     content: format!("Your previous reply exhausted the per-round output budget (max_tokens={output_cap}) during reasoning and produced no visible answer. The budget has been raised to {next}. Keep reasoning brief and produce the answer directly."),
                                     attachments: None, tool_calls: None, tool_call_id: None, name: None });
                                 retry_llm = Some(client);

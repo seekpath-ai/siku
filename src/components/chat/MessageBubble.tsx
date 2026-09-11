@@ -78,7 +78,7 @@ function UserText({ content }: { content: string }) {
   const [expanded, setExpanded] = useState(false);
 
   if (blocks.length === 0) {
-    return <p className="whitespace-pre-wrap">{content}</p>;
+    return <p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{content}</p>;
   }
   return (
     <>
@@ -217,7 +217,7 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
             )}
           </>
         ) : (
-          <div className="prose prose-sm prose-invert max-w-none [&>*:first-child]:mt-0">
+          <div className="prose prose-sm prose-invert max-w-none [&>*:first-child]:mt-0 [overflow-wrap:anywhere]">
             <ReactMarkdown
               remarkPlugins={[remarkGfm, remarkMath]}
               rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}

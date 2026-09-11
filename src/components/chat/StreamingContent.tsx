@@ -11,7 +11,7 @@ interface Props {
 
 export function StreamingContent({ content }: Props) {
   return (
-    <div className="prose prose-sm prose-invert max-w-none [&>*:first-child]:mt-0">
+    <div className="prose prose-sm prose-invert max-w-none [&>*:first-child]:mt-0 [overflow-wrap:anywhere]">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}

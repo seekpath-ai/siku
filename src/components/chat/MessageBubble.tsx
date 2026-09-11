@@ -13,6 +13,7 @@ import { ToolCallCard } from './ToolCallCard';
 import { ReasoningProcessCard } from './ReasoningProcessCard';
 import { ReasoningBlock } from './ReasoningBlock';
 import { ExternalLink } from '@/components/ui/ExternalLink';
+import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
 
 interface Props {
   message: ChatMessage;
@@ -115,6 +116,14 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
   const hasLegacyReasoning = !!message.reasoning_content;
   const hasLegacyToolCalls = toolCalls.length > 0;
   const hasSteps = agentSteps.length > 0;
+
+  // LLMs commonly emit \(...\) / \[...\] math; remark-math only reads $..$.
+  // Normalize before render (code spans/blocks are left intact). Hook stays
+  // above the early return below.
+  const normalizedContent = useMemo(
+    () => (isUser ? message.content : normalizeMathDelimiters(message.content)),
+    [isUser, message.content]
+  );
 
   if (isSystem || isTool) return null;
 
@@ -227,7 +236,7 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
                 pre: MarkdownPre,
               }}
             >
-              {message.content}
+              {normalizedContent}
             </ReactMarkdown>
           </div>
         )}

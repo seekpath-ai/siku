@@ -11,6 +11,7 @@ import { MarkdownCode, MarkdownPre } from '@/components/chat/CodeBlock';
 import { open } from '@tauri-apps/plugin-shell';
 import { resolveImageUrl } from '@/lib/imageCache';
 import { parseReaderUrl } from '@/lib/evidence';
+import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
 import { useEvidenceStore } from '@/stores/evidenceStore';
 import type { Note } from '@/lib/types';
 
@@ -199,7 +200,8 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
       }
       return `[${display}](note://${targetId})`;
     });
-    return text;
+    // 3. LLM-style math delimiters \(...\) / \[...\] → remark-math's $..$.
+    return normalizeMathDelimiters(text);
   }, [content, notes]);
 
   const LinkComponent = useCallback(

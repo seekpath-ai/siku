@@ -75,7 +75,11 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": []
+    "resources": {
+      "bin/pdfium.dll": "pdfium.dll",
+      "bin/libpdfium.so": "libpdfium.so",
+      "bin/PDFIUM-LICENSE.txt": "PDFIUM-LICENSE.txt"
+    }
   },
   "plugins": {
     "shell": {

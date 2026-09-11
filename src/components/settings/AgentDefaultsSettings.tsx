@@ -110,7 +110,7 @@ export function AgentDefaultsSettings() {
 
       <div className="grid grid-cols-3 gap-4">
         <div className="space-y-2">
-          <label className="block text-sm text-text-secondary">最大轮次</label>
+          <label className="block text-sm text-text-secondary">最大推理轮次</label>
           <input
             type="number"
             value={maxLoops}

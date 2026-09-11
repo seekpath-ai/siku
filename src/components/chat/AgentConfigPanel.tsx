@@ -317,7 +317,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
 
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 border-t border-codex-border pt-3">
             <div className="space-y-1">
-              <label className="text-xs text-codex-muted">最大轮次</label>
+              <label className="text-xs text-codex-muted">最大推理轮次</label>
               <input
                 type="number"
                 value={maxLoops}
@@ -326,7 +326,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
               />
             </div>
             <div className="space-y-1">
-              <label className="text-xs text-codex-muted">单轮输出上限</label>
+              <label className="text-xs text-codex-muted">单轮词元输出上限</label>
               <input
                 type="number"
                 value={maxTokens}

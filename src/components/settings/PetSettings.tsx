@@ -106,7 +106,7 @@ export function PetSettings() {
       <div>
         <h2 className="text-base font-semibold text-text-primary">宠物智能体</h2>
         <p className="text-xs text-text-secondary/60 mt-1">
-          全局宠物球在不同页面唤起对应的内置智能体。可在此控制各智能体是否启用，或自定义其提示词与单轮输出上限（留空使用默认）。
+          全局宠物球在不同页面唤起对应的内置智能体。可在此控制各智能体是否启用，或自定义其提示词与单轮词元输出上限（留空使用默认）。
         </p>
       </div>
 
@@ -140,7 +140,7 @@ export function PetSettings() {
             {st.enabled && (
               <div className="px-4 pb-4">
                 <div className="flex items-center gap-2 mb-2">
-                  <label className="text-xs text-text-secondary/70 shrink-0">单轮输出上限</label>
+                  <label className="text-xs text-text-secondary/70 shrink-0">单轮词元输出上限</label>
                   <input
                     type="number"
                     value={st.maxTokens}

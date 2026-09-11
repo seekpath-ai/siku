@@ -228,6 +228,9 @@ export async function petCreateSession(domain: string, context: Record<string, u
 /** System-prompt snapshot stored for a user message's turn (本地表，不同步). */
 export interface TurnContext {
   system_prompt: string;
+  /** JSON array of the exact history records sent with the turn
+   *  ([{role, content, time}]); null for snapshots predating the column. */
+  history: string | null;
   created_at: string;
 }
 

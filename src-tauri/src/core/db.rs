@@ -787,11 +787,15 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
             session_id TEXT NOT NULL,
             message_id TEXT NOT NULL,
             system_prompt TEXT NOT NULL,
+            history TEXT,
             created_at TEXT NOT NULL
         )"
     )
     .execute(&db)
     .await?;
+    // Existing DBs: the history column (the exact memory records sent with the
+    // turn) was added after the table first shipped.
+    add_column_if_missing(&db, "turn_contexts", "history", "TEXT").await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_turn_contexts_message ON turn_contexts(message_id)"
     )

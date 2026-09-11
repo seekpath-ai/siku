@@ -811,6 +811,8 @@ pub(crate) async fn run_agent_turn(
     // messages; intermediate tool calls / tool results live in the DB (agent_steps).
     let history_records = memory.load_recent(config.effective_max_memory_rounds());
     info!(session_id=%session_id, records=%history_records.len(), "loading agent history from memory");
+    // Parallel timestamps for the turn-context snapshot (ChatMessage drops them).
+    let history_times: Vec<String> = history_records.iter().map(|r| r.time.to_rfc3339()).collect();
     let mut history: Vec<ChatMessage> = history_records
         .into_iter()
         .map(|r| ChatMessage {
@@ -923,7 +925,7 @@ pub(crate) async fn run_agent_turn(
         let _turn_guard = turn_guard;
         let engine_ref = Arc::new(engine);
         let result = engine_ref
-            .process_message(&content, attachments_json.as_deref(), &history, event_tx, &mut approval_rx, &mut ask_rx, &user_message_id)
+            .process_message(&content, attachments_json.as_deref(), &history, event_tx, &mut approval_rx, &mut ask_rx, &user_message_id, &history_times)
             .await;
 
         // Only remove registrations that belong to this turn. The turn guard
@@ -1418,15 +1420,16 @@ pub async fn agent_get_turn_context(
     state: State<'_, AppState>,
     message_id: String,
 ) -> Result<Option<serde_json::Value>, String> {
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT system_prompt, created_at FROM turn_contexts WHERE message_id = ? ORDER BY created_at DESC LIMIT 1"
+    let row: Option<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT system_prompt, history, created_at FROM turn_contexts WHERE message_id = ? ORDER BY created_at DESC LIMIT 1"
     )
     .bind(&message_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| format!("db: {e}"))?;
-    Ok(row.map(|(system_prompt, created_at)| serde_json::json!({
+    Ok(row.map(|(system_prompt, history, created_at)| serde_json::json!({
         "system_prompt": system_prompt,
+        "history": history,
         "created_at": created_at,
     })))
 }

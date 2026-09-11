@@ -351,6 +351,9 @@ impl AgentEngine {
         approval_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ApprovalResponse>,
         ask_rx: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
         user_message_id: &str,
+        // RFC3339 timestamps parallel to `history` (memory records carry
+        // them; ChatMessage does not). Used only for the context snapshot.
+        history_times: &[String],
     ) -> Result<(String, Vec<AgentStep>, bool, crate::ai::llm::LlmUsage, Option<String>), String> {
         let span = info_span!("agent_turn", session_id = %self.session_id);
         let _guard = span.enter();
@@ -386,23 +389,50 @@ impl AgentEngine {
         messages.extend(history.iter().cloned());
         messages.push(ChatMessage { role: "user".into(), content: user_message.to_string(), attachments: attachments.map(|s| s.to_string()), tool_calls: None, tool_call_id: None, name: None });
 
-        // Snapshot the assembled system prompt for the "查看本轮上下文"
+        // Snapshot what this turn actually starts with — the assembled system
+        // prompt AND the history as loaded from memory (post max_memory_rounds
+        // selection, post attachment stripping) — for the "查看本轮上下文"
         // viewer (local turn_contexts table, never synced). Capped: the
-        // long-term memory block can make it very large.
-        if let Some(sys) = messages.first().filter(|m| m.role == "system") {
+        // long-term memory block / long history entries can be very large.
+        {
             const MAX_SNAPSHOT_CHARS: usize = 50_000;
-            let mut snap = sys.content.clone();
+            const MAX_HISTORY_ENTRY_CHARS: usize = 5_000;
+            let mut snap = messages
+                .first()
+                .filter(|m| m.role == "system")
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
             if snap.chars().count() > MAX_SNAPSHOT_CHARS {
                 snap = snap.chars().take(MAX_SNAPSHOT_CHARS).collect();
                 snap.push_str("\n\n…（快照过长，已截断）");
             }
+            let history_json = serde_json::to_string(
+                &history
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        let mut content = m.content.clone();
+                        if content.chars().count() > MAX_HISTORY_ENTRY_CHARS {
+                            content = content.chars().take(MAX_HISTORY_ENTRY_CHARS).collect();
+                            content.push_str("\n…（条目过长，已截断）");
+                        }
+                        serde_json::json!({
+                            "role": m.role,
+                            "content": content,
+                            "time": history_times.get(i),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            )
+            .unwrap_or_else(|_| "[]".into());
             let _ = sqlx::query(
-                "INSERT INTO turn_contexts (id, session_id, message_id, system_prompt, created_at) VALUES (?, ?, ?, ?, ?)"
+                "INSERT INTO turn_contexts (id, session_id, message_id, system_prompt, history, created_at) VALUES (?, ?, ?, ?, ?, ?)"
             )
             .bind(uuid::Uuid::new_v4().to_string())
             .bind(&sid)
             .bind(user_message_id)
             .bind(&snap)
+            .bind(&history_json)
             .bind(time::now_iso())
             .execute(&self.db)
             .await;

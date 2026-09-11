@@ -684,6 +684,7 @@ pub fn run() {
             commands::library::preview_paper_from_link,
             commands::library::import_paper_from_link,
             commands::library::paper_reprocess_index,
+            commands::library::paper_get_paragraphs,
             commands::library::paper_enrich_metadata,
             // Collections
             commands::collections::collections_list,

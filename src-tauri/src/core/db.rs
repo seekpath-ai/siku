@@ -796,6 +796,19 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // Existing DBs: the history column (the exact memory records sent with the
     // turn) was added after the table first shipped.
     add_column_if_missing(&db, "turn_contexts", "history", "TEXT").await?;
+
+    // Per-paper anchored paragraphs (page + bbox + text) for the reader's
+    // dual-pane view. Device-local derived data: recomputed from the PDF on
+    // demand, so no sync weight.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS paper_paragraphs (
+            paper_id TEXT PRIMARY KEY NOT NULL,
+            paragraphs TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )"
+    )
+    .execute(&db)
+    .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_turn_contexts_message ON turn_contexts(message_id)"
     )

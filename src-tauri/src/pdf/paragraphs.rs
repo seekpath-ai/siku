@@ -40,44 +40,58 @@ fn median(mut v: Vec<f32>) -> f32 {
     v[(v.len() - 1) / 2]
 }
 
-/// Detect a column gutter: the x position in the page's middle band that the
-/// fewest lines cross. Full-width elements (title, author block, abstract
-/// heading on a paper's first page) cross every x, so instead of requiring an
-/// empty band we accept the minimum when it is small relative to the page's
-/// line count. Returns None when the columns would be badly unbalanced
-/// (single-column page with a figure gap).
+/// Detect a column gutter by measuring the empty vertical band between the
+/// columns: only "narrow" lines (< 55% page width) take part, so full-width
+/// titles / figures / captions can't poison the detection. The gutter is the
+/// band midpoint that maximizes (right column's left edge − left column's
+/// right edge). Returns None when no real empty band exists or the columns
+/// would be badly unbalanced (single-column page with a figure gap).
 fn find_gutter(lines: &[GeoLine], page_width: f32, body_font: f32) -> Option<f32> {
+    let narrow: Vec<&GeoLine> = lines
+        .iter()
+        .filter(|l| l.x_end - l.x_start < page_width * 0.55)
+        .collect();
+    if narrow.len() < 8 {
+        return None;
+    }
     let band_start = page_width * 0.35;
     let band_end = page_width * 0.65;
-    let steps = 30;
-    let mut best: Option<(f32, usize)> = None;
+    let steps = 40;
+    let mut best: Option<(f32, f32)> = None; // (x, empty band width)
     for i in 0..=steps {
         let x = band_start + (band_end - band_start) * i as f32 / steps as f32;
-        let crossings = lines
+        let left_edge = narrow
             .iter()
-            .filter(|l| l.x_start < x - body_font * 0.5 && l.x_end > x + body_font * 0.5)
-            .count();
-        // Prefer fewer crossings, then closeness to the page center.
-        let center_dist = ((page_width / 2.0 - x).abs() * 10.0) as usize;
-        let score = crossings * 1000 + center_dist;
-        if best.map(|(_, s)| score < s).unwrap_or(true) {
+            .filter(|l| l.x_end < x)
+            .map(|l| l.x_end)
+            .fold(0.0f32, f32::max);
+        let right_edge = narrow
+            .iter()
+            .filter(|l| l.x_start > x)
+            .map(|l| l.x_start)
+            .fold(f32::MAX, f32::min);
+        if right_edge == f32::MAX || left_edge == 0.0 {
+            continue;
+        }
+        let band = right_edge - left_edge;
+        // A real gutter is at least ~half a font of empty space.
+        if band < body_font * 0.5 {
+            continue;
+        }
+        // Prefer the widest empty band; ties go to the x nearest the center.
+        let center_penalty = (page_width / 2.0 - x).abs() * 0.001;
+        let score = band - center_penalty;
+        if best.map(|(_, s)| score > s).unwrap_or(true) {
             best = Some((x, score));
         }
     }
-    let (x, score) = best?;
-    let crossings = score / 1000;
-    if crossings > usize::max(2, lines.len() / 20) {
-        return None;
-    }
-    // Two columns must each hold a decent share of the non-crossing lines,
-    // otherwise this is a single-column page with a gap (figure, table).
-    let body: Vec<&GeoLine> = lines
-        .iter()
-        .filter(|l| !(l.x_start < x && l.x_end > x))
-        .collect();
-    let left = body.iter().filter(|l| (l.x_start + l.x_end) / 2.0 < x).count();
-    let right = body.len() - left;
-    if left >= 4 && right >= 4 && left * 4 >= body.len() && right * 4 >= body.len() {
+    let (x, _) = best?;
+    // Balance check on non-crossing narrow lines: each column must hold a
+    // decent share (a lone figure on one side is not a column).
+    let left = narrow.iter().filter(|l| l.x_end < x).count();
+    let right = narrow.iter().filter(|l| l.x_start > x).count();
+    let base = left + right;
+    if left >= 4 && right >= 4 && left * 4 >= base && right * 4 >= base {
         Some(x)
     } else {
         None
@@ -117,6 +131,10 @@ fn reading_order(lines: Vec<GeoLine>, gutter: Option<f32>) -> Vec<GeoLine> {
 
 /// Join two consecutive lines of the same paragraph: hyphenation for Latin,
 /// no space across CJK boundaries, a single space otherwise.
+pub fn join_lines_pub(prev: &str, next: &str) -> String {
+    join_lines(prev, next)
+}
+
 fn join_lines(prev: &str, next: &str) -> String {
     let prev_trim = prev.trim_end();
     let next_trim = next.trim_start();
@@ -143,8 +161,18 @@ fn join_lines(prev: &str, next: &str) -> String {
     }
 }
 
-/// Rebuild paragraph text (paragraphs joined by "\n\n") from geometric lines.
-pub fn lines_to_text(lines: Vec<GeoLine>, page_width: f32, page_height: f32) -> String {
+/// Group geometric lines into paragraphs. Each returned paragraph is its
+/// lines in reading order — callers that only need text use
+/// `lines_to_text`, callers anchoring paragraphs to the page (dual-pane
+/// view) use the geometry directly. `gutter_hint` is a page-level column
+/// gutter precomputed from the char histogram (see `page_to_lines`); when
+/// absent, the line-geometry detector `find_gutter` is used.
+pub fn paragraphize(
+    lines: Vec<GeoLine>,
+    page_width: f32,
+    page_height: f32,
+    gutter_hint: Option<f32>,
+) -> Vec<Vec<GeoLine>> {
     // Drop running heads / page numbers in the top and bottom margins.
     let lines: Vec<GeoLine> = lines
         .into_iter()
@@ -155,11 +183,11 @@ pub fn lines_to_text(lines: Vec<GeoLine>, page_width: f32, page_height: f32) -> 
         })
         .collect();
     if lines.is_empty() {
-        return String::new();
+        return Vec::new();
     }
 
     let body_font = median(lines.iter().map(|l| l.font_size).collect());
-    let gutter = find_gutter(&lines, page_width, body_font);
+    let gutter = gutter_hint.or_else(|| find_gutter(&lines, page_width, body_font));
     let ordered = reading_order(lines, gutter);
 
     // Column edges, for indent / short-line tests.
@@ -215,8 +243,8 @@ pub fn lines_to_text(lines: Vec<GeoLine>, page_width: f32, page_height: f32) -> 
     }
     let pitch = median(pitch_samples).max(body_font * 1.1);
 
-    let mut paragraphs: Vec<String> = Vec::new();
-    let mut current = String::new();
+    let mut paragraphs: Vec<Vec<GeoLine>> = Vec::new();
+    let mut current: Vec<GeoLine> = Vec::new();
     let mut prev: Option<&GeoLine> = None;
     for line in &ordered {
         let is_heading = line.font_size > body_font * 1.15 && line.text.trim().chars().count() < 120;
@@ -242,20 +270,37 @@ pub fn lines_to_text(lines: Vec<GeoLine>, page_width: f32, page_height: f32) -> 
             }
         }
         if new_para {
-            if !current.trim().is_empty() {
-                paragraphs.push(current.trim().to_string());
+            if !current.is_empty() {
+                paragraphs.push(std::mem::take(&mut current));
             }
-            current = line.text.clone();
-        } else {
-            current = join_lines(&current, &line.text);
         }
+        current.push(line.clone());
         prev = Some(line);
     }
-    if !current.trim().is_empty() {
-        paragraphs.push(current.trim().to_string());
+    if !current.is_empty() {
+        paragraphs.push(current);
     }
 
-    paragraphs.join("\n\n")
+    paragraphs
+}
+
+/// Rebuild paragraph text (paragraphs joined by "\n\n") from geometric lines.
+pub fn lines_to_text(
+    lines: Vec<GeoLine>,
+    page_width: f32,
+    page_height: f32,
+    gutter_hint: Option<f32>,
+) -> String {
+    paragraphize(lines, page_width, page_height, gutter_hint)
+        .iter()
+        .map(|para| {
+            para.iter()
+                .map(|l| l.text.as_str())
+                .fold(String::new(), |acc, l| join_lines(&acc, l))
+        })
+        .filter(|p| !p.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Extract a page's geometric lines from its pdfium text page. Space glyphs
@@ -263,10 +308,13 @@ pub fn lines_to_text(lines: Vec<GeoLine>, page_width: f32, page_height: f32) -> 
 ///
 /// Baseline clustering alone would merge same-y text from DIFFERENT columns
 /// into one line, so each cluster is then split at large internal x-gaps —
-/// every returned line belongs to exactly one column.
+/// every returned line belongs to exactly one column. Returns the lines plus
+/// a page-level column gutter when the char histogram shows one (used to
+/// force splits across narrow gutters that per-line thresholds miss).
 pub fn page_to_lines(
     text_page: &pdfium_render::prelude::PdfPageText,
-) -> Vec<GeoLine> {
+    page_width: f32,
+) -> (Vec<GeoLine>, Option<f32>) {
     let mut chars: Vec<(f32, f32, f32, f32, char)> = Vec::new(); // x, y, right, font, ch
     for ch in text_page.chars().iter() {
         let Some(c) = ch.unicode_char() else { continue };
@@ -284,8 +332,14 @@ pub fn page_to_lines(
         chars.push((x, y, right, font, c));
     }
     if chars.is_empty() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
+
+    // Page-level gutter from the char x-histogram: a true column gutter is a
+    // near-empty vertical band along the WHOLE page height, so it stands out
+    // even when full-width lines (abstract, title) cross it. Per-line gap
+    // thresholds can't reliably catch narrow (IEEE ~1.2 font) gutters.
+    let gutter = detect_gutter_chars(&chars, page_width);
 
     // Cluster into baseline groups (y desc, x asc within a group).
     chars.sort_by(|a, b| {
@@ -306,7 +360,7 @@ pub fn page_to_lines(
         let same_line = !group.is_empty() && (y - group_y).abs() <= tol;
         if !same_line {
             if !group.is_empty() {
-                lines.extend(split_line_segments(&group, group_y));
+                lines.extend(split_line_segments(&group, group_y, gutter));
             }
             group.clear();
             group_y = y;
@@ -316,26 +370,86 @@ pub fn page_to_lines(
         group.push((x, right, font, c));
     }
     if !group.is_empty() {
-        lines.extend(split_line_segments(&group, group_y));
+        lines.extend(split_line_segments(&group, group_y, gutter));
     }
-    lines
+    (lines, gutter)
 }
 
-/// Split a baseline cluster at large internal x-gaps (> 1.5 fonts — column
-/// gutters and layout separators, far wider than any word gap). `chars` are
-/// (x, right, font, char); they are re-sorted by x here because clustering is
-/// y-tolerant and two columns with slightly different baselines arrive
-/// out of x order.
+/// Page-level column gutter from the char x-histogram: the middle-band
+/// position with the fewest characters along the full page height, requiring
+/// it to be near-empty AND both sides to hold a decent share of the text.
+fn detect_gutter_chars(chars: &[(f32, f32, f32, f32, char)], page_width: f32) -> Option<f32> {
+    const BUCKET: f32 = 4.0;
+    let buckets = (page_width / BUCKET).ceil() as usize + 1;
+    let mut hist = vec![0usize; buckets];
+    let mut non_space = 0usize;
+    for &(x, _, _, _, c) in chars {
+        if c.is_whitespace() {
+            continue;
+        }
+        non_space += 1;
+        let b = ((x / BUCKET) as usize).min(buckets - 1);
+        hist[b] += 1;
+    }
+    if non_space < 200 {
+        return None; // too little text to speak of columns
+    }
+    let mut best: Option<(f32, usize)> = None;
+    let mut x = page_width * 0.35;
+    while x <= page_width * 0.65 {
+        let b = ((x / BUCKET) as usize).min(buckets - 1);
+        let count = hist[b];
+        if best.map(|(_, c)| count < c).unwrap_or(true) {
+            best = Some((x, count));
+        }
+        x += BUCKET;
+    }
+    let (x, count) = best?;
+    // Near-empty band: crossing full-width lines (abstract/title) still leave
+    // it far below the column-text density.
+    if count > usize::max(4, non_space / 100) {
+        return None;
+    }
+    let left_mass: usize = hist[..((x / BUCKET) as usize)].iter().sum();
+    let right_mass: usize = hist[((x / BUCKET) as usize) + 1..].iter().sum();
+    if left_mass * 3 < non_space || right_mass * 3 < non_space {
+        return None; // badly unbalanced — not columns
+    }
+    Some(x)
+}
+
+/// Split a baseline cluster at large internal x-gaps (column gutters and
+/// layout separators). `chars` are (x, right, font, char); they are re-sorted
+/// by x here because clustering is y-tolerant and two columns with slightly
+/// different baselines arrive out of x order.
+///
+/// The split threshold is relative, not fixed: IEEE-style papers pack columns
+/// with a gutter as narrow as ~1.2 fonts, while justified text can stretch
+/// word gaps to ~0.6 fonts. A gutter is an extreme outlier among the line's
+/// gaps, so split where the gap exceeds both 0.8×font and 3× the line's
+/// median gap.
 fn split_line_segments(
     chars: &[(f32, f32, f32, char)],
     baseline_y: f32,
+    page_gutter: Option<f32>,
 ) -> Vec<GeoLine> {
     let mut chars = chars.to_vec();
     chars.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     // Font for the gap threshold: median of non-degenerate sizes only
     // (pdfium reports font=1.0 for some space glyphs).
     let real_fonts: Vec<f32> = chars.iter().map(|c| c.2).filter(|&f| f >= 2.0).collect();
-    let gap_threshold = (median(real_fonts).max(2.0)) * 1.5;
+    let median_font = median(real_fonts).max(2.0);
+    // Median internal gap (word spacing) — a layout separator must stand out
+    // from it. A page-level gutter (when detected) forces splits regardless.
+    let mut gaps: Vec<f32> = Vec::new();
+    for w in chars.windows(2) {
+        let g = w[1].0 - w[0].1;
+        if g > 0.1 {
+            gaps.push(g);
+        }
+    }
+    let median_gap = median(gaps);
+    let gap_threshold = (median_font * 0.8).max(median_gap * 3.0).max(median_font * 0.22);
     let mut out: Vec<GeoLine> = Vec::new();
     let mut text = String::new();
     let mut x_start = 0.0f32;
@@ -362,7 +476,10 @@ fn split_line_segments(
 
     for &(x, right, font, c) in chars.iter() {
         if let Some(pr) = prev_right {
-            if x - pr > gap_threshold {
+            let crosses_gutter = page_gutter
+                .map(|g| pr < g && x > g)
+                .unwrap_or(false);
+            if crosses_gutter || x - pr > gap_threshold {
                 flush!();
             }
         }
@@ -416,7 +533,7 @@ mod tests {
             line("second line continues.", 60.0, 300.0, 688.0, 10.0),
             line("Second paragraph starts.", 60.0, 300.0, 668.0, 10.0), // 20pt gap vs 12pt pitch
         ];
-        let text = lines_to_text(lines, W, H);
+        let text = lines_to_text(lines, W, H, None);
         assert_eq!(
             text,
             "First paragraph line one. second line continues.\n\nSecond paragraph starts."
@@ -429,7 +546,7 @@ mod tests {
             line("A full first line of a paragraph that ends here.", 60.0, 540.0, 700.0, 10.0),
             line("New paragraph is indented.", 75.0, 300.0, 688.0, 10.0),
         ];
-        let text = lines_to_text(lines, W, H);
+        let text = lines_to_text(lines, W, H, None);
         assert!(text.contains("\n\nNew paragraph is indented."));
     }
 
@@ -446,7 +563,7 @@ mod tests {
             line("left four", 60.0, 250.0, 664.0, 10.0),
             line("right four", 340.0, 540.0, 664.0, 10.0),
         ];
-        let text = lines_to_text(lines, W, H);
+        let text = lines_to_text(lines, W, H, None);
         let li = text.find("left one").unwrap();
         let ri = text.find("right one").unwrap();
         assert!(li < ri, "left column must come first: {text:?}");
@@ -461,7 +578,7 @@ mod tests {
             line("1. Introduction", 60.0, 200.0, 680.0, 16.0),
             line("Body text after.", 60.0, 300.0, 664.0, 10.0),
         ];
-        let text = lines_to_text(lines, W, H);
+        let text = lines_to_text(lines, W, H, None);
         assert!(text.contains("\n\n1. Introduction\n\n"), "{text:?}");
     }
 
@@ -474,6 +591,7 @@ mod tests {
             ],
             W,
             H,
+            None,
         );
         assert_eq!(hyph, "dependencies continue");
 
@@ -484,8 +602,27 @@ mod tests {
             ],
             W,
             H,
+            None,
         );
         assert_eq!(cjk, "这是一段中文的第二行内容");
+    }
+
+    #[test]
+    fn full_width_title_does_not_break_two_columns() {
+        // A wide title/caption line must not defeat gutter detection (the
+        // demo2 failure mode: first-page figure spans both columns).
+        let mut lines = vec![line(
+            "A Very Long Full-Width Paper Title Spanning Most of the Page",
+            80.0, 520.0, 720.0, 16.0,
+        )];
+        for i in 0..5 {
+            lines.push(line("left column text", 60.0, 260.0, 680.0 - i as f32 * 12.0, 10.0));
+            lines.push(line("right column text", 340.0, 540.0, 680.0 - i as f32 * 12.0, 10.0));
+        }
+        let text = lines_to_text(lines, W, H, None);
+        let li = text.find("left column").unwrap();
+        let ri = text.find("right column").unwrap();
+        assert!(li < ri, "columns must not interleave: {text:?}");
     }
 
     #[test]
@@ -495,7 +632,7 @@ mod tests {
             line("42", 290.0, 310.0, 20.0, 9.0),                 // page number
             line("Real body text.", 60.0, 300.0, 700.0, 10.0),
         ];
-        let text = lines_to_text(lines, W, H);
+        let text = lines_to_text(lines, W, H, None);
         assert_eq!(text, "Real body text.");
     }
 }

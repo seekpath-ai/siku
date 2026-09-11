@@ -220,6 +220,19 @@ export async function agentSetSessionModel(
   return invoke<void>('agent_set_session_model', { sessionId, llmProviderIds, llmModels });
 }
 
+/** Anchored paragraph from the dual-pane extraction (bbox 为 PDF 点坐标，y 自下而上). */
+export interface PaperParagraph {
+  page: number;
+  /** [x0, y0(bottom), x1, y1(top)] PDF points; null = 仅页级锚定。 */
+  bbox: [number, number, number, number] | null;
+  text: string;
+}
+
+/** Anchored paragraphs for the reader's dual-pane view (懒计算+本地缓存). */
+export async function paperGetParagraphs(id: string): Promise<PaperParagraph[]> {
+  return invoke<PaperParagraph[]>('paper_get_paragraphs', { id });
+}
+
 /** Create a pet (built-in domain agent) session bound to the current context. */
 export async function petCreateSession(domain: string, context: Record<string, unknown>): Promise<AgentSession> {
   return invoke<AgentSession>('pet_create_session', { domain, context });

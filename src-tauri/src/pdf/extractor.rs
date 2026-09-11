@@ -9,6 +9,85 @@ pub struct PageText {
     pub text: String,
 }
 
+/// One paragraph anchored to its page region — the dual-pane (PDF ↔
+/// Markdown) view renders these and hit-tests clicks against `bbox`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AnchoredParagraph {
+    pub page: u16,
+    /// [x0, y0(bottom), x1, y1(top)] in PDF points (y grows upward from the
+    /// bottom-left page corner). None when geometry was unavailable (lopdf
+    /// fallback) — the anchor then degrades to page level.
+    pub bbox: Option<[f32; 4]>,
+    pub text: String,
+}
+
+/// Extract anchored paragraphs for the dual-pane view. Geometry comes from
+/// pdfium; without it the lopdf fallback yields page-level paragraphs
+/// (bbox = None).
+pub fn extract_paragraphs(path: &Path) -> Result<Vec<AnchoredParagraph>> {
+    if let Ok(pdfium) = crate::pdf::bindings::pdfium() {
+        let doc = pdfium
+            .load_pdf_from_file(path, None)
+            .map_err(|e| SikuError::PdfParse(format!("failed to load PDF: {e}")))?;
+        let pages = doc.pages();
+        let mut out = Vec::new();
+        for (index, page) in pages.iter().enumerate() {
+            let Ok(text_page) = page.text() else { continue };
+            let (lines, gutter) =
+                crate::pdf::paragraphs::page_to_lines(&text_page, page.width().value);
+            for para in crate::pdf::paragraphs::paragraphize(
+                lines,
+                page.width().value,
+                page.height().value,
+                gutter,
+            ) {
+                let text = para
+                    .iter()
+                    .map(|l| l.text.as_str())
+                    .fold(String::new(), |acc, l| crate::pdf::paragraphs::join_lines_pub(&acc, l));
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let x0 = para.iter().map(|l| l.x_start).fold(f32::MAX, f32::min);
+                let x1 = para.iter().map(|l| l.x_end).fold(0.0f32, f32::max);
+                let y0 = para
+                    .iter()
+                    .map(|l| l.baseline_y - l.font_size * 0.35)
+                    .fold(f32::MAX, f32::min);
+                let y1 = para
+                    .iter()
+                    .map(|l| l.baseline_y + l.font_size * 1.1)
+                    .fold(0.0f32, f32::max);
+                out.push(AnchoredParagraph {
+                    page: (index + 1) as u16,
+                    bbox: Some([x0, y0, x1, y1]),
+                    text,
+                });
+            }
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+    }
+    // Fallback: lopdf text without geometry.
+    let pages = extract_text_lopdf(path)?;
+    let mut out = Vec::new();
+    for p in pages {
+        for para in p.text.split("\n\n") {
+            let t = para.trim();
+            if !t.is_empty() {
+                out.push(AnchoredParagraph {
+                    page: p.page,
+                    bbox: None,
+                    text: t.to_string(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+
 /// Extract text from all pages of a PDF file.
 ///
 /// Tries pdfium-render first (needs the platform `pdfium.dll`), and falls
@@ -46,7 +125,8 @@ fn extract_text_pdfium(path: &Path) -> Result<Vec<PageText>> {
         // Geometry-first: rebuild paragraphs (columns, indents, gaps) so the
         // chunker's paragraph split sees real boundaries. Fall back to the
         // flat dump when geometry yields nothing (unusual encodings).
-        let lines = crate::pdf::paragraphs::page_to_lines(&text_page);
+        let (lines, gutter) =
+            crate::pdf::paragraphs::page_to_lines(&text_page, page.width().value);
         let text = if lines.is_empty() {
             text_page.all()
         } else {
@@ -54,6 +134,7 @@ fn extract_text_pdfium(path: &Path) -> Result<Vec<PageText>> {
                 lines,
                 page.width().value,
                 page.height().value,
+                gutter,
             )
         };
 

@@ -83,6 +83,22 @@ pub async fn paper_reprocess_index(
         .map_err(|e| e.to_string())
 }
 
+/// Anchored paragraphs for the reader's dual-pane view (computed lazily,
+/// cached in the device-local paper_paragraphs table).
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn paper_get_paragraphs(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<crate::pdf::extractor::AnchoredParagraph>, String> {
+    let paper = paper_service::get_paper(&state.db, &id)
+        .await
+        .map_err(|e| e.to_string())?;
+    paper_service::get_paragraphs(&state.db, &state.app_data_dir, &paper)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Enrich a paper's bibliographic metadata from CrossRef (DOI / title).
 /// Returns true when fields were filled.
 #[tauri::command]

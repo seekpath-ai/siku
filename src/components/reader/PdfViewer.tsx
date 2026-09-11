@@ -118,6 +118,10 @@ export interface PdfViewerProps {
   onDocumentLoaded?: (doc: any) => void;
   /** Recolor rendered pages via pdf.js pageColors. Null keeps original colors. */
   pageTheme?: { background: string; foreground: string } | null;
+  /** Bare click on a page (no active selection, no drawing tool), with the
+   *  point converted to PDF points (y-up). Used by the dual-pane view to
+   *  hit-test paragraph anchors. */
+  onPagePointClick?: (pageNum: number, pdfX: number, pdfY: number) => void;
 }
 
 export interface PdfViewerHandle {
@@ -400,6 +404,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     onPasswordSubmit,
     onDocumentLoaded,
     pageTheme = null,
+    onPagePointClick,
   }, ref) {
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -439,6 +444,8 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
   useEffect(() => { drawingToolRef.current = drawingTool; }, [drawingTool]);
   useEffect(() => { drawingColorRef.current = drawingColor; }, [drawingColor]);
   useEffect(() => { strokesRef.current = strokes; }, [strokes]);
+  const onPagePointClickRef = useRef(onPagePointClick);
+  useEffect(() => { onPagePointClickRef.current = onPagePointClick; }, [onPagePointClick]);
 
   const [totalPages, setTotalPages] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -913,6 +920,24 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
       wrapper.style.height = `${height}px`;
       wrapper.style.marginBottom = `${PAGE_GAP}px`;
       wrapper.style.overflow = 'hidden'; // prevent child content from expanding wrapper
+      // Dual-pane anchoring: report bare clicks in PDF-point coordinates.
+      wrapper.addEventListener('click', (e) => {
+        const cb = onPagePointClickRef.current;
+        if (!cb || drawingToolRef.current) return;
+        const sel = window.getSelection();
+        if (sel && !sel.isCollapsed) return; // the click ended a text selection
+        const rect = wrapper.getBoundingClientRect();
+        const px = e.clientX - rect.left;
+        const py = e.clientY - rect.top;
+        const pageNum = Number(wrapper.dataset.pageNum);
+        doc.getPage(pageNum).then((p: any) => {
+          const vp1 = p.getViewport({ scale: 1, rotation: pagesRotationRef.current });
+          const fitScale = computeFitScale(vp1, zoomModeRef.current, zoomRef.current, containerSizeRef.current);
+          const viewport = p.getViewport({ scale: fitScale, rotation: pagesRotationRef.current });
+          const [pdfX, pdfY] = viewport.convertToPdfPoint(px, py);
+          cb(pageNum, pdfX, pdfY);
+        }).catch(() => {});
+      });
       // Lightweight placeholder
       const ph = document.createElement('div');
       ph.className = 'flex items-center justify-center h-full text-text-secondary/30 text-xs select-none';

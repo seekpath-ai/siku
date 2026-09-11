@@ -8,11 +8,12 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import {
   Loader2, FileQuestion, ArrowLeft, ZoomIn, ZoomOut, StickyNote, FileText,
   ScanSearch, Download, Upload, MoreVertical, Pencil, Highlighter, Eraser,
-  BookOpen, LayoutGrid, RotateCw, RotateCcw, Printer, Check,
+  BookOpen, LayoutGrid, RotateCw, RotateCcw, Printer, Check, Columns2,
 } from 'lucide-react';
 import { PdfViewer } from '@/components/reader/PdfViewer';
 import type { PdfViewerHandle, TextSelection, PdfViewerProps, SnippetRect } from '@/components/reader/PdfViewer';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
+import { ComparePanel } from '@/components/reader/ComparePanel';
 import { PdfOutline } from '@/components/reader/PdfOutline';
 import { PdfThumbnails } from '@/components/reader/PdfThumbnails';
 import { ExportLayoutDialog } from '@/components/reader/ExportLayoutDialog';
@@ -34,8 +35,9 @@ import { useTranslationStore } from '@/stores/translationStore';
 import { useTranslationStreamStore } from '@/stores/translationStreamStore';
 import {
   readPdfBytes, translateTextStream, annotationUpdateTranslation, paperRecordRead,
-  exportPdf, openPaperInSystem,
+  exportPdf, openPaperInSystem, paperGetParagraphs,
 } from '@/lib/tauri';
+import type { PaperParagraph } from '@/lib/tauri';
 import type { DetectedRegion } from '@/components/reader/regions';
 import { saveCachedRegions, loadCachedRegions, clearPaperCache } from '@/lib/regionCache';
 import type { DrawingTool, Stroke } from '@/components/reader/drawing';
@@ -86,8 +88,13 @@ function ReaderView({ paperId }: { paperId: string }) {
   const [pdfLoading, setPdfLoading] = useState(false);
   const [totalPages, setTotalPages] = useState(0);
   const [displayZoom, setDisplayZoom] = useState(savedReaderState.zoom);
-  const [panel, setPanel] = useState<'zhisi' | 'notes' | null>(null);
+  const [panel, setPanel] = useState<'zhisi' | 'notes' | 'compare' | null>(null);
   const [panelWidth, setPanelWidth] = useState(300);
+  // Dual-pane anchoring: paragraph hit by the last PDF-side click.
+  const [activeParagraph, setActiveParagraph] = useState<number | null>(null);
+  // Anchored paragraphs for the 对照 pane (lazy-loaded on first open).
+  const [compareParagraphs, setCompareParagraphs] = useState<PaperParagraph[] | null>(null);
+  const [compareError, setCompareError] = useState<string | null>(null);
   const [toolbarSelection, setToolbarSelection] = useState<TextSelection | null>(null);
   const [highlightTarget, setHighlightTarget] = useState<PdfViewerProps['highlightTarget']>(null);
   const [clearSelectionSignal, setClearSelectionSignal] = useState(0);
@@ -255,6 +262,67 @@ function ReaderView({ paperId }: { paperId: string }) {
     }
     pdfViewerRef.current?.jumpToPage(snippet.pageIndex);
   };
+
+  // ── Dual-pane (对照) anchoring ──
+  // Lazy-load anchored paragraphs when the pane first opens.
+  useEffect(() => {
+    if (panel !== 'compare' || compareParagraphs || compareError) return;
+    paperGetParagraphs(paperId)
+      .then(setCompareParagraphs)
+      .catch((e) => setCompareError(String(e)));
+  }, [panel, paperId, compareParagraphs, compareError]);
+
+  // Markdown → PDF: jump to the paragraph's page and paint its bbox.
+  const handleParagraphClick = async (_index: number, p: PaperParagraph) => {
+    setActiveParagraph(null);
+    if (!p.bbox) {
+      pdfViewerRef.current?.jumpToPage(p.page);
+      return;
+    }
+    const dims = await pdfViewerRef.current?.getPageTextContent(p.page);
+    if (!dims || dims.width <= 0 || dims.height <= 0) {
+      pdfViewerRef.current?.jumpToPage(p.page);
+      return;
+    }
+    const [x0, y0, x1, y1] = p.bbox; // PDF points, y-up
+    const rect: SnippetRect = {
+      xRatio: (x0 + x1) / 2 / dims.width,
+      // PDF y grows upward; SnippetRect y is measured from the page top.
+      yRatio: (dims.height - (y0 + y1) / 2) / dims.height,
+      widthRatio: (x1 - x0) / dims.width,
+      heightRatio: (y1 - y0) / dims.height,
+    };
+    setHighlightTarget([{ pageIndex: p.page, rects: [rect] }]);
+    pdfViewerRef.current?.jumpToPage(p.page);
+  };
+
+  // PDF → Markdown: hit-test the clicked point against paragraph bboxes on
+  // that page; fall back to the nearest paragraph above the point.
+  const handlePagePointClick = (pageNum: number, pdfX: number, pdfY: number) => {
+    if (panel !== 'compare' || !compareParagraphs) return;
+    const onPage = compareParagraphs
+      .map((p, i) => ({ p, i }))
+      .filter(({ p }) => p.page === pageNum && p.bbox);
+    const hit = onPage.find(({ p }) => {
+      const [x0, y0, x1, y1] = p.bbox!;
+      return pdfX >= x0 - 4 && pdfX <= x1 + 4 && pdfY >= y0 - 4 && pdfY <= y1 + 4;
+    });
+    const target = hit ?? (() => {
+      // Nearest paragraph whose top is below the click (y-up: the click is
+      // under the paragraph's bottom edge means the paragraph is above).
+      let best: { i: number; dist: number } | null = null;
+      for (const { p, i } of onPage) {
+        const [, y0] = p.bbox!;
+        if (y0 <= pdfY) {
+          const dist = pdfY - y0;
+          if (!best || dist < best.dist) best = { i, dist };
+        }
+      }
+      return best ? { p: compareParagraphs[best.i], i: best.i } : null;
+    })();
+    if (target) setActiveParagraph(target.i);
+  };
+
   const pdfViewerRef = useRef<PdfViewerHandle>(null);
   const addSnippet = useSnippetStore((s) => s.addSnippet);
 
@@ -758,6 +826,16 @@ function ReaderView({ paperId }: { paperId: string }) {
           <FileText size={13} />
           笔记
         </button>
+        <button
+          onClick={() => setPanel((p) => (p === 'compare' ? null : 'compare'))}
+          title="PDF ↔ 文本双栏对照"
+          className={`flex items-center gap-1 px-2 py-0.5 rounded text-xs transition-colors ${
+            panel === 'compare' ? 'bg-primary/10 text-primary' : 'text-text-secondary hover:bg-surface-hover'
+          }`}
+        >
+          <Columns2 size={13} />
+          对照
+        </button>
 
         {/* Drawing tools */}
         <div className="flex items-center gap-0.5">
@@ -939,6 +1017,7 @@ function ReaderView({ paperId }: { paperId: string }) {
                   onPasswordSubmit={handlePasswordSubmit}
                   onDocumentLoaded={setPdfDoc}
                   pageTheme={pageTheme}
+                  onPagePointClick={handlePagePointClick}
                 />
               </div>
               {toolbarSelection && (
@@ -1020,6 +1099,19 @@ function ReaderView({ paperId }: { paperId: string }) {
                   totalPages={totalPages}
                   onJumpToSnippet={handleJumpToSnippet}
                 />
+              ) : panel === 'compare' ? (
+                compareError ? (
+                  <div className="flex items-center justify-center h-full px-4 text-center text-xs text-red-400">
+                    {compareError}
+                  </div>
+                ) : (
+                  <ComparePanel
+                    paragraphs={compareParagraphs}
+                    currentPage={currentPage}
+                    activeIndex={activeParagraph}
+                    onParagraphClick={handleParagraphClick}
+                  />
+                )
               ) : (
                 <NotesTab paperId={paperId} />
               )}

@@ -150,6 +150,20 @@ export function Pet() {
     };
   }, [notify]);
 
+  // Rebind the panel when the page context changes while it is open. Without
+  // this, a session-less panel (opened on a page with no domain agent) stays
+  // session-less — ⋯ menu disabled — after switching to a page that has one,
+  // until the panel is closed and reopened. start() itself short-circuits
+  // when the current session already matches the new context, and the deps
+  // use only page/objectId so reader pageNum/selection updates don't rebind.
+  // While streaming, defer the rebind until the run finishes (streaming in
+  // deps re-fires the effect then).
+  useEffect(() => {
+    if (!store.open || !context || store.streaming) return;
+    usePetStore.getState().start(context).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [store.open, store.streaming, context?.page, context?.objectId]);
+
   if (!store.open) return null;
 
   return (

@@ -38,10 +38,24 @@ fn extract_text_pdfium(path: &Path) -> Result<Vec<PageText>> {
     let mut result = Vec::with_capacity(pages.len() as usize);
 
     for (index, page) in pages.iter().enumerate() {
-        let text = page
-            .text()
-            .map(|t| t.all())
-            .unwrap_or_default();
+        let text_page = match page.text() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        // Geometry-first: rebuild paragraphs (columns, indents, gaps) so the
+        // chunker's paragraph split sees real boundaries. Fall back to the
+        // flat dump when geometry yields nothing (unusual encodings).
+        let lines = crate::pdf::paragraphs::page_to_lines(&text_page);
+        let text = if lines.is_empty() {
+            text_page.all()
+        } else {
+            crate::pdf::paragraphs::lines_to_text(
+                lines,
+                page.width().value,
+                page.height().value,
+            )
+        };
 
         // Only include non-empty pages
         let trimmed = text.trim().to_string();

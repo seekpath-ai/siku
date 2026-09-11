@@ -727,6 +727,7 @@ pub fn run() {
             commands::agent::agent_rename_session,
             commands::agent::agent_answer_user,
             commands::agent::pet_create_session,
+            commands::agent::agent_get_turn_context,
             commands::agent::pet_domains,
             commands::agent::get_agent_steps,
             // Settings

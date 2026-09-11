@@ -350,6 +350,7 @@ impl AgentEngine {
         event_tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
         approval_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ApprovalResponse>,
         ask_rx: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+        user_message_id: &str,
     ) -> Result<(String, Vec<AgentStep>, bool, crate::ai::llm::LlmUsage, Option<String>), String> {
         let span = info_span!("agent_turn", session_id = %self.session_id);
         let _guard = span.enter();
@@ -384,6 +385,28 @@ impl AgentEngine {
         }
         messages.extend(history.iter().cloned());
         messages.push(ChatMessage { role: "user".into(), content: user_message.to_string(), attachments: attachments.map(|s| s.to_string()), tool_calls: None, tool_call_id: None, name: None });
+
+        // Snapshot the assembled system prompt for the "查看本轮上下文"
+        // viewer (local turn_contexts table, never synced). Capped: the
+        // long-term memory block can make it very large.
+        if let Some(sys) = messages.first().filter(|m| m.role == "system") {
+            const MAX_SNAPSHOT_CHARS: usize = 50_000;
+            let mut snap = sys.content.clone();
+            if snap.chars().count() > MAX_SNAPSHOT_CHARS {
+                snap = snap.chars().take(MAX_SNAPSHOT_CHARS).collect();
+                snap.push_str("\n\n…（快照过长，已截断）");
+            }
+            let _ = sqlx::query(
+                "INSERT INTO turn_contexts (id, session_id, message_id, system_prompt, created_at) VALUES (?, ?, ?, ?, ?)"
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&sid)
+            .bind(user_message_id)
+            .bind(&snap)
+            .bind(time::now_iso())
+            .execute(&self.db)
+            .await;
+        }
 
         info!(message_count=%messages.len(), messages_summary=%messages.iter().map(|m| {
             let tc = m.tool_calls.as_ref().map(|v| v.len()).unwrap_or(0);

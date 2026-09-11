@@ -225,6 +225,18 @@ export async function petCreateSession(domain: string, context: Record<string, u
   return invoke<AgentSession>('pet_create_session', { domain, context });
 }
 
+/** System-prompt snapshot stored for a user message's turn (本地表，不同步). */
+export interface TurnContext {
+  system_prompt: string;
+  created_at: string;
+}
+
+/** Fetch the turn context snapshot for a user message; null when the turn
+ *  predates the snapshot feature. */
+export async function agentGetTurnContext(messageId: string): Promise<TurnContext | null> {
+  return invoke<TurnContext | null>('agent_get_turn_context', { messageId });
+}
+
 export interface PetDomainInfo {
   id: string;
   name: string;

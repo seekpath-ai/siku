@@ -778,6 +778,26 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     .execute(&db)
     .await?;
 
+    // Per-turn system-prompt snapshots for the "查看本轮上下文" viewer.
+    // Device-local on purpose: the assembled prompt is a function of this
+    // device's settings/memory at send time and would just be sync weight.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS turn_contexts (
+            id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            system_prompt TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )"
+    )
+    .execute(&db)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_turn_contexts_message ON turn_contexts(message_id)"
+    )
+    .execute(&db)
+    .await?;
+
     // Migration: multi-device sync preparation (added 2026-08-19).
     // Rebuilds vaults / note_versions with TEXT uuid PKs and drops the
     // UNIQUE(name) constraint on tags. Must run BEFORE CRR registration so

@@ -803,7 +803,7 @@ pub(crate) async fn run_agent_turn(
 
     // Save user message to DB
     let attachments_json = attachments.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()).filter(|s| !s.is_empty());
-    chat::save_chat_message(&state.db, &session_id, "user", &content, None, None, None, None, None, None, None, None, None, attachments_json.as_deref()).await?;
+    let user_message_id = chat::save_chat_message(&state.db, &session_id, "user", &content, None, None, None, None, None, None, None, None, None, attachments_json.as_deref()).await?;
 
     // Load history BEFORE appending current user message, then append it.
     // The engine itself will prepend the current user message to the prompt.
@@ -923,7 +923,7 @@ pub(crate) async fn run_agent_turn(
         let _turn_guard = turn_guard;
         let engine_ref = Arc::new(engine);
         let result = engine_ref
-            .process_message(&content, attachments_json.as_deref(), &history, event_tx, &mut approval_rx, &mut ask_rx)
+            .process_message(&content, attachments_json.as_deref(), &history, event_tx, &mut approval_rx, &mut ask_rx, &user_message_id)
             .await;
 
         // Only remove registrations that belong to this turn. The turn guard
@@ -1396,6 +1396,9 @@ pub async fn agent_delete_session(
     sqlx::query("DELETE FROM tool_executions WHERE session_id = ?")
         .bind(&session_id)
         .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
+    sqlx::query("DELETE FROM turn_contexts WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
     sqlx::query("DELETE FROM chat_messages WHERE session_id = ?")
         .bind(&session_id)
         .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
@@ -1406,6 +1409,26 @@ pub async fn agent_delete_session(
         .bind(&session_id)
         .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
     Ok(())
+}
+
+/// Fetch the system-prompt snapshot stored for a user message's turn (the
+/// "查看本轮上下文" viewer). None for turns predating the snapshot feature.
+#[tauri::command]
+pub async fn agent_get_turn_context(
+    state: State<'_, AppState>,
+    message_id: String,
+) -> Result<Option<serde_json::Value>, String> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT system_prompt, created_at FROM turn_contexts WHERE message_id = ? ORDER BY created_at DESC LIMIT 1"
+    )
+    .bind(&message_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| format!("db: {e}"))?;
+    Ok(row.map(|(system_prompt, created_at)| serde_json::json!({
+        "system_prompt": system_prompt,
+        "created_at": created_at,
+    })))
 }
 
 /// Respond to a pending tool approval.

@@ -3,7 +3,7 @@ import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import { User, Copy, Check, Paperclip, ChevronDown, ChevronUp } from 'lucide-react';
-import { memo, useMemo, useState } from 'react';
+import { memo, useEffect, useMemo, useState } from 'react';
 import type { AgentStep, ChatMessage } from '@/lib/types';
 import { parseToolCalls, stepsToPhases } from '@/lib/agentPhases';
 import { parseAttachments } from '@/lib/attachments';
@@ -12,6 +12,7 @@ import { MarkdownCode, MarkdownPre } from './CodeBlock';
 import { ToolCallCard } from './ToolCallCard';
 import { ReasoningProcessCard } from './ReasoningProcessCard';
 import { ReasoningBlock } from './ReasoningBlock';
+import { TurnContextDialog } from './TurnContextDialog';
 import { ExternalLink } from '@/components/ui/ExternalLink';
 import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
 
@@ -116,6 +117,23 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
   const hasLegacyReasoning = !!message.reasoning_content;
   const hasLegacyToolCalls = toolCalls.length > 0;
   const hasSteps = agentSteps.length > 0;
+  // 本轮上下文 viewer: right-click the user avatar (see TurnContextDialog).
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
+  const [ctxOpen, setCtxOpen] = useState(false);
+
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const close = () => setCtxMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') close();
+    };
+    window.addEventListener('mousedown', close);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('mousedown', close);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [ctxMenu]);
 
   // LLMs commonly emit \(...\) / \[...\] math; remark-math only reads $..$.
   // Normalize before render (code spans/blocks are left intact). Hook stays
@@ -137,9 +155,14 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
 
   const avatar = (
     <div
+      onContextMenu={isUser ? (e) => {
+        e.preventDefault();
+        setCtxMenu({ x: e.clientX, y: e.clientY });
+      } : undefined}
+      title={isUser ? '右键查看本轮上下文' : undefined}
       className={`w-8 h-8 rounded-full shrink-0 flex items-center justify-center text-[14px] font-semibold ${
         isUser
-          ? 'bg-codex-surface border border-codex-border text-codex-primary'
+          ? 'bg-codex-surface border border-codex-border text-codex-primary cursor-context-menu'
           : 'bg-gradient-to-br from-codex-accent to-emerald-700 text-black'
       }`}
     >
@@ -279,6 +302,26 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
     >
       {avatar}
       {content}
+
+      {ctxMenu && (
+        <div
+          className="fixed z-[6000] min-w-[150px] py-1 rounded-lg border border-codex-border bg-codex-surface shadow-xl"
+          style={{ left: ctxMenu.x, top: ctxMenu.y }}
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <button
+            onClick={() => {
+              setCtxMenu(null);
+              setCtxOpen(true);
+            }}
+            className="w-full px-3 py-2 text-left text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
+          >
+            查看本轮上下文
+          </button>
+        </div>
+      )}
+
+      {ctxOpen && <TurnContextDialog message={message} onClose={() => setCtxOpen(false)} />}
     </div>
   );
 }

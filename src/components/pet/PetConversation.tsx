@@ -5,15 +5,16 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import { emit } from '@tauri-apps/api/event';
 import { useNavigate } from '@tanstack/react-router';
-import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus, CheckCircle2, AlertCircle, Square } from 'lucide-react';
 import { usePetStore } from '@/stores/petStore';
 import type { PetContext } from '@/stores/petContextStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
-import { getChatMessages, getAgentSteps, notesCreate, noteCreateUnderPaper, readImageFile, settingsAppGet, settingsGet, settingsSet } from '@/lib/tauri';
+import { agentCancel, getChatMessages, getAgentSteps, notesCreate, noteCreateUnderPaper, readImageFile, settingsAppGet, settingsGet, settingsSet } from '@/lib/tauri';
 import { parseEvidence, buildNoteMarkdown } from '@/lib/evidence';
 import type { EvidenceEntry } from '@/lib/evidence';
 import { MarkdownCode, MarkdownPre } from '@/components/chat/CodeBlock';
 import { ApprovalCard } from '@/components/chat/ApprovalCard';
+import { PetAskUserDialog } from '@/components/chat/AskUserDialog';
 import { ApprovalPolicySwitch } from '@/components/chat/ApprovalPolicySwitch';
 import { parseAttachments } from '@/lib/attachments';
 import { ReasoningProcessCard } from '@/components/chat/ReasoningProcessCard';
@@ -505,11 +506,27 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
         }
         break;
       }
+      case 'ask_user': {
+        // The agent is blocked waiting for an answer; without rendering this
+        // the question was invisible here and the turn sat until the backend
+        // timeout expired.
+        try {
+          const raw = e.content ? JSON.parse(e.content) : null;
+          const parsed = Array.isArray(raw) ? raw : raw?.questions;
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            st.setPendingQuestions(parsed);
+          }
+        } catch {
+          /* ignore malformed questions */
+        }
+        break;
+      }
       case 'done':
       case 'cancelled':
       case 'error': {
         st.setStreaming(false);
         st.setPendingApproval(null);
+        st.setPendingQuestions(null);
         // Mid-turn failures (e.g. context-size 400) are persisted server-side
         // with their partial text and steps — same as a cancel — so fall
         // into the same history reload below to render the 推理过程 card and
@@ -662,6 +679,10 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
     return map;
   }, [store.agentSteps]);
 
+  const handleStop = () => {
+    if (petSessionId) agentCancel(petSessionId).catch(() => {});
+  };
+
   const handleSend = async () => {
     const text = input.trim();
     if ((!text && images.length === 0) || store.streaming) return;
@@ -784,6 +805,8 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
       </div>
 
       {/* Approval — same four-decision card as the main chat. */}
+      <PetAskUserDialog />
+
       {store.pendingApproval && store.session && (
         <div className="px-3 border-t border-surface-hover shrink-0">
           <ApprovalCard
@@ -940,14 +963,25 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
                 titleSuffix="（对所有宠物智能体生效）"
               />
             </div>
-            <button
-              onClick={handleSend}
-              disabled={(!input.trim() && images.length === 0) || store.streaming}
-              className="w-8 h-8 rounded-lg bg-primary/15 text-primary flex items-center justify-center hover:bg-primary/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
-              aria-label="发送"
-            >
-              {store.streaming ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
-            </button>
+            {store.streaming ? (
+              <button
+                onClick={handleStop}
+                className="w-8 h-8 rounded-lg bg-surface-hover text-text-primary flex items-center justify-center hover:bg-red-500/20 hover:text-red-400 transition-colors shrink-0"
+                aria-label="中断"
+                title="中断当前轮次（已生成的内容会保留）"
+              >
+                <Square size={13} />
+              </button>
+            ) : (
+              <button
+                onClick={handleSend}
+                disabled={!input.trim() && images.length === 0}
+                className="w-8 h-8 rounded-lg bg-primary/15 text-primary flex items-center justify-center hover:bg-primary/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                aria-label="发送"
+              >
+                <Send size={14} />
+              </button>
+            )}
           </div>
         </div>
       </div>

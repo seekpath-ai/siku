@@ -2,7 +2,9 @@ import { useEffect, useState } from 'react';
 import { Bot, Timer } from 'lucide-react';
 import type { AskAnswer } from '@/lib/types';
 import { useChatStore } from '@/stores/chatStore';
+import { usePetStore } from '@/stores/petStore';
 import { agentAnswerUser } from '@/lib/tauri';
+import type { AskQuestion } from '@/lib/types';
 
 /** Backend wait for AskUserQuestion answers (mirrors the approval timeout). */
 const ASK_USER_TIMEOUT_SEC = 300;
@@ -27,18 +29,23 @@ function TimeoutCountdown() {
   );
 }
 
-/** Dialog for the agent's AskUserQuestion tool. */
-export function AskUserDialog() {
-  const questions = useChatStore((s) => s.pendingQuestions);
-  const questionsSessionId = useChatStore((s) => s.pendingQuestionsSessionId);
-  const activeSessionId = useChatStore((s) => s.activeSessionId);
-  const setPendingQuestions = useChatStore((s) => s.setPendingQuestions);
+interface AskUserQuestionsProps {
+  questions: AskQuestion[];
+  /** Hand the answers back to the agent that asked. */
+  onAnswer: (answers: AskAnswer[]) => Promise<void> | void;
+  /** Closing without answering must still unblock the backend — otherwise it
+   *  waits out the full timeout with the whole turn frozen. */
+  onDismiss: () => Promise<void> | void;
+}
+
+/** Presentation for the agent's AskUserQuestion tool, shared by the chat panel
+ *  and the pet panel: the two have separate stores but must behave identically,
+ *  including the countdown and the "answer to unblock" rule. */
+export function AskUserQuestionsDialog({ questions, onAnswer, onDismiss }: AskUserQuestionsProps) {
   const [answers, setAnswers] = useState<Record<number, string[]>>({});
   const [submitting, setSubmitting] = useState(false);
 
-  // Only render for the session the questions were raised in; they survive
-  // session switches and re-appear when switching back.
-  if (!questions || questions.length === 0 || questionsSessionId !== activeSessionId) return null;
+  if (questions.length === 0) return null;
 
   const toggle = (qi: number, label: string) => {
     setAnswers((prev) => {
@@ -55,7 +62,6 @@ export function AskUserDialog() {
   };
 
   const handleSubmit = async () => {
-    if (!activeSessionId) return;
     const allAnswered = questions.every((_, i) => (answers[i] ?? []).length > 0);
     if (!allAnswered) return;
     setSubmitting(true);
@@ -64,8 +70,7 @@ export function AskUserDialog() {
         question: q.question,
         answer: (answers[i] ?? []).join(', '),
       }));
-      await agentAnswerUser(activeSessionId, result);
-      setPendingQuestions(null);
+      await onAnswer(result);
       setAnswers({});
     } catch (err) {
       console.error('Failed to answer:', err);
@@ -74,16 +79,12 @@ export function AskUserDialog() {
     }
   };
 
-  // Closing without answering must still unblock the backend — otherwise it
-  // waits out the full 300s timeout with the whole turn frozen.
-  const dismiss = () => {
-    if (activeSessionId) {
-      agentAnswerUser(
-        activeSessionId,
-        questions.map((q) => ({ question: q.question, answer: '用户暂不回答' }))
-      ).catch((err) => console.error('Failed to dismiss ask_user:', err));
+  const dismiss = async () => {
+    try {
+      await onDismiss();
+    } catch (err) {
+      console.error('Failed to dismiss ask_user:', err);
     }
-    setPendingQuestions(null);
     setAnswers({});
   };
 
@@ -146,5 +147,65 @@ export function AskUserDialog() {
         </div>
       </div>
     </div>
+  );
+}
+
+/** Chat panel: answers go to the active chat session. */
+export function AskUserDialog() {
+  const questions = useChatStore((s) => s.pendingQuestions);
+  const questionsSessionId = useChatStore((s) => s.pendingQuestionsSessionId);
+  const activeSessionId = useChatStore((s) => s.activeSessionId);
+  const setPendingQuestions = useChatStore((s) => s.setPendingQuestions);
+
+  // Only render for the session the questions were raised in; they survive
+  // session switches and re-appear when switching back.
+  if (!questions || questions.length === 0 || questionsSessionId !== activeSessionId) return null;
+
+  return (
+    <AskUserQuestionsDialog
+      questions={questions}
+      onAnswer={async (answers) => {
+        if (!activeSessionId) return;
+        await agentAnswerUser(activeSessionId, answers);
+        setPendingQuestions(null);
+      }}
+      onDismiss={async () => {
+        if (activeSessionId) {
+          await agentAnswerUser(
+            activeSessionId,
+            questions.map((q) => ({ question: q.question, answer: '用户暂不回答' }))
+          );
+        }
+        setPendingQuestions(null);
+      }}
+    />
+  );
+}
+
+/** Pet panel: the agent asks here too, and the answer has to reach the pet
+ *  session — without this the question was never shown and the turn froze for
+ *  the whole backend timeout. */
+export function PetAskUserDialog() {
+  const questions = usePetStore((s) => s.pendingQuestions);
+  const sessionId = usePetStore((s) => s.session?.id ?? null);
+  const setPendingQuestions = usePetStore((s) => s.setPendingQuestions);
+
+  if (!questions || questions.length === 0 || !sessionId) return null;
+
+  return (
+    <AskUserQuestionsDialog
+      questions={questions}
+      onAnswer={async (answers) => {
+        await agentAnswerUser(sessionId, answers);
+        setPendingQuestions(null);
+      }}
+      onDismiss={async () => {
+        await agentAnswerUser(
+          sessionId,
+          questions.map((q) => ({ question: q.question, answer: '用户暂不回答' }))
+        );
+        setPendingQuestions(null);
+      }}
+    />
   );
 }

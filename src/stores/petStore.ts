@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { AgentSession, AgentStep, ChatAttachment, ChatMessage, StreamingStep, ToolCallInfo } from '@/lib/types';
+import type { AgentSession, AgentStep, ChatAttachment, ChatMessage, StreamingStep, ToolCallInfo, AskQuestion } from '@/lib/types';
 import { petCreateSession, getChatMessages, getAgentSteps, agentGetSession, agentSendMessage, agentListSessions, agentSetSessionModel, agentDeleteSession } from '@/lib/tauri';
 import type { PetContext } from './petContextStore';
 
@@ -50,6 +50,8 @@ interface PetState {
   loading: boolean;
   streaming: boolean;
   pendingApproval: PetApproval | null;
+  /** Pending AskUserQuestion, rendered by <PetAskUserDialog />. */
+  pendingQuestions: AskQuestion[] | null;
   error: string | null;
   /** Completed streaming steps (for the reasoning/tool-call process card). */
   streamingSteps: StreamingStep[];
@@ -68,6 +70,7 @@ interface PetState {
   appendDelta: (t: string) => void;
   setStreaming: (s: boolean) => void;
   setPendingApproval: (a: PetApproval | null) => void;
+  setPendingQuestions: (q: AskQuestion[] | null) => void;
   setSession: (s: AgentSession | null) => void;
   /** Switch the pet session to a global (provider-pool) model, next turn on
    *  (same semantics as the chat header badge: any inline custom llm is
@@ -97,6 +100,7 @@ const initial = {
   loading: false,
   streaming: false,
   pendingApproval: null,
+  pendingQuestions: null,
   error: null,
   streamingSteps: [],
   currentStreamingStep: null,
@@ -118,7 +122,7 @@ export const usePetStore = create<PetState>((set, get) => ({
     }
     set({
       loading: true, open: true, session: null, messages: [], agentSteps: [], streamContent: '',
-      streaming: false, pendingApproval: null, error: null,
+      streaming: false, pendingApproval: null, pendingQuestions: null, error: null,
       streamingSteps: [], currentStreamingStep: null,
     });
     try {
@@ -156,7 +160,7 @@ export const usePetStore = create<PetState>((set, get) => ({
   attach: async (sessionId) => {
     set({
       loading: true, open: true, session: null, messages: [], agentSteps: [], streamContent: '',
-      streaming: false, pendingApproval: null, error: null,
+      streaming: false, pendingApproval: null, pendingQuestions: null, error: null,
       streamingSteps: [], currentStreamingStep: null,
     });
     try {
@@ -193,7 +197,7 @@ export const usePetStore = create<PetState>((set, get) => ({
     };
     set((s) => ({
       messages: [...s.messages, userMsg], streamContent: '', streaming: true,
-      pendingApproval: null, streamingSteps: [], currentStreamingStep: null, error: null,
+      pendingApproval: null, pendingQuestions: null, streamingSteps: [], currentStreamingStep: null, error: null,
     }));
     try {
       await agentSendMessage(session.id, text, attachments);
@@ -206,6 +210,7 @@ export const usePetStore = create<PetState>((set, get) => ({
   appendDelta: (t) => set((s) => ({ streamContent: s.streamContent + t })),
   setStreaming: (streaming) => set({ streaming }),
   setPendingApproval: (pendingApproval) => set({ pendingApproval }),
+  setPendingQuestions: (pendingQuestions) => set({ pendingQuestions }),
   setSession: (session) => set({ session }),
   setSessionModel: async (providerId) => {
     const { session } = get();

@@ -78,20 +78,36 @@ pub async fn generate_embeddings_for_paper(
     Ok(count)
 }
 
-/// Embed a batch of texts with the configured backend. Falls back to the
-/// hash embedding when the API backend is unset or fails.
+/// Embed a batch of texts with the configured backend.
+///
+/// With an API backend configured, a failure is returned as an error — it is
+/// NOT silently replaced by the hash placeholder. Falling back used to store
+/// character-histogram vectors under the API model's label, so the vector leg
+/// kept "working" while comparing meaningless numbers.
 pub async fn embed_texts(db: &SqlitePool, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
     let settings = crate::core::settings_service::cached_settings();
     let device_settings = crate::core::settings_service::cached_device_settings();
-    if settings.embedding_backend == "api"
-        && !settings.embedding_base_url.trim().is_empty()
-    {
-        match api_embed_texts(&settings.embedding_base_url, &device_settings.embedding_api_key, &settings.embedding_model, texts).await {
-            Ok(vectors) if vectors.len() == texts.len() => return Ok(vectors),
-            Ok(_) => warn!("embedding API returned mismatched count, falling back to hash"),
-            Err(e) => warn!(error = %e, "embedding API failed, falling back to hash"),
+    if crate::ai::retriever::vector_leg_enabled() {
+        let vectors = api_embed_texts(
+            &settings.embedding_base_url,
+            &device_settings.embedding_api_key,
+            &settings.embedding_model,
+            texts,
+        )
+        .await?;
+        if vectors.len() != texts.len() {
+            return Err(format!(
+                "embedding API returned {} vectors for {} inputs",
+                vectors.len(),
+                texts.len()
+            ));
         }
+        return Ok(vectors);
     }
+
+    // No real backend configured: the placeholder keeps the pipeline runnable
+    // (it is never used for retrieval).
+    let _ = db;
     Ok(texts.iter().map(|t| generate_fallback_embedding(t)).collect())
 }
 

@@ -12,8 +12,10 @@ pub async fn rag_query(
     query: &str,
     top_k: usize,
 ) -> Result<String, String> {
-    // 1. Retrieve
-    let results = retriever::hybrid_search(db, query, top_k).await?;
+    // 1. Retrieve, then pull in the neighbouring chunks of every hit: a
+    //    ~512-token boundary regularly cuts a sentence in half.
+    let mut results = retriever::hybrid_search(db, query, top_k).await?;
+    retriever::expand_with_neighbors(db, &mut results, false).await?;
 
     // 2. Build context messages
     let messages = context_builder::build_rag_messages(&results, query, None);

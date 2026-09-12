@@ -675,6 +675,67 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
             .map_err(|e| anyhow::anyhow!("migration failed for papers.{col}: {e}"))?;
     }
 
+    // Migration: Chinese-searchable bigram index for chunks (added 2026-09-12).
+    // The trigram index cannot match terms shorter than three characters, so
+    // two-character Chinese words (方法, 模型…) were unreachable. A second FTS
+    // table over a bigram-expanded `search_text` column fixes that; existing
+    // rows are backfilled and the index rebuilt once.
+    add_column_if_missing(&db, "chunks", "search_text", "TEXT NOT NULL DEFAULT ''")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chunks.search_text: {}", e))?;
+    {
+        let pending: Vec<(i64, String)> =
+            sqlx::query_as("SELECT rowid, content FROM chunks WHERE search_text = ''")
+                .fetch_all(&db)
+                .await?;
+        if !pending.is_empty() {
+            info!(rows = pending.len(), "backfilling chunks.search_text");
+            for (rowid, content) in pending {
+                let search_text = crate::ai::query::bigram_index_text(&content);
+                sqlx::query("UPDATE chunks SET search_text = ? WHERE rowid = ?")
+                    .bind(&search_text)
+                    .bind(rowid)
+                    .execute(&db)
+                    .await?;
+            }
+        }
+    }
+    let bi_sql: Option<(String,)> =
+        sqlx::query_as("SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts_bi'")
+            .fetch_optional(&db)
+            .await?;
+    if bi_sql.is_none() {
+        info!("creating chunks_fts_bi (CJK bigram index)");
+        sqlx::query(
+            "CREATE VIRTUAL TABLE chunks_fts_bi USING fts5(
+                search_text,
+                tokenize='unicode61',
+                content='chunks', content_rowid='search_text'
+            )",
+        )
+        .execute(&db)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to create chunks_fts_bi: {e}"))?;
+    }
+    for sql in [
+        "CREATE TRIGGER IF NOT EXISTS chunks_fts_bi_ai AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts_bi(rowid, search_text) VALUES (new.rowid, new.search_text);
+        END",
+        "CREATE TRIGGER IF NOT EXISTS chunks_fts_bi_ad AFTER DELETE ON chunks BEGIN
+            INSERT INTO chunks_fts_bi(chunks_fts_bi, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+        END",
+        "CREATE TRIGGER IF NOT EXISTS chunks_fts_bi_au AFTER UPDATE ON chunks BEGIN
+            INSERT INTO chunks_fts_bi(chunks_fts_bi, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+            INSERT INTO chunks_fts_bi(rowid, search_text) VALUES (new.rowid, new.search_text);
+        END",
+        "INSERT INTO chunks_fts_bi(chunks_fts_bi) VALUES('rebuild')",
+    ] {
+        sqlx::query(sql)
+            .execute(&db)
+            .await
+            .map_err(|e| anyhow::anyhow!("chunks_fts_bi setup failed: {e}"))?;
+    }
+
     // Migration: chunks_fts → trigram tokenizer (added 2026-08-10).
     // The default unicode61 tokenizer treats CJK text (no spaces) as single
     // tokens, making Chinese keyword search effectively broken. Trigram

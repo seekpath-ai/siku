@@ -294,11 +294,13 @@ async fn insert_chunks_tx(
     for chunk in chunks {
         let chunk_id = Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO chunks (id, paper_id, content, page_start, page_end, section, section_path, block_type, is_tail, chunk_index, token_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO chunks (id, paper_id, content, search_text, page_start, page_end, section, section_path, block_type, is_tail, chunk_index, token_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&chunk_id)
         .bind(paper_id)
         .bind(&chunk.content)
+        // CJK bigram form for the Chinese-capable FTS index (ai/query.rs).
+        .bind(crate::ai::query::bigram_index_text(&chunk.content))
         .bind(chunk.page_start)
         .bind(chunk.page_end)
         .bind(&chunk.section)

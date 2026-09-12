@@ -233,6 +233,10 @@ CREATE TABLE IF NOT EXISTS chunks (
     block_type TEXT NOT NULL DEFAULT 'prose',
     -- References/appendix tail: indexed, but down-weighted by default.
     is_tail INTEGER NOT NULL DEFAULT 0,
+    -- Search form of the content: CJK runs expanded into bigrams so that
+    -- two-character Chinese words are reachable (see ai/query.rs). Indexed by
+    -- chunks_fts_bi below; ASCII keeps the trigram table.
+    search_text TEXT NOT NULL DEFAULT '',
     chunk_index INTEGER NOT NULL,
     token_count INTEGER,
     created_at TEXT NOT NULL
@@ -534,6 +538,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     tokenize='trigram',
     content='chunks', content_rowid='rowid'
 );
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_bi USING fts5(
+    search_text,
+    tokenize='unicode61',
+    content='chunks', content_rowid='search_text'
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_items_fts USING fts5(
     title, content,
     content='knowledge_items', content_rowid='rowid'
@@ -571,6 +580,17 @@ END;
 CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE ON chunks BEGIN
   INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
   INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_fts_bi_ai AFTER INSERT ON chunks BEGIN
+  INSERT INTO chunks_fts_bi(rowid, search_text) VALUES (new.rowid, new.search_text);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_fts_bi_ad AFTER DELETE ON chunks BEGIN
+  INSERT INTO chunks_fts_bi(chunks_fts_bi, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_fts_bi_au AFTER UPDATE ON chunks BEGIN
+  INSERT INTO chunks_fts_bi(chunks_fts_bi, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+  INSERT INTO chunks_fts_bi(rowid, search_text) VALUES (new.rowid, new.search_text);
 END;
 
 CREATE TRIGGER IF NOT EXISTS knowledge_items_fts_ai AFTER INSERT ON knowledge_items BEGIN

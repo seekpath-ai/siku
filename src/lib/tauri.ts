@@ -430,7 +430,6 @@ export interface AppSettings {
   tool_knowledge_read_max_chars: number;
 
   // Embedding backend
-  embedding_backend?: string;
   embedding_base_url?: string;
   embedding_api_key?: string;
   embedding_model?: string;
@@ -810,18 +809,19 @@ export interface EmbeddingModelCount {
   dimensions: number;
 }
 export interface EmbeddingStatus {
+  /** 语义搜索是否开启：填了服务地址就是开启。 */
   leg_enabled: boolean;
-  backend: string;
   model: string;
   base_url: string;
   total_chunks: number;
   embedded_chunks: number;
   dimensions: number | null;
+  /** 早期占位向量，永远不参与检索。 */
+  placeholder_chunks: number;
   other_models: EmbeddingModelCount[];
 }
 export interface EmbeddingProbe {
   ok: boolean;
-  backend: string;
   model: string;
   base_url: string;
   dimensions: number | null;
@@ -831,8 +831,12 @@ export interface EmbeddingProbe {
 export async function searchEmbeddingStatus(): Promise<EmbeddingStatus> {
   return invoke<EmbeddingStatus>('search_embedding_status');
 }
-export async function searchTestEmbeddingEndpoint(): Promise<EmbeddingProbe> {
-  return invoke<EmbeddingProbe>('search_test_embedding_endpoint');
+export async function searchTestEmbeddingEndpoint(
+  baseUrl: string,
+  model: string,
+  apiKey: string,
+): Promise<EmbeddingProbe> {
+  return invoke<EmbeddingProbe>('search_test_embedding_endpoint', { baseUrl, model, apiKey });
 }
 export async function searchRagQuery(query: string, topK?: number): Promise<string> {
   return invoke<string>('search_rag_query', { query, topK });

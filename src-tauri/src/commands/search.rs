@@ -30,12 +30,17 @@ pub async fn search_embedding_status(
     crate::ai::embedder::embedding_status(&state.db).await
 }
 
-/// Probe the configured embeddings endpoint once. Failures come back as a
+/// Probe an embeddings endpoint from the values the settings form holds, so a
+/// configuration can be tried before it is saved. Failures come back as a
 /// report, not as a rejected command.
 #[tauri::command]
-#[instrument]
-pub async fn search_test_embedding_endpoint() -> crate::ai::embedder::EmbeddingProbe {
-    crate::ai::embedder::test_embedding_endpoint().await
+#[instrument(skip(api_key))]
+pub async fn search_test_embedding_endpoint(
+    base_url: String,
+    model: String,
+    api_key: String,
+) -> crate::ai::embedder::EmbeddingProbe {
+    crate::ai::embedder::test_embedding_endpoint_with(&base_url, &model, &api_key).await
 }
 
 #[tauri::command]

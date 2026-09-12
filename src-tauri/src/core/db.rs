@@ -2625,10 +2625,10 @@ pub(crate) mod tests {
     #[test]
     fn placeholder_label_is_disjoint_from_real_model_names() {
         use crate::ai::embedder::{model_label, PLACEHOLDER_MODEL, RECOMMENDED_LOCAL_MODEL};
-        assert_eq!(model_label("hash", RECOMMENDED_LOCAL_MODEL), PLACEHOLDER_MODEL);
-        assert_ne!(model_label("hash", RECOMMENDED_LOCAL_MODEL), RECOMMENDED_LOCAL_MODEL);
+        assert_eq!(model_label(false, RECOMMENDED_LOCAL_MODEL), PLACEHOLDER_MODEL);
+        assert_ne!(model_label(false, RECOMMENDED_LOCAL_MODEL), RECOMMENDED_LOCAL_MODEL);
         assert_eq!(
-            model_label("api", RECOMMENDED_LOCAL_MODEL),
+            model_label(true, RECOMMENDED_LOCAL_MODEL),
             RECOMMENDED_LOCAL_MODEL,
             "真实后端必须用自己的模型名当标签"
         );

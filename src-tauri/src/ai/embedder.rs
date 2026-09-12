@@ -95,7 +95,6 @@ pub async fn generate_embeddings_for_paper(
 /// without touching the process-wide settings cache.
 #[derive(Debug, Clone, Default)]
 pub struct EmbeddingConfig {
-    pub backend: String,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -103,21 +102,24 @@ pub struct EmbeddingConfig {
 
 impl EmbeddingConfig {
     /// Read the active configuration from app + device settings.
+    ///
+    /// The service address IS the switch: empty means "no semantic search", and
+    /// there is nothing else to turn on. There used to be a separate backend
+    /// enum (`hash` / `api`) whose only job was to disable something that a
+    /// missing address already disables.
     pub fn active() -> Self {
         let settings = crate::core::settings_service::cached_settings();
         let device = crate::core::settings_service::cached_device_settings();
         Self {
-            backend: settings.embedding_backend,
             base_url: settings.embedding_base_url,
             api_key: device.embedding_api_key,
             model: settings.embedding_model,
         }
     }
 
-    /// A real endpoint is configured, so vectors may take part in retrieval.
-    /// The built-in placeholder never qualifies.
+    /// An endpoint is configured, so vectors may take part in retrieval.
     pub fn enabled(&self) -> bool {
-        self.backend == "api" && !self.base_url.trim().is_empty()
+        !self.base_url.trim().is_empty()
     }
 }
 
@@ -154,30 +156,30 @@ pub async fn embed_texts_with(
         return Ok(vectors);
     }
 
-    // No real backend configured: the placeholder keeps the pipeline runnable
-    // (it is never used for retrieval).
+    // No endpoint configured. The old code answered with the hash placeholder
+    // here, which made an unconfigured install look like it had vectors.
     let _ = db;
-    Ok(texts.iter().map(|t| generate_fallback_embedding(t)).collect())
+    Err("no embeddings endpoint configured".to_string())
 }
 
-/// Model label recorded in the embeddings table for the active backend.
+/// Model label recorded in the embeddings table for the active configuration.
 ///
 /// Retrieval compares vectors only within the same label: rows from another
-/// backend live in a different vector space (and often a different dimension).
+/// model live in a different vector space (and often a different dimension).
 pub fn embedding_model_label() -> String {
-    let settings = crate::core::settings_service::cached_settings();
-    model_label(&settings.embedding_backend, &settings.embedding_model)
+    let cfg = EmbeddingConfig::active();
+    model_label(cfg.enabled(), &cfg.model)
 }
 
-/// Label for a backend configuration. Split out so the "the placeholder label
-/// must never equal a real model name" rule is testable without the global
+/// Label for a configuration. Split out so the "a stored label must never
+/// accidentally match a real model name" rule is testable without the global
 /// settings cache.
 ///
-/// Returns `None` from callers' point of view when the placeholder is active:
-/// it yields `PLACEHOLDER_MODEL`, which no configured endpoint can produce
-/// under its own name by accident.
-pub fn model_label(backend: &str, configured_model: &str) -> String {
-    if backend == "api" {
+/// With no endpoint configured the label is `PLACEHOLDER_MODEL`: rows left over
+/// from the hash-placeholder era must never look like they were produced by the
+/// model the user later configures.
+pub fn model_label(enabled: bool, configured_model: &str) -> String {
+    if enabled {
         configured_model.to_string()
     } else {
         PLACEHOLDER_MODEL.to_string()
@@ -327,7 +329,6 @@ pub async fn embed_query_with(
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EmbeddingProbe {
     pub ok: bool,
-    pub backend: String,
     pub model: String,
     pub base_url: String,
     /// Dimensions returned by the endpoint, when it answered.
@@ -343,11 +344,25 @@ pub async fn test_embedding_endpoint() -> EmbeddingProbe {
     probe_endpoint(&EmbeddingConfig::active()).await
 }
 
+/// Probe an endpoint described by the values the settings form currently holds,
+/// so a configuration can be tried before it is saved.
+pub async fn test_embedding_endpoint_with(
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+) -> EmbeddingProbe {
+    probe_endpoint(&EmbeddingConfig {
+        base_url: base_url.to_string(),
+        api_key: api_key.to_string(),
+        model: model.to_string(),
+    })
+    .await
+}
+
 /// Probe an explicit configuration once.
 pub async fn probe_endpoint(cfg: &EmbeddingConfig) -> EmbeddingProbe {
     let mut probe = EmbeddingProbe {
         ok: false,
-        backend: cfg.backend.clone(),
         model: cfg.model.clone(),
         base_url: cfg.base_url.clone(),
         dimensions: None,
@@ -356,11 +371,9 @@ pub async fn probe_endpoint(cfg: &EmbeddingConfig) -> EmbeddingProbe {
     };
 
     if !cfg.enabled() {
-        probe.error = Some(if cfg.backend == "api" {
-            "未填写 Base URL（需包含 /v1，例如 http://127.0.0.1:11434/v1）".to_string()
-        } else {
-            "当前后端是内置占位，不会生成向量；请选择「API 嵌入」".to_string()
-        });
+        probe.error = Some(
+            "未填写服务地址（需包含 /v1，例如 http://127.0.0.1:8899/v1）".to_string(),
+        );
         return probe;
     }
 
@@ -393,8 +406,9 @@ pub struct EmbeddingModelCount {
 /// What the vector leg is doing right now, and why it might be doing nothing.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EmbeddingStatus {
+    /// Semantic search is on: a service address is configured.
     pub leg_enabled: bool,
-    pub backend: String,
+    /// Model the vectors are (or will be) labelled with.
     pub model: String,
     pub base_url: String,
     pub total_chunks: i64,
@@ -402,8 +416,12 @@ pub struct EmbeddingStatus {
     pub embedded_chunks: i64,
     /// Dimensions of those vectors, when there is at least one row.
     pub dimensions: Option<i64>,
-    /// Rows left under other model labels. Retrieval ignores them, so they are
-    /// the visible reason a paper "has no vectors" after switching backends.
+    /// Leftovers from the hash-placeholder era. They never take part in
+    /// retrieval; the UI says so explicitly instead of letting them look like
+    /// usable vectors.
+    pub placeholder_chunks: i64,
+    /// Vectors under any other real model. Retrieval ignores them, so they are
+    /// the visible reason a paper "has no vectors" after switching models.
     pub other_models: Vec<EmbeddingModelCount>,
 }
 
@@ -435,9 +453,10 @@ pub async fn embedding_status_with(
     let other_models: Vec<EmbeddingModelCount> =
         sqlx::query_as::<_, (String, i64, i64)>(
             "SELECT model, COUNT(*), COALESCE(MAX(dimensions), 0) FROM embeddings \
-             WHERE model <> ? GROUP BY model ORDER BY COUNT(*) DESC",
+             WHERE model <> ? AND model <> ? GROUP BY model ORDER BY COUNT(*) DESC",
         )
         .bind(model)
+        .bind(PLACEHOLDER_MODEL)
         .fetch_all(db)
         .await
         .map_err(|e| format!("db: {e}"))?
@@ -445,14 +464,21 @@ pub async fn embedding_status_with(
         .map(|(model, chunks, dimensions)| EmbeddingModelCount { model, chunks, dimensions })
         .collect();
 
+    let placeholder_chunks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM embeddings WHERE model = ?")
+            .bind(PLACEHOLDER_MODEL)
+            .fetch_one(db)
+            .await
+            .map_err(|e| format!("db: {e}"))?;
+
     Ok(EmbeddingStatus {
         leg_enabled: cfg.enabled(),
-        backend: cfg.backend.clone(),
         model: model.to_string(),
         base_url: cfg.base_url.clone(),
         total_chunks,
         embedded_chunks,
         dimensions,
+        placeholder_chunks,
         other_models,
     })
 }
@@ -482,9 +508,9 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    fn cfg(backend: &str, base_url: &str) -> EmbeddingConfig {
+    /// Only the address matters: there is no backend switch any more.
+    fn cfg(base_url: &str) -> EmbeddingConfig {
         EmbeddingConfig {
-            backend: backend.to_string(),
             base_url: base_url.to_string(),
             api_key: String::new(),
             model: "bge-m3".to_string(),
@@ -554,7 +580,7 @@ mod tests {
             "{\"data\":[{\"embedding\":[0.1,0.2,0.3]}]}",
         )
         .await;
-        let probe = probe_endpoint(&cfg("api", &base)).await;
+        let probe = probe_endpoint(&cfg(&base)).await;
         assert!(probe.ok, "探针应成功，实际错误 {:?}", probe.error);
         assert_eq!(probe.dimensions, Some(3));
         assert!(probe.error.is_none());
@@ -565,7 +591,7 @@ mod tests {
     async fn probe_explains_a_missing_v1_segment() {
         let base = stub_endpoint("/v1/embeddings", "{}").await;
         let without_v1 = base.trim_end_matches("/v1").to_string();
-        let probe = probe_endpoint(&cfg("api", &without_v1)).await;
+        let probe = probe_endpoint(&cfg(&without_v1)).await;
         assert!(!probe.ok);
         let err = probe.error.expect("错误信息");
         assert!(err.contains("404"), "应报告 404，实际 {err}");
@@ -573,18 +599,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_refuses_the_placeholder_backend_without_calling_out() {
-        let probe = probe_endpoint(&cfg("hash", "http://127.0.0.1:1/v1")).await;
-        assert!(!probe.ok);
-        assert_eq!(probe.latency_ms, 0, "占位后端不应发起请求");
-        assert!(probe.error.expect("错误信息").contains("占位"));
+    async fn an_empty_address_means_semantic_search_is_off() {
+        let db = test_db().await;
+        assert!(!cfg("").enabled(), "地址为空即关闭语义搜索");
+        assert!(embed_query_with(&cfg(""), &db, "任意查询").await.is_none());
+        assert!(
+            embed_texts_with(&cfg(""), &db, &["任意".to_string()])
+                .await
+                .is_err(),
+            "没有端点时必须报错，不能悄悄回退成占位向量"
+        );
     }
 
     #[tokio::test]
-    async fn probe_requires_a_base_url() {
-        let probe = probe_endpoint(&cfg("api", "   ")).await;
+    async fn probe_requires_a_service_address() {
+        let probe = probe_endpoint(&cfg("   ")).await;
         assert!(!probe.ok);
-        assert!(probe.error.expect("错误信息").contains("Base URL"));
+        assert_eq!(probe.latency_ms, 0, "没有地址时不应发起请求");
+        let err = probe.error.expect("错误信息");
+        assert!(err.contains("服务地址"), "应提示填服务地址，实际 {err}");
     }
 
     #[tokio::test]
@@ -595,7 +628,7 @@ mod tests {
         )
         .await;
         let db = test_db().await;
-        let vector = embed_query_with(&cfg("api", &base), &db, "这篇论文用了什么方法")
+        let vector = embed_query_with(&cfg(&base), &db, "这篇论文用了什么方法")
             .await
             .expect("应拿到查询向量");
         assert_eq!(vector.len(), 4);
@@ -605,18 +638,14 @@ mod tests {
     #[tokio::test]
     async fn query_embedding_is_none_when_the_endpoint_is_down() {
         let db = test_db().await;
-        let dead = cfg("api", &dead_endpoint().await);
+        let dead = cfg(&dead_endpoint().await);
         assert!(
             embed_query_with(&dead, &db, "query").await.is_none(),
             "端点不可用时必须返回 None，而不是退回哈希占位向量"
         );
     }
 
-    #[tokio::test]
-    async fn query_embedding_is_none_for_the_placeholder_backend() {
-        let db = test_db().await;
-        assert!(embed_query_with(&cfg("hash", ""), &db, "任意查询").await.is_none());
-    }
+
 
     #[tokio::test]
     async fn status_reports_coverage_and_rows_left_under_other_models() {
@@ -659,7 +688,7 @@ mod tests {
         }
 
         let status = embedding_status_with(
-            &cfg("api", "http://127.0.0.1:11434/v1"),
+            &cfg("http://127.0.0.1:8899/v1"),
             &db,
             "bge-m3",
         )
@@ -669,6 +698,7 @@ mod tests {
         assert!(status.leg_enabled);
         assert_eq!(status.total_chunks, 3);
         assert_eq!(status.embedded_chunks, 2);
+        assert_eq!(status.placeholder_chunks, 0, "没有占位行");
         assert_eq!(status.dimensions, Some(1024));
         assert_eq!(status.other_models.len(), 1);
         assert_eq!(status.other_models[0].model, "old-model");
@@ -679,7 +709,7 @@ mod tests {
     #[tokio::test]
     async fn status_flags_a_disabled_vector_leg() {
         let db = test_db().await;
-        let status = embedding_status_with(&cfg("hash", ""), &db, "placeholder")
+        let status = embedding_status_with(&cfg(""), &db, "placeholder")
             .await
             .expect("status");
         assert!(!status.leg_enabled, "占位后端不能算作启用");

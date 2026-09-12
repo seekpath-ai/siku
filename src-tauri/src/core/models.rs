@@ -530,7 +530,9 @@ pub struct AppSettings {
     pub tool_knowledge_read_max_chars: i32,
 
     // ── Embedding backend ──
-    /// "hash" (local fallback) | "api" (OpenAI-compatible embeddings endpoint).
+    /// LEGACY, ignored. Semantic search is switched on by a non-empty
+    /// `embedding_base_url`; this field is kept only so existing settings rows
+    /// deserialize and round-trip unchanged.
     #[serde(default = "default_embedding_backend")]
     pub embedding_backend: String,
     #[serde(default = "default_embedding_base_url")]

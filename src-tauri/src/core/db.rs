@@ -376,6 +376,20 @@ async fn migrate_chunk_bigram_index(db: &Db) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chunks.search_text: {}", e))?;
 
+    let existing: Option<(String,)> =
+        sqlx::query_as("SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts_bi'")
+            .fetch_optional(db)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read the chunks_fts_bi definition: {e}"))?;
+    let broken = existing.as_ref().is_some_and(|(sql,)| {
+        sql.contains("content_rowid='search_text'") || sql.contains("content_rowid=\"search_text\"")
+    });
+
+    if broken {
+        warn!("repairing chunks_fts_bi: stored definition has an invalid content_rowid");
+        drop_chunk_bigram_index(db).await?;
+    }
+
     let pending: Vec<(i64, String)> =
         sqlx::query_as("SELECT rowid, content FROM chunks WHERE search_text = ''")
             .fetch_all(db)
@@ -405,20 +419,7 @@ async fn migrate_chunk_bigram_index(db: &Db) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to commit the search_text backfill: {e}"))?;
     }
 
-    let existing: Option<(String,)> =
-        sqlx::query_as("SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts_bi'")
-            .fetch_optional(db)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read the chunks_fts_bi definition: {e}"))?;
-    let broken = existing.as_ref().is_some_and(|(sql,)| {
-        sql.contains("content_rowid='search_text'") || sql.contains("content_rowid=\"search_text\"")
-    });
-
-    if broken {
-        warn!("repairing chunks_fts_bi: stored definition has an invalid content_rowid");
-        drop_chunk_bigram_index(db).await?;
-    }
-
+    // Any write to `chunks` from here on is safe: the broken triggers are gone.
     let created = existing.is_none() || broken;
     if created && !broken {
         info!("creating chunks_fts_bi (CJK bigram index)");
@@ -2387,6 +2388,49 @@ pub(crate) mod tests {
             .await
             .expect("delete");
         assert!(bigram_hits(&db, "指标").await.is_empty());
+    }
+
+    /// The exact shape of a library that hit the broken definition: schema init
+    /// created the bigram table and its triggers with `content_rowid` pointing
+    /// at a TEXT column, and `search_text` is still empty because the backfill
+    /// died on its first UPDATE — the delete path of the broken trigger raises
+    /// SQLITE_CORRUPT_VTAB there. The repair therefore has to happen BEFORE any
+    /// write to `chunks`.
+    #[tokio::test]
+    async fn broken_definition_present_before_the_backfill_is_repaired() {
+        let db = legacy_chunk_db().await;
+        sqlx::raw_sql(
+            "ALTER TABLE chunks ADD COLUMN search_text TEXT NOT NULL DEFAULT '';
+             CREATE VIRTUAL TABLE chunks_fts_bi USING fts5(
+                 search_text, tokenize='unicode61',
+                 content='chunks', content_rowid='search_text'
+             );
+             CREATE TRIGGER chunks_fts_bi_ai AFTER INSERT ON chunks BEGIN
+                 INSERT INTO chunks_fts_bi(rowid, search_text) VALUES (new.rowid, new.search_text);
+             END;
+             CREATE TRIGGER chunks_fts_bi_ad AFTER DELETE ON chunks BEGIN
+                 INSERT INTO chunks_fts_bi(chunks_fts_bi, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+             END;
+             CREATE TRIGGER chunks_fts_bi_au AFTER UPDATE ON chunks BEGIN
+                 INSERT INTO chunks_fts_bi(chunks_fts_bi, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+                 INSERT INTO chunks_fts_bi(rowid, search_text) VALUES (new.rowid, new.search_text);
+             END;",
+        )
+        .execute(&db)
+        .await
+        .expect("state after the broken schema init");
+
+        // `search_text` is empty for every row: the backfill never ran.
+        migrate_chunk_bigram_index(&db)
+            .await
+            .expect("迁移必须在回填前先修掉坏定义，否则 UPDATE 会撞 267");
+
+        let empty: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE search_text = ''")
+            .fetch_one(&db)
+            .await
+            .expect("count");
+        assert_eq!(empty, 0, "回填必须完成");
+        assert_eq!(bigram_hits(&db, "方法").await, vec!["c0".to_string()]);
     }
 
     /// A database left behind by the broken migration (the virtual table was

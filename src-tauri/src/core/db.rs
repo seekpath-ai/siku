@@ -3,7 +3,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Connection, Pool, Row, Sqlite};
 use std::path::{Path, PathBuf};
 use tauri::Manager;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::core::models::DeviceAppSettings;
 
@@ -265,6 +265,175 @@ async fn recast_crr_site_id(db: &Db) -> anyhow::Result<()> {
 }
 
 #[instrument]
+/// Drop the bigram index and its triggers so it can be recreated cleanly.
+async fn drop_chunk_bigram_index(db: &Db) -> anyhow::Result<()> {
+    for sql in [
+        "DROP TRIGGER IF EXISTS chunks_fts_bi_ai",
+        "DROP TRIGGER IF EXISTS chunks_fts_bi_ad",
+        "DROP TRIGGER IF EXISTS chunks_fts_bi_au",
+        "DROP TABLE IF EXISTS chunks_fts_bi",
+    ] {
+        sqlx::query(sql).execute(db).await?;
+    }
+    Ok(())
+}
+
+/// Whether an error looks like damage to a full-text index rather than a
+/// schema, permission or I/O problem.
+///
+/// The indexes over `chunks` are derived data. Whatever ails them, the answer
+/// is to rebuild them from `chunks` — never to refuse to start: a corrupt
+/// search index used to abort `init` and take the whole app down with it.
+fn is_fts_corruption(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}").to_ascii_lowercase();
+    text.contains("malformed") || text.contains("corrupt") || text.contains("fts5")
+}
+
+/// Drop and rebuild both full-text indexes over `chunks` from scratch.
+async fn rebuild_chunk_fts(db: &Db) -> anyhow::Result<()> {
+    warn!("rebuilding the full-text indexes over chunks");
+    for sql in [
+        "DROP TRIGGER IF EXISTS chunks_fts_ai",
+        "DROP TRIGGER IF EXISTS chunks_fts_ad",
+        "DROP TRIGGER IF EXISTS chunks_fts_au",
+    ] {
+        sqlx::query(sql).execute(db).await?;
+    }
+    drop_chunk_bigram_index(db).await?;
+    sqlx::query("DROP TABLE IF EXISTS chunks_fts")
+        .execute(db)
+        .await?;
+    sqlx::raw_sql(
+        "CREATE VIRTUAL TABLE chunks_fts USING fts5(
+             content, tokenize='trigram', content='chunks', content_rowid='rowid'
+         );
+         CREATE VIRTUAL TABLE chunks_fts_bi USING fts5(
+             search_text, tokenize='unicode61', content='chunks', content_rowid='rowid'
+         );
+         CREATE TRIGGER chunks_fts_ai AFTER INSERT ON chunks BEGIN
+             INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+         END;
+         CREATE TRIGGER chunks_fts_ad AFTER DELETE ON chunks BEGIN
+             INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+         END;
+         CREATE TRIGGER chunks_fts_au AFTER UPDATE ON chunks BEGIN
+             INSERT INTO chunks_fts(chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+             INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+         END;
+         CREATE TRIGGER chunks_fts_bi_ai AFTER INSERT ON chunks BEGIN
+             INSERT INTO chunks_fts_bi(rowid, search_text) VALUES (new.rowid, new.search_text);
+         END;
+         CREATE TRIGGER chunks_fts_bi_ad AFTER DELETE ON chunks BEGIN
+             INSERT INTO chunks_fts_bi(chunks_fts_bi, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+         END;
+         CREATE TRIGGER chunks_fts_bi_au AFTER UPDATE ON chunks BEGIN
+             INSERT INTO chunks_fts_bi(chunks_fts_bi, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+             INSERT INTO chunks_fts_bi(rowid, search_text) VALUES (new.rowid, new.search_text);
+         END;
+         INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');
+         INSERT INTO chunks_fts_bi(chunks_fts_bi) VALUES('rebuild');",
+    )
+    .execute(db)
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to rebuild the chunk full-text indexes: {e}"))?;
+    Ok(())
+}
+
+/// Create — or repair — the CJK bigram index over `chunks.search_text`.
+///
+/// The trigram index cannot match terms shorter than three characters, so
+/// two-character Chinese words (方法, 模型…) were unreachable. This adds a
+/// second FTS table over a bigram-expanded column, backfills existing rows and
+/// rebuilds the index once.
+///
+/// `content_rowid` must name the INTEGER rowid column of the content table.
+/// The first version of this migration wrote `content_rowid='search_text'` — a
+/// TEXT column — so FTS5 read a string as a row id: on any non-empty library
+/// the rebuild failed with SQLITE_CORRUPT_VTAB ("database disk image is
+/// malformed") and the app could not start at all. Note the broken table is
+/// created *before* the rebuild fails, so it survives on disk and existing
+/// databases have to be repaired, not just new ones created correctly.
+async fn migrate_chunk_bigram_index(db: &Db) -> anyhow::Result<()> {
+    const CREATE: &str = "CREATE VIRTUAL TABLE chunks_fts_bi USING fts5(
+                search_text,
+                tokenize='unicode61',
+                content='chunks', content_rowid='rowid'
+            )";
+    const TRIGGERS: [&str; 3] = [
+        "CREATE TRIGGER IF NOT EXISTS chunks_fts_bi_ai AFTER INSERT ON chunks BEGIN
+            INSERT INTO chunks_fts_bi(rowid, search_text) VALUES (new.rowid, new.search_text);
+        END",
+        "CREATE TRIGGER IF NOT EXISTS chunks_fts_bi_ad AFTER DELETE ON chunks BEGIN
+            INSERT INTO chunks_fts_bi(chunks_fts_bi, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+        END",
+        "CREATE TRIGGER IF NOT EXISTS chunks_fts_bi_au AFTER UPDATE ON chunks BEGIN
+            INSERT INTO chunks_fts_bi(chunks_fts_bi, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
+            INSERT INTO chunks_fts_bi(rowid, search_text) VALUES (new.rowid, new.search_text);
+        END",
+    ];
+
+    add_column_if_missing(db, "chunks", "search_text", "TEXT NOT NULL DEFAULT ''")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chunks.search_text: {}", e))?;
+
+    let pending: Vec<(i64, String)> =
+        sqlx::query_as("SELECT rowid, content FROM chunks WHERE search_text = ''")
+            .fetch_all(db)
+            .await?;
+    if !pending.is_empty() {
+        info!(rows = pending.len(), "backfilling chunks.search_text");
+        for (rowid, content) in pending {
+            sqlx::query("UPDATE chunks SET search_text = ? WHERE rowid = ?")
+                .bind(crate::ai::query::bigram_index_text(&content))
+                .bind(rowid)
+                .execute(db)
+                .await?;
+        }
+    }
+
+    let existing: Option<(String,)> =
+        sqlx::query_as("SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts_bi'")
+            .fetch_optional(db)
+            .await?;
+    let broken = existing.as_ref().is_some_and(|(sql,)| {
+        sql.contains("content_rowid='search_text'") || sql.contains("content_rowid=\"search_text\"")
+    });
+
+    if broken {
+        warn!("repairing chunks_fts_bi: stored definition has an invalid content_rowid");
+        drop_chunk_bigram_index(db).await?;
+    }
+
+    let created = existing.is_none() || broken;
+    if created && !broken {
+        info!("creating chunks_fts_bi (CJK bigram index)");
+    }
+    if created {
+        sqlx::query(CREATE)
+            .execute(db)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to create chunks_fts_bi: {e}"))?;
+    }
+
+    for sql in TRIGGERS {
+        sqlx::query(sql)
+            .execute(db)
+            .await
+            .map_err(|e| anyhow::anyhow!("chunks_fts_bi trigger setup failed: {e}"))?;
+    }
+
+    // Only when the index was just created from scratch: otherwise every app
+    // start would re-index the whole library for nothing.
+    if created {
+        sqlx::query("INSERT INTO chunks_fts_bi(chunks_fts_bi) VALUES('rebuild')")
+            .execute(db)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to rebuild chunks_fts_bi: {e}"))?;
+    }
+
+    Ok(())
+}
+
 pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     let app_data_dir = app_handle
         .path()
@@ -676,64 +845,15 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     }
 
     // Migration: Chinese-searchable bigram index for chunks (added 2026-09-12).
-    // The trigram index cannot match terms shorter than three characters, so
-    // two-character Chinese words (方法, 模型…) were unreachable. A second FTS
-    // table over a bigram-expanded `search_text` column fixes that; existing
-    // rows are backfilled and the index rebuilt once.
-    add_column_if_missing(&db, "chunks", "search_text", "TEXT NOT NULL DEFAULT ''")
-        .await
-        .map_err(|e| anyhow::anyhow!("migration failed for chunks.search_text: {}", e))?;
-    {
-        let pending: Vec<(i64, String)> =
-            sqlx::query_as("SELECT rowid, content FROM chunks WHERE search_text = ''")
-                .fetch_all(&db)
-                .await?;
-        if !pending.is_empty() {
-            info!(rows = pending.len(), "backfilling chunks.search_text");
-            for (rowid, content) in pending {
-                let search_text = crate::ai::query::bigram_index_text(&content);
-                sqlx::query("UPDATE chunks SET search_text = ? WHERE rowid = ?")
-                    .bind(&search_text)
-                    .bind(rowid)
-                    .execute(&db)
-                    .await?;
-            }
+    if let Err(e) = migrate_chunk_bigram_index(&db).await {
+        if !is_fts_corruption(&e) {
+            return Err(e);
         }
-    }
-    let bi_sql: Option<(String,)> =
-        sqlx::query_as("SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts_bi'")
-            .fetch_optional(&db)
-            .await?;
-    if bi_sql.is_none() {
-        info!("creating chunks_fts_bi (CJK bigram index)");
-        sqlx::query(
-            "CREATE VIRTUAL TABLE chunks_fts_bi USING fts5(
-                search_text,
-                tokenize='unicode61',
-                content='chunks', content_rowid='search_text'
-            )",
-        )
-        .execute(&db)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to create chunks_fts_bi: {e}"))?;
-    }
-    for sql in [
-        "CREATE TRIGGER IF NOT EXISTS chunks_fts_bi_ai AFTER INSERT ON chunks BEGIN
-            INSERT INTO chunks_fts_bi(rowid, search_text) VALUES (new.rowid, new.search_text);
-        END",
-        "CREATE TRIGGER IF NOT EXISTS chunks_fts_bi_ad AFTER DELETE ON chunks BEGIN
-            INSERT INTO chunks_fts_bi(chunks_fts_bi, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
-        END",
-        "CREATE TRIGGER IF NOT EXISTS chunks_fts_bi_au AFTER UPDATE ON chunks BEGIN
-            INSERT INTO chunks_fts_bi(chunks_fts_bi, rowid, search_text) VALUES('delete', old.rowid, old.search_text);
-            INSERT INTO chunks_fts_bi(rowid, search_text) VALUES (new.rowid, new.search_text);
-        END",
-        "INSERT INTO chunks_fts_bi(chunks_fts_bi) VALUES('rebuild')",
-    ] {
-        sqlx::query(sql)
-            .execute(&db)
+        warn!(error = %e, "bigram index could not be maintained; rebuilding it from chunks");
+        drop_chunk_bigram_index(&db).await?;
+        migrate_chunk_bigram_index(&db)
             .await
-            .map_err(|e| anyhow::anyhow!("chunks_fts_bi setup failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("bigram index rebuild failed: {e}"))?;
     }
 
     // Migration: chunks_fts → trigram tokenizer (added 2026-08-10).
@@ -791,10 +911,15 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
             .await?;
     if fts_rebuilt.is_none() {
         for table in ["papers_fts", "notes_fts", "chunks_fts", "knowledge_items_fts"] {
-            sqlx::query(&format!("INSERT INTO {table}({table}) VALUES('rebuild')"))
+            if let Err(e) = sqlx::query(&format!("INSERT INTO {table}({table}) VALUES('rebuild')"))
                 .execute(&db)
                 .await
-                .map_err(|e| anyhow::anyhow!("failed to rebuild {table}: {e}"))?;
+            {
+                // Derived data again: log it and stay up rather than abort
+                // startup. The index is repaired on demand instead.
+                warn!(table, error = %e, "full-text index rebuild failed; continuing without it");
+                continue;
+            }
         }
         let now = crate::core::time::now_iso();
         sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES ('fts.rebuilt', '1', ?)")
@@ -2156,5 +2281,187 @@ pub(crate) mod tests {
         sqlx::query("SELECT crsql_finalize()").execute(&imported).await?;
         imported.close().await;
         Ok(())
+    }
+
+    /// An old-style library: chunks with content and the trigram index, but no
+    /// `search_text` column and no bigram index yet.
+    async fn legacy_chunk_db() -> Db {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        sqlx::raw_sql(
+            "CREATE TABLE chunks (
+                 id TEXT PRIMARY KEY,
+                 paper_id TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 chunk_index INTEGER NOT NULL,
+                 token_count INTEGER,
+                 created_at TEXT NOT NULL
+             );
+             CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                 content, tokenize='trigram', content='chunks', content_rowid='rowid'
+             );
+             INSERT INTO chunks (id, paper_id, content, chunk_index, created_at) VALUES
+                 ('c0', 'p1', '本文提出了一种基于注意力的语义分割方法。', 0, 't'),
+                 ('c1', 'p1', '实验使用公开数据集评测，评价指标为 mIoU。', 1, 't');",
+        )
+        .execute(&db)
+        .await
+        .expect("legacy schema");
+        db
+    }
+
+    async fn bigram_hits(db: &Db, term: &str) -> Vec<String> {
+        let expr = crate::ai::query::bigram_match_expr(&[term.to_string()]).expect("expr");
+        sqlx::query_scalar::<_, String>(
+            "SELECT c.id FROM chunks_fts_bi f JOIN chunks c ON c.rowid = f.rowid \
+             WHERE chunks_fts_bi MATCH ?",
+        )
+        .bind(expr)
+        .fetch_all(db)
+        .await
+        .expect("bigram query")
+    }
+
+    /// The migration must index rows that already exist. With the first
+    /// version's `content_rowid='search_text'` this rebuild failed with
+    /// SQLITE_CORRUPT_VTAB (267), which aborted app startup on every library
+    /// that was not empty.
+    #[tokio::test]
+    async fn bigram_index_migrates_a_non_empty_library() {
+        let db = legacy_chunk_db().await;
+        migrate_chunk_bigram_index(&db).await.expect("migration");
+
+        let sql: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = 'chunks_fts_bi'")
+                .fetch_one(&db)
+                .await
+                .expect("definition");
+        assert!(
+            sql.contains("content_rowid='rowid'"),
+            "content_rowid 必须是整数 rowid 列，实际: {sql}"
+        );
+
+        assert_eq!(bigram_hits(&db, "方法").await, vec!["c0".to_string()]);
+        assert_eq!(bigram_hits(&db, "指标").await, vec!["c1".to_string()]);
+    }
+
+    /// The index must stay in sync through the delete path of its triggers.
+    #[tokio::test]
+    async fn bigram_index_follows_updates_and_deletes() {
+        let db = legacy_chunk_db().await;
+        migrate_chunk_bigram_index(&db).await.expect("migration");
+
+        sqlx::query("UPDATE chunks SET content = '改成了图神经网络相关的内容。', search_text = ? WHERE id = 'c0'")
+            .bind(crate::ai::query::bigram_index_text("改成了图神经网络相关的内容。"))
+            .execute(&db)
+            .await
+            .expect("update");
+        assert!(bigram_hits(&db, "方法").await.is_empty(), "旧词必须从索引里消失");
+        assert_eq!(bigram_hits(&db, "网络").await, vec!["c0".to_string()]);
+
+        sqlx::query("DELETE FROM chunks WHERE id = 'c1'")
+            .execute(&db)
+            .await
+            .expect("delete");
+        assert!(bigram_hits(&db, "指标").await.is_empty());
+    }
+
+    /// A database left behind by the broken migration (the virtual table was
+    /// created before the rebuild failed) must be repaired, not just new ones
+    /// created correctly.
+    #[tokio::test]
+    async fn broken_bigram_index_is_repaired() {
+        let db = legacy_chunk_db().await;
+        // Reproduce the state after the failing run: column added, values
+        // backfilled, virtual table created with the wrong rowid column.
+        sqlx::query("ALTER TABLE chunks ADD COLUMN search_text TEXT NOT NULL DEFAULT ''")
+            .execute(&db)
+            .await
+            .expect("add column");
+        for (id, content) in [("c0", "本文提出了一种基于注意力的语义分割方法。"), ("c1", "实验使用公开数据集评测，评价指标为 mIoU。")] {
+            sqlx::query("UPDATE chunks SET search_text = ? WHERE id = ?")
+                .bind(crate::ai::query::bigram_index_text(content))
+                .bind(id)
+                .execute(&db)
+                .await
+                .expect("backfill");
+        }
+        sqlx::raw_sql(
+            "CREATE VIRTUAL TABLE chunks_fts_bi USING fts5(
+                 search_text, tokenize='unicode61',
+                 content='chunks', content_rowid='search_text'
+             );",
+        )
+        .execute(&db)
+        .await
+        .expect("broken table");
+
+        migrate_chunk_bigram_index(&db).await.expect("repair");
+
+        let sql: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = 'chunks_fts_bi'")
+                .fetch_one(&db)
+                .await
+                .expect("definition");
+        assert!(sql.contains("content_rowid='rowid'"), "修复后仍用错列: {sql}");
+        assert_eq!(bigram_hits(&db, "方法").await, vec!["c0".to_string()]);
+    }
+
+    /// A damaged full-text index must be rebuildable, and the rebuild must
+    /// leave both indexes queryable — a corrupt index showing up at startup
+    /// used to take the whole app down.
+    #[tokio::test]
+    async fn damaged_chunk_fts_is_rebuilt_from_chunks() {
+        let db = legacy_chunk_db().await;
+        migrate_chunk_bigram_index(&db).await.expect("migration");
+        // Damage the index behind FTS5's back: drop one of its shadow tables.
+        sqlx::query("DROP TABLE chunks_fts_bi_data")
+            .execute(&db)
+            .await
+            .expect("drop shadow table");
+
+        rebuild_chunk_fts(&db).await.expect("rebuild");
+
+        assert_eq!(bigram_hits(&db, "方法").await, vec!["c0".to_string()]);
+        let trigram: Vec<String> = sqlx::query_scalar(
+            "SELECT c.id FROM chunks_fts f JOIN chunks c ON c.rowid = f.rowid \
+             WHERE chunks_fts MATCH '语义分割'",
+        )
+        .fetch_all(&db)
+        .await
+        .expect("trigram query");
+        assert_eq!(trigram, vec!["c0".to_string()]);
+        // The rewrite must leave one trigger set per index, not duplicates.
+        let triggers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'chunks_fts%'",
+        )
+        .fetch_one(&db)
+        .await
+        .expect("trigger count");
+        assert_eq!(triggers, 6, "两个索引各 3 个触发器");
+    }
+
+    /// Only index damage justifies the rebuild detour; real problems must
+    /// still surface.
+    #[test]
+    fn corruption_detection_does_not_swallow_other_errors() {
+        for msg in [
+            "error returned from database: (code: 267) database disk image is malformed",
+            "fts5: corruption found in the index",
+        ] {
+            let err = anyhow::anyhow!("{}", msg);
+            assert!(is_fts_corruption(&err), "应判为索引损坏: {msg}");
+        }
+        for msg in [
+            "no such table: chunks",
+            "attempt to write a readonly database",
+            "UNIQUE constraint failed: chunks.id",
+        ] {
+            let err = anyhow::anyhow!("{}", msg);
+            assert!(!is_fts_corruption(&err), "不应判为索引损坏: {msg}");
+        }
     }
 }

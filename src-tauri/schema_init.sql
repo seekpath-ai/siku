@@ -538,10 +538,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     tokenize='trigram',
     content='chunks', content_rowid='rowid'
 );
+-- content_rowid must be the INTEGER rowid column of the content table: a TEXT
+-- column here makes FTS5 read a string as a row id, and any rebuild or delete
+-- then fails with SQLITE_CORRUPT_VTAB ("database disk image is malformed").
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_bi USING fts5(
     search_text,
     tokenize='unicode61',
-    content='chunks', content_rowid='search_text'
+    content='chunks', content_rowid='rowid'
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_items_fts USING fts5(
     title, content,

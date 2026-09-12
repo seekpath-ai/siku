@@ -186,6 +186,45 @@ pub fn model_label(enabled: bool, configured_model: &str) -> String {
     }
 }
 
+/// Ask an OpenAI-compatible service which models it serves.
+///
+/// `GET {base_url}/models` is implemented by OpenAI, Ollama, vLLM, LM Studio and
+/// the script in `scripts/`, so the model name can be discovered rather than
+/// typed. A missing route is not an error condition for the caller: it only
+/// means the name has to come from the user.
+async fn fetch_endpoint_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let mut builder = client.get(&url);
+    if !api_key.trim().is_empty() {
+        builder = builder.header("Authorization", format!("Bearer {}", api_key.trim()));
+    }
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| format!("请求 {url} 失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("{url} 返回 {}", resp.status()));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|e| format!("响应不是 JSON：{e}"))?;
+    let data = body["data"]
+        .as_array()
+        .ok_or_else(|| "响应里没有 data 数组".to_string())?;
+    let models: Vec<String> = data
+        .iter()
+        .filter_map(|item| {
+            item["id"]
+                .as_str()
+                .or_else(|| item.as_str())
+                .map(|id| id.to_string())
+        })
+        .collect();
+    if models.is_empty() {
+        return Err("服务未报告任何模型".to_string());
+    }
+    Ok(models)
+}
+
 /// Call an OpenAI-compatible `/embeddings` endpoint.
 async fn api_embed_texts(
     base_url: &str,
@@ -329,12 +368,21 @@ pub async fn embed_query_with(
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EmbeddingProbe {
     pub ok: bool,
+    /// Model name the probe requested with.
     pub model: String,
     pub base_url: String,
     /// Dimensions returned by the endpoint, when it answered.
     pub dimensions: Option<usize>,
     pub latency_ms: u64,
     pub error: Option<String>,
+    /// Model name announced by `GET {base_url}/models`, when the service
+    /// implements that route. The UI adopts it instead of asking the user to
+    /// guess: the name is both the request field and the label under which the
+    /// vectors are stored.
+    pub detected_model: Option<String>,
+    /// Why the model list could not be read. A service without `/v1/models` is
+    /// not an error — the user just has to name the model themselves.
+    pub detect_error: Option<String>,
 }
 
 const PROBE_TEXT: &str = "siku embedding probe 向量探针";
@@ -368,6 +416,8 @@ pub async fn probe_endpoint(cfg: &EmbeddingConfig) -> EmbeddingProbe {
         dimensions: None,
         latency_ms: 0,
         error: None,
+        detected_model: None,
+        detect_error: None,
     };
 
     if !cfg.enabled() {
@@ -377,9 +427,24 @@ pub async fn probe_endpoint(cfg: &EmbeddingConfig) -> EmbeddingProbe {
         return probe;
     }
 
+    // Ask for the model list first: it is the cheapest way to catch a wrong
+    // address, and it names the model when the user did not.
+    match fetch_endpoint_models(&cfg.base_url, &cfg.api_key).await {
+        Ok(models) => probe.detected_model = models.first().cloned(),
+        Err(e) => probe.detect_error = Some(e),
+    }
+
+    // An unnamed model is still worth probing: the name the service announced
+    // is what the request should carry in that case.
+    let model = if cfg.model.trim().is_empty() {
+        probe.detected_model.clone().unwrap_or_default()
+    } else {
+        cfg.model.clone()
+    };
+    probe.model = model.clone();
+
     let started = std::time::Instant::now();
-    let result =
-        api_embed_texts(&cfg.base_url, &cfg.api_key, &cfg.model, &[PROBE_TEXT.to_string()]).await;
+    let result = api_embed_texts(&cfg.base_url, &cfg.api_key, &model, &[PROBE_TEXT.to_string()]).await;
     probe.latency_ms = started.elapsed().as_millis() as u64;
 
     match result {
@@ -534,6 +599,22 @@ mod tests {
     /// anything else — so a wrong URL shape fails loudly instead of silently
     /// passing.
     async fn stub_endpoint(path: &'static str, body: &'static str) -> String {
+        stub_server(None, path, body, None).await
+    }
+
+    /// A stub OpenAI-compatible service.
+    ///
+    /// `models` serves `GET /v1/models` (None → 404, i.e. a service without the
+    /// route), `embeddings_path` + `embeddings_body` serve the embedding call,
+    /// and `require_model` makes the embedding call fail unless the request body
+    /// carries that model name — which is how the tests prove the announced name
+    /// is actually used when the user left the field empty.
+    async fn stub_server(
+        models: Option<&'static str>,
+        embeddings_path: &'static str,
+        embeddings_body: &'static str,
+        require_model: Option<&'static str>,
+    ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stub");
@@ -542,11 +623,22 @@ mod tests {
             while let Ok((mut socket, _)) = listener.accept().await {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 8192];
+                    let mut buf = vec![0u8; 16384];
                     let n = socket.read(&mut buf).await.unwrap_or(0);
                     let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let (status, payload) = if head.starts_with(&format!("POST {path} ")) {
-                        ("200 OK", body)
+                    let (status, payload) = if head.starts_with("GET /v1/models ") {
+                        match models {
+                            Some(body) => ("200 OK", body),
+                            None => ("404 Not Found", "{\"error\":\"no such route\"}"),
+                        }
+                    } else if head.starts_with(&format!("POST {embeddings_path} ")) {
+                        match require_model {
+                            Some(model) if !head.contains(&format!("\"model\":\"{model}\"")) => (
+                                "400 Bad Request",
+                                "{\"error\":\"unexpected model\"}",
+                            ),
+                            _ => ("200 OK", embeddings_body),
+                        }
                     } else {
                         ("404 Not Found", "{\"error\":\"no such route\"}")
                     };
@@ -571,6 +663,59 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         drop(listener);
         format!("http://127.0.0.1:{port}/v1")
+    }
+
+
+    #[tokio::test]
+    async fn probe_adopts_the_model_name_the_service_announces() {
+        let base = stub_server(
+            Some("{\"object\":\"list\",\"data\":[{\"id\":\"BAAI/bge-small-zh-v1.5\",\"object\":\"model\"}]}"),
+            "/v1/embeddings",
+            "{\"data\":[{\"embedding\":[0.1,0.2,0.3]}]}",
+            None,
+        )
+        .await;
+        let probe = probe_endpoint(&cfg(&base)).await;
+        assert!(probe.ok, "探针应成功：{:?}", probe.error);
+        assert_eq!(
+            probe.detected_model.as_deref(),
+            Some("BAAI/bge-small-zh-v1.5"),
+            "应报告服务端声明的模型名"
+        );
+        assert!(probe.detect_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_empty_model_name_still_probes_with_the_announced_one() {
+        // The stub rejects any request that does not carry the announced name.
+        let base = stub_server(
+            Some("{\"data\":[{\"id\":\"bge-m3\"}]}"),
+            "/v1/embeddings",
+            "{\"data\":[{\"embedding\":[0.5,0.5]}]}",
+            Some("bge-m3"),
+        )
+        .await;
+        let probe = probe_endpoint(&cfg(&base)).await;
+        assert!(
+            probe.ok,
+            "未填模型名时应拿检测到的名字去请求，实际错误 {:?}",
+            probe.error
+        );
+        assert_eq!(probe.model, "bge-m3");
+    }
+
+    #[tokio::test]
+    async fn a_service_without_a_model_list_still_probes_and_says_why() {
+        let base = stub_endpoint(
+            "/v1/embeddings",
+            "{\"data\":[{\"embedding\":[0.1,0.2,0.3]}]}",
+        )
+        .await;
+        let probe = probe_endpoint(&cfg(&base)).await;
+        assert!(probe.ok, "没有 /v1/models 不应影响连接测试：{:?}", probe.error);
+        assert!(probe.detected_model.is_none());
+        let why = probe.detect_error.expect("应说明未能自动获取模型名");
+        assert!(why.contains("404"), "错误里应带状态码，实际 {why}");
     }
 
     #[tokio::test]

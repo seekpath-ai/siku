@@ -827,6 +827,10 @@ export interface EmbeddingProbe {
   dimensions: number | null;
   latency_ms: number;
   error: string | null;
+  /** 服务通过 GET /v1/models 声明的模型名，可用来自动填写。 */
+  detected_model: string | null;
+  /** 未能自动获取模型名的原因（例如服务没有 /v1/models）。 */
+  detect_error: string | null;
 }
 export async function searchEmbeddingStatus(): Promise<EmbeddingStatus> {
   return invoke<EmbeddingStatus>('search_embedding_status');

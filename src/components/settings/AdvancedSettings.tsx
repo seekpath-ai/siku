@@ -103,13 +103,17 @@ export function AdvancedSettings() {
   const handleTestEndpoint = async () => {
     setTesting(true);
     try {
-      setProbe(
-        await searchTestEmbeddingEndpoint(
-          settings.embedding_base_url || '',
-          settings.embedding_model || '',
-          settings.embedding_api_key || '',
-        ),
+      const result = await searchTestEmbeddingEndpoint(
+        settings.embedding_base_url || '',
+        settings.embedding_model || '',
+        settings.embedding_api_key || '',
       );
+      // Adopt the name the service announces when the field is still empty; a
+      // name the user typed is never overwritten, only pointed out.
+      if (result.detected_model && !(settings.embedding_model || '').trim()) {
+        setSettings((prev) => ({ ...prev, embedding_model: result.detected_model! }));
+      }
+      setProbe(result);
     } catch (err) {
       console.error('Failed to probe embedding endpoint:', err);
     } finally {
@@ -265,6 +269,7 @@ export function AdvancedSettings() {
                 (probe.ok ? (
                   <p className="text-xs text-emerald-400">
                     连接成功 · {probe.dimensions} 维 · {probe.latency_ms} ms
+                    {probe.detected_model && ` · 服务模型 ${probe.detected_model}`}
                     {embeddingStatus?.dimensions != null &&
                       probe.dimensions !== embeddingStatus.dimensions &&
                       ' · 与库中已存向量维度不一致，需重建索引'}
@@ -272,6 +277,31 @@ export function AdvancedSettings() {
                 ) : (
                   <p className="text-xs text-red-400">连接失败：{probe.error}</p>
                 ))}
+
+              {probe?.detect_error && (
+                <p className="text-xs text-text-secondary/70">
+                  未能自动获取模型名（{probe.detect_error}），请手填服务端使用的模型名。
+                </p>
+              )}
+
+              {probe?.detected_model &&
+                (settings.embedding_model || '').trim() !== probe.detected_model && (
+                  <p className="text-xs text-amber-400">
+                    服务声明的是 {probe.detected_model}，与上面填的不一致。
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSettings((prev) => ({
+                          ...prev,
+                          embedding_model: probe.detected_model || '',
+                        }))
+                      }
+                      className="ml-1 underline hover:text-primary"
+                    >
+                      改用 {probe.detected_model}
+                    </button>
+                  </p>
+                )}
             </div>
           </>
         )}

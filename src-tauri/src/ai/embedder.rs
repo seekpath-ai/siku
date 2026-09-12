@@ -1,8 +1,19 @@
 use sqlx::SqlitePool;
 use tracing::{info, instrument, warn};
 
-/// Default embedding model (stored in the embeddings table as metadata).
-pub const DEFAULT_MODEL: &str = "BAAI/bge-small-zh-v1.5";
+/// Model name this project recommends for a local OpenAI-compatible endpoint.
+pub const RECOMMENDED_LOCAL_MODEL: &str = "BAAI/bge-small-zh-v1.5";
+
+/// Label stored for the built-in character-histogram placeholder vectors.
+///
+/// Deliberately NOT a real model name. It used to be `DEFAULT_MODEL`
+/// ("BAAI/bge-small-zh-v1.5"), which is exactly the model a local endpoint
+/// serves — so the moment someone configured such an endpoint, the stale
+/// placeholder rows carried the same label as the new vectors: the re-embed
+/// query (`e.model <> ?`) skipped them as "already done", and the vector leg
+/// scored real query vectors against character histograms. The labels are now
+/// disjoint, and `relabel_placeholder_embeddings` fixes existing databases.
+pub const PLACEHOLDER_MODEL: &str = "placeholder-hash";
 pub const DEFAULT_DIMENSIONS: usize = 512;
 
 /// Generate embeddings for text chunks and store them in the database.
@@ -155,10 +166,21 @@ pub async fn embed_texts_with(
 /// backend live in a different vector space (and often a different dimension).
 pub fn embedding_model_label() -> String {
     let settings = crate::core::settings_service::cached_settings();
-    if settings.embedding_backend == "api" {
-        settings.embedding_model.clone()
+    model_label(&settings.embedding_backend, &settings.embedding_model)
+}
+
+/// Label for a backend configuration. Split out so the "the placeholder label
+/// must never equal a real model name" rule is testable without the global
+/// settings cache.
+///
+/// Returns `None` from callers' point of view when the placeholder is active:
+/// it yields `PLACEHOLDER_MODEL`, which no configured endpoint can produce
+/// under its own name by accident.
+pub fn model_label(backend: &str, configured_model: &str) -> String {
+    if backend == "api" {
+        configured_model.to_string()
     } else {
-        DEFAULT_MODEL.to_string()
+        PLACEHOLDER_MODEL.to_string()
     }
 }
 

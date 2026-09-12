@@ -353,6 +353,73 @@ async fn rebuild_chunk_fts(db: &Db) -> anyhow::Result<()> {
 /// malformed") and the app could not start at all. Note the broken table is
 /// created *before* the rebuild fails, so it survives on disk and existing
 /// databases have to be repaired, not just new ones created correctly.
+/// Mark vectors that are actually the built-in hash placeholder as such.
+///
+/// Rows written before the labels were separated carry `BAAI/bge-small-zh-v1.5`
+/// — the same label a real local endpoint reports — so they would be mistaken
+/// for up-to-date embeddings and scored against real query vectors. Only rows
+/// whose blob is bit-for-bit the hash of their own chunk content are relabelled,
+/// so genuinely embedded rows are left alone. One-off, guarded by a flag.
+async fn relabel_placeholder_embeddings(db: &Db) -> anyhow::Result<()> {
+    let done: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM settings WHERE key = 'embeddings.placeholder_relabeled'")
+            .fetch_optional(db)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read the placeholder relabel flag: {e}"))?;
+    if done.is_some() {
+        return Ok(());
+    }
+
+    let rows: Vec<(String, Vec<u8>, String)> = sqlx::query_as(
+        "SELECT e.chunk_id, e.vector, c.content FROM embeddings e \
+         JOIN chunks c ON c.id = e.chunk_id WHERE e.model = ?",
+    )
+    .bind(crate::ai::embedder::RECOMMENDED_LOCAL_MODEL)
+    .fetch_all(db)
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to read embeddings for relabelling: {e}"))?;
+
+    let mut relabeled = 0usize;
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to start the relabel: {e}"))?;
+    for (chunk_id, blob, content) in rows {
+        let stored = crate::ai::embedder::blob_to_vector(&blob);
+        if stored == crate::ai::embedder::generate_fallback_embedding(&content) {
+            sqlx::query("UPDATE embeddings SET model = ? WHERE chunk_id = ?")
+                .bind(crate::ai::embedder::PLACEHOLDER_MODEL)
+                .bind(&chunk_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to relabel placeholder vector {chunk_id}: {e}"))?;
+            relabeled += 1;
+        }
+    }
+    tx.commit()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to commit the relabel: {e}"))?;
+
+    // Bookkeeping is best-effort: failing to record the flag must not abort
+    // startup. The relabel is idempotent, so the worst case is a repeat scan.
+    let now = crate::core::time::now_iso();
+    if let Err(e) = sqlx::query(
+        "INSERT OR REPLACE INTO settings (key, value, updated_at) \
+         VALUES ('embeddings.placeholder_relabeled', '1', ?)",
+    )
+    .bind(&now)
+    .execute(db)
+    .await
+    {
+        warn!(error = %e, "could not record the placeholder relabel; it will run again next start");
+    }
+
+    if relabeled > 0 {
+        warn!(relabeled, "placeholder vectors relabelled; they will be re-embedded on the next index");
+    }
+    Ok(())
+}
+
 async fn migrate_chunk_bigram_index(db: &Db) -> anyhow::Result<()> {
     const CREATE: &str = "CREATE VIRTUAL TABLE chunks_fts_bi USING fts5(
                 search_text,
@@ -859,6 +926,9 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
             .await
             .map_err(|e| anyhow::anyhow!("migration failed for papers.{col}: {e}"))?;
     }
+
+    // Migration: separate the placeholder label from real model names.
+    relabel_placeholder_embeddings(&db).await?;
 
     // Migration: Chinese-searchable bigram index for chunks (added 2026-09-12).
     if let Err(e) = migrate_chunk_bigram_index(&db).await {
@@ -2527,5 +2597,130 @@ pub(crate) mod tests {
             let err = anyhow::anyhow!("{}", msg);
             assert!(!is_fts_corruption(&err), "不应判为索引损坏: {msg}");
         }
+    }
+    async fn test_db() -> Db {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        sqlx::raw_sql(include_str!("../../schema_init.sql"))
+            .execute(&pool)
+            .await
+            .expect("schema");
+        sqlx::query(
+            "INSERT INTO papers (id, title, created_at, updated_at) VALUES ('p1', '测试', 't', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    /// The placeholder label must never collide with a real model name.
+    ///
+    /// It used to be `BAAI/bge-small-zh-v1.5`, which is exactly what a local
+    /// endpoint serves: stale placeholder rows then looked up-to-date, were
+    /// never re-embedded, and were scored against real query vectors.
+    #[test]
+    fn placeholder_label_is_disjoint_from_real_model_names() {
+        use crate::ai::embedder::{model_label, PLACEHOLDER_MODEL, RECOMMENDED_LOCAL_MODEL};
+        assert_eq!(model_label("hash", RECOMMENDED_LOCAL_MODEL), PLACEHOLDER_MODEL);
+        assert_ne!(model_label("hash", RECOMMENDED_LOCAL_MODEL), RECOMMENDED_LOCAL_MODEL);
+        assert_eq!(
+            model_label("api", RECOMMENDED_LOCAL_MODEL),
+            RECOMMENDED_LOCAL_MODEL,
+            "真实后端必须用自己的模型名当标签"
+        );
+    }
+
+    /// Existing placeholder rows are relabelled so the vector leg ignores them
+    /// and the re-embed query picks them up; real vectors keep their label.
+    #[tokio::test]
+    async fn placeholder_embeddings_are_relabelled_and_real_ones_kept() {
+        let db = test_db().await;
+        let content = "本文提出了一种基于注意力的语义分割方法。";
+        sqlx::query(
+            "INSERT INTO chunks (id, paper_id, content, search_text, block_type, is_tail, chunk_index, created_at)
+             VALUES ('c0', 'p1', ?, '', 'prose', 0, 0, 't')",
+        )
+        .bind(content)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let placeholder = crate::ai::embedder::generate_fallback_embedding(content);
+        let real: Vec<f32> = (0..512).map(|i| i as f32 / 512.0).collect();
+        for (chunk_id, vector) in [("c0", &placeholder)] {
+            let blob: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+            sqlx::query(
+                "INSERT INTO embeddings (chunk_id, model, dimensions, vector, created_at)
+                 VALUES (?, ?, 512, ?, 't')",
+            )
+            .bind(chunk_id)
+            .bind(crate::ai::embedder::RECOMMENDED_LOCAL_MODEL)
+            .bind(blob)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        let real_blob: Vec<u8> = real.iter().flat_map(|f| f.to_le_bytes()).collect();
+        sqlx::query(
+            "INSERT INTO chunks (id, paper_id, content, search_text, block_type, is_tail, chunk_index, created_at)
+             VALUES ('c1', 'p1', '另一段内容', '', 'prose', 0, 1, 't')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO embeddings (chunk_id, model, dimensions, vector, created_at)
+             VALUES ('c1', ?, 512, ?, 't')",
+        )
+        .bind(crate::ai::embedder::RECOMMENDED_LOCAL_MODEL)
+        .bind(real_blob)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        // Discriminating probes: is writing `settings` possible at all here?
+        println!(
+            "PROBE settings 裸写: {:?}",
+            sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES ('probe.bare', '1', 't')")
+                .execute(&db)
+                .await
+                .map(|_| "ok")
+                .map_err(|e| e.to_string())
+        );
+        let tx_probe = async {
+            let mut tx = db.begin().await?;
+            sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES ('probe.tx', '1', 't')")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await
+        };
+        println!("PROBE settings 事务内写: {:?}", tx_probe.await.map(|_| "ok").map_err(|e: sqlx::Error| e.to_string()));
+        let crr: Vec<(String,)> = sqlx::query_as("SELECT name FROM sqlite_master WHERE name LIKE 'crsql%'")
+            .fetch_all(&db)
+            .await
+            .unwrap_or_default();
+        println!("PROBE crsql 元数据表: {:?}", crr.iter().map(|r| r.0.as_str()).collect::<Vec<_>>());
+
+        relabel_placeholder_embeddings(&db).await.expect("relabel");
+
+        let placeholder_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM embeddings WHERE model = ?")
+                .bind(crate::ai::embedder::PLACEHOLDER_MODEL)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        let real_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM embeddings WHERE model = ? AND chunk_id = 'c1'",
+        )
+        .bind(crate::ai::embedder::RECOMMENDED_LOCAL_MODEL)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(placeholder_rows, 1, "占位向量应被改标");
+        assert_eq!(real_rows, 1, "真实向量必须保持原标签");
     }
 }

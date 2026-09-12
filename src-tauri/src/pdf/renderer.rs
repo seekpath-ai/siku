@@ -5,6 +5,8 @@ use crate::core::error::{Result, SikuError};
 /// Render the first page of a PDF to a PNG thumbnail.
 /// The thumbnail is saved to the given output path.
 pub fn render_thumbnail(pdf_path: &Path, output_path: &Path) -> Result<()> {
+    // pdfium is process-global and not thread-safe; see `bindings::pdfium_guard`.
+    let _pdfium = crate::pdf::bindings::pdfium_guard();
     let pdfium = crate::pdf::bindings::pdfium()
         .map_err(SikuError::PdfParse)?;
 

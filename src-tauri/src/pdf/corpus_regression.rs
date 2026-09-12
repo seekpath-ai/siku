@@ -284,3 +284,48 @@ fn structure_metadata_is_populated() {
         );
     }
 }
+
+/// Concurrent extraction must stay stable.
+///
+/// A single `Pdfium` instance is shared process-wide, and pdfium is not
+/// thread-safe: running these extractions in parallel used to corrupt the heap
+/// (SIGSEGV / `free(): invalid pointer`) — which is what importing several PDFs
+/// at once, or rendering a thumbnail during an import, does in the app. The
+/// guard in `bindings::pdfium_guard` is the fix; this test is the detector.
+#[test]
+fn concurrent_extraction_stays_stable() {
+    let Some(corpus) = Corpus::locate() else { return };
+    let names = ["demo0.pdf", "demo1.pdf", "demo2.pdf"];
+
+    let baseline: Vec<(String, usize, usize)> = names
+        .iter()
+        .map(|name| {
+            let pages = extract_text(&corpus.pdf(name)).expect("extract");
+            let chars: usize = pages.iter().map(|p| p.text.len()).sum();
+            (name.to_string(), pages.len(), chars)
+        })
+        .collect();
+
+    let handles: Vec<_> = (0..6)
+        .map(|worker| {
+            let dir = corpus.dir.clone();
+            std::thread::spawn(move || {
+                let name = names[worker % names.len()];
+                let pages = extract_text(&dir.join(name)).expect("extract");
+                let chars: usize = pages.iter().map(|p| p.text.len()).sum();
+                (name.to_string(), pages.len(), chars)
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let (name, pages, chars) = handle.join().expect("worker thread panicked");
+        let (_, want_pages, want_chars) = baseline
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .expect("baseline");
+        // Same input, same output: concurrent runs must not lose pages or text.
+        assert_eq!(pages, *want_pages, "{name}: page count differs under load");
+        assert_eq!(chars, *want_chars, "{name}: extracted text differs under load");
+    }
+}

@@ -1,6 +1,27 @@
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use pdfium_render::prelude::{Pdfium, PdfiumError};
+
+/// Serializes every pdfium call in the process.
+///
+/// pdfium keeps process-global state (font and loader caches) and is not safe
+/// to drive from several threads at once: two extractions running concurrently
+/// corrupt the heap. That shows up as SIGSEGV or `free(): invalid pointer`,
+/// reproduced by running the corpus regression tests in parallel — which is
+/// exactly what importing two PDFs at once, or rendering a thumbnail while an
+/// import is running, does in the app.
+///
+/// The guard must cover the whole load + read, not just the binding: the
+/// corruption comes from concurrent document access.
+///
+/// NEVER call a function that takes this guard from inside a critical section —
+/// `std::sync::Mutex` is not reentrant.
+static PDFIUM_LOCK: Mutex<()> = Mutex::new(());
+
+/// Hold this for the entire duration of any pdfium work.
+pub fn pdfium_guard() -> MutexGuard<'static, ()> {
+    PDFIUM_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Lazily bound, process-wide Pdfium instance.
 ///

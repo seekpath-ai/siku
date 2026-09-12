@@ -23,6 +23,8 @@ pub struct AnchoredParagraph {
 /// Extract anchored paragraphs for the dual-pane view. Geometry comes from
 /// pdfium, with the pdf_oxide fallback running the same pipeline.
 pub fn extract_paragraphs(path: &Path) -> Result<Vec<AnchoredParagraph>> {
+    // pdfium is process-global and not thread-safe; see `bindings::pdfium_guard`.
+    let _pdfium = crate::pdf::bindings::pdfium_guard();
     if let Ok(pdfium) = crate::pdf::bindings::pdfium() {
         let doc = pdfium
             .load_pdf_from_file(path, None)
@@ -202,6 +204,8 @@ pub fn extract_text(path: &Path) -> Result<Vec<PageText>> {
 
 /// pdfium-based extraction (requires the dynamic pdfium library).
 fn extract_text_pdfium(path: &Path) -> Result<Vec<PageText>> {
+    // pdfium is process-global and not thread-safe; see `bindings::pdfium_guard`.
+    let _pdfium = crate::pdf::bindings::pdfium_guard();
     let pdfium = crate::pdf::bindings::pdfium()
         .map_err(SikuError::PdfParse)?;
 

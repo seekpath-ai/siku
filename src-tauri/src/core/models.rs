@@ -723,9 +723,11 @@ fn default_tool_file_read_max_chars() -> i32 {
     8000
 }
 fn default_tool_paper_read_max_chars() -> i32 {
-    // Matches the default shown in the settings UI. Callers of paper_read
-    // can override per call via the max_chars parameter.
-    500
+    // Roughly the median chunk length in the demo corpus (2.1–2.2k characters),
+    // so the default read hands the model whole chunks instead of the first
+    // ~23% of each one. The previous 500 produced silent truncation on nearly
+    // every chunk. Callers of paper_read can still override per call.
+    2500
 }
 fn default_tool_paper_read_total_max_chars() -> i32 {
     // Matches the default shown in the settings UI.

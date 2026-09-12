@@ -146,8 +146,10 @@ fn extract_pages_oxide(
         };
         let raw: Vec<RawChar> = chars
             .iter()
-            .filter(|ch| !ch.char.is_control())
-            .map(|ch| {
+            .filter_map(|ch| {
+                // Same glyph normalisation as the pdfium path (keeps the
+                // line-final hyphen marker as a real '-').
+                let ch_char = crate::pdf::paragraphs::normalize_glyph(ch.char)?;
                 let (mut x, y) = rotation.map_point(ch.bbox.x, ch.bbox.y, display_w, display_h);
                 let mut right = ch.bbox.x + ch.bbox.width;
                 if rotation.needs_frame_remap() {
@@ -164,14 +166,14 @@ fn extract_pages_oxide(
                     x = mapped[0];
                     right = mapped[2];
                 }
-                RawChar {
+                Some(RawChar {
                     x,
                     y,
                     right,
                     font: ch.font_size,
-                    ch: ch.char,
+                    ch: ch_char,
                     bold: (ch.font_weight as u16) >= 600,
-                }
+                })
             })
             .collect();
         let (lines, gutter) = crate::pdf::paragraphs::chars_to_lines(raw, display_w);

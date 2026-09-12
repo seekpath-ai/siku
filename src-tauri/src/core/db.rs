@@ -345,6 +345,18 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for annotations.translation: {}", e))?;
 
+    // Migration: structure metadata on chunks (added 2026-09-12). Existing rows
+    // keep the defaults; a re-index fills the real values.
+    add_column_if_missing(&db, "chunks", "section_path", "TEXT")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chunks.section_path: {}", e))?;
+    add_column_if_missing(&db, "chunks", "block_type", "TEXT NOT NULL DEFAULT 'prose'")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chunks.block_type: {}", e))?;
+    add_column_if_missing(&db, "chunks", "is_tail", "INTEGER NOT NULL DEFAULT 0")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chunks.is_tail: {}", e))?;
+
     // Migration: soft-delete (trash) support for papers (added 2026-08-16)
     add_column_if_missing(&db, "papers", "deleted_at", "TEXT")
         .await

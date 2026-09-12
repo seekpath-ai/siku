@@ -1,53 +1,16 @@
 use async_trait::async_trait;
-use regex::Regex;
 use sqlx::SqlitePool;
-use std::sync::OnceLock;
 use crate::ai::agent::tool_registry::{Tool, ToolParameter};
 
 pub struct PaperReadTool {
     db: SqlitePool,
-    /// paper_id → cached body-end boundary (chunk index); avoids rescanning
-    /// every chunk on repeat reads of the same paper.
-    body_end_cache: std::sync::Mutex<std::collections::HashMap<String, Option<usize>>>,
 }
 
 impl PaperReadTool {
     pub fn new(db: SqlitePool) -> Self {
-        Self {
-            db,
-            body_end_cache: Default::default(),
-        }
+        Self { db }
     }
 }
-
-/// Find the chunk where the references/appendix tail begins.
-///
-/// PDF text extraction reflows the layout — headings do NOT sit on their own
-/// lines (verified against the real chunk store), so this matches an inline,
-/// case-sensitive heading (`References`, incl. the "R EFERENCES" small-caps
-/// extraction artifact) that is IMMEDIATELY followed by the first reference
-/// entry: `[1]` (numeric style), `Adlakha, …` or `Anthropic. 2024` (author-year
-/// style). Prose mentions ("meme references", "see Appendix B") and TOC lines
-/// ("References ......... 59") never match because of the entry requirement.
-/// Validated 7/7 papers against the production chunk store.
-fn detect_body_end(chunks: &[(i32, Option<i32>, String)]) -> Option<i32> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        const NAME: &str = r"(?:[A-Z][A-Za-z\-']+\s+){0,3}[A-Z][A-Za-z\-']+";
-        Regex::new(&format!(
-            r"(?:\d{{1,2}}\s+)?(?:References|Bibliography|R EFERENCES|参考文献)\s*(?:\[1\]|{NAME},|{NAME}\.\s*(?:19|20)\d{{2}})"
-        ))
-        .expect("tail heading regex")
-    });
-    // Skip chunk 0 (title page) — a false positive there would hide the body.
-    for (idx, _, content) in chunks {
-        if *idx > 0 && re.is_match(content) {
-            return Some(*idx);
-        }
-    }
-    None
-}
-
 #[async_trait]
 impl Tool for PaperReadTool {
     fn name(&self) -> &str { "paper_read" }
@@ -56,12 +19,11 @@ impl Tool for PaperReadTool {
 
     fn description(&self) -> &str {
         "Get a paper's metadata, abstract and paginated text chunks. \
-         Raw chunks target ~512 tokens, which is roughly 500–4000 characters depending on the \
-         language and whether a long paragraph/sentence could not be split. Every call counts \
-         against your context budget, which is also capped per call. The response marks where \
-         the body ends — chunks after that (references/appendix) are excluded by default. Use \
-         offset/limit to read only the parts relevant to the question, and set max_chars high \
-         enough to avoid truncating the chunks you need."
+         Raw chunks target ~512 tokens (2–3k characters for English prose). Each chunk is \
+         returned whole by default; every call also counts against a per-call character budget. \
+         Chunks carry their section path and kind (prose/heading/caption/reference), and the \
+         references/appendix tail is labelled rather than hidden. Use offset/limit to read only \
+         the parts relevant to the question."
     }
 
     fn parameters(&self) -> Vec<ToolParameter> {
@@ -93,13 +55,7 @@ impl Tool for PaperReadTool {
             ToolParameter {
                 name: "max_chars".into(),
                 param_type: "integer".into(),
-                description: "Per-chunk character cap. Default comes from the app settings (typically 500), which truncates most chunks to short previews — fine for locating content. Raw chunks can reach several thousand characters when a long paragraph or sentence cannot be split; set this high enough to avoid truncation.".into(),
-                required: false,
-            },
-            ToolParameter {
-                name: "include_tail".into(),
-                param_type: "boolean".into(),
-                description: "Chunks after the body end (references/appendix) are excluded by default; set true to include them (default false)".into(),
+                description: "Per-chunk character cap. Defaults to the app setting (2500 ≈ a whole chunk), so chunks normally arrive untruncated. Lower it to scan many chunks cheaply; raise it for unusually long chunks.".into(),
                 required: false,
             },
         ]
@@ -108,7 +64,6 @@ impl Tool for PaperReadTool {
     async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
         let paper_id = args["paper_id"].as_str().ok_or("paper_id required")?;
         let include_chunks = args["include_chunks"].as_bool().unwrap_or(false);
-        let include_tail = args["include_tail"].as_bool().unwrap_or(false);
         let offset = args["offset"].as_i64().unwrap_or(0).max(0);
         let limit = args["limit"].as_i64().unwrap_or(20).clamp(1, 50);
 
@@ -151,56 +106,42 @@ impl Tool for PaperReadTool {
             return Ok(result);
         }
 
-        // Scan chunk contents once for the body-end boundary. The result is
-        // cached per paper; the lock is never held across an await.
-        let cached = self.body_end_cache.lock().unwrap().get(paper_id).copied();
-        let (body_end, end_page) = match cached {
-            Some(cached_end) => {
-                let end_page = match cached_end {
-                    Some(end) => sqlx::query_as::<_, (Option<i32>,)>(
-                        "SELECT page_start FROM chunks WHERE paper_id = ? AND chunk_index = ?",
-                    )
-                    .bind(paper_id)
-                    .bind(end as i32)
-                    .fetch_optional(&self.db)
-                    .await
-                    .map_err(|e| format!("db error: {e}"))?
-                    .and_then(|(ps,)| ps),
-                    None => None,
-                };
-                (cached_end.map(|e| e as i32), end_page)
-            }
-            None => {
-                let all_chunks: Vec<(i32, Option<i32>, String)> = sqlx::query_as(
-                    "SELECT chunk_index, page_start, content FROM chunks WHERE paper_id = ? ORDER BY chunk_index"
-                )
-                .bind(paper_id)
-                .fetch_all(&self.db)
-                .await
-                .map_err(|e| format!("db error: {e}"))?;
-                let detected = detect_body_end(&all_chunks);
-                let end_page = detected.and_then(|end| {
-                    all_chunks
-                        .iter()
-                        .find(|(idx, _, _)| *idx == end)
-                        .and_then(|(_, ps, _)| *ps)
-                });
-                self.body_end_cache
-                    .lock()
-                    .unwrap()
-                    .insert(paper_id.to_string(), detected.map(|e| e as usize));
-                (detected, end_page)
-            }
-        };
+        // Structure metadata (section path, block type, references tail) is
+        // computed while indexing, so the boundary is read from the index rather
+        // than re-derived on every call. The tail is LABELLED, never hidden: the
+        // previous behaviour truncated pagination at the boundary, so one wrong
+        // boundary made the rest of a paper unreachable.
+        let rows: Vec<(i32, String, Option<i32>, Option<i32>, i64)> = sqlx::query_as(
+            "SELECT chunk_index, content, page_start, page_end, is_tail \
+             FROM chunks WHERE paper_id = ? ORDER BY chunk_index",
+        )
+        .bind(paper_id)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
 
-        // Reading boundary: the model navigates by this instead of fetching
-        // everything.
+        let body_end = rows
+            .iter()
+            .find(|(_, _, _, _, is_tail)| *is_tail != 0)
+            .map(|(idx, _, _, _, _)| *idx)
+            .or_else(|| {
+                // Index built before the structure migration: derive it here.
+                crate::pdf::chunker::detect_body_end(
+                    rows.iter().map(|(i, c, _, _, _)| (*i, c.as_str())),
+                )
+            });
+        let end_page = body_end.and_then(|end| {
+            rows.iter()
+                .find(|(i, _, _, _, _)| *i == end)
+                .and_then(|(_, _, ps, _, _)| *ps)
+        });
+
+        // Navigation hint: the model pages by this instead of fetching everything.
         result.push_str(&format!("\n\nChunks: {total} (paginate with offset/limit)"));
         if let Some(end) = body_end {
             result.push_str(&format!(
-                "\nBody ends at chunk {end}{}. Chunks {end}-{total_minus_1} are references/appendix — excluded from reads by default; pass include_tail=true if you really need them.",
+                "\nReferences/appendix start at chunk {end}{}; those chunks are labelled in the output and can be read normally.",
                 end_page.map(|p| format!(" (p.{p})")).unwrap_or_default(),
-                total_minus_1 = total - 1,
             ));
         }
 
@@ -208,39 +149,19 @@ impl Tool for PaperReadTool {
             return Ok(result);
         }
 
-        // Chunks past the body end are unreachable unless explicitly asked for.
-        let readable_end = match body_end {
-            Some(end) if !include_tail => end as i64,
-            _ => total,
-        };
-
-        if offset >= readable_end {
-            if readable_end < total {
-                result.push_str(&format!(
-                    "\n\n--- Text Chunks ---\noffset {offset} is inside the excluded tail (references/appendix, chunks {readable_end}-{}) — pass include_tail=true to read them",
-                    total - 1,
-                ));
-            } else {
-                result.push_str(&format!(
-                    "\n\n--- Text Chunks (0 of {total}) ---\noffset {offset} is past the end — this paper has {total} chunks in total",
-                ));
-            }
+        if offset >= total {
+            result.push_str(&format!(
+                "\n\n--- Text Chunks (0 of {total}) ---\noffset {offset} is past the end — this paper has {total} chunks in total",
+            ));
             return Ok(result);
         }
 
-        let limit = limit.min(readable_end - offset);
-        let chunks: Vec<(String, i32, Option<i32>, Option<i32>)> = sqlx::query_as(
-            "SELECT content, chunk_index, page_start, page_end FROM chunks WHERE paper_id = ? ORDER BY chunk_index LIMIT ? OFFSET ?"
-        )
-        .bind(paper_id)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| format!("db error: {e}"))?;
+        let limit = limit.min(total - offset);
+        let selected: Vec<&(i32, String, Option<i32>, Option<i32>, i64)> =
+            rows.iter().skip(offset as usize).take(limit as usize).collect();
 
         let from = offset + 1;
-        let to = offset + chunks.len() as i64;
+        let to = offset + selected.len() as i64;
         result.push_str(&format!("\n\n--- Text Chunks ({from}-{to} of {total}) ---\n"));
 
         let chunk_limit = args["max_chars"].as_i64()
@@ -260,7 +181,8 @@ impl Tool for PaperReadTool {
         let page = |v: &Option<i32>| v.map(|n| n.to_string()).unwrap_or_else(|| "?".into());
         let mut spent = 0usize;
         let mut emitted = 0usize;
-        for (content, idx, ps, pe) in &chunks {
+        for row in &selected {
+            let (idx, content, ps, pe, is_tail) = (&row.0, &row.1, &row.2, &row.3, row.4);
             // Truncate over-long chunks, but say so — otherwise the agent
             // may quote a partial chunk as if it were complete.
             let mut chars = content.chars();
@@ -271,12 +193,13 @@ impl Tool for PaperReadTool {
                 result.push_str(&format!(
                     "(output budget exhausted — spent {spent} of {total_budget} chars this call; \
                      {} more chunk(s) in this range; call again with offset {idx})\n",
-                    chunks.len() - emitted,
+                    selected.len() - emitted,
                 ));
                 break;
             }
+            let kind = if is_tail != 0 { ", references/appendix" } else { "" };
             result.push_str(&format!(
-                "[Chunk {} (p.{}-{})] {}{}\n\n",
+                "[Chunk {} (p.{}-{}{kind})] {}{}\n\n",
                 idx,
                 page(ps),
                 page(pe),
@@ -286,86 +209,9 @@ impl Tool for PaperReadTool {
             spent += text_len;
             emitted += 1;
         }
-        if emitted == chunks.len() {
-            if to < readable_end {
-                result.push_str(&format!("(more chunks available — call again with offset {to})\n"));
-            } else if readable_end < total {
-                result.push_str(&format!(
-                    "(end of body — chunks {readable_end}-{} are references/appendix, excluded by default)\n",
-                    total - 1,
-                ));
-            }
+        if emitted == selected.len() && to < total {
+            result.push_str(&format!("(more chunks available — call again with offset {to})\n"));
         }
         Ok(result)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn chunks(contents: &[&str]) -> Vec<(i32, Option<i32>, String)> {
-        contents
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (i as i32, Some(i as i32 + 1), c.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn detects_numeric_style_references() {
-        let c = chunks(&[
-            "body text",
-            "supported in part by NSF CNS-2145295. References [1] Chaos mesh: A powerful chaos engineering platform",
-            "[2] Claude Code by Anthropic",
-        ]);
-        assert_eq!(detect_body_end(&c), Some(1));
-    }
-
-    #[test]
-    fn detects_author_year_style_references() {
-        let c = chunks(&[
-            "body",
-            "References Vaibhav Adlakha, Parishad BehnamGhader, Xing Han Lu",
-            "tail",
-        ]);
-        assert_eq!(detect_body_end(&c), Some(1));
-    }
-
-    #[test]
-    fn detects_year_after_name_style() {
-        let c = chunks(&[
-            "body",
-            "correspondence to: panlu@stanford.edu. References Anthropic. 2024. Claude 3.5 haiku",
-            "tail",
-        ]);
-        assert_eq!(detect_body_end(&c), Some(1));
-    }
-
-    #[test]
-    fn detects_smallcaps_extraction_variant() {
-        let c = chunks(&[
-            "body",
-            "of AIOps tasks. R EFERENCES Josh Achiam, Steven Adler, Sandhini Agarwal",
-            "tail",
-        ]);
-        assert_eq!(detect_body_end(&c), Some(1));
-    }
-
-    #[test]
-    fn rejects_prose_and_toc() {
-        let c = chunks(&[
-            "Contents: References ......... 59",
-            "find reliable sources or references that explain the conversion process",
-            "we refer the reader to Appendix A for details",
-        ]);
-        assert_eq!(detect_body_end(&c), None);
-    }
-
-    #[test]
-    fn skips_title_chunk() {
-        let c = chunks(&["References [1] bogus match on the title chunk", "real body"]);
-        assert_eq!(detect_body_end(&c), None);
-    }
-}
-

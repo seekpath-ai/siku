@@ -294,7 +294,7 @@ async fn insert_chunks_tx(
     for chunk in chunks {
         let chunk_id = Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO chunks (id, paper_id, content, page_start, page_end, section, chunk_index, token_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO chunks (id, paper_id, content, page_start, page_end, section, section_path, block_type, is_tail, chunk_index, token_count, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&chunk_id)
         .bind(paper_id)
@@ -302,6 +302,9 @@ async fn insert_chunks_tx(
         .bind(chunk.page_start)
         .bind(chunk.page_end)
         .bind(&chunk.section)
+        .bind(&chunk.section_path)
+        .bind(chunk.block_type.as_str())
+        .bind(if chunk.is_tail { 1 } else { 0 })
         .bind(chunk.chunk_index)
         .bind(chunk.token_count)
         .bind(now)

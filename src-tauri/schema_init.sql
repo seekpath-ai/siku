@@ -227,6 +227,12 @@ CREATE TABLE IF NOT EXISTS chunks (
     page_start INTEGER,
     page_end INTEGER,
     section TEXT,
+    -- Ancestor chain of the section ("A > B > C") and the kind of content, so
+    -- retrieval can filter/prioritise without re-parsing the text.
+    section_path TEXT,
+    block_type TEXT NOT NULL DEFAULT 'prose',
+    -- References/appendix tail: indexed, but down-weighted by default.
+    is_tail INTEGER NOT NULL DEFAULT 0,
     chunk_index INTEGER NOT NULL,
     token_count INTEGER,
     created_at TEXT NOT NULL

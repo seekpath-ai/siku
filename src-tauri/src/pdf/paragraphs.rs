@@ -14,6 +14,24 @@
 //! exactly what `chunker::split_paragraphs` consumes — the chunker is
 //! unchanged.
 
+/// Normalise one glyph from a PDF text layer.
+///
+/// pdfium reports a **line-final hyphen** as `U+0002` (its soft-hyphen marker)
+/// and real soft hyphens arrive as `U+00AD`. Both used to be dropped as control
+/// characters, which broke one word in two: `join_lines` then saw "bench" +
+/// "marking" and inserted a space, so "benchmarking" was indexed as
+/// "bench marking" and could never be matched by FTS or embeddings. Measured on
+/// the demo corpus: 149 / 54 / 96 lost hyphens (demo0/1/2).
+///
+/// Returns `None` for glyphs that carry no text (the real control characters).
+pub fn normalize_glyph(c: char) -> Option<char> {
+    match c {
+        '\u{2}' | '\u{ad}' => Some('-'),
+        c if c.is_control() => None,
+        c => Some(c),
+    }
+}
+
 /// One character with layout geometry, source-agnostic: produced by the
 /// pdfium adapter (`page_to_lines`) or the pdf_oxide fallback path.
 #[derive(Debug, Clone)]
@@ -145,9 +163,7 @@ pub fn page_to_lines(
     let mut chars: Vec<RawChar> = Vec::new();
     for ch in text_page.chars().iter() {
         let Some(c) = ch.unicode_char() else { continue };
-        if c.is_control() {
-            continue;
-        }
+        let Some(c) = normalize_glyph(c) else { continue };
         let (Ok(origin_x), Ok(origin_y)) = (ch.origin_x(), ch.origin_y()) else { continue };
         let reported_font = ch.scaled_font_size().value;
         // Content-frame glyph box (fall back to an origin+advance estimate when

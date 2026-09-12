@@ -56,7 +56,7 @@ const DEFAULT_VALUES: AppSettings = {
   rag_chunk_max_chars: 800,
   tool_web_fetch_max_chars: 10000,
   tool_file_read_max_chars: 8000,
-  tool_paper_read_max_chars: 500,
+  tool_paper_read_max_chars: 2500,
   tool_paper_read_total_max_chars: 24000,
   tool_note_read_max_chars: 200,
   tool_knowledge_read_max_chars: 200,

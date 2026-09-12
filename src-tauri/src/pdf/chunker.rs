@@ -1,13 +1,42 @@
 use crate::pdf::extractor::PageText;
 
+/// What kind of content a chunk holds. Lets retrieval prefer prose, keep
+/// captions/tables addressable, and label the references tail instead of
+/// silently dropping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockType {
+    Prose,
+    Heading,
+    Caption,
+    Reference,
+}
+
+impl BlockType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prose => "prose",
+            Self::Heading => "heading",
+            Self::Caption => "caption",
+            Self::Reference => "reference",
+        }
+    }
+}
+
 /// A text chunk for RAG storage.
 #[derive(Debug, Clone)]
 pub struct ChunkData {
     pub content: String,
     pub page_start: Option<i32>,
     pub page_end: Option<i32>,
-    /// Detected section heading this chunk belongs to (e.g. "3.2 Methods").
+    /// Detected section heading this chunk belongs to (e.g. "Methods").
     pub section: Option<String>,
+    /// Ancestor chain of the section, " > " separated (e.g.
+    /// "Data and system requirements > Technology deployment process").
+    pub section_path: Option<String>,
+    pub block_type: BlockType,
+    /// The chunk belongs to the references/appendix tail. Kept in the index
+    /// (it answers "what does this paper cite?") but down-weighted by default.
+    pub is_tail: bool,
     pub chunk_index: i32,
     pub token_count: Option<i32>,
 }
@@ -60,40 +89,206 @@ const HEADING_KEYWORDS: &[&str] = &[
     "abstract", "introduction", "methods", "methodology", "results", "discussion",
     "conclusion", "conclusions", "references", "related work", "background",
     "experiments", "evaluation", "acknowledgments", "acknowledgements", "appendix",
+    "system model", "design", "implementation", "motivation", "problem statement",
+    "limitations", "future work", "threat model",
     "摘要", "引言", "方法", "结果", "讨论", "结论", "参考文献", "相关工作", "背景",
-    "实验", "评估", "致谢", "附录",
+    "实验", "评估", "致谢", "附录", "系统模型", "设计", "实现", "局限性",
 ];
 
+/// Collapse letter-spaced small caps: "A B S T R A C T" → "ABSTRACT",
+/// "I NTRODUCTION" → "INTRODUCTION".
+///
+/// PDF text layers keep small caps as separate glyph runs, so heading keywords
+/// used to be missed entirely — and the raw form then leaked into the chunk
+/// label and the FTS index. Returns the collapsed string plus whether it took a
+/// "hard" collapse (3+ single-letter groups), which callers use to avoid
+/// turning arbitrary letter-spaced furniture into headings.
+fn collapse_small_caps(s: &str) -> (String, bool) {
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    if tokens.len() < 2 {
+        return (s.to_string(), false);
+    }
+    let singles = tokens.iter().filter(|t| t.chars().count() == 1).count();
+    // A single letter followed by an uppercase run ("I NTRODUCTION") is the same
+    // artifact, and joins the two tokens.
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let cur = tokens[i];
+        // Only join when the next token is ALL CAPS: "I NTRODUCTION" and
+        // "R EFERENCES" are small-caps artefacts, whereas "A Multi-Agent …" is a
+        // normal title whose leading article must stay a separate word.
+        let next_upper_run = tokens
+            .get(i + 1)
+            .map(|n| {
+                n.chars().count() >= 2
+                    && n.chars().all(|c| c.is_uppercase() || !c.is_alphabetic())
+                    && n.chars().any(|c| c.is_alphabetic())
+            })
+            .unwrap_or(false);
+        if cur.chars().count() == 1 && next_upper_run {
+            out.push(format!("{cur}{}", tokens[i + 1]));
+            i += 2;
+            continue;
+        }
+        out.push(cur.to_string());
+        i += 1;
+    }
+    let hard = singles >= 3;
+    (out.join(if hard { "" } else { " " }), hard)
+}
+
+/// Heading-level prefix ("3.2 ", "IV. ", "A. ") → the heading body after it.
+fn strip_number_prefix(s: &str) -> Option<&str> {
+    let (raw_head, rest) = s.split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    if rest.is_empty() || rest.chars().count() < 2 {
+        return None;
+    }
+    let head = raw_head.trim_end_matches(['.', ')', ':', '：']);
+    if head.is_empty() {
+        return None;
+    }
+    // "3." / "3.2" — the digit run itself may be a single digit, so test the
+    // raw prefix (before stripping the separator) for the dotted form.
+    // "3." / "3.2" / "3" (dotted numbering)
+    let is_dotted = raw_head.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && raw_head.chars().any(|c| c.is_ascii_digit())
+        && (raw_head.contains('.') || raw_head.len() <= 2);
+    // "2C." / "3A." (digit + letter, Elsevier style)
+    let is_digit_letter = (2..=3).contains(&head.chars().count())
+        && head.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+        && head.chars().last().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+        && head.chars().all(|c| c.is_ascii_alphanumeric());
+    // "IV." (roman numerals, IEEE style)
+    let is_roman = (2..=6).contains(&head.chars().count())
+        && head.chars().all(|c| matches!(c, 'I' | 'V' | 'X' | 'L' | 'C'));
+    // "A." (lettered subsections)
+    let is_letter = head.chars().count() == 1 && head.chars().all(|c| c.is_ascii_uppercase());
+    if is_dotted || is_digit_letter || is_roman || is_letter {
+        // The body must look like a title, not a sentence.
+        if rest.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// Text that is page furniture rather than a heading: line numbers, captions,
+/// reference entries, sentence fragments.
+fn is_heading_reject(t: &str) -> bool {
+    if !t.chars().any(|c| c.is_alphabetic()) {
+        return true; // "10", "- 12 -", "|||"
+    }
+    // Figure/table/equation captions are content, not structure.
+    const CAPTION_PREFIXES: &[&str] = &[
+        "fig", "figure", "table", "tab", "eq", "equation", "algorithm", "listing", "appendix a.",
+    ];
+    let lower = t.to_lowercase();
+    for p in CAPTION_PREFIXES {
+        if let Some(rest) = lower.strip_prefix(p) {
+            let rest = rest.trim_start_matches(['.', ')', ':', ' ', '\u{a0}']);
+            if lower.starts_with(p) && (rest.starts_with(|c: char| c.is_ascii_digit()) || rest.is_empty() || *p == "figure" || *p == "table") {
+                return true;
+            }
+        }
+    }
+    if t.starts_with('(') {
+        return true; // "(a) A failure scenario ..." figure sub-labels
+    }
+    if t.ends_with(['.', '。', '!', '！', '?', '？']) || t.contains('。') || t.contains(". ") {
+        return true; // prose, or a numbered sentence
+    }
+    if t.starts_with('[') || t.contains("et al.") || t.contains("(19") || t.contains("(20") {
+        return true; // reference entry
+    }
+    false
+}
+
+/// Title case, ALL CAPS, or a single capitalised word — the shape a heading has
+/// and a sentence fragment does not.
+fn looks_like_title(t: &str) -> bool {
+    const FUNCTION_WORDS: &[&str] = &[
+        "of", "the", "and", "for", "in", "on", "to", "a", "an", "at", "by", "with", "from", "as", "or", "vs",
+    ];
+    let words: Vec<&str> = t.split_whitespace().collect();
+    if words.is_empty() {
+        return false;
+    }
+    let letters: String = t.chars().filter(|c| c.is_alphabetic()).collect();
+    if letters.chars().count() >= 2 && letters.chars().all(|c| c.is_uppercase()) {
+        return true; // ALL CAPS heading
+    }
+    if words.len() == 1 {
+        return words[0].chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+    }
+    words.iter().all(|w| {
+        let first = w.chars().next().unwrap_or(' ');
+        first.is_uppercase()
+            || FUNCTION_WORDS.contains(&w.to_lowercase().as_str())
+            || !first.is_alphabetic()
+    })
+}
+
 /// Detect whether a paragraph is a section heading and return its heading text.
+///
+/// Every rule is gated by `is_heading_reject` + `looks_like_title`: without them
+/// "any short line" qualified, so ACM line numbers ("10", "11"), figure
+/// sub-labels and caption fragments all became section labels (measured: 18 of
+/// 50 chunks on demo1).
 fn detect_section(text: &str) -> Option<String> {
     let t = text.trim();
     if t.is_empty() || t.chars().count() > 80 {
         return None;
     }
-    let lower = t.to_lowercase();
-    // 1. Explicit heading keywords (exact / prefix).
-    for kw in HEADING_KEYWORDS {
-        if lower == *kw
-            || lower.starts_with(&format!("{kw} "))
-            || lower.starts_with(&format!("{kw}:"))
-            || lower.starts_with(&format!("{kw}："))
-        {
-            return Some(t.to_string());
+    let (collapsed, hard_collapse) = collapse_small_caps(t);
+
+    // 1. Numbered headings first: their ". " belongs to the number, so the
+    //    "looks like prose" rejection must not run before them.
+    if let Some(rest) = strip_number_prefix(&collapsed) {
+        if !is_heading_reject(rest) {
+            return Some(rest.to_string());
         }
     }
-    // 2. Numbered headings with a dotted prefix: "1.2 Methods", "3. Results".
-    let rest = t.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
-    let prefix_len = t.len() - rest.len();
-    if prefix_len > 0 && t[..prefix_len].contains('.') && !rest.trim().is_empty() {
-        return Some(rest.trim().to_string());
+    if is_heading_reject(&collapsed) {
+        return None;
     }
-    // 3. Standalone short title-like line (no sentence-ending punctuation).
-    if t.chars().count() <= 60
-        && !t.ends_with(['.', '。', '!', '！', '?', '？'])
-        && !t.contains('。')
-        && !t.contains(". ")
+
+    // 2. Explicit heading keywords (exact / prefix), only for heading-shaped text.
+    let lower = collapsed.to_lowercase();
+    let short = collapsed.chars().count() <= 60;
+    for kw in HEADING_KEYWORDS {
+        let hit = lower == *kw
+            || lower.starts_with(&format!("{kw} "))
+            || lower.starts_with(&format!("{kw}:"))
+            || lower.starts_with(&format!("{kw}："));
+        if hit && short && (collapsed == *kw || looks_like_title(&collapsed) || lower == *kw) {
+            return Some(collapsed);
+        }
+    }
+    // A hard collapse (3+ letter-spaced glyph groups) is only trusted when a
+    // keyword matched above — otherwise it is letter-spaced furniture such as
+    // "A R T I C L E I N F O".
+    if hard_collapse {
+        return None;
+    }
+
+    // 3. Standalone short line. Title case ("Tool Usage", "Related Work") or a
+    //    short sentence-case heading ("Computational toxicology", "Data and
+    //    system requirements"); longer lowercase-heavy lines are prose.
+    let words: Vec<&str> = collapsed.split_whitespace().collect();
+    let first_upper = collapsed.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+    let caps = words
+        .iter()
+        .filter(|w| w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false))
+        .count();
+    let caps_ratio = caps as f32 / words.len().max(1) as f32;
+    if collapsed.chars().count() <= 60
+        && first_upper
+        && words.len() <= 12
+        && (caps_ratio >= 0.5 || words.len() <= 5)
     {
-        return Some(t.to_string());
+        return Some(collapsed);
     }
     None
 }
@@ -204,6 +399,78 @@ fn dehyphenate(text: &str) -> String {
     out
 }
 
+/// Nesting depth of a heading, from its numbering prefix: "3.2" → 2,
+/// "3." → 1, "IV." → 1, "A." → 2, "2C." → 1, no prefix → 1.
+fn section_level(text: &str) -> u8 {
+    let Some((head, _)) = text.split_once(char::is_whitespace) else {
+        return 1;
+    };
+    let head = head.trim_end_matches(['.', ')', ':', '：']);
+    if head.is_empty() {
+        return 1;
+    }
+    if head.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return head.split('.').filter(|p| !p.is_empty()).count().clamp(1, 4) as u8;
+    }
+    // "2C." — dot-less top level in Elsevier's scheme.
+    if (2..=3).contains(&head.chars().count())
+        && head.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+    {
+        return 1;
+    }
+    if head.chars().count() == 1 && head.chars().all(|c| c.is_ascii_uppercase()) {
+        return 2; // "A." subsection under a numbered/roman parent
+    }
+    1 // roman numerals and plain titles
+}
+
+/// A figure/table caption paragraph (kept as its own block type so retrieval
+/// can treat it differently from prose).
+fn is_caption(text: &str) -> bool {
+    let lower = text.trim().to_lowercase();
+    let mut head = lower.split_whitespace();
+    let Some(first) = head.next() else { return false };
+    let first = first.trim_end_matches(['.', ':', ')']);
+    if !matches!(first, "fig" | "figure" | "table" | "tab" | "algorithm" | "listing") {
+        return false;
+    }
+    head.next()
+        .map(|n| n.trim_end_matches(['.', ':']).chars().next().map(|c| c.is_ascii_digit() || "ivx".contains(c)).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+/// Find the chunk where the references/appendix tail begins, using the same
+/// rule that labels chunks at indexing time.
+///
+/// PDF text extraction reflows the layout — headings do NOT sit on their own
+/// lines (verified against the real chunk store), so this matches an inline
+/// heading (`References`, `REFERENCES`, the "R EFERENCES" small-caps artifact,
+/// `参考文献`) that is IMMEDIATELY followed by the first reference entry:
+/// `[1]` (numeric style), `Adlakha, …` or `Anthropic. 2024` (author-year).
+/// Prose mentions ("meme references", "see Appendix B") and TOC lines
+/// ("References ......... 59") never match because of the entry requirement.
+/// The heading itself is case-insensitive while the entry patterns are not —
+/// the all-caps `REFERENCES` heading on demo2 was missed for months because of
+/// a case-sensitive match.
+pub fn detect_body_end<'a>(chunks: impl Iterator<Item = (i32, &'a str)>) -> Option<i32> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        const NAME: &str = r"(?:[A-Z][A-Za-z\-']+\s+){0,3}[A-Z][A-Za-z\-']+";
+        regex::Regex::new(&format!(
+            r"(?:\d{{1,2}}\s+)?(?i:references|bibliography|r eferences|参考文献)\s*(?:\[1\]|{NAME},|{NAME}\.\s*(?:19|20)\d{{2}})"
+        ))
+        .expect("tail heading regex")
+    });
+    // Skip chunk 0 (title page) — a false positive there would hide the body.
+    for (index, content) in chunks {
+        if index > 0 && re.is_match(content) {
+            return Some(index);
+        }
+    }
+    None
+}
+
 /// Chunk extracted pages into ChunkData for RAG storage.
 ///
 /// Strategy:
@@ -221,26 +488,41 @@ pub fn chunk_pages(pages: &[PageText], config: &ChunkConfig) -> Vec<ChunkData> {
         text: String,
         page: u16,
         section: Option<String>,
+        section_path: Option<String>,
+        block_type: BlockType,
     }
 
     let mut paragraphs: Vec<ParaInfo> = Vec::new();
-    let mut current_section: Option<String> = None;
+    // Ancestor chain of the current section, by nesting level.
+    let mut heading_stack: Vec<(u8, String)> = Vec::new();
     for page_text in pages {
         let paras = split_paragraphs(&dehyphenate(&page_text.text));
         for para in paras {
             if let Some(sec) = detect_section(&para) {
-                current_section = Some(sec);
+                let level = section_level(&para);
+                heading_stack.retain(|(l, _)| *l < level);
+                heading_stack.push((level, sec.clone()));
                 // The heading paragraph itself is kept as content.
                 paragraphs.push(ParaInfo {
                     text: para,
                     page: page_text.page,
-                    section: None,
+                    section: Some(sec),
+                    section_path: Some(
+                        heading_stack.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" > "),
+                    ),
+                    block_type: BlockType::Heading,
                 });
             } else {
                 paragraphs.push(ParaInfo {
-                    text: para,
+                    text: para.clone(),
                     page: page_text.page,
-                    section: current_section.clone(),
+                    section: heading_stack.last().map(|(_, t)| t.clone()),
+                    section_path: if heading_stack.is_empty() {
+                        None
+                    } else {
+                        Some(heading_stack.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" > "))
+                    },
+                    block_type: if is_caption(&para) { BlockType::Caption } else { BlockType::Prose },
                 });
             }
         }
@@ -261,6 +543,8 @@ pub fn chunk_pages(pages: &[PageText], config: &ChunkConfig) -> Vec<ChunkData> {
         text: String,
         page: u16,
         section: Option<String>,
+        section_path: Option<String>,
+        block_type: BlockType,
         join_with_space: bool,
     }
 
@@ -271,6 +555,8 @@ pub fn chunk_pages(pages: &[PageText], config: &ChunkConfig) -> Vec<ChunkData> {
                 text: para.text.clone(),
                 page: para.page,
                 section: para.section.clone(),
+                section_path: para.section_path.clone(),
+                block_type: para.block_type,
                 join_with_space: false,
             });
             continue;
@@ -284,6 +570,8 @@ pub fn chunk_pages(pages: &[PageText], config: &ChunkConfig) -> Vec<ChunkData> {
                     text: std::mem::take(&mut current),
                     page: para.page,
                     section: para.section.clone(),
+                    section_path: para.section_path.clone(),
+                    block_type: para.block_type,
                     join_with_space: true,
                 });
                 current_tokens = 0;
@@ -299,6 +587,8 @@ pub fn chunk_pages(pages: &[PageText], config: &ChunkConfig) -> Vec<ChunkData> {
                 text: current,
                 page: para.page,
                 section: para.section.clone(),
+                section_path: para.section_path.clone(),
+                block_type: para.block_type,
                 join_with_space: true,
             });
         }
@@ -316,6 +606,8 @@ pub fn chunk_pages(pages: &[PageText], config: &ChunkConfig) -> Vec<ChunkData> {
         let mut page_end = pieces[i].page;
         let mut token_count = 0usize;
         let mut chunk_section: Option<String> = None;
+        let mut chunk_path: Option<String> = None;
+        let mut chunk_block = BlockType::Prose;
         let mut j = i;
 
         while j < pieces.len() {
@@ -326,6 +618,15 @@ pub fn chunk_pages(pages: &[PageText], config: &ChunkConfig) -> Vec<ChunkData> {
             if chunk_section.is_none() {
                 chunk_section = pieces[j].section.clone();
             }
+            if chunk_path.is_none() {
+                chunk_path = pieces[j].section_path.clone();
+            }
+            // A chunk is a heading chunk only while it is made of headings.
+            if j == i {
+                chunk_block = pieces[j].block_type;
+            } else if chunk_block != pieces[j].block_type {
+                chunk_block = BlockType::Prose;
+            }
             if !chunk_text.is_empty() {
                 chunk_text.push_str(if pieces[j].join_with_space { " " } else { "\n\n" });
             }
@@ -335,11 +636,12 @@ pub fn chunk_pages(pages: &[PageText], config: &ChunkConfig) -> Vec<ChunkData> {
             j += 1;
         }
 
-        // Prepend the section heading when the chunk enters a new section,
-        // so the retrieved text (and the FTS index) carry section context.
+        // Prepend the section title when the chunk enters a new section so the
+        // FTS index and the embedding carry section context. Plain text (no
+        // "##" marker): the marker used to leak into the indexed content.
         if let Some(sec) = &chunk_section {
-            if prev_section.as_deref() != Some(sec.as_str()) {
-                chunk_text = format!("## {sec}\n\n{}", chunk_text.trim());
+            if prev_section.as_deref() != Some(sec.as_str()) && chunk_block != BlockType::Heading {
+                chunk_text = format!("{sec}\n\n{}", chunk_text.trim());
             }
         }
         prev_section = chunk_section.clone();
@@ -349,6 +651,9 @@ pub fn chunk_pages(pages: &[PageText], config: &ChunkConfig) -> Vec<ChunkData> {
             page_start: Some(page_start as i32),
             page_end: Some(page_end as i32),
             section: chunk_section,
+            section_path: chunk_path,
+            block_type: chunk_block,
+            is_tail: false,
             chunk_index,
             token_count: Some(token_count as i32),
         });
@@ -378,6 +683,20 @@ pub fn chunk_pages(pages: &[PageText], config: &ChunkConfig) -> Vec<ChunkData> {
             i = if start > i { start } else { j };
         } else {
             i = j;
+        }
+    }
+
+    // Label — never drop — the references/appendix tail. A wrong boundary then
+    // costs a down-weight instead of making 60% of a paper unreadable, which is
+    // what the previous "truncate by chunk_index" behaviour did.
+    if let Some(end) = detect_body_end(chunks.iter().map(|c| (c.chunk_index, c.content.as_str()))) {
+        for chunk in chunks.iter_mut() {
+            if chunk.chunk_index >= end {
+                chunk.is_tail = true;
+                if chunk.block_type == BlockType::Prose {
+                    chunk.block_type = BlockType::Reference;
+                }
+            }
         }
     }
 
@@ -494,5 +813,131 @@ mod tests {
                 "missing sentence {n}"
             );
         }
+    }
+
+    #[test]
+    fn detects_numbered_roman_and_lettered_headings() {
+        assert_eq!(detect_section("3.2 Methods").as_deref(), Some("Methods"));
+        assert_eq!(detect_section("3. Results").as_deref(), Some("Results"));
+        // IEEE roman numerals — the previous rule rejected them via ". ".
+        assert_eq!(detect_section("I. I NTRODUCTION").as_deref(), Some("INTRODUCTION"));
+        assert_eq!(detect_section("IV. Conclusion").as_deref(), Some("Conclusion"));
+        assert_eq!(detect_section("A. Dataset").as_deref(), Some("Dataset"));
+        assert_eq!(detect_section("2C. Accessing competencies").as_deref(), Some("Accessing competencies"));
+    }
+
+    #[test]
+    fn collapses_letter_spaced_headings() {
+        // Small caps arrive as separate glyph runs; without collapsing, the
+        // keyword never matched and the raw form leaked into the label.
+        assert_eq!(detect_section("A B S T R A C T").as_deref(), Some("ABSTRACT"));
+        assert_eq!(detect_section("R EFERENCES").as_deref(), Some("REFERENCES"));
+        // ... but letter-spaced furniture that matches no keyword must NOT
+        // become a heading.
+        assert_eq!(detect_section("A R T I C L E I N F O"), None);
+    }
+
+    #[test]
+    fn rejects_page_furniture_and_captions() {
+        for bad in [
+            "10", "11", "18",            // ACM line numbers (18/50 chunks on demo1)
+            "- 12 -", "|||",             // page numbers / rules
+            "Fig. 3. Agent trajectories of two systems",   // caption
+            "TABLE I\nAGENT ROLES AND OUTPUTS",            // table caption
+            "(a) A failure scenario where a microservice misses an",
+            "AI needs to be fed with adequate data (quality/volume); there are",
+            "[24] L. Zhou, J. Bao, and B. Parmanto",
+            "as shown in Smith et al. 2025 and Fig. 3 the method works.",
+        ] {
+            assert_eq!(detect_section(bad), None, "should not be a heading: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_real_subsection_titles() {
+        for good in ["Tool Usage", "Related Work", "Computational toxicology", "Discussion and Conclusion"] {
+            assert!(detect_section(good).is_some(), "should be a heading: {good:?}");
+        }
+    }
+
+    fn body_end_of(contents: &[&str]) -> Option<i32> {
+        let owned: Vec<(i32, String)> = contents
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i as i32, c.to_string()))
+            .collect();
+        detect_body_end(owned.iter().map(|(i, c)| (*i, c.as_str())))
+    }
+
+    #[test]
+    fn body_end_numeric_style() {
+        assert_eq!(
+            body_end_of(&[
+                "body text",
+                "supported in part by NSF CNS-2145295. References [1] Chaos mesh: A powerful chaos engineering platform",
+                "[2] Claude Code by Anthropic",
+            ]),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn body_end_author_year_style() {
+        assert_eq!(
+            body_end_of(&["body", "References Vaibhav Adlakha, Parishad BehnamGhader, Xing Han Lu", "tail"]),
+            Some(1)
+        );
+        assert_eq!(
+            body_end_of(&["body", "correspondence to: panlu@stanford.edu. References Anthropic. 2024. Claude 3.5 haiku", "tail"]),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn body_end_matches_all_caps_heading() {
+        // Regression: the demo2 paper prints "REFERENCES"; the old pattern was
+        // case-sensitive and reported "no references section" for the whole
+        // document, so the reference list was read as body text.
+        assert_eq!(
+            body_end_of(&["body", "future work. REFERENCES [1] R. U. Kothari, A. Pancioli, T. Liu, T. Brott", "more"]),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn body_end_rejects_prose_and_toc() {
+        assert_eq!(
+            body_end_of(&[
+                "Contents: References ......... 59",
+                "find reliable sources or references that explain the conversion process",
+                "we refer the reader to Appendix A for details",
+            ]),
+            None
+        );
+        assert_eq!(body_end_of(&["References [1] bogus match on the title chunk", "real body"]), None);
+    }
+
+    #[test]
+    fn tail_is_labelled_not_dropped() {
+        // The tail stays in the index: a wrong boundary must cost a down-weight,
+        // not make the rest of a paper unreachable (the old behaviour truncated
+        // pagination at the boundary).
+        let pages = vec![PageText {
+            page: 1,
+            text: format!(
+                "{}\n\n5. Conclusion\n\nWe conclude that the system works.\n\nReferences\n\n[1] Smith, J. 2020. A paper about things.\n\n[2] Doe, A. 2021. Another paper.",
+                "A long body paragraph about the system and its evaluation. ".repeat(60)
+            ),
+        }];
+        let chunks = chunk_pages(&pages, &ChunkConfig::default());
+        assert!(chunks.len() > 1, "expected several chunks, got {}", chunks.len());
+        let tail: Vec<&ChunkData> = chunks.iter().filter(|c| c.is_tail).collect();
+        assert!(!tail.is_empty(), "references tail must be labelled");
+        assert!(
+            tail.iter().any(|c| c.content.contains("[2] Doe")),
+            "tail content must stay in the index"
+        );
+        assert!(tail.iter().all(|c| c.block_type == BlockType::Reference));
+        assert!(chunks.iter().any(|c| !c.is_tail), "body must not be flagged as tail");
     }
 }

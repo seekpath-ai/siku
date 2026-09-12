@@ -14,11 +14,31 @@ pub async fn generate_embeddings_for_paper(
     db: &SqlitePool,
     paper_id: &str,
 ) -> Result<usize, String> {
-    // Get chunks without embeddings
+    // The built-in "hash" backend is a character-histogram placeholder, not a
+    // semantic model: retrieval refuses those vectors (`retriever::
+    // vector_leg_enabled`), so generating them would only burn CPU. Configure an
+    // OpenAI-compatible embeddings endpoint (or wire up `fastembed` behind the
+    // `onnx` feature) to enable the vector leg.
+    if !crate::ai::retriever::vector_leg_enabled() {
+        tracing::debug!(
+            paper_id,
+            "embedding backend is the built-in placeholder — skipping embedding generation"
+        );
+        return Ok(0);
+    }
+
+    // Chunks that need a vector: never embedded, or embedded by a DIFFERENT
+    // model. The old query only looked for missing rows, so switching the
+    // embedding backend left every existing chunk in the previous vector space
+    // for ever (retrieval then matched almost nothing, silently).
+    let model = embedding_model_label();
     let chunks: Vec<(String, String)> = sqlx::query_as(
-        "SELECT c.id, c.content FROM chunks c LEFT JOIN embeddings e ON c.id = e.chunk_id WHERE c.paper_id = ? AND e.chunk_id IS NULL"
+        "SELECT c.id, c.content FROM chunks c \
+         LEFT JOIN embeddings e ON c.id = e.chunk_id \
+         WHERE c.paper_id = ? AND (e.chunk_id IS NULL OR e.model <> ?)",
     )
     .bind(paper_id)
+    .bind(&model)
     .fetch_all(db)
     .await
     .map_err(|e| format!("db: {e}"))?;
@@ -31,7 +51,6 @@ pub async fn generate_embeddings_for_paper(
     info!(paper_id, count, "generating embeddings");
 
     let vectors = embed_texts(db, &chunks.iter().map(|(_, c)| c.clone()).collect::<Vec<_>>()).await?;
-    let model = embedding_model_label();
 
     for ((chunk_id, _), vector) in chunks.iter().zip(vectors.iter()) {
         let vector_blob = vector_to_blob(vector);
@@ -77,7 +96,10 @@ pub async fn embed_texts(db: &SqlitePool, texts: &[String]) -> Result<Vec<Vec<f3
 }
 
 /// Model label recorded in the embeddings table for the active backend.
-fn embedding_model_label() -> String {
+///
+/// Retrieval compares vectors only within the same label: rows from another
+/// backend live in a different vector space (and often a different dimension).
+pub fn embedding_model_label() -> String {
     let settings = crate::core::settings_service::cached_settings();
     if settings.embedding_backend == "api" {
         settings.embedding_model.clone()

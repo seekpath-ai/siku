@@ -62,9 +62,9 @@ Siku 把这些揉成一件事：**让 AI 在你本地的知识库里干活。**
 | 路由 | TanStack Router |
 | 后端 | Rust |
 | 数据库 | SQLite (WAL 模式) + sqlx |
-| 搜索 | FTS5 + sqlite-vec + RRF 融合 |
-| PDF | pdfium-render + lopdf |
-| Embedding | fastembed-rs (BAAI/bge-small-zh-v1.5) |
+| 搜索 | FTS5（trigram）关键词检索；RRF 混合检索已就绪，语义向量需配置真实 embedding 后端 |
+| PDF | pdfium-render（含 /Rotate 与分栏几何重建）+ pdf_oxide 兜底；lopdf 取元数据 |
+| Embedding | 可配 OpenAI 兼容 /embeddings 端点；内置哈希实现仅为占位、不参与检索 |
 | LLM | OpenAI / Anthropic / DeepSeek / SiliconFlow / Ollama / Qwen / Zhipu / Kimi / Gemini |
 | Agent | ReAct 循环 + Tool Registry（23+ 工具 / Skill）+ SSE 流式 + 后台任务 + 定时任务 |
 

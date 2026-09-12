@@ -32,6 +32,7 @@
 
 | 工具名 | 类别 | 只读 | 说明 |
 |--------|------|------|------|
+| `search_library` | 文献 | ✅ | 在已索引的论文全文中检索段落（跨文献） |
 | `paper_search` | 文献 | ✅ | 在本地图书馆中检索论文 |
 | `paper_read` | 文献 | ✅ | 读取论文元数据、摘要与分页文本块 |
 | `paper_import` | 文献 | ❌ | 从本地文件导入 PDF 到图书馆 |
@@ -72,9 +73,19 @@
 | `limit` | integer | ❌ | 最大返回条数，默认 5，最大 50 |
 | `offset` | integer | ❌ | 跳过的条数，默认 0 |
 
+### `search_library`
+
+在**已索引**的论文全文中检索最相关的段落（关键词 FTS5；配置了真实 embedding 后端时叠加向量召回并做 RRF 融合）。返回论文标题、页码范围与章节路径，便于直接引用或再用 `paper_read` 取上下文。找具体事实/方法/论断时用它；需要完整论证时用 `paper_read`。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `query` | string | ✅ | 检索词（用论文本身的语言，关键词优于长问句） |
+| `limit` | integer | ❌ | 返回段落数，默认 8，最大 30 |
+| `include_references` | boolean | ❌ | 是否检索参考文献/附录，默认 `false` |
+
 ### `paper_read`
 
-获取论文的元数据、摘要及分页文本块。默认不返回正文块，可通过 `include_chunks=true` 开启；会自动识别正文结束位置并排除参考文献/附录。
+获取论文的元数据、摘要及分页文本块。默认不返回正文块，可通过 `include_chunks=true` 开启。每个块带**章节路径**与**块类型**（prose/heading/caption/reference）；参考文献/附录会**打标不隐藏**（输出中标为 `references/appendix`），可正常读取——检索侧默认不召回它们。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -82,8 +93,7 @@
 | `include_chunks` | boolean | ❌ | 是否返回正文块，默认 `false` |
 | `offset` | integer | ❌ | 起始块索引，默认 0 |
 | `limit` | integer | ❌ | 返回块数，默认 20，最大 50 |
-| `max_chars` | integer | ❌ | 每块最大字符数，默认来自设置 |
-| `include_tail` | boolean | ❌ | 是否包含参考文献/附录，默认 `false` |
+| `max_chars` | integer | ❌ | 每块最大字符数，默认来自设置（2500 ≈ 整块） |
 
 ### `paper_import`
 

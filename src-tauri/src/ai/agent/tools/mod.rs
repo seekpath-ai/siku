@@ -1,4 +1,5 @@
 pub mod paper_search;
+pub mod library_search;
 pub mod paper_read;
 pub mod paper_import;
 pub mod note_read;

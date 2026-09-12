@@ -379,22 +379,37 @@ async fn migrate_chunk_bigram_index(db: &Db) -> anyhow::Result<()> {
     let pending: Vec<(i64, String)> =
         sqlx::query_as("SELECT rowid, content FROM chunks WHERE search_text = ''")
             .fetch_all(db)
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read chunks for the search_text backfill: {e}"))?;
     if !pending.is_empty() {
+        // One transaction: the backfill touches every chunk, so committing per
+        // row would write a WAL frame per row and leave a half-migrated index
+        // behind if the app is killed mid-way.
         info!(rows = pending.len(), "backfilling chunks.search_text");
+        let mut tx = db
+            .begin()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to start the search_text backfill: {e}"))?;
         for (rowid, content) in pending {
             sqlx::query("UPDATE chunks SET search_text = ? WHERE rowid = ?")
                 .bind(crate::ai::query::bigram_index_text(&content))
                 .bind(rowid)
-                .execute(db)
-                .await?;
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to backfill chunks.search_text for rowid {rowid}: {e}")
+                })?;
         }
+        tx.commit()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to commit the search_text backfill: {e}"))?;
     }
 
     let existing: Option<(String,)> =
         sqlx::query_as("SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts_bi'")
             .fetch_optional(db)
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read the chunks_fts_bi definition: {e}"))?;
     let broken = existing.as_ref().is_some_and(|(sql,)| {
         sql.contains("content_rowid='search_text'") || sql.contains("content_rowid=\"search_text\"")
     });
@@ -864,11 +879,15 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     let chunks_fts_sql: Option<(String,)> =
         sqlx::query_as("SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts'")
             .fetch_optional(&db)
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read the chunks_fts definition: {e}"))?;
     if let Some((sql,)) = chunks_fts_sql {
         if !sql.contains("trigram") {
             info!("migrating chunks_fts to trigram tokenizer");
-            sqlx::query("DROP TABLE chunks_fts").execute(&db).await?;
+            sqlx::query("DROP TABLE chunks_fts")
+                .execute(&db)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to drop chunks_fts: {e}"))?;
             sqlx::query(
                 "CREATE VIRTUAL TABLE chunks_fts USING fts5(
                     content,
@@ -908,7 +927,8 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     let fts_rebuilt: Option<(String,)> =
         sqlx::query_as("SELECT value FROM settings WHERE key = 'fts.rebuilt'")
             .fetch_optional(&db)
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read the fts.rebuilt flag: {e}"))?;
     if fts_rebuilt.is_none() {
         for table in ["papers_fts", "notes_fts", "chunks_fts", "knowledge_items_fts"] {
             if let Err(e) = sqlx::query(&format!("INSERT INTO {table}({table}) VALUES('rebuild')"))

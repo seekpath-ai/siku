@@ -164,7 +164,9 @@ export function AdvancedSettings() {
       <section className="space-y-3">
         <h3 className="text-sm font-medium text-text-primary">向量嵌入</h3>
         <p className="text-xs text-text-secondary">
-          默认使用内置哈希嵌入（离线、无语义）。选择「API 嵌入」后，文献重建索引时将通过 OpenAI 兼容的 embeddings 接口生成真实语义向量。
+          语义召回需要一个真实的 embeddings 端点。内置的「关闭（占位）」是字符直方图实现，选中它不会生成任何向量，
+          关键词检索不受影响。选择「API 嵌入」后，文献重建索引时会通过 OpenAI 兼容的 embeddings 接口生成语义向量；
+          端点不可用时向量腿不参与召回，不会回退到占位向量。
         </p>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="space-y-1.5">
@@ -174,7 +176,7 @@ export function AdvancedSettings() {
               onChange={(e) => updateText('embedding_backend', e.target.value)}
               className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
             >
-              <option value="hash">内置哈希嵌入（离线）</option>
+              <option value="hash">关闭（内置占位）</option>
               <option value="api">API 嵌入（OpenAI 兼容）</option>
             </select>
           </div>
@@ -197,6 +199,9 @@ export function AdvancedSettings() {
               placeholder="https://api.openai.com/v1"
               className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
             />
+            <p className="text-xs text-text-secondary/70">
+              需包含 <code>/v1</code>，例如 <code>http://127.0.0.1:11434/v1</code>（Ollama）。
+            </p>
           </div>
           <div className="space-y-1.5">
             <label className="block text-sm text-text-secondary">API Key</label>
@@ -210,7 +215,7 @@ export function AdvancedSettings() {
           </div>
         </div>
         <p className="text-xs text-text-secondary/70">
-          配置后，请在图书馆对文献右键执行「重建索引」以生成新向量。
+          配置后，请在图书馆对文献右键执行「重建索引」以生成新向量；更换端点或模型名后，已有向量会在下次索引时按新模型重算。
         </p>
       </section>
 

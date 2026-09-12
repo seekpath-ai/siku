@@ -211,15 +211,24 @@ User → UI (React) → Tauri IPC → Commands → Services → SQLite / File St
 
 ### 语义检索（可选）
 
-关键词检索（FTS5，中文按 bigram 索引）开箱即用。**语义向量召回需要配置一个真实的
-embeddings 端点才会启用**——内置的哈希实现只是占位，不参与检索：
+关键词检索（FTS5，中文按 bigram 索引）开箱即用，无需任何配置。**语义向量召回只在一个真实的
+embeddings 端点配置好之后才启用**：内置的 `hash` 后端是字符直方图占位，不参与检索，选中它时
+不会生成任何向量（等价于关闭向量腿）。
 
-- **自建（推荐）**：起一个 OpenAI 兼容的嵌入服务，在「设置 → 嵌入」里把后端设为 `api`，
-  填 Base URL 与模型名。例如 llama.cpp：`llama-server --embeddings -m bge-m3.gguf`。
-- **本机验证**：`python3 -m pip install fastembed && python3 scripts/local_embed_server.py`，
-  再指向 `http://127.0.0.1:8899/v1`。
+在「设置 → 向量嵌入」里把后端设为 `API 嵌入`，再填 Base URL 与模型名。**Base URL 必须包含
+`/v1`**——路径直接拼在它后面（请求的是 `{base_url}/embeddings`）。
 
-更换 embedding 后端后，已有块的向量会在下次索引时自动重算。
+| 端点 | 启动方式 | Base URL | 模型名 |
+| --- | --- | --- | --- |
+| Ollama | `ollama pull bge-m3` | `http://127.0.0.1:11434/v1` | `bge-m3` |
+| llama.cpp | `llama-server --embeddings -m bge-m3.gguf` | `http://127.0.0.1:8080/v1` | 任意，仅作标记 |
+| 本项目脚本 | `python3 -m pip install fastembed && python3 scripts/local_embed_server.py` | `http://127.0.0.1:8899/v1` | `BAAI/bge-small-zh-v1.5` |
+| 云端 API | 无需自建 | `https://api.openai.com/v1` 等 | `text-embedding-3-small` 等 |
+
+本地端点意味着文献正文不离开本机；换成云端 API 则所有被检索的块都会发往对方服务器，按需选择。
+
+更换端点或模型后，已有块的向量会在下次索引时按模型名自动重算。端点没配好或请求失败时不会
+回退到占位向量：向量腿直接不参与召回，而不是拿无意义的数值去比对。
 
 ### 日志
 

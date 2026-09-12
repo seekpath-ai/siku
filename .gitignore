@@ -50,3 +50,5 @@ test-results
 # Icon generation venv
 .venv-icons/__pycache__/
 siku.db*
+demo/*
+demo*

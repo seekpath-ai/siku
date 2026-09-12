@@ -413,24 +413,31 @@ pub async fn reprocess_paper_index(
     Ok(chunks.len())
 }
 
+/// Bump when the extraction pipeline's output shape changes (geometry fixes,
+/// new char sources) — cached paragraphs from older versions are recomputed.
+const PARAGRAPH_EXTRACTOR_VERSION: i32 = 2;
+
 /// Anchored paragraphs (page + bbox + text) for the reader's dual-pane view.
 /// Computed from the PDF on first request and cached in the device-local
-/// paper_paragraphs table; reprocess_paper_index invalidates the cache.
+/// paper_paragraphs table; reprocess_paper_index invalidates the cache, and
+/// a version mismatch (extractor upgraded) forces recomputation.
 #[instrument(skip(db))]
 pub async fn get_paragraphs(
     db: &SqlitePool,
     app_data_dir: &Path,
     paper: &Paper,
 ) -> Result<Vec<crate::pdf::extractor::AnchoredParagraph>> {
-    if let Some((json,)) = sqlx::query_as::<_, (String,)>(
-        "SELECT paragraphs FROM paper_paragraphs WHERE paper_id = ?",
+    if let Some((json, version)) = sqlx::query_as::<_, (String, i32)>(
+        "SELECT paragraphs, version FROM paper_paragraphs WHERE paper_id = ?",
     )
     .bind(&paper.id)
     .fetch_optional(db)
     .await?
     {
-        if let Ok(v) = serde_json::from_str(&json) {
-            return Ok(v);
+        if version == PARAGRAPH_EXTRACTOR_VERSION {
+            if let Ok(v) = serde_json::from_str(&json) {
+                return Ok(v);
+            }
         }
     }
     let rel_path = paper
@@ -445,10 +452,11 @@ pub async fn get_paragraphs(
     let json = serde_json::to_string(&paragraphs)
         .map_err(|e| SikuError::PdfParse(format!("json: {e}")))?;
     sqlx::query(
-        "INSERT OR REPLACE INTO paper_paragraphs (paper_id, paragraphs, created_at) VALUES (?, ?, ?)",
+        "INSERT OR REPLACE INTO paper_paragraphs (paper_id, paragraphs, version, created_at) VALUES (?, ?, ?, ?)",
     )
     .bind(&paper.id)
     .bind(&json)
+    .bind(PARAGRAPH_EXTRACTOR_VERSION)
     .bind(now_iso())
     .execute(db)
     .await?;

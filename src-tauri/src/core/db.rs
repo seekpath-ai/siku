@@ -804,11 +804,15 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         "CREATE TABLE IF NOT EXISTS paper_paragraphs (
             paper_id TEXT PRIMARY KEY NOT NULL,
             paragraphs TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         )"
     )
     .execute(&db)
     .await?;
+    // Existing installs: the version column guards cache staleness across
+    // extractor upgrades (geometry fixes change the paragraph output).
+    add_column_if_missing(&db, "paper_paragraphs", "version", "INTEGER NOT NULL DEFAULT 1").await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_turn_contexts_message ON turn_contexts(message_id)"
     )

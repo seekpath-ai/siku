@@ -14,6 +14,18 @@
 //! exactly what `chunker::split_paragraphs` consumes — the chunker is
 //! unchanged.
 
+/// One character with layout geometry, source-agnostic: produced by the
+/// pdfium adapter (`page_to_lines`) or the pdf_oxide fallback path.
+#[derive(Debug, Clone)]
+pub struct RawChar {
+    pub x: f32,
+    pub y: f32,
+    pub right: f32,
+    pub font: f32,
+    pub ch: char,
+    pub bold: bool,
+}
+
 /// One visual line with its geometry (PDF points; y grows upward).
 #[derive(Debug, Clone)]
 pub struct GeoLine {
@@ -22,6 +34,243 @@ pub struct GeoLine {
     pub x_end: f32,
     pub baseline_y: f32,
     pub font_size: f32,
+    /// Majority of the line's characters are bold (heading signal).
+    pub bold: bool,
+}
+
+/// Extract a page's geometric lines from its pdfium text page. Space glyphs
+/// are unreliable in PDFs, so inter-word spaces are inferred from x gaps.
+pub fn page_to_lines(
+    text_page: &pdfium_render::prelude::PdfPageText,
+    page_width: f32,
+) -> (Vec<GeoLine>, Option<f32>) {
+    let mut chars: Vec<RawChar> = Vec::new();
+    for ch in text_page.chars().iter() {
+        let Some(c) = ch.unicode_char() else { continue };
+        if c.is_control() {
+            continue;
+        }
+        let (Ok(x), Ok(y)) = (ch.origin_x(), ch.origin_y()) else { continue };
+        let x = x.value;
+        let y = y.value;
+        let font = ch.scaled_font_size().value;
+        let right = ch
+            .loose_bounds()
+            .map(|b| b.right().value)
+            .unwrap_or(x + font * 0.5);
+        let bold = ch.font_name().to_lowercase().contains("bold");
+        chars.push(RawChar { x, y, right, font, ch: c, bold });
+    }
+    chars_to_lines(chars, page_width)
+}
+
+/// Core line reconstruction: baseline clustering, page-level gutter
+/// detection, and per-cluster x-gap segment splits. Every returned line
+/// belongs to exactly one column; the gutter (when found) is returned
+/// alongside for the paragraph stage.
+///
+/// Baseline clustering alone would merge same-y text from DIFFERENT columns
+/// into one line, so each cluster is then split at large internal x-gaps.
+pub fn chars_to_lines(
+    mut chars: Vec<RawChar>,
+    page_width: f32,
+) -> (Vec<GeoLine>, Option<f32>) {
+    if chars.is_empty() {
+        return (Vec::new(), None);
+    }
+
+    // Page-level gutter from the char x-histogram: a true column gutter is a
+    // near-empty vertical band along the WHOLE page height, so it stands out
+    // even when full-width lines (abstract, title) cross it. Per-line gap
+    // thresholds can't reliably catch narrow (IEEE ~1.2 font) gutters.
+    let gutter = detect_gutter_chars(&chars, page_width);
+
+    // Cluster into baseline groups (y desc, x asc within a group).
+    chars.sort_by(|a, b| {
+        b.y.partial_cmp(&a.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let mut lines: Vec<GeoLine> = Vec::new();
+    let mut group: Vec<RawChar> = Vec::new();
+    let mut group_y = 0.0f32;
+    let mut group_font = 0.0f32;
+    for ch in chars {
+        // Group font is the running MAX: pdfium reports degenerate sizes
+        // (font=1.0) for some space glyphs, and a first-char space would
+        // otherwise collapse the clustering tolerance and split thresholds,
+        // shredding the line into per-word pieces.
+        let tol = (group_font.max(ch.font) * 0.5).max(1.0);
+        let same_line = !group.is_empty() && (ch.y - group_y).abs() <= tol;
+        if !same_line {
+            if !group.is_empty() {
+                lines.extend(split_line_segments(&group, group_y, gutter));
+            }
+            group.clear();
+            group_y = ch.y;
+            group_font = ch.font;
+        }
+        group_font = group_font.max(ch.font);
+        group.push(ch);
+    }
+    if !group.is_empty() {
+        lines.extend(split_line_segments(&group, group_y, gutter));
+    }
+    (lines, gutter)
+}
+
+/// Page-level column gutter from the char x-histogram. Metric per x bucket:
+/// how many DISTINCT lines cross it (a full-width title/abstract line crosses
+/// the gutter, but so does EVERY line of a single-column page — only a true
+/// gutter has few crossing lines relative to the text buckets around it).
+/// Accept the minimum when its ratio to the median is small and both sides
+/// hold a decent share of the text mass.
+fn detect_gutter_chars(chars: &[RawChar], page_width: f32) -> Option<f32> {
+    const BUCKET: f32 = 4.0;
+    let nb = (page_width / BUCKET).ceil() as usize + 1;
+    // bucket -> set of coarse y keys (one entry per distinct line crossing it)
+    let mut crossings: Vec<std::collections::HashSet<i32>> = (0..nb).map(|_| Default::default()).collect();
+    let mut mass = vec![0usize; nb];
+    for c in chars {
+        if c.ch.is_whitespace() {
+            continue;
+        }
+        let b = ((c.x / BUCKET) as usize).min(nb - 1);
+        crossings[b].insert((c.y / 2.0).round() as i32);
+        mass[b] += 1;
+    }
+    let total_chars: usize = mass.iter().sum();
+    if total_chars < 200 {
+        return None; // too little text to speak of columns
+    }
+    let cross_counts: Vec<f32> = crossings
+        .iter()
+        .map(|s| s.len() as f32)
+        .filter(|&c| c > 0.0)
+        .collect();
+    let typical = median(cross_counts).max(1.0);
+
+    let mut best: Option<(f32, f32)> = None; // (x, ratio)
+    let mut x = page_width * 0.35;
+    while x <= page_width * 0.65 {
+        let b = ((x / BUCKET) as usize).min(nb - 1);
+        let ratio = crossings[b].len() as f32 / typical;
+        // Prefer the smallest ratio; ties go to the x nearest the center.
+        let center_penalty = (page_width / 2.0 - x).abs() * 0.0001;
+        let score = ratio + center_penalty;
+        if best.map(|(_, s)| score < s).unwrap_or(true) {
+            best = Some((x, score));
+        }
+        x += BUCKET;
+    }
+    let (x, ratio) = best?;
+    if ratio > 0.4 {
+        return None; // no band distinctly emptier than the text around it
+    }
+    let left_mass: usize = mass[..((x / BUCKET) as usize)].iter().sum();
+    let right_mass: usize = mass[((x / BUCKET) as usize) + 1..].iter().sum();
+    if left_mass * 3 < total_chars || right_mass * 3 < total_chars {
+        return None; // badly unbalanced — not columns
+    }
+    Some(x)
+}
+
+/// Split a baseline cluster at large internal x-gaps (column gutters and
+/// layout separators). Chars are re-sorted by x here because clustering is
+/// y-tolerant and two columns with slightly different baselines arrive out
+/// of x order.
+///
+/// The split threshold is relative, not fixed: IEEE-style papers pack columns
+/// with a gutter as narrow as ~1.2 fonts, while justified text can stretch
+/// word gaps to ~0.6 fonts. A gutter is an extreme outlier among the line's
+/// gaps, so split where the gap exceeds both 0.8×font and 3× the line's
+/// median gap.
+fn split_line_segments(
+    chars: &[RawChar],
+    baseline_y: f32,
+    page_gutter: Option<f32>,
+) -> Vec<GeoLine> {
+    let mut chars = chars.to_vec();
+    chars.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+    // Font for the gap threshold: median of non-degenerate sizes only
+    // (pdfium reports font=1.0 for some space glyphs).
+    let real_fonts: Vec<f32> = chars.iter().map(|c| c.font).filter(|&f| f >= 2.0).collect();
+    let median_font = median(real_fonts).max(2.0);
+    // Median internal gap (word spacing) — a layout separator must stand out
+    // from it. A page-level gutter (when detected) forces splits regardless.
+    let mut gaps: Vec<f32> = Vec::new();
+    for w in chars.windows(2) {
+        let g = w[1].x - w[0].right;
+        if g > 0.1 {
+            gaps.push(g);
+        }
+    }
+    let median_gap = median(gaps);
+    let gap_threshold = (median_font * 0.8).max(median_gap * 3.0).max(median_font * 0.22);
+    let mut out: Vec<GeoLine> = Vec::new();
+    let mut text = String::new();
+    let mut x_start = 0.0f32;
+    let mut x_end = 0.0f32;
+    let mut fonts: Vec<f32> = Vec::new();
+    let mut bold_count = 0usize;
+    let mut prev_right: Option<f32> = None;
+
+    macro_rules! flush {
+        () => {
+            if !text.trim().is_empty() {
+                let real: Vec<f32> = fonts.iter().copied().filter(|&f| f >= 2.0).collect();
+                out.push(GeoLine {
+                    text: text.trim().to_string(),
+                    x_start,
+                    x_end,
+                    baseline_y,
+                    font_size: median(real),
+                    bold: bold_count * 2 > fonts.len(),
+                });
+            }
+            text.clear();
+            prev_right = None;
+            bold_count = 0;
+        };
+    }
+
+    for ch in chars.iter() {
+        let (x, right, font, c) = (ch.x, ch.right, ch.font, ch.ch);
+        if let Some(pr) = prev_right {
+            let crosses_gutter = page_gutter
+                .map(|g| pr < g && x > g)
+                .unwrap_or(false);
+            if crosses_gutter || x - pr > gap_threshold {
+                flush!();
+            }
+        }
+        if text.is_empty() {
+            x_start = x;
+        }
+        if c.is_whitespace() {
+            // Whitespace glyphs are explicit word separators; the gap-based
+            // inference only fires for visible glyphs (a space glyph often
+            // carries no width, and would otherwise double-insert).
+            if !text.ends_with(' ') && !text.is_empty() {
+                text.push(' ');
+            }
+        } else {
+            if let Some(pr) = prev_right {
+                if x - pr > font * 0.22 && x - pr <= gap_threshold && !text.ends_with(' ') {
+                    text.push(' ');
+                }
+            }
+            text.push(c);
+        }
+        x_end = right.max(x_end);
+        fonts.push(font);
+        if ch.bold {
+            bold_count += 1;
+        }
+        prev_right = Some(right);
+    }
+    flush!();
+    out
 }
 
 fn is_cjk(c: char) -> bool {
@@ -248,6 +497,10 @@ pub fn paragraphize(
     let mut prev: Option<&GeoLine> = None;
     for line in &ordered {
         let is_heading = line.font_size > body_font * 1.15 && line.text.trim().chars().count() < 120;
+        // Bold short lines are headings too (font-size-only detection misses
+        // same-size bold headings — the pdf-struct-chunker approach).
+        let is_heading = is_heading
+            || (line.bold && line.text.trim().chars().count() < 60 && !line.text.trim().ends_with(['.', '。']));
         let mut new_para = current.is_empty();
         if let Some(p) = prev {
             if col_of(p) != col_of(line) || is_heading || line.font_size > body_font * 1.15 {
@@ -255,13 +508,18 @@ pub fn paragraphize(
             } else {
                 let gap = p.baseline_y - line.baseline_y;
                 let c = col_of(line);
+                // First-line indent = THIS line indented while the previous
+                // one started flush at the column edge. (Without the flush
+                // requirement, a uniformly indented block — e.g. a centered
+                // abstract — breaks into one paragraph per line.)
+                let prev_flush = p.x_start - col_left[c] <= body_font * 1.2;
                 let indent = line.x_start - col_left[c];
                 let prev_short = p.x_end < col_right[c] - body_font * 3.0;
                 // Strong signals: extra vertical gap, first-line indent.
                 // Weak signal: previous line ended short (last line of a
                 // paragraph) combined with a normal-to-slightly-open gap.
                 if gap > pitch * 1.45
-                    || indent > body_font * 1.2
+                    || (prev_flush && indent > body_font * 1.2)
                     || (prev_short && gap > pitch * 1.1)
                     || (p.font_size > body_font * 1.15)
                 {
@@ -303,211 +561,6 @@ pub fn lines_to_text(
         .join("\n\n")
 }
 
-/// Extract a page's geometric lines from its pdfium text page. Space glyphs
-/// are unreliable in PDFs, so inter-word spaces are inferred from x gaps.
-///
-/// Baseline clustering alone would merge same-y text from DIFFERENT columns
-/// into one line, so each cluster is then split at large internal x-gaps —
-/// every returned line belongs to exactly one column. Returns the lines plus
-/// a page-level column gutter when the char histogram shows one (used to
-/// force splits across narrow gutters that per-line thresholds miss).
-pub fn page_to_lines(
-    text_page: &pdfium_render::prelude::PdfPageText,
-    page_width: f32,
-) -> (Vec<GeoLine>, Option<f32>) {
-    let mut chars: Vec<(f32, f32, f32, f32, char)> = Vec::new(); // x, y, right, font, ch
-    for ch in text_page.chars().iter() {
-        let Some(c) = ch.unicode_char() else { continue };
-        if c.is_control() {
-            continue;
-        }
-        let (Ok(x), Ok(y)) = (ch.origin_x(), ch.origin_y()) else { continue };
-        let x = x.value;
-        let y = y.value;
-        let font = ch.scaled_font_size().value;
-        let right = ch
-            .loose_bounds()
-            .map(|b| b.right().value)
-            .unwrap_or(x + font * 0.5);
-        chars.push((x, y, right, font, c));
-    }
-    if chars.is_empty() {
-        return (Vec::new(), None);
-    }
-
-    // Page-level gutter from the char x-histogram: a true column gutter is a
-    // near-empty vertical band along the WHOLE page height, so it stands out
-    // even when full-width lines (abstract, title) cross it. Per-line gap
-    // thresholds can't reliably catch narrow (IEEE ~1.2 font) gutters.
-    let gutter = detect_gutter_chars(&chars, page_width);
-
-    // Cluster into baseline groups (y desc, x asc within a group).
-    chars.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-    });
-    let mut lines: Vec<GeoLine> = Vec::new();
-    let mut group: Vec<(f32, f32, f32, char)> = Vec::new(); // x, right, font, ch
-    let mut group_y = 0.0f32;
-    let mut group_font = 0.0f32;
-    for (x, y, right, font, c) in chars {
-        // Group font is the running MAX: pdfium reports degenerate sizes
-        // (font=1.0) for some space glyphs, and a first-char space would
-        // otherwise collapse the clustering tolerance and split thresholds,
-        // shredding the line into per-word pieces.
-        let tol = (group_font.max(font) * 0.5).max(1.0);
-        let same_line = !group.is_empty() && (y - group_y).abs() <= tol;
-        if !same_line {
-            if !group.is_empty() {
-                lines.extend(split_line_segments(&group, group_y, gutter));
-            }
-            group.clear();
-            group_y = y;
-            group_font = font;
-        }
-        group_font = group_font.max(font);
-        group.push((x, right, font, c));
-    }
-    if !group.is_empty() {
-        lines.extend(split_line_segments(&group, group_y, gutter));
-    }
-    (lines, gutter)
-}
-
-/// Page-level column gutter from the char x-histogram: the middle-band
-/// position with the fewest characters along the full page height, requiring
-/// it to be near-empty AND both sides to hold a decent share of the text.
-fn detect_gutter_chars(chars: &[(f32, f32, f32, f32, char)], page_width: f32) -> Option<f32> {
-    const BUCKET: f32 = 4.0;
-    let buckets = (page_width / BUCKET).ceil() as usize + 1;
-    let mut hist = vec![0usize; buckets];
-    let mut non_space = 0usize;
-    for &(x, _, _, _, c) in chars {
-        if c.is_whitespace() {
-            continue;
-        }
-        non_space += 1;
-        let b = ((x / BUCKET) as usize).min(buckets - 1);
-        hist[b] += 1;
-    }
-    if non_space < 200 {
-        return None; // too little text to speak of columns
-    }
-    let mut best: Option<(f32, usize)> = None;
-    let mut x = page_width * 0.35;
-    while x <= page_width * 0.65 {
-        let b = ((x / BUCKET) as usize).min(buckets - 1);
-        let count = hist[b];
-        if best.map(|(_, c)| count < c).unwrap_or(true) {
-            best = Some((x, count));
-        }
-        x += BUCKET;
-    }
-    let (x, count) = best?;
-    // Near-empty band: crossing full-width lines (abstract/title) still leave
-    // it far below the column-text density.
-    if count > usize::max(4, non_space / 100) {
-        return None;
-    }
-    let left_mass: usize = hist[..((x / BUCKET) as usize)].iter().sum();
-    let right_mass: usize = hist[((x / BUCKET) as usize) + 1..].iter().sum();
-    if left_mass * 3 < non_space || right_mass * 3 < non_space {
-        return None; // badly unbalanced — not columns
-    }
-    Some(x)
-}
-
-/// Split a baseline cluster at large internal x-gaps (column gutters and
-/// layout separators). `chars` are (x, right, font, char); they are re-sorted
-/// by x here because clustering is y-tolerant and two columns with slightly
-/// different baselines arrive out of x order.
-///
-/// The split threshold is relative, not fixed: IEEE-style papers pack columns
-/// with a gutter as narrow as ~1.2 fonts, while justified text can stretch
-/// word gaps to ~0.6 fonts. A gutter is an extreme outlier among the line's
-/// gaps, so split where the gap exceeds both 0.8×font and 3× the line's
-/// median gap.
-fn split_line_segments(
-    chars: &[(f32, f32, f32, char)],
-    baseline_y: f32,
-    page_gutter: Option<f32>,
-) -> Vec<GeoLine> {
-    let mut chars = chars.to_vec();
-    chars.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    // Font for the gap threshold: median of non-degenerate sizes only
-    // (pdfium reports font=1.0 for some space glyphs).
-    let real_fonts: Vec<f32> = chars.iter().map(|c| c.2).filter(|&f| f >= 2.0).collect();
-    let median_font = median(real_fonts).max(2.0);
-    // Median internal gap (word spacing) — a layout separator must stand out
-    // from it. A page-level gutter (when detected) forces splits regardless.
-    let mut gaps: Vec<f32> = Vec::new();
-    for w in chars.windows(2) {
-        let g = w[1].0 - w[0].1;
-        if g > 0.1 {
-            gaps.push(g);
-        }
-    }
-    let median_gap = median(gaps);
-    let gap_threshold = (median_font * 0.8).max(median_gap * 3.0).max(median_font * 0.22);
-    let mut out: Vec<GeoLine> = Vec::new();
-    let mut text = String::new();
-    let mut x_start = 0.0f32;
-    let mut x_end = 0.0f32;
-    let mut fonts: Vec<f32> = Vec::new();
-    let mut prev_right: Option<f32> = None;
-
-    macro_rules! flush {
-        () => {
-            if !text.trim().is_empty() {
-                let real: Vec<f32> = fonts.iter().copied().filter(|&f| f >= 2.0).collect();
-                out.push(GeoLine {
-                    text: text.trim().to_string(),
-                    x_start,
-                    x_end,
-                    baseline_y,
-                    font_size: median(real),
-                });
-            }
-            text.clear();
-            prev_right = None;
-        };
-    }
-
-    for &(x, right, font, c) in chars.iter() {
-        if let Some(pr) = prev_right {
-            let crosses_gutter = page_gutter
-                .map(|g| pr < g && x > g)
-                .unwrap_or(false);
-            if crosses_gutter || x - pr > gap_threshold {
-                flush!();
-            }
-        }
-        if text.is_empty() {
-            x_start = x;
-        }
-        if c.is_whitespace() {
-            // Whitespace glyphs are explicit word separators; the gap-based
-            // inference only fires for visible glyphs (a space glyph often
-            // carries no width, and would otherwise double-insert).
-            if !text.ends_with(' ') && !text.is_empty() {
-                text.push(' ');
-            }
-        } else {
-            if let Some(pr) = prev_right {
-                if x - pr > font * 0.22 && x - pr <= gap_threshold && !text.ends_with(' ') {
-                    text.push(' ');
-                }
-            }
-            text.push(c);
-        }
-        x_end = right.max(x_end);
-        fonts.push(font);
-        prev_right = Some(right);
-    }
-    flush!();
-    out
-}
 
 #[cfg(test)]
 mod tests {
@@ -520,6 +573,7 @@ mod tests {
             x_end: xe,
             baseline_y: y,
             font_size: font,
+            bold: false,
         }
     }
 

@@ -26,6 +26,95 @@ pub struct RawChar {
     pub bold: bool,
 }
 
+/// The page's `/Rotate` value — the viewer's display rotation.
+///
+/// Both pdfium and pdf_oxide hand back character origins in the **content
+/// frame** (the unrotated media box), while the page is *displayed* rotated.
+/// On a `/Rotate 90` page that means a line of text arrives as glyphs stacked
+/// along +y, so the baseline clustering below (which assumes horizontal text)
+/// shreds it into one-character lines: on a landscape-table page that turned
+/// 43% of the extracted tokens into single letters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageRotation {
+    None,
+    Degrees90,
+    Degrees180,
+    Degrees270,
+}
+
+impl PageRotation {
+    /// From a /Rotate value in degrees (pdf_oxide's `get_page_rotation`).
+    pub fn from_degrees(deg: i32) -> Self {
+        match deg.rem_euclid(360) {
+            90 => Self::Degrees90,
+            180 => Self::Degrees180,
+            270 => Self::Degrees270,
+            _ => Self::None,
+        }
+    }
+
+    /// From pdfium's reported page rotation.
+    pub fn from_pdfium(rotation: pdfium_render::prelude::PdfPageRenderRotation) -> Self {
+        use pdfium_render::prelude::PdfPageRenderRotation as R;
+        match rotation {
+            R::None => Self::None,
+            R::Degrees90 => Self::Degrees90,
+            R::Degrees180 => Self::Degrees180,
+            R::Degrees270 => Self::Degrees270,
+        }
+    }
+
+    /// Whether displaying the page swaps its width and height.
+    pub fn swaps_axes(self) -> bool {
+        matches!(self, Self::Degrees90 | Self::Degrees270)
+    }
+
+    /// Whether the content frame needs remapping before line reconstruction.
+    ///
+    /// Deliberately false for `Degrees180`: a half-turn leaves text advancing
+    /// along +x, so the content frame is already in reading order — rotating it
+    /// into the display frame would reverse every line. (The only thing
+    /// `/Rotate 180` leaves wrong is the bbox handed to the reader's hit-test,
+    /// which is no worse than before.)
+    pub fn needs_frame_remap(self) -> bool {
+        self.swaps_axes()
+    }
+
+    /// Map a point from the content frame into the display frame, both with the
+    /// origin at the bottom-left and y growing upward. `display_w`/`display_h`
+    /// are the display dimensions (pdfium's `page.width()/height()`; for
+    /// pdf_oxide, the media box with the axes swapped when `swaps_axes()`).
+    pub fn map_point(self, x: f32, y: f32, display_w: f32, display_h: f32) -> (f32, f32) {
+        match self {
+            Self::None | Self::Degrees180 => (x, y),
+            // Verified against poppler on demo0 p11: the glyph 'T' of the
+            // rotated "Table 1 (continued)" at content (43.31, 52.27) lands at
+            // display (52.3, 43.3 from the top), matching poppler's word box.
+            Self::Degrees90 => (y, display_h - x),
+            Self::Degrees270 => (display_w - y, x),
+        }
+    }
+
+    /// Map an axis-aligned content-frame rect into the display frame.
+    pub fn map_rect(self, r: [f32; 4], display_w: f32, display_h: f32) -> [f32; 4] {
+        if !self.needs_frame_remap() {
+            return r;
+        }
+        let pts = [
+            self.map_point(r[0], r[1], display_w, display_h),
+            self.map_point(r[2], r[1], display_w, display_h),
+            self.map_point(r[0], r[3], display_w, display_h),
+            self.map_point(r[2], r[3], display_w, display_h),
+        ];
+        let x0 = pts.iter().map(|p| p.0).fold(f32::MAX, f32::min);
+        let x1 = pts.iter().map(|p| p.0).fold(f32::MIN, f32::max);
+        let y0 = pts.iter().map(|p| p.1).fold(f32::MAX, f32::min);
+        let y1 = pts.iter().map(|p| p.1).fold(f32::MIN, f32::max);
+        [x0, y0, x1, y1]
+    }
+}
+
+
 /// One visual line with its geometry (PDF points; y grows upward).
 #[derive(Debug, Clone)]
 pub struct GeoLine {
@@ -40,28 +129,73 @@ pub struct GeoLine {
 
 /// Extract a page's geometric lines from its pdfium text page. Space glyphs
 /// are unreliable in PDFs, so inter-word spaces are inferred from x gaps.
+///
+/// `display_w`/`display_h` are the page's displayed dimensions (what
+/// `page.width()/height()` report) and `rotation` its `/Rotate`; character
+/// origins are mapped from the content frame into that display frame first,
+/// so `/Rotate 90|270` pages — landscape tables stored in a portrait media box
+/// — reconstruct as ordinary horizontal text instead of one-char lines.
 pub fn page_to_lines(
     text_page: &pdfium_render::prelude::PdfPageText,
-    page_width: f32,
+    display_w: f32,
+    display_h: f32,
+    rotation: PageRotation,
 ) -> (Vec<GeoLine>, Option<f32>) {
+    // Read every glyph, mapping it from the content frame into the display frame.
     let mut chars: Vec<RawChar> = Vec::new();
     for ch in text_page.chars().iter() {
         let Some(c) = ch.unicode_char() else { continue };
         if c.is_control() {
             continue;
         }
-        let (Ok(x), Ok(y)) = (ch.origin_x(), ch.origin_y()) else { continue };
-        let x = x.value;
-        let y = y.value;
-        let font = ch.scaled_font_size().value;
-        let right = ch
-            .loose_bounds()
-            .map(|b| b.right().value)
-            .unwrap_or(x + font * 0.5);
+        let (Ok(origin_x), Ok(origin_y)) = (ch.origin_x(), ch.origin_y()) else { continue };
+        let reported_font = ch.scaled_font_size().value;
+        // Content-frame glyph box (fall back to an origin+advance estimate when
+        // pdfium reports no bounds).
+        let content_box = match ch.loose_bounds() {
+            Ok(b) => [b.left().value, b.bottom().value, b.right().value, b.top().value],
+            Err(_) => [
+                origin_x.value,
+                origin_y.value - reported_font * 0.2,
+                origin_x.value + reported_font * 0.5,
+                origin_y.value + reported_font * 0.8,
+            ],
+        };
+        // pdfium reports a degenerate size (0 / 1) for some glyphs — notably
+        // rotated text and space glyphs. A 0 would collapse every downstream
+        // threshold, so recover the size from the glyph box (its extent across
+        // the advance direction is the body height).
+        let box_w = (content_box[2] - content_box[0]).abs();
+        let box_h = (content_box[3] - content_box[1]).abs();
+        let font = if reported_font >= 2.0 || !rotation.needs_frame_remap() {
+            // Unrotated pages keep the historical behaviour exactly.
+            reported_font
+        } else {
+            box_w.max(box_h).max(2.0)
+        };
+        // Pen position in the display frame; `right` is the glyph's ink edge
+        // along the display advance direction. Using the box's *left* edge for
+        // `x` here would mix ink and pen metrics and manufacture spaces inside
+        // words ("desig n"), so `x` stays the mapped origin.
+        let (x, y) = rotation.map_point(origin_x.value, origin_y.value, display_w, display_h);
+        let right = if rotation.needs_frame_remap() {
+            let mapped = rotation.map_rect(content_box, display_w, display_h);
+            mapped[2].max(x)
+        } else {
+            content_box[2]
+        };
         let bold = ch.font_name().to_lowercase().contains("bold");
         chars.push(RawChar { x, y, right, font, ch: c, bold });
     }
-    chars_to_lines(chars, page_width)
+
+    // Every glyph is kept. Dropping the "display-vertical" minority (running
+    // heads, page numbers, sideways insets) looks attractive but measured
+    // worse: text-object boundaries inside a rotated table make that
+    // classification unreliable, and dropping ~14% of the glyphs cost 4 points
+    // of word-level F1 without improving the single-letter share. Such glyphs
+    // fall to the ordinary margin/paragraph machinery instead.
+
+    chars_to_lines(chars, display_w)
 }
 
 /// Core line reconstruction: baseline clustering, page-level gutter
@@ -79,19 +213,13 @@ pub fn chars_to_lines(
         return (Vec::new(), None);
     }
 
-    // Page-level gutter from the char x-histogram: a true column gutter is a
-    // near-empty vertical band along the WHOLE page height, so it stands out
-    // even when full-width lines (abstract, title) cross it. Per-line gap
-    // thresholds can't reliably catch narrow (IEEE ~1.2 font) gutters.
-    let gutter = detect_gutter_chars(&chars, page_width);
-
     // Cluster into baseline groups (y desc, x asc within a group).
     chars.sort_by(|a, b| {
         b.y.partial_cmp(&a.y)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
     });
-    let mut lines: Vec<GeoLine> = Vec::new();
+    let mut groups: Vec<(f32, Vec<RawChar>)> = Vec::new();
     let mut group: Vec<RawChar> = Vec::new();
     let mut group_y = 0.0f32;
     let mut group_font = 0.0f32;
@@ -104,9 +232,8 @@ pub fn chars_to_lines(
         let same_line = !group.is_empty() && (ch.y - group_y).abs() <= tol;
         if !same_line {
             if !group.is_empty() {
-                lines.extend(split_line_segments(&group, group_y, gutter));
+                groups.push((group_y, std::mem::take(&mut group)));
             }
-            group.clear();
             group_y = ch.y;
             group_font = ch.font;
         }
@@ -114,9 +241,147 @@ pub fn chars_to_lines(
         group.push(ch);
     }
     if !group.is_empty() {
-        lines.extend(split_line_segments(&group, group_y, gutter));
+        groups.push((group_y, group));
+    }
+
+    // Column gutter has to be known BEFORE splitting, because the split is what
+    // separates the two columns sharing a baseline. The line-geometry detector
+    // (widest empty vertical band) comes first: the char x-histogram misreads a
+    // page whose top half is a table spanning both columns as single-column
+    // (demo2 p6), and then merged left+right lines survive into the index.
+    let rough: Vec<GeoLine> = groups.iter().map(|(y, g)| rough_line(g, *y)).collect();
+    let body_font = median(
+        rough.iter().map(|l| l.font_size).filter(|&f| f >= 2.0).collect(),
+    )
+    .max(2.0);
+    // Median inter-glyph gap on the page — the yardstick that separates a word
+    // space from a column gutter.
+    let mut gaps: Vec<f32> = Vec::new();
+    for (_, g) in &groups {
+        for w in g.windows(2) {
+            let gap = w[1].x - w[0].right;
+            if gap > 0.2 && gap < page_width * 0.05 {
+                gaps.push(gap);
+            }
+        }
+    }
+    let median_gap = median(gaps.clone());
+    let gutter = detect_gutter_from_gaps(&groups, page_width, &gaps)
+        .or_else(|| find_gutter(&rough, page_width, body_font))
+        .or_else(|| detect_gutter_chars(&rough_to_chars(&groups), page_width));
+    tracing::debug!(
+        gutter = ?gutter,
+        median_gap,
+        groups = groups.len(),
+        "column gutter detection"
+    );
+
+    let mut lines: Vec<GeoLine> = Vec::new();
+    for (y, g) in &groups {
+        lines.extend(split_line_segments(g, *y, gutter));
     }
     (lines, gutter)
+}
+
+/// A baseline group collapsed to one rough line — only the geometry is used
+/// (gutter detection); the text is joined cheaply and never leaves this module.
+fn rough_line(group: &[RawChar], baseline_y: f32) -> GeoLine {
+    let x_start = group.iter().map(|c| c.x).fold(f32::MAX, f32::min);
+    let x_end = group.iter().map(|c| c.right).fold(f32::MIN, f32::max);
+    let real: Vec<f32> = group.iter().map(|c| c.font).filter(|&f| f >= 2.0).collect();
+    GeoLine {
+        text: group.iter().map(|c| c.ch).collect(),
+        x_start,
+        x_end,
+        baseline_y,
+        font_size: median(real),
+        bold: false,
+    }
+}
+
+fn rough_to_chars(groups: &[(f32, Vec<RawChar>)]) -> Vec<RawChar> {
+    groups
+        .iter()
+        .flat_map(|(_, g)| g.iter().cloned())
+        .collect()
+}
+
+/// Column gutter from *gap support*: an x that falls inside a wide inter-glyph
+/// gap on many lines.
+///
+/// Why not the two simpler tests: a page can be two-column only in its lower
+/// part while its top half is a table spanning both columns (demo2 p6). Then
+/// (a) no x is empty across the whole page height, so an "empty vertical band"
+/// never exists, and (b) the char x-histogram sees almost every line crossing
+/// the gutter and concludes "single column". What survives is the local
+/// evidence: the gutter's x sits inside a wide gap on many lines, consistently.
+fn detect_gutter_from_gaps(groups: &[(f32, Vec<RawChar>)], page_width: f32, gaps: &[f32]) -> Option<f32> {
+    // Justified text stretches word spaces a long way (measured p95 ≈ 6pt,
+    // p99 ≈ 8pt on demo2 p6), so the yardstick has to be well above the bulk of
+    // the gap distribution — otherwise ordinary spaces masquerade as gutters.
+    let mut sorted = gaps.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p95 = if sorted.is_empty() { 2.0 } else { sorted[((sorted.len() - 1) as f32 * 0.95) as usize] };
+    let min_gap = (p95 * 1.5).max(8.0);
+    let lo = page_width * 0.25;
+    let hi = page_width * 0.75;
+    let step = 2.0f32;
+    let nb = (((hi - lo) / step) as usize) + 1;
+    let mut support = vec![0usize; nb];
+    let mut widest = vec![0.0f32; nb];
+
+    for (_, g) in groups {
+        for w in g.windows(2) {
+            let gap = w[1].x - w[0].right;
+            if gap < min_gap {
+                continue;
+            }
+            let (a, b) = (w[0].right, w[1].x);
+            let i0 = (((a - lo) / step).ceil().max(0.0)) as usize;
+            let i1 = (((b - lo) / step).floor()).max(0.0) as usize;
+            for i in i0..=i1.min(nb - 1) {
+                support[i] += 1;
+                widest[i] = widest[i].max(gap);
+            }
+        }
+    }
+
+    let mut best: Option<(f32, usize, f32)> = None; // (x, support, score)
+    for i in 0..nb {
+        if support[i] < 5 {
+            continue;
+        }
+        let x = lo + step * i as f32;
+        // A gutter is well-supported AND near the middle: a table's internal
+        // cell boundary can be supported by more rows than the real gutter is
+        // by body lines (demo2 p6), so proximity to the centre breaks that tie.
+        let score = support[i] as f32 - (page_width / 2.0 - x).abs() * 0.5;
+        if best.map(|(_, _, s)| score > s).unwrap_or(true) {
+            best = Some((x, support[i], score));
+        }
+    }
+    let (x, _, _) = best?;
+
+    // Both sides must hold a real share of the text.
+    let mut left = 0usize;
+    let mut right = 0usize;
+    for (_, g) in groups {
+        for c in g {
+            if c.ch.is_whitespace() {
+                continue;
+            }
+            if (c.x + c.right) / 2.0 < x {
+                left += 1;
+            } else {
+                right += 1;
+            }
+        }
+    }
+    let total = left + right;
+    if total == 0 || left * 4 < total || right * 4 < total {
+        return None;
+    }
+    Some(x)
 }
 
 /// Page-level column gutter from the char x-histogram. Metric per x bucket:
@@ -680,13 +945,98 @@ mod tests {
     }
 
     #[test]
-    fn margin_noise_dropped() {
-        let lines = vec![
+    fn margin_noise_dropped() {        let lines = vec![
             line("Journal Header 123", 60.0, 300.0, 790.0, 9.0), // top margin
             line("42", 290.0, 310.0, 20.0, 9.0),                 // page number
             line("Real body text.", 60.0, 300.0, 700.0, 10.0),
         ];
         let text = lines_to_text(lines, W, H, None);
         assert_eq!(text, "Real body text.");
+    }
+
+    // ---- /Rotate handling (see PageRotation) ----
+
+    #[test]
+    fn rotation_map_matches_poppler_on_a_rotated_table_page() {
+        // demo0 p11: media box 595x794 with /Rotate 90 -> display 794x595.
+        // The glyph 'T' of the rotated "Table 1 (continued)" sits at content
+        // (43.31, 52.27); poppler (display frame, y from the top) puts the word
+        // box at x=[52.3, 71.1], y_top=[34.7, 46.5].
+        let rot = PageRotation::Degrees90;
+        let (dw, dh) = (794.0, 595.0);
+        let (x, y) = rot.map_point(43.31, 52.27, dw, dh);
+        assert!((x - 52.27).abs() < 0.1, "display x = {x}");
+        assert!((y - 551.7).abs() < 0.1, "display y (up) = {y}");
+        assert!((dh - y - 43.3).abs() < 0.1, "y from the top = {}", dh - y);
+        // 270 is the mirror case: content (x, y) -> (display_w - y, x)
+        let (x, y) = PageRotation::Degrees270.map_point(43.31, 52.27, 794.0, 595.0);
+        assert!((x - 741.7).abs() < 0.1, "display x = {x}");
+        assert!((y - 43.31).abs() < 0.1, "display y = {y}");
+        // unrotated / half-turned pages must be left alone
+        assert!(!PageRotation::None.needs_frame_remap());
+        assert!(!PageRotation::Degrees180.needs_frame_remap());
+        assert_eq!(PageRotation::from_degrees(90), PageRotation::Degrees90);
+        assert_eq!(PageRotation::from_degrees(-90), PageRotation::Degrees270);
+        assert_eq!(PageRotation::from_degrees(0), PageRotation::None);
+    }
+
+    #[test]
+    fn rotated_glyph_run_collapses_into_one_line() {
+        // On a /Rotate 90 page the content frame delivers a whole word as
+        // glyphs stacked along +y (this is what used to become one-char lines).
+        let rot = PageRotation::Degrees90;
+        let (dw, dh) = (794.0, 595.0);
+        let chars: Vec<RawChar> = "Table 1"
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                let cx = 43.31;
+                let cy = 52.27 + i as f32 * 4.0;
+                let (x, y) = rot.map_point(cx, cy, dw, dh);
+                let m = rot.map_rect([cx, cy, cx + 8.0, cy + 4.0], dw, dh);
+                RawChar { x: if i == 5 { cy } else { m[0] }, y, right: m[2], font: 8.0, ch: c, bold: false }
+            })
+            .collect();
+        let (lines, _gutter) = chars_to_lines(chars, dw);
+        assert_eq!(lines.len(), 1, "rotated glyph run must become a single line");
+        assert_eq!(lines[0].baseline_y, 595.0 - 43.31);
+        assert!(lines[0].text.starts_with("Table"), "{:?}", lines[0].text);
+    }
+
+    #[test]
+    fn gutter_found_when_only_part_of_the_page_is_two_column() {
+        // demo2 p6's shape: a table spanning both columns on top, two columns
+        // below. No x is empty across the whole page, so the empty-band and
+        // char-histogram detectors both fail; the gap-support detector must not.
+        let mut chars: Vec<RawChar> = Vec::new();
+        let mut push = |text: &str, x0: f32, y: f32, chars: &mut Vec<RawChar>| {
+            let adv = 6.0f32;
+            for (i, c) in text.chars().enumerate() {
+                let x = x0 + i as f32 * adv;
+                chars.push(RawChar { x, y, right: x + adv * 0.8, font: 10.0, ch: c, bold: false });
+            }
+        };
+        for i in 0..8 {
+            push(
+                "a wide table row that spans the full page width and crosses the gutter",
+                60.0,
+                760.0 - i as f32 * 14.0,
+                &mut chars,
+            );
+        }
+        for i in 0..6 {
+            let y = 600.0 - i as f32 * 14.0;
+            push("left column body text line here", 60.0, y, &mut chars);
+            push("right column body text line here", 320.0, y, &mut chars);
+        }
+        let (lines, gutter) = chars_to_lines(chars, 600.0);
+        let g = gutter.expect("a gutter must be found on a mixed-layout page");
+        assert!((g - 300.0).abs() < 45.0, "gutter detected at {g}, expected ~300");
+        // No BODY line may still span both columns.
+        let merged = lines
+            .iter()
+            .filter(|l| l.baseline_y < 620.0 && l.x_start < 300.0 && l.x_end > 320.0)
+            .count();
+        assert_eq!(merged, 0, "body lines were left merged across the gutter");
     }
 }

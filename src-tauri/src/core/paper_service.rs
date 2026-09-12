@@ -415,7 +415,10 @@ pub async fn reprocess_paper_index(
 
 /// Bump when the extraction pipeline's output shape changes (geometry fixes,
 /// new char sources) — cached paragraphs from older versions are recomputed.
-const PARAGRAPH_EXTRACTOR_VERSION: i32 = 2;
+///
+/// v3: page `/Rotate` is applied before line reconstruction (landscape tables
+/// on `/Rotate 90|270` pages were being shredded into one-char lines).
+const PARAGRAPH_EXTRACTOR_VERSION: i32 = 3;
 
 /// Anchored paragraphs (page + bbox + text) for the reader's dual-pane view.
 /// Computed from the PDF on first request and cached in the device-local

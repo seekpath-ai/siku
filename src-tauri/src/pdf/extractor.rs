@@ -31,8 +31,15 @@ pub fn extract_paragraphs(path: &Path) -> Result<Vec<AnchoredParagraph>> {
         let mut out = Vec::new();
         for (index, page) in pages.iter().enumerate() {
             let Ok(text_page) = page.text() else { continue };
-            let (lines, gutter) =
-                crate::pdf::paragraphs::page_to_lines(&text_page, page.width().value);
+            let rotation = crate::pdf::paragraphs::PageRotation::from_pdfium(
+                page.rotation().unwrap_or(pdfium_render::prelude::PdfPageRenderRotation::None),
+            );
+            let (lines, gutter) = crate::pdf::paragraphs::page_to_lines(
+                &text_page,
+                page.width().value,
+                page.height().value,
+                rotation,
+            );
             for para in crate::pdf::paragraphs::paragraphize(
                 lines,
                 page.width().value,
@@ -109,7 +116,7 @@ pub fn extract_paragraphs(path: &Path) -> Result<Vec<AnchoredParagraph>> {
 fn extract_pages_oxide(
     path: &Path,
 ) -> Result<Vec<(u16, f32, f32, Vec<crate::pdf::paragraphs::GeoLine>, Option<f32>)>> {
-    use crate::pdf::paragraphs::RawChar;
+    use crate::pdf::paragraphs::{PageRotation, RawChar};
     let bytes = std::fs::read(path)?;
     let mut doc = pdf_oxide::PdfDocument::from_bytes(bytes)
         .map_err(|e| SikuError::PdfParse(format!("failed to load PDF with pdf_oxide: {e}")))?;
@@ -120,20 +127,55 @@ fn extract_pages_oxide(
         let (x0, y0, x1, y1) = doc
             .get_page_media_box(idx)
             .unwrap_or((0.0, 0.0, 612.0, 792.0));
+        // pdf_oxide also reports char boxes in the CONTENT frame (verified on
+        // demo0 p11: media box 595x794 while /Rotate is 90), so the same
+        // display-frame mapping applies; only then do the page dimensions swap.
+        //
+        // Known limitation: pdf_oxide's `TextChar` exposes only an ink box, no
+        // pen origin, so on a rotated page the mapped boxes can tile without
+        // gaps and inter-word spaces are lost ("wordswouldglue"). The pdfium
+        // path above is unaffected (it has true char origins). Still a strict
+        // improvement over the previous behaviour, which returned one-char
+        // lines on such pages.
+        let rotation = PageRotation::from_degrees(doc.get_page_rotation(idx).unwrap_or(0));
+        let (content_w, content_h) = (x1 - x0, y1 - y0);
+        let (display_w, display_h) = if rotation.swaps_axes() {
+            (content_h, content_w)
+        } else {
+            (content_w, content_h)
+        };
         let raw: Vec<RawChar> = chars
             .iter()
             .filter(|ch| !ch.char.is_control())
-            .map(|ch| RawChar {
-                x: ch.bbox.x,
-                y: ch.bbox.y,
-                right: ch.bbox.x + ch.bbox.width,
-                font: ch.font_size,
-                ch: ch.char,
-                bold: (ch.font_weight as u16) >= 600,
+            .map(|ch| {
+                let (mut x, y) = rotation.map_point(ch.bbox.x, ch.bbox.y, display_w, display_h);
+                let mut right = ch.bbox.x + ch.bbox.width;
+                if rotation.needs_frame_remap() {
+                    let mapped = rotation.map_rect(
+                        [
+                            ch.bbox.x,
+                            ch.bbox.y,
+                            ch.bbox.x + ch.bbox.width,
+                            ch.bbox.y + ch.bbox.height,
+                        ],
+                        display_w,
+                        display_h,
+                    );
+                    x = mapped[0];
+                    right = mapped[2];
+                }
+                RawChar {
+                    x,
+                    y,
+                    right,
+                    font: ch.font_size,
+                    ch: ch.char,
+                    bold: (ch.font_weight as u16) >= 600,
+                }
             })
             .collect();
-        let (lines, gutter) = crate::pdf::paragraphs::chars_to_lines(raw, x1 - x0);
-        pages.push(((idx + 1) as u16, x1 - x0, y1 - y0, lines, gutter));
+        let (lines, gutter) = crate::pdf::paragraphs::chars_to_lines(raw, display_w);
+        pages.push(((idx + 1) as u16, display_w, display_h, lines, gutter));
     }
     Ok(pages)
 }
@@ -177,8 +219,15 @@ fn extract_text_pdfium(path: &Path) -> Result<Vec<PageText>> {
         // Geometry-first: rebuild paragraphs (columns, indents, gaps) so the
         // chunker's paragraph split sees real boundaries. Fall back to the
         // flat dump when geometry yields nothing (unusual encodings).
-        let (lines, gutter) =
-            crate::pdf::paragraphs::page_to_lines(&text_page, page.width().value);
+        let rotation = crate::pdf::paragraphs::PageRotation::from_pdfium(
+            page.rotation().unwrap_or(pdfium_render::prelude::PdfPageRenderRotation::None),
+        );
+        let (lines, gutter) = crate::pdf::paragraphs::page_to_lines(
+            &text_page,
+            page.width().value,
+            page.height().value,
+            rotation,
+        );
         let text = if lines.is_empty() {
             text_page.all()
         } else {

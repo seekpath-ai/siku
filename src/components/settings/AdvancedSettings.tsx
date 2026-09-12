@@ -1,8 +1,13 @@
 import { useEffect, useState } from 'react';
-import { Loader2, SlidersHorizontal } from 'lucide-react';
-import { settingsAppGet, settingsAppSave } from '@/lib/tauri';
+import { Loader2, SlidersHorizontal, Zap } from 'lucide-react';
+import {
+  settingsAppGet,
+  settingsAppSave,
+  searchEmbeddingStatus,
+  searchTestEmbeddingEndpoint,
+} from '@/lib/tauri';
 import { SaveButton } from '@/components/ui/SaveButton';
-import type { AppSettings } from '@/lib/tauri';
+import type { AppSettings, EmbeddingStatus, EmbeddingProbe } from '@/lib/tauri';
 
 interface LimitField {
   key: keyof AppSettings;
@@ -74,6 +79,15 @@ export function AdvancedSettings() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_VALUES);
+  const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingStatus | null>(null);
+  const [probe, setProbe] = useState<EmbeddingProbe | null>(null);
+  const [testing, setTesting] = useState(false);
+
+  const refreshEmbeddingStatus = () => {
+    searchEmbeddingStatus()
+      .then(setEmbeddingStatus)
+      .catch((err) => console.error('Failed to load embedding status:', err));
+  };
 
   useEffect(() => {
     settingsAppGet()
@@ -82,7 +96,19 @@ export function AdvancedSettings() {
       })
       .catch((err) => console.error('Failed to load advanced settings:', err))
       .finally(() => setLoading(false));
+    refreshEmbeddingStatus();
   }, []);
+
+  const handleTestEndpoint = async () => {
+    setTesting(true);
+    try {
+      setProbe(await searchTestEmbeddingEndpoint());
+    } catch (err) {
+      console.error('Failed to probe embedding endpoint:', err);
+    } finally {
+      setTesting(false);
+    }
+  };
 
   const updateField = (key: keyof AppSettings, value: number) => {
     setSettings((prev) => ({ ...prev, [key]: value }));
@@ -98,6 +124,10 @@ export function AdvancedSettings() {
       const current = await settingsAppGet();
       await settingsAppSave({ ...current, ...settings });
       setSaved(true);
+      // The backend reads the saved settings, so the probe is only meaningful
+      // against what was just stored.
+      setProbe(null);
+      refreshEmbeddingStatus();
     } catch (err) {
       console.error('Failed to save advanced settings:', err);
     } finally {
@@ -214,6 +244,52 @@ export function AdvancedSettings() {
             />
           </div>
         </div>
+        <div className="space-y-2 rounded-lg border border-surface-hover p-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={handleTestEndpoint}
+              disabled={testing}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-surface-hover px-3 py-1.5 text-sm text-text-primary hover:border-primary disabled:opacity-50"
+            >
+              {testing ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
+              测试连接
+            </button>
+            <span className="text-xs text-text-secondary/70">
+              测试的是已保存的配置；改完请先保存再测。
+            </span>
+          </div>
+
+          {embeddingStatus && (
+            <p className="text-xs text-text-secondary">
+              {embeddingStatus.leg_enabled ? '向量腿已启用' : '向量腿未启用'} · 已嵌入{' '}
+              {embeddingStatus.embedded_chunks}/{embeddingStatus.total_chunks} 块
+              {embeddingStatus.dimensions != null && ` · ${embeddingStatus.dimensions} 维`}
+              {embeddingStatus.embedded_chunks > 0 && ` · 模型 ${embeddingStatus.model}`}
+            </p>
+          )}
+
+          {embeddingStatus && embeddingStatus.other_models.length > 0 && (
+            <p className="text-xs text-amber-400">
+              另有 {embeddingStatus.other_models.reduce((sum, m) => sum + m.chunks, 0)} 块属于旧模型（
+              {embeddingStatus.other_models.map((m) => m.model).join('、')}
+              ），不参与检索；对这些文献重建索引即可重算。
+            </p>
+          )}
+
+          {probe &&
+            (probe.ok ? (
+              <p className="text-xs text-emerald-400">
+                连接成功 · {probe.dimensions} 维 · {probe.latency_ms} ms
+                {embeddingStatus?.dimensions != null &&
+                  probe.dimensions !== embeddingStatus.dimensions &&
+                  ' · 与已存向量维度不一致，需要重建索引'}
+              </p>
+            ) : (
+              <p className="text-xs text-red-400">连接失败：{probe.error}</p>
+            ))}
+        </div>
+
         <p className="text-xs text-text-secondary/70">
           配置后，请在图书馆对文献右键执行「重建索引」以生成新向量；更换端点或模型名后，已有向量会在下次索引时按新模型重算。
         </p>

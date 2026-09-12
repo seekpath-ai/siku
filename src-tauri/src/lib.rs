@@ -866,6 +866,8 @@ pub fn run() {
             // Search
             commands::search::search_hybrid,
             commands::search::search_generate_embeddings,
+            commands::search::search_embedding_status,
+            commands::search::search_test_embedding_endpoint,
             commands::search::search_rag_query,
             // Timeline
             commands::timeline::timeline_list,

@@ -78,6 +78,43 @@ pub async fn generate_embeddings_for_paper(
     Ok(count)
 }
 
+/// The embedding backend as configured right now.
+///
+/// Passed explicitly to the `_with` helpers so tests can exercise a backend
+/// without touching the process-wide settings cache.
+#[derive(Debug, Clone, Default)]
+pub struct EmbeddingConfig {
+    pub backend: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+}
+
+impl EmbeddingConfig {
+    /// Read the active configuration from app + device settings.
+    pub fn active() -> Self {
+        let settings = crate::core::settings_service::cached_settings();
+        let device = crate::core::settings_service::cached_device_settings();
+        Self {
+            backend: settings.embedding_backend,
+            base_url: settings.embedding_base_url,
+            api_key: device.embedding_api_key,
+            model: settings.embedding_model,
+        }
+    }
+
+    /// A real endpoint is configured, so vectors may take part in retrieval.
+    /// The built-in placeholder never qualifies.
+    pub fn enabled(&self) -> bool {
+        self.backend == "api" && !self.base_url.trim().is_empty()
+    }
+}
+
+/// Whether the vector leg may contribute results for the active configuration.
+pub fn vector_leg_enabled() -> bool {
+    EmbeddingConfig::active().enabled()
+}
+
 /// Embed a batch of texts with the configured backend.
 ///
 /// With an API backend configured, a failure is returned as an error — it is
@@ -85,16 +122,17 @@ pub async fn generate_embeddings_for_paper(
 /// character-histogram vectors under the API model's label, so the vector leg
 /// kept "working" while comparing meaningless numbers.
 pub async fn embed_texts(db: &SqlitePool, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
-    let settings = crate::core::settings_service::cached_settings();
-    let device_settings = crate::core::settings_service::cached_device_settings();
-    if crate::ai::retriever::vector_leg_enabled() {
-        let vectors = api_embed_texts(
-            &settings.embedding_base_url,
-            &device_settings.embedding_api_key,
-            &settings.embedding_model,
-            texts,
-        )
-        .await?;
+    embed_texts_with(&EmbeddingConfig::active(), db, texts).await
+}
+
+/// `embed_texts` against an explicit configuration.
+pub async fn embed_texts_with(
+    cfg: &EmbeddingConfig,
+    db: &SqlitePool,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>, String> {
+    if cfg.enabled() {
+        let vectors = api_embed_texts(&cfg.base_url, &cfg.api_key, &cfg.model, texts).await?;
         if vectors.len() != texts.len() {
             return Err(format!(
                 "embedding API returned {} vectors for {} inputs",
@@ -145,7 +183,14 @@ async fn api_embed_texts(
         .await
         .map_err(|e| format!("embedding request failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("embedding API status {}", resp.status()));
+        // The most common misconfiguration by far: the base URL has no `/v1`,
+        // so the request lands one path segment too high.
+        let hint = if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            "（检查 Base URL 是否包含 /v1，例如 http://127.0.0.1:11434/v1）"
+        } else {
+            ""
+        };
+        return Err(format!("embedding API status {}{hint}", resp.status()));
     }
     let body: serde_json::Value = resp.json().await.map_err(|e| format!("embedding json: {e}"))?;
     let data = body["data"]
@@ -220,11 +265,174 @@ pub fn blob_to_vector(blob: &[u8]) -> Vec<f32> {
 }
 
 /// Generate an embedding for a single query text using the active backend.
-pub async fn embed_query(db: &SqlitePool, text: &str) -> Vec<f32> {
-    match embed_texts(db, &[text.to_string()]).await {
-        Ok(mut v) if !v.is_empty() => v.remove(0),
-        _ => generate_fallback_embedding(text),
+///
+/// `None` means "no semantic query vector is available": either the vector leg
+/// is not configured, or the endpoint did not answer. It never falls back to
+/// the hash placeholder — those vectors live in another space, and when the
+/// dimensions happen to coincide (both 512 for `bge-small-zh-v1.5`) the retriever
+/// would score real vectors against a character histogram and mix the garbage
+/// into the fused ranking.
+pub async fn embed_query(db: &SqlitePool, text: &str) -> Option<Vec<f32>> {
+    embed_query_with(&EmbeddingConfig::active(), db, text).await
+}
+
+/// `embed_query` against an explicit configuration.
+pub async fn embed_query_with(
+    cfg: &EmbeddingConfig,
+    db: &SqlitePool,
+    text: &str,
+) -> Option<Vec<f32>> {
+    if !cfg.enabled() {
+        return None;
     }
+    match embed_texts_with(cfg, db, &[text.to_string()]).await {
+        Ok(mut v) if v.first().is_some_and(|vec| !vec.is_empty()) => Some(v.remove(0)),
+        Ok(_) => {
+            warn!("embedding endpoint returned no vector; vector leg skipped");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "query embedding failed; vector leg skipped");
+            None
+        }
+    }
+}
+
+/// One-shot probe of the configured endpoint, for the settings UI.
+///
+/// Always returns a report: a configuration or transport failure is the
+/// payload, not a rejected promise, so the panel can show the raw reason.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EmbeddingProbe {
+    pub ok: bool,
+    pub backend: String,
+    pub model: String,
+    pub base_url: String,
+    /// Dimensions returned by the endpoint, when it answered.
+    pub dimensions: Option<usize>,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+}
+
+const PROBE_TEXT: &str = "siku embedding probe 向量探针";
+
+/// Probe the active endpoint once.
+pub async fn test_embedding_endpoint() -> EmbeddingProbe {
+    probe_endpoint(&EmbeddingConfig::active()).await
+}
+
+/// Probe an explicit configuration once.
+pub async fn probe_endpoint(cfg: &EmbeddingConfig) -> EmbeddingProbe {
+    let mut probe = EmbeddingProbe {
+        ok: false,
+        backend: cfg.backend.clone(),
+        model: cfg.model.clone(),
+        base_url: cfg.base_url.clone(),
+        dimensions: None,
+        latency_ms: 0,
+        error: None,
+    };
+
+    if !cfg.enabled() {
+        probe.error = Some(if cfg.backend == "api" {
+            "未填写 Base URL（需包含 /v1，例如 http://127.0.0.1:11434/v1）".to_string()
+        } else {
+            "当前后端是内置占位，不会生成向量；请选择「API 嵌入」".to_string()
+        });
+        return probe;
+    }
+
+    let started = std::time::Instant::now();
+    let result =
+        api_embed_texts(&cfg.base_url, &cfg.api_key, &cfg.model, &[PROBE_TEXT.to_string()]).await;
+    probe.latency_ms = started.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(vectors) => match vectors.first() {
+            Some(v) if !v.is_empty() => {
+                probe.ok = true;
+                probe.dimensions = Some(v.len());
+            }
+            _ => probe.error = Some("端点返回了空向量".to_string()),
+        },
+        Err(e) => probe.error = Some(e),
+    }
+    probe
+}
+
+/// How much of the library actually has vectors for the active model.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EmbeddingModelCount {
+    pub model: String,
+    pub chunks: i64,
+    pub dimensions: i64,
+}
+
+/// What the vector leg is doing right now, and why it might be doing nothing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EmbeddingStatus {
+    pub leg_enabled: bool,
+    pub backend: String,
+    pub model: String,
+    pub base_url: String,
+    pub total_chunks: i64,
+    /// Chunks holding a vector under the active model label.
+    pub embedded_chunks: i64,
+    /// Dimensions of those vectors, when there is at least one row.
+    pub dimensions: Option<i64>,
+    /// Rows left under other model labels. Retrieval ignores them, so they are
+    /// the visible reason a paper "has no vectors" after switching backends.
+    pub other_models: Vec<EmbeddingModelCount>,
+}
+
+/// Report the state of the vector leg for the active configuration.
+pub async fn embedding_status(db: &SqlitePool) -> Result<EmbeddingStatus, String> {
+    let cfg = EmbeddingConfig::active();
+    let model = embedding_model_label();
+    embedding_status_with(&cfg, db, &model).await
+}
+
+/// `embedding_status` against an explicit configuration and model label.
+pub async fn embedding_status_with(
+    cfg: &EmbeddingConfig,
+    db: &SqlitePool,
+    model: &str,
+) -> Result<EmbeddingStatus, String> {
+    let total_chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks")
+        .fetch_one(db)
+        .await
+        .map_err(|e| format!("db: {e}"))?;
+
+    let (embedded_chunks, dimensions): (i64, Option<i64>) =
+        sqlx::query_as("SELECT COUNT(*), MAX(dimensions) FROM embeddings WHERE model = ?")
+            .bind(model)
+            .fetch_one(db)
+            .await
+            .map_err(|e| format!("db: {e}"))?;
+
+    let other_models: Vec<EmbeddingModelCount> =
+        sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT model, COUNT(*), COALESCE(MAX(dimensions), 0) FROM embeddings \
+             WHERE model <> ? GROUP BY model ORDER BY COUNT(*) DESC",
+        )
+        .bind(model)
+        .fetch_all(db)
+        .await
+        .map_err(|e| format!("db: {e}"))?
+        .into_iter()
+        .map(|(model, chunks, dimensions)| EmbeddingModelCount { model, chunks, dimensions })
+        .collect();
+
+    Ok(EmbeddingStatus {
+        leg_enabled: cfg.enabled(),
+        backend: cfg.backend.clone(),
+        model: model.to_string(),
+        base_url: cfg.base_url.clone(),
+        total_chunks,
+        embedded_chunks,
+        dimensions,
+        other_models,
+    })
 }
 
 /// Cosine similarity between two vectors
@@ -245,4 +453,213 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 
     dot / (norm_a.sqrt() * norm_b.sqrt())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    fn cfg(backend: &str, base_url: &str) -> EmbeddingConfig {
+        EmbeddingConfig {
+            backend: backend.to_string(),
+            base_url: base_url.to_string(),
+            api_key: String::new(),
+            model: "bge-m3".to_string(),
+        }
+    }
+
+    async fn test_db() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        sqlx::raw_sql(include_str!("../../schema_init.sql"))
+            .execute(&pool)
+            .await
+            .expect("schema");
+        pool
+    }
+
+    /// A stub endpoint that answers `body` only for `POST path`, and 404 for
+    /// anything else — so a wrong URL shape fails loudly instead of silently
+    /// passing.
+    async fn stub_endpoint(path: &'static str, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (status, payload) = if head.starts_with(&format!("POST {path} ")) {
+                        ("200 OK", body)
+                    } else {
+                        ("404 Not Found", "{\"error\":\"no such route\"}")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
+    /// A URL that is guaranteed not to be listening.
+    async fn dead_endpoint() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    #[tokio::test]
+    async fn probe_reports_dimensions_for_a_working_endpoint() {
+        let base = stub_endpoint(
+            "/v1/embeddings",
+            "{\"data\":[{\"embedding\":[0.1,0.2,0.3]}]}",
+        )
+        .await;
+        let probe = probe_endpoint(&cfg("api", &base)).await;
+        assert!(probe.ok, "探针应成功，实际错误 {:?}", probe.error);
+        assert_eq!(probe.dimensions, Some(3));
+        assert!(probe.error.is_none());
+        assert_eq!(probe.model, "bge-m3");
+    }
+
+    #[tokio::test]
+    async fn probe_explains_a_missing_v1_segment() {
+        let base = stub_endpoint("/v1/embeddings", "{}").await;
+        let without_v1 = base.trim_end_matches("/v1").to_string();
+        let probe = probe_endpoint(&cfg("api", &without_v1)).await;
+        assert!(!probe.ok);
+        let err = probe.error.expect("错误信息");
+        assert!(err.contains("404"), "应报告 404，实际 {err}");
+        assert!(err.contains("/v1"), "应提示补 /v1，实际 {err}");
+    }
+
+    #[tokio::test]
+    async fn probe_refuses_the_placeholder_backend_without_calling_out() {
+        let probe = probe_endpoint(&cfg("hash", "http://127.0.0.1:1/v1")).await;
+        assert!(!probe.ok);
+        assert_eq!(probe.latency_ms, 0, "占位后端不应发起请求");
+        assert!(probe.error.expect("错误信息").contains("占位"));
+    }
+
+    #[tokio::test]
+    async fn probe_requires_a_base_url() {
+        let probe = probe_endpoint(&cfg("api", "   ")).await;
+        assert!(!probe.ok);
+        assert!(probe.error.expect("错误信息").contains("Base URL"));
+    }
+
+    #[tokio::test]
+    async fn query_embedding_uses_the_endpoint_vector() {
+        let base = stub_endpoint(
+            "/v1/embeddings",
+            "{\"data\":[{\"embedding\":[1.0,0.0,0.0,0.0]}]}",
+        )
+        .await;
+        let db = test_db().await;
+        let vector = embed_query_with(&cfg("api", &base), &db, "这篇论文用了什么方法")
+            .await
+            .expect("应拿到查询向量");
+        assert_eq!(vector.len(), 4);
+        assert_eq!(vector[0], 1.0);
+    }
+
+    #[tokio::test]
+    async fn query_embedding_is_none_when_the_endpoint_is_down() {
+        let db = test_db().await;
+        let dead = cfg("api", &dead_endpoint().await);
+        assert!(
+            embed_query_with(&dead, &db, "query").await.is_none(),
+            "端点不可用时必须返回 None，而不是退回哈希占位向量"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_embedding_is_none_for_the_placeholder_backend() {
+        let db = test_db().await;
+        assert!(embed_query_with(&cfg("hash", ""), &db, "任意查询").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn status_reports_coverage_and_rows_left_under_other_models() {
+        let db = test_db().await;
+        sqlx::query(
+            "INSERT INTO papers (id, title, created_at, updated_at) VALUES ('p1', '测试', 't', 't')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        for i in 0..3 {
+            sqlx::query(
+                "INSERT INTO chunks (id, paper_id, content, search_text, block_type, is_tail, chunk_index, created_at)
+                 VALUES (?, 'p1', '正文', '正文', 'prose', 0, ?, 't')",
+            )
+            .bind(format!("c{i}"))
+            .bind(i)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        let rows: [(&str, &str, i64); 3] = [
+            ("c0", "bge-m3", 1024),
+            ("c1", "bge-m3", 1024),
+            // Left behind by a previous backend: retrieval ignores these.
+            ("c2", "old-model", 512),
+        ];
+        for (chunk_id, model, dimensions) in rows {
+            sqlx::query(
+                "INSERT INTO embeddings (chunk_id, model, dimensions, vector, created_at)
+                 VALUES (?, ?, ?, ?, 't')",
+            )
+            .bind(chunk_id)
+            .bind(model)
+            .bind(dimensions)
+            .bind(vec![0u8; 8])
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+
+        let status = embedding_status_with(
+            &cfg("api", "http://127.0.0.1:11434/v1"),
+            &db,
+            "bge-m3",
+        )
+        .await
+        .expect("status");
+
+        assert!(status.leg_enabled);
+        assert_eq!(status.total_chunks, 3);
+        assert_eq!(status.embedded_chunks, 2);
+        assert_eq!(status.dimensions, Some(1024));
+        assert_eq!(status.other_models.len(), 1);
+        assert_eq!(status.other_models[0].model, "old-model");
+        assert_eq!(status.other_models[0].chunks, 1);
+        assert_eq!(status.other_models[0].dimensions, 512);
+    }
+
+    #[tokio::test]
+    async fn status_flags_a_disabled_vector_leg() {
+        let db = test_db().await;
+        let status = embedding_status_with(&cfg("hash", ""), &db, "placeholder")
+            .await
+            .expect("status");
+        assert!(!status.leg_enabled, "占位后端不能算作启用");
+    }
 }

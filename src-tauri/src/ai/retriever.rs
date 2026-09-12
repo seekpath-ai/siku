@@ -81,11 +81,10 @@ pub async fn hybrid_search_with(
 
 /// Whether the vector leg may contribute results.
 ///
-/// True only for a real embedding backend ("api" with a model configured, or a
-/// future local ONNX backend). See `embedder::generate_embeddings_for_paper`.
+/// Defined by the embedding backend: true only for "api" with a base URL
+/// configured. See `embedder::vector_leg_enabled`.
 pub fn vector_leg_enabled() -> bool {
-    let settings = crate::core::settings_service::cached_settings();
-    settings.embedding_backend == "api" && !settings.embedding_base_url.trim().is_empty()
+    embedder::vector_leg_enabled()
 }
 
 /// Keyword search on one of the chunk FTS indexes.
@@ -206,7 +205,11 @@ async fn vector_search(
     limit: usize,
     include_tail: bool,
 ) -> Result<Vec<SearchResult>, String> {
-    let query_vec = embedder::embed_query(db, query).await;
+    // No query vector means no vector leg: the endpoint is unreachable or
+    // returned nothing usable. Dropping the leg keeps keyword results intact.
+    let Some(query_vec) = embedder::embed_query(db, query).await else {
+        return Ok(Vec::new());
+    };
     let model = embedder::embedding_model_label();
     let stamp = vector_cache_stamp(db).await?;
 

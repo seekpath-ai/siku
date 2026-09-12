@@ -804,6 +804,36 @@ export async function searchHybrid(query: string, limit?: number): Promise<unkno
 export async function searchGenerateEmbeddings(paperId: string): Promise<number> {
   return invoke<number>('search_generate_embeddings', { paperId });
 }
+export interface EmbeddingModelCount {
+  model: string;
+  chunks: number;
+  dimensions: number;
+}
+export interface EmbeddingStatus {
+  leg_enabled: boolean;
+  backend: string;
+  model: string;
+  base_url: string;
+  total_chunks: number;
+  embedded_chunks: number;
+  dimensions: number | null;
+  other_models: EmbeddingModelCount[];
+}
+export interface EmbeddingProbe {
+  ok: boolean;
+  backend: string;
+  model: string;
+  base_url: string;
+  dimensions: number | null;
+  latency_ms: number;
+  error: string | null;
+}
+export async function searchEmbeddingStatus(): Promise<EmbeddingStatus> {
+  return invoke<EmbeddingStatus>('search_embedding_status');
+}
+export async function searchTestEmbeddingEndpoint(): Promise<EmbeddingProbe> {
+  return invoke<EmbeddingProbe>('search_test_embedding_endpoint');
+}
 export async function searchRagQuery(query: string, topK?: number): Promise<string> {
   return invoke<string>('search_rag_query', { query, topK });
 }

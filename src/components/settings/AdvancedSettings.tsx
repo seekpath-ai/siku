@@ -82,6 +82,7 @@ export function AdvancedSettings() {
   const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingStatus | null>(null);
   const [probe, setProbe] = useState<EmbeddingProbe | null>(null);
   const [testing, setTesting] = useState(false);
+  const apiBackend = (settings.embedding_backend || 'hash') === 'api';
 
   const refreshEmbeddingStatus = () => {
     searchEmbeddingStatus()
@@ -198,101 +199,126 @@ export function AdvancedSettings() {
           关键词检索不受影响。选择「API 嵌入」后，文献重建索引时会通过 OpenAI 兼容的 embeddings 接口生成语义向量；
           端点不可用时向量腿不参与召回，不会回退到占位向量。
         </p>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div className="space-y-1.5">
-            <label className="block text-sm text-text-secondary">嵌入后端</label>
-            <select
-              value={settings.embedding_backend || 'hash'}
-              onChange={(e) => updateText('embedding_backend', e.target.value)}
-              className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
-            >
-              <option value="hash">关闭（内置占位）</option>
-              <option value="api">API 嵌入（OpenAI 兼容）</option>
-            </select>
-          </div>
-          <div className="space-y-1.5">
-            <label className="block text-sm text-text-secondary">嵌入模型</label>
-            <input
-              type="text"
-              value={settings.embedding_model || ''}
-              onChange={(e) => updateText('embedding_model', e.target.value)}
-              placeholder="text-embedding-3-small"
-              className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
-            />
-          </div>
-          <div className="space-y-1.5">
-            <label className="block text-sm text-text-secondary">API 地址（Base URL）</label>
-            <input
-              type="text"
-              value={settings.embedding_base_url || ''}
-              onChange={(e) => updateText('embedding_base_url', e.target.value)}
-              placeholder="https://api.openai.com/v1"
-              className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
-            />
+        <div className="max-w-xs space-y-1.5">
+          <label className="block text-sm text-text-secondary">嵌入后端</label>
+          <select
+            value={settings.embedding_backend || 'hash'}
+            onChange={(e) => updateText('embedding_backend', e.target.value)}
+            className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
+          >
+            <option value="hash">关闭（内置占位）</option>
+            <option value="api">API 嵌入（OpenAI 兼容）</option>
+          </select>
+        </div>
+
+        {apiBackend ? (
+          <>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-1.5">
+                <label className="block text-sm text-text-secondary">嵌入模型</label>
+                <input
+                  type="text"
+                  value={settings.embedding_model || ''}
+                  onChange={(e) => updateText('embedding_model', e.target.value)}
+                  placeholder="text-embedding-3-small"
+                  className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="block text-sm text-text-secondary">API 地址（Base URL）</label>
+                <input
+                  type="text"
+                  value={settings.embedding_base_url || ''}
+                  onChange={(e) => updateText('embedding_base_url', e.target.value)}
+                  placeholder="https://api.openai.com/v1"
+                  className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
+                />
+                <p className="text-xs text-text-secondary/70">
+                  需包含 <code>/v1</code>，例如 <code>http://127.0.0.1:8899/v1</code>（本项目脚本 /
+                  Ollama 用 <code>:11434</code>）。
+                </p>
+              </div>
+              <div className="space-y-1.5">
+                <label className="block text-sm text-text-secondary">API Key</label>
+                <input
+                  type="password"
+                  value={settings.embedding_api_key || ''}
+                  onChange={(e) => updateText('embedding_api_key', e.target.value)}
+                  placeholder="本地服务留空"
+                  className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2 rounded-lg border border-surface-hover p-3">
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handleTestEndpoint}
+                  disabled={testing}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-surface-hover px-3 py-1.5 text-sm text-text-primary hover:border-primary disabled:opacity-50"
+                >
+                  {testing ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
+                  测试连接
+                </button>
+                <span className="text-xs text-text-secondary/70">
+                  测试的是已保存的配置；改完请先保存再测。
+                </span>
+              </div>
+
+              {embeddingStatus && (
+                <p className="text-xs text-text-secondary">
+                  {embeddingStatus.leg_enabled ? '向量腿已启用' : '向量腿未启用'} · 已嵌入{' '}
+                  {embeddingStatus.embedded_chunks}/{embeddingStatus.total_chunks} 块
+                  {embeddingStatus.dimensions != null && ` · ${embeddingStatus.dimensions} 维`}
+                  {embeddingStatus.embedded_chunks > 0 && ` · 模型 ${embeddingStatus.model}`}
+                </p>
+              )}
+
+              {embeddingStatus && embeddingStatus.other_models.length > 0 && (
+                <p className="text-xs text-amber-400">
+                  另有 {embeddingStatus.other_models.reduce((sum, m) => sum + m.chunks, 0)}{' '}
+                  块属于旧模型（{embeddingStatus.other_models.map((m) => m.model).join('、')}
+                  ），不参与检索；对这些文献重建索引即可重算。
+                </p>
+              )}
+
+              {probe &&
+                (probe.ok ? (
+                  <p className="text-xs text-emerald-400">
+                    连接成功 · {probe.dimensions} 维 · {probe.latency_ms} ms
+                    {embeddingStatus?.dimensions != null &&
+                      probe.dimensions !== embeddingStatus.dimensions &&
+                      ' · 与已存向量维度不一致，需要重建索引'}
+                  </p>
+                ) : (
+                  <p className="text-xs text-red-400">连接失败：{probe.error}</p>
+                ))}
+            </div>
+
             <p className="text-xs text-text-secondary/70">
-              需包含 <code>/v1</code>，例如 <code>http://127.0.0.1:11434/v1</code>（Ollama）。
+              配置后，请在图书馆对文献右键执行「重建索引」以生成新向量；更换端点或模型名后，已有向量会在下次索引时按新模型重算。
             </p>
-          </div>
-          <div className="space-y-1.5">
-            <label className="block text-sm text-text-secondary">API Key</label>
-            <input
-              type="password"
-              value={settings.embedding_api_key || ''}
-              onChange={(e) => updateText('embedding_api_key', e.target.value)}
-              placeholder="sk-..."
-              className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
-            />
-          </div>
-        </div>
-        <div className="space-y-2 rounded-lg border border-surface-hover p-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <button
-              type="button"
-              onClick={handleTestEndpoint}
-              disabled={testing}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-surface-hover px-3 py-1.5 text-sm text-text-primary hover:border-primary disabled:opacity-50"
-            >
-              {testing ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
-              测试连接
-            </button>
-            <span className="text-xs text-text-secondary/70">
-              测试的是已保存的配置；改完请先保存再测。
-            </span>
-          </div>
-
-          {embeddingStatus && (
-            <p className="text-xs text-text-secondary">
-              {embeddingStatus.leg_enabled ? '向量腿已启用' : '向量腿未启用'} · 已嵌入{' '}
-              {embeddingStatus.embedded_chunks}/{embeddingStatus.total_chunks} 块
-              {embeddingStatus.dimensions != null && ` · ${embeddingStatus.dimensions} 维`}
-              {embeddingStatus.embedded_chunks > 0 && ` · 模型 ${embeddingStatus.model}`}
-            </p>
-          )}
-
-          {embeddingStatus && embeddingStatus.other_models.length > 0 && (
-            <p className="text-xs text-amber-400">
-              另有 {embeddingStatus.other_models.reduce((sum, m) => sum + m.chunks, 0)} 块属于旧模型（
-              {embeddingStatus.other_models.map((m) => m.model).join('、')}
-              ），不参与检索；对这些文献重建索引即可重算。
-            </p>
-          )}
-
-          {probe &&
-            (probe.ok ? (
-              <p className="text-xs text-emerald-400">
-                连接成功 · {probe.dimensions} 维 · {probe.latency_ms} ms
-                {embeddingStatus?.dimensions != null &&
-                  probe.dimensions !== embeddingStatus.dimensions &&
-                  ' · 与已存向量维度不一致，需要重建索引'}
+          </>
+        ) : (
+          embeddingStatus &&
+          (embeddingStatus.embedded_chunks > 0 || embeddingStatus.other_models.length > 0) && (
+            <div className="space-y-2 rounded-lg border border-surface-hover p-3">
+              <p className="text-xs text-text-secondary">
+                向量腿未启用 · 已嵌入 {embeddingStatus.embedded_chunks}/
+                {embeddingStatus.total_chunks} 块
+                {embeddingStatus.embedded_chunks > 0 && ` · 模型 ${embeddingStatus.model}`}
               </p>
-            ) : (
-              <p className="text-xs text-red-400">连接失败：{probe.error}</p>
-            ))}
-        </div>
-
-        <p className="text-xs text-text-secondary/70">
-          配置后，请在图书馆对文献右键执行「重建索引」以生成新向量；更换端点或模型名后，已有向量会在下次索引时按新模型重算。
-        </p>
+              {embeddingStatus.other_models.length > 0 && (
+                <p className="text-xs text-amber-400">
+                  另有 {embeddingStatus.other_models.reduce((sum, m) => sum + m.chunks, 0)}{' '}
+                  块属于旧模型（{embeddingStatus.other_models.map((m) => m.model).join('、')}
+                  ），不参与检索；对这些文献重建索引即可重算。
+                </p>
+              )}
+            </div>
+          )
+        )}
       </section>
 
       <section className="space-y-3">

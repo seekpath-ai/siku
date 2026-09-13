@@ -329,3 +329,59 @@ fn concurrent_extraction_stays_stable() {
         assert_eq!(chars, *want_chars, "{name}: extracted text differs under load");
     }
 }
+
+/// Line anchors must tile each paragraph exactly, and every line box must sit
+/// inside its paragraph box: the dual-pane sync slices the paragraph text by
+/// these lengths and aligns the PDF to these boxes, so an off-by-one highlights
+/// the wrong words.
+#[test]
+fn paragraph_line_anchors_tile_the_text() {
+    let Some(corpus) = Corpus::locate() else { return };
+    let mut paragraphs = 0usize;
+    let mut with_lines = 0usize;
+    let mut problems: Vec<String> = Vec::new();
+    let mut boxes_checked = 0usize;
+
+    for name in ["demo0.pdf", "demo1.pdf", "demo2.pdf"] {
+        let anchors = crate::pdf::extractor::extract_paragraphs(&corpus.pdf(name))
+            .expect("extract paragraph anchors");
+        for p in &anchors {
+            paragraphs += 1;
+            if !p.lines.is_empty() {
+                with_lines += 1;
+            }
+            let sum: usize = p.lines.iter().map(|l| l.len).sum();
+            let want = p.text.encode_utf16().count();
+            if sum != want {
+                problems.push(format!("{name} p{}: 行长度之和 {sum} != 文本长度 {want}", p.page));
+            }
+            if let Some([px0, py0, px1, py1]) = p.bbox {
+                for line in &p.lines {
+                    boxes_checked += 1;
+                    let [x0, y0, x1, y1] = line.bbox;
+                    if y1 > py1 + 1.0 || y0 < py0 - 1.0 || x0 < px0 - 1.0 || x1 > px1 + 1.0 {
+                        problems.push(format!(
+                            "{name} p{}: 行框 [{x0:.0},{y0:.0},{x1:.0},{y1:.0}] 超出段落框",
+                            p.page
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    println!(
+        "行锚点：段落 {paragraphs}，带行锚点 {with_lines}，校验行框 {boxes_checked}，问题 {}",
+        problems.len()
+    );
+    assert!(
+        problems.is_empty(),
+        "行锚点不一致（前 5 条）: {:?}",
+        &problems[..problems.len().min(5)]
+    );
+    assert!(
+        with_lines * 100 / paragraphs.max(1) >= 95,
+        "只有 {with_lines}/{paragraphs} 个段落带行锚点"
+    );
+    assert!(boxes_checked > 1000, "校验到的行框太少：{boxes_checked}");
+}

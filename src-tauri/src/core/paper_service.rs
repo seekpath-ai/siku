@@ -423,7 +423,10 @@ pub async fn reprocess_paper_index(
 ///
 /// v3: page `/Rotate` is applied before line reconstruction (landscape tables
 /// on `/Rotate 90|270` pages were being shredded into one-char lines).
-const PARAGRAPH_EXTRACTOR_VERSION: i32 = 3;
+// 4: paragraphs carry per-line anchors (bbox + UTF-16 length) for the
+// dual-pane line-level sync; older cached JSON has no `lines` and must be
+// re-extracted.
+const PARAGRAPH_EXTRACTOR_VERSION: i32 = 4;
 
 /// Anchored paragraphs (page + bbox + text) for the reader's dual-pane view.
 /// Computed from the PDF on first request and cached in the device-local

@@ -665,6 +665,52 @@ pub fn join_lines_pub(prev: &str, next: &str) -> String {
     join_lines(prev, next)
 }
 
+/// Split a paragraph's lines into the text they contribute, plus the whole
+/// paragraph text.
+///
+/// The per-line pieces concatenate to exactly the string the `join_lines` fold
+/// produces (trailing whitespace of the last line aside), so a text pane can
+/// render the paragraph as one text node and still address a single line by
+/// slicing at these offsets. Lengths are returned as **UTF-16 code units** so a
+/// JavaScript string can be sliced with them directly.
+pub fn line_segments(lines: &[GeoLine]) -> (String, Vec<usize>) {
+    let mut segments: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut text = String::new();
+    // Whether the previous line ended in a hyphen that this line continues:
+    // the two are then glued without a space.
+    let mut prev_dropped_hyphen = false;
+    for (i, line) in lines.iter().enumerate() {
+        let raw = line.text.trim_start().trim_end();
+        if raw.is_empty() {
+            segments.push(0);
+            continue;
+        }
+        // A line-final hyphen that the next line continues is dropped: the word
+        // is stored whole in the paragraph text (same rule as `join_lines`).
+        let next_first = lines[i + 1..]
+            .iter()
+            .find_map(|n| n.text.trim_start().chars().next());
+        let continues = next_first.is_some_and(|c| c.is_lowercase());
+        let dropped_hyphen = raw.ends_with('-') && continues;
+        let core = if dropped_hyphen { &raw[..raw.len() - 1] } else { raw };
+        // Inter-word space unless the seam is CJK or a hyphen was removed here
+        // (a removed hyphen joins the word directly, no space in between).
+        let sep = match (text.chars().last(), core.chars().next()) {
+            (Some(prev), Some(next))
+                if !prev_dropped_hyphen && !is_cjk(prev) && !is_cjk(next) =>
+            {
+                " "
+            }
+            _ => "",
+        };
+        text.push_str(sep);
+        text.push_str(core);
+        segments.push(sep.len() + core.encode_utf16().count());
+        prev_dropped_hyphen = dropped_hyphen;
+    }
+    (text, segments)
+}
+
 fn join_lines(prev: &str, next: &str) -> String {
     let prev_trim = prev.trim_end();
     let next_trim = next.trim_start();
@@ -1054,5 +1100,67 @@ mod tests {
             .filter(|l| l.baseline_y < 620.0 && l.x_start < 300.0 && l.x_end > 320.0)
             .count();
         assert_eq!(merged, 0, "body lines were left merged across the gutter");
+    }
+
+    /// The per-line slices must add up to exactly the paragraph text — the text
+    /// pane renders one node and addresses lines by slicing, so a mismatch would
+    /// highlight the wrong span.
+    #[test]
+    fn line_segments_reproduce_the_joined_text() {
+        let cases: Vec<Vec<GeoLine>> = vec![
+            vec![
+                line("The proposed method achieves", 0.0, 100.0, 100.0, 10.0),
+                line("state-of-the-art results on", 0.0, 100.0, 90.0, 10.0),
+                line("three benchmarks.", 0.0, 100.0, 80.0, 10.0),
+            ],
+            // Line-final hyphen continued by a lowercase word.
+            vec![
+                line("dependencies and depen-", 0.0, 100.0, 100.0, 10.0),
+                line("dencies again", 0.0, 100.0, 90.0, 10.0),
+            ],
+            // CJK: no inter-word space, and a hyphen is NOT a continuation.
+            vec![
+                line("本文提出了一种基于注意力的", 0.0, 100.0, 100.0, 10.0),
+                line("语义分割方法，在多个数据集", 0.0, 100.0, 90.0, 10.0),
+                line("上取得最优结果。", 0.0, 100.0, 80.0, 10.0),
+            ],
+            vec![
+                line("A hyphen at the end of a line-", 0.0, 100.0, 100.0, 10.0),
+                line("and a capitalised continuation", 0.0, 100.0, 90.0, 10.0),
+            ],
+        ];
+
+        for (ci, lines) in cases.into_iter().enumerate() {
+            let old_fold = lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .fold(String::new(), |acc, l| join_lines(&acc, l));
+            let (text, lengths) = line_segments(&lines);
+
+            assert_eq!(
+                lengths.iter().sum::<usize>(),
+                text.encode_utf16().count(),
+                "每行长度之和必须等于段落文本长度: {text:?}"
+            );
+            assert_eq!(
+                text,
+                old_fold.trim_end(),
+                "case {ci}: 行切片拼起来必须与原来的 join_lines 折叠结果一致\n  旧: {old_fold:?}\n  新: {text:?}"
+            );
+            // Slicing by the reported lengths lands on line boundaries.
+            let units: Vec<u16> = text.encode_utf16().collect();
+            let mut offset = 0usize;
+            for (i, len) in lengths.iter().enumerate() {
+                let piece = String::from_utf16_lossy(&units[offset..offset + len]);
+                let head = lines[i].text.trim().chars().next().unwrap_or(' ');
+                if !piece.is_empty() {
+                    assert!(
+                        piece.starts_with(head) || piece.starts_with(' '),
+                        "第 {i} 行切片应以该行首字符开头，实际 {piece:?}"
+                    );
+                }
+                offset += len;
+            }
+        }
     }
 }

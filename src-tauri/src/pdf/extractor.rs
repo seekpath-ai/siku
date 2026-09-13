@@ -18,6 +18,61 @@ pub struct AnchoredParagraph {
     /// bottom-left page corner).
     pub bbox: Option<[f32; 4]>,
     pub text: String,
+    /// One entry per extracted line, in reading order. Defaulted so caches
+    /// written before line anchors existed still deserialize.
+    #[serde(default)]
+    pub lines: Vec<AnchoredLine>,
+}
+
+/// One line of a paragraph. Only the box and the length of the line's slice of
+/// `AnchoredParagraph::text` travel over IPC: the pane renders the paragraph as
+/// a single text node and slices by `len` (UTF-16 code units) to address a
+/// line, which keeps a 700-page book from becoming tens of thousands of DOM
+/// nodes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AnchoredLine {
+    /// [x0, y0(bottom), x1, y1(top)] in PDF points, y-up.
+    pub bbox: [f32; 4],
+    /// Length of this line's slice of the paragraph text, in UTF-16 code units.
+    pub len: usize,
+}
+
+/// Bbox of one geometric line, in display-frame PDF points (y-up). Same padding
+/// the paragraph box uses, so a line box never sticks out of its paragraph.
+pub fn line_bbox(line: &crate::pdf::paragraphs::GeoLine) -> [f32; 4] {
+    [
+        line.x_start,
+        line.baseline_y - line.font_size * 0.35,
+        line.x_end,
+        line.baseline_y + line.font_size * 1.1,
+    ]
+}
+
+/// Anchor one paragraph (its lines) for the dual-pane view. `None` when the
+/// paragraph has no visible text.
+fn anchor_paragraph(
+    page: u16,
+    para: &[crate::pdf::paragraphs::GeoLine],
+) -> Option<AnchoredParagraph> {
+    let (text, lengths) = crate::pdf::paragraphs::line_segments(para);
+    if text.trim().is_empty() {
+        return None;
+    }
+    let boxes: Vec<[f32; 4]> = para.iter().map(line_bbox).collect();
+    let x0 = boxes.iter().map(|b| b[0]).fold(f32::MAX, f32::min);
+    let x1 = boxes.iter().map(|b| b[2]).fold(0.0f32, f32::max);
+    let y0 = boxes.iter().map(|b| b[1]).fold(f32::MAX, f32::min);
+    let y1 = boxes.iter().map(|b| b[3]).fold(0.0f32, f32::max);
+    Some(AnchoredParagraph {
+        page,
+        bbox: Some([x0, y0, x1, y1]),
+        text,
+        lines: boxes
+            .into_iter()
+            .zip(lengths)
+            .map(|(bbox, len)| AnchoredLine { bbox, len })
+            .collect(),
+    })
 }
 
 /// Extract anchored paragraphs for the dual-pane view. Geometry comes from
@@ -48,28 +103,9 @@ pub fn extract_paragraphs(path: &Path) -> Result<Vec<AnchoredParagraph>> {
                 page.height().value,
                 gutter,
             ) {
-                let text = para
-                    .iter()
-                    .map(|l| l.text.as_str())
-                    .fold(String::new(), |acc, l| crate::pdf::paragraphs::join_lines_pub(&acc, l));
-                if text.trim().is_empty() {
-                    continue;
+                if let Some(anchored) = anchor_paragraph((index + 1) as u16, &para) {
+                    out.push(anchored);
                 }
-                let x0 = para.iter().map(|l| l.x_start).fold(f32::MAX, f32::min);
-                let x1 = para.iter().map(|l| l.x_end).fold(0.0f32, f32::max);
-                let y0 = para
-                    .iter()
-                    .map(|l| l.baseline_y - l.font_size * 0.35)
-                    .fold(f32::MAX, f32::min);
-                let y1 = para
-                    .iter()
-                    .map(|l| l.baseline_y + l.font_size * 1.1)
-                    .fold(0.0f32, f32::max);
-                out.push(AnchoredParagraph {
-                    page: (index + 1) as u16,
-                    bbox: Some([x0, y0, x1, y1]),
-                    text,
-                });
             }
         }
         if !out.is_empty() {
@@ -83,28 +119,9 @@ pub fn extract_paragraphs(path: &Path) -> Result<Vec<AnchoredParagraph>> {
     let mut out = Vec::new();
     for (page_no, width, height, lines, gutter) in pages {
         for para in crate::pdf::paragraphs::paragraphize(lines, width, height, gutter) {
-            let text = para
-                .iter()
-                .map(|l| l.text.as_str())
-                .fold(String::new(), |acc, l| crate::pdf::paragraphs::join_lines_pub(&acc, l));
-            if text.trim().is_empty() {
-                continue;
+            if let Some(anchored) = anchor_paragraph(page_no, &para) {
+                out.push(anchored);
             }
-            let x0 = para.iter().map(|l| l.x_start).fold(f32::MAX, f32::min);
-            let x1 = para.iter().map(|l| l.x_end).fold(0.0f32, f32::max);
-            let y0 = para
-                .iter()
-                .map(|l| l.baseline_y - l.font_size * 0.35)
-                .fold(f32::MAX, f32::min);
-            let y1 = para
-                .iter()
-                .map(|l| l.baseline_y + l.font_size * 1.1)
-                .fold(0.0f32, f32::max);
-            out.push(AnchoredParagraph {
-                page: page_no,
-                bbox: Some([x0, y0, x1, y1]),
-                text,
-            });
         }
     }
     Ok(out)

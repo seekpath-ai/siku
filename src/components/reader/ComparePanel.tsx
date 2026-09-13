@@ -12,12 +12,29 @@ interface Props {
    *  view. Index into the paragraphs array. */
   activeIndex: number | null;
   onParagraphClick: (index: number, p: PaperParagraph) => void;
+  /** True while the PDF side is driving the sync: this pane then follows the
+   *  PDF instead of reporting its own position back. */
+  followingPdf?: boolean;
+  /** Page-granular follow, used when continuous sync is off. With sync on the
+   *  anchor follow supersedes it and the two would fight over the scroll. */
+  followPage?: boolean;
+  /** Reports the paragraph at the top of this pane while the user scrolls it,
+   *  so the PDF can be aligned to it. Throttled to one call per animation frame. */
+  onVisibleParagraph?: (index: number, p: PaperParagraph) => void;
 }
 
 /** Dual-pane Markdown side: paragraphs extracted with page/bbox anchors.
  *  Click a paragraph to jump+highlight on the PDF; clicking the PDF (handled
  *  by the parent) flashes the matching paragraph here. */
-export function ComparePanel({ paragraphs, currentPage, activeIndex, onParagraphClick }: Props) {
+export function ComparePanel({
+  paragraphs,
+  currentPage,
+  activeIndex,
+  onParagraphClick,
+  followingPdf,
+  followPage = true,
+  onVisibleParagraph,
+}: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const paraRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
@@ -34,18 +51,76 @@ export function ComparePanel({ paragraphs, currentPage, activeIndex, onParagraph
   // already jumped the PDF to the paragraph's page and we must not yank the
   // pane back to the top of that page).
   const lastClickAtRef = useRef(0);
+  /** Programmatic scrolls must not be mistaken for the user scrolling this
+   *  pane — otherwise opening the pane drags the PDF to the page's first
+   *  paragraph. */
+  const suppressReportUntilRef = useRef(0);
   useEffect(() => {
+    if (!followPage) return;
     if (Date.now() - lastClickAtRef.current < 800) return;
     const idx = pageFirstIndex.get(currentPage);
     if (idx == null) return;
+    suppressReportUntilRef.current = Date.now() + 400;
     paraRefs.current.get(idx)?.scrollIntoView({ block: 'start' });
-  }, [currentPage, pageFirstIndex]);
+  }, [currentPage, pageFirstIndex, followPage]);
 
-  // Flash + reveal the paragraph hit by a PDF-side click.
+  // Report this pane's own scroll position so the PDF can follow it. Only the
+  // pane the user is actually scrolling reports (followingPdf is false), and
+  // the parent's lock keeps the two directions from pushing each other.
+  const onVisibleRef = useRef(onVisibleParagraph);
+  useEffect(() => { onVisibleRef.current = onVisibleParagraph; }, [onVisibleParagraph]);
+  const followingRef = useRef(followingPdf);
+  useEffect(() => { followingRef.current = followingPdf; }, [followingPdf]);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    let ticking = false;
+    const onScroll = () => {
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(() => {
+        ticking = false;
+        const cb = onVisibleRef.current;
+        if (!cb || followingRef.current) return;
+        if (Date.now() < suppressReportUntilRef.current) return;
+        const top = el.getBoundingClientRect().top;
+        for (const [i, node] of paraRefs.current) {
+          const r = node.getBoundingClientRect();
+          if (r.bottom > top + 4) {
+            // Paragraphs without a bbox cannot be located on the PDF; skip to
+            // the next one that can.
+            for (const j of paraRefs.current.keys()) {
+              if (j < i) continue;
+              if (paragraphs?.[j]?.bbox) {
+                cb(j, paragraphs[j]);
+                return;
+              }
+            }
+            return;
+          }
+        }
+      });
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [paragraphs]);
+
+  // Reveal the active paragraph. While the PDF is driving, align it to the top
+  // instantly — smooth centering lags behind a fast scroll and can leave the
+  // block off-screen, which is the whole point of the sync.
   useEffect(() => {
     if (activeIndex == null) return;
-    paraRefs.current.get(activeIndex)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-  }, [activeIndex]);
+    const node = paraRefs.current.get(activeIndex);
+    const el = scrollRef.current;
+    if (!node) return;
+    suppressReportUntilRef.current = Date.now() + (followingPdf ? 200 : 800);
+    if (followingPdf && el) {
+      el.scrollTop += node.getBoundingClientRect().top - el.getBoundingClientRect().top - 8;
+      return;
+    }
+    node.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, [activeIndex, followingPdf]);
 
   if (!paragraphs) {
     return (

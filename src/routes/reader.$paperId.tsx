@@ -4,11 +4,11 @@ import { usePaper } from '@/hooks/useLibrary';
 import { useTabStore } from '@/stores/tabStore';
 import { usePetContextStore } from '@/stores/petContextStore';
 import { useDialog } from '@/hooks/useDialog';
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   Loader2, FileQuestion, ArrowLeft, ZoomIn, ZoomOut, StickyNote, FileText,
   ScanSearch, Download, Upload, MoreVertical, Pencil, Highlighter, Eraser,
-  BookOpen, LayoutGrid, RotateCw, RotateCcw, Printer, Check, Columns2,
+  BookOpen, LayoutGrid, RotateCw, RotateCcw, Printer, Check, Columns2, Link2,
 } from 'lucide-react';
 import { PdfViewer } from '@/components/reader/PdfViewer';
 import type { PdfViewerHandle, TextSelection, PdfViewerProps, SnippetRect } from '@/components/reader/PdfViewer';
@@ -89,6 +89,15 @@ function ReaderView({ paperId }: { paperId: string }) {
   const [totalPages, setTotalPages] = useState(0);
   const [displayZoom, setDisplayZoom] = useState(savedReaderState.zoom);
   const [panel, setPanel] = useState<'zhisi' | 'notes' | 'compare' | null>(null);
+  /** Dual-pane sync: PDF and text follow each other while scrolling. */
+  const [syncScroll, setSyncScroll] = useState(true);
+  /** Which pane is driving the sync right now, and when — the follower's own
+   *  scroll events must be ignored or the two panes push each other. */
+  const syncSourceRef = useRef<{ source: 'pdf' | 'text'; at: number } | null>(null);
+  const SYNC_LOCK_MS = 150;
+  /** True while the PDF is the driver: the text pane then aligns instantly to
+   *  the top instead of smooth-centering (which lags behind a fast scroll). */
+  const [pdfDrivenSync, setPdfDrivenSync] = useState(false);
   const [panelWidth, setPanelWidth] = useState(300);
   // Dual-pane anchoring: paragraph hit by the last PDF-side click.
   const [activeParagraph, setActiveParagraph] = useState<number | null>(null);
@@ -298,30 +307,94 @@ function ReaderView({ paperId }: { paperId: string }) {
 
   // PDF → Markdown: hit-test the clicked point against paragraph bboxes on
   // that page; fall back to the nearest paragraph above the point.
-  const handlePagePointClick = (pageNum: number, pdfX: number, pdfY: number) => {
-    if (panel !== 'compare' || !compareParagraphs) return;
-    const onPage = compareParagraphs
-      .map((p, i) => ({ p, i }))
-      .filter(({ p }) => p.page === pageNum && p.bbox);
-    const hit = onPage.find(({ p }) => {
-      const [x0, y0, x1, y1] = p.bbox!;
-      return pdfX >= x0 - 4 && pdfX <= x1 + 4 && pdfY >= y0 - 4 && pdfY <= y1 + 4;
+  /**
+   * Paragraph at a display-frame PDF point (y-up). With `pdfX` the point must
+   * fall inside the bbox; the scroll sync only knows the vertical position, so
+   * it omits it. Falls back to the paragraph that ended closest above the point
+   * — that is the one being read when the point is the viewport top.
+   */
+  /** Paragraphs with a bbox, indexed by page. The scroll sync hit-tests once per
+   *  animation frame, so the full list must not be rescanned each time. */
+  const anchoredByPage = useMemo(() => {
+    const m = new Map<number, { i: number; bbox: [number, number, number, number] }[]>();
+    compareParagraphs?.forEach((p, i) => {
+      if (!p.bbox) return;
+      const list = m.get(p.page);
+      if (list) list.push({ i, bbox: p.bbox });
+      else m.set(p.page, [{ i, bbox: p.bbox }]);
     });
-    const target = hit ?? (() => {
-      // Nearest paragraph whose top is below the click (y-up: the click is
-      // under the paragraph's bottom edge means the paragraph is above).
+    return m;
+  }, [compareParagraphs]);
+
+  const paragraphAtPoint = useCallback(
+    (pageNum: number, pdfY: number, pdfX?: number): number | null => {
+      const onPage = anchoredByPage.get(pageNum);
+      if (!onPage) return null;
+      const hit = onPage.find(({ bbox: [x0, y0, x1, y1] }) => {
+        if (pdfX !== undefined && (pdfX < x0 - 4 || pdfX > x1 + 4)) return false;
+        return pdfY >= y0 - 4 && pdfY <= y1 + 4;
+      });
+      if (hit) return hit.i;
       let best: { i: number; dist: number } | null = null;
-      for (const { p, i } of onPage) {
-        const [, y0] = p.bbox!;
+      for (const { bbox: [, y0], i } of onPage) {
         if (y0 <= pdfY) {
           const dist = pdfY - y0;
           if (!best || dist < best.dist) best = { i, dist };
         }
       }
-      return best ? { p: compareParagraphs[best.i], i: best.i } : null;
-    })();
-    if (target) setActiveParagraph(target.i);
+      return best ? best.i : null;
+    },
+    [anchoredByPage],
+  );
+
+  const handlePagePointClick = (pageNum: number, pdfX: number, pdfY: number) => {
+    if (panel !== 'compare' || !compareParagraphs) return;
+    const idx = paragraphAtPoint(pageNum, pdfY, pdfX);
+    if (idx != null) {
+      syncSourceRef.current = { source: 'pdf', at: Date.now() };
+      setActiveParagraph(idx);
+    }
   };
+
+  /** PDF scrolled: move the text pane to the paragraph under the viewport top. */
+  const handleViewportAnchor = useCallback(
+    ({ page, pdfY }: { page: number; pdfY: number }) => {
+      if (!syncScroll || panel !== 'compare' || anchoredByPage.size === 0) return;
+      const lock = syncSourceRef.current;
+      if (lock && lock.source === 'text' && Date.now() - lock.at < SYNC_LOCK_MS) return;
+      syncSourceRef.current = { source: 'pdf', at: Date.now() };
+      const idx = paragraphAtPoint(page, pdfY);
+      if (idx == null) return;
+      setPdfDrivenSync(true);
+      setActiveParagraph((cur) => (cur === idx ? cur : idx));
+    },
+    [syncScroll, panel, anchoredByPage, paragraphAtPoint],
+  );
+
+  /** Text pane scrolled: align the PDF with the paragraph now at its top. */
+  const handleVisibleParagraph = useCallback(
+    (index: number, p: PaperParagraph) => {
+      if (!syncScroll || panel !== 'compare') return;
+      const lock = syncSourceRef.current;
+      if (lock && lock.source === 'pdf' && Date.now() - lock.at < SYNC_LOCK_MS) return;
+      syncSourceRef.current = { source: 'text', at: Date.now() };
+      setPdfDrivenSync(false);
+      setActiveParagraph((cur) => (cur === index ? cur : index));
+      if (!p.bbox) return;
+      // y-up bbox: y1 is the top edge, i.e. what should sit at the viewport top.
+      pdfViewerRef.current?.scrollToAnchor(p.page, Math.max(p.bbox[1], p.bbox[3]), {
+        align: 'top',
+      });
+    },
+    [syncScroll, panel],
+  );
+
+  /** The block the text pane is showing, marked on the PDF. */
+  const anchorHighlight = useMemo(() => {
+    if (panel !== 'compare' || activeParagraph == null || !compareParagraphs) return null;
+    const p = compareParagraphs[activeParagraph];
+    return p?.bbox ? { page: p.page, bbox: p.bbox } : null;
+  }, [panel, activeParagraph, compareParagraphs]);
 
   const pdfViewerRef = useRef<PdfViewerHandle>(null);
   const addSnippet = useSnippetStore((s) => s.addSnippet);
@@ -836,6 +909,22 @@ function ReaderView({ paperId }: { paperId: string }) {
           <Columns2 size={13} />
           对照
         </button>
+        {panel === 'compare' && (
+          <button
+            onClick={() => setSyncScroll((v) => !v)}
+            title={
+              syncScroll
+                ? '同步滚动：两侧互相跟随（点击可关闭，单独滚动一侧）'
+                : '已关闭同步滚动：两侧独立滚动'
+            }
+            className={`flex items-center gap-1 px-2 py-0.5 rounded text-xs transition-colors ${
+              syncScroll ? 'bg-primary/10 text-primary' : 'text-text-secondary hover:bg-surface-hover'
+            }`}
+          >
+            <Link2 size={13} />
+            同步
+          </button>
+        )}
 
         {/* Drawing tools */}
         <div className="flex items-center gap-0.5">
@@ -1002,6 +1091,8 @@ function ReaderView({ paperId }: { paperId: string }) {
                   initialPage={savedReaderState.page}
                   initialZoom={savedReaderState.zoom}
                   onPageChange={setCurrentPage}
+                  onViewportAnchor={handleViewportAnchor}
+                  anchorHighlight={anchorHighlight}
                   onTotalPages={setTotalPages}
                   onZoomChange={setDisplayZoom}
                   onTextSelect={handleTextSelect}
@@ -1110,6 +1201,9 @@ function ReaderView({ paperId }: { paperId: string }) {
                     currentPage={currentPage}
                     activeIndex={activeParagraph}
                     onParagraphClick={handleParagraphClick}
+                    followingPdf={syncScroll && pdfDrivenSync}
+                    followPage={!syncScroll}
+                    onVisibleParagraph={handleVisibleParagraph}
                   />
                 )
               ) : (

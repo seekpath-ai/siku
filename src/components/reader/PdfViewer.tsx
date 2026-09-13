@@ -98,6 +98,14 @@ export interface PdfViewerProps {
   /** When set, shows blue highlight overlay(s) at the given page+positions.
    * Multiple targets highlight a multi-segment snippet across pages. */
   highlightTarget?: { pageIndex: number; rects: SnippetRect[] }[] | null;
+  /** Reports where the top of the viewport sits, in display-frame PDF points
+   *  (y-up), so the dual-pane text view can follow the scroll instead of only
+   *  following page changes. */
+  onViewportAnchor?: (anchor: { page: number; pdfY: number }) => void;
+  /** Marks the block the dual-pane view is currently reading (a paragraph bbox
+   *  in display-frame PDF points, y-up). Painted without scrolling and without
+   *  delay: the dual-pane sync decides where both panes sit. */
+  anchorHighlight?: { page: number; bbox: [number, number, number, number] } | null;
   /** Increment to clear stored multi-range selection segments. */
   clearSelectionSignal?: number;
   /** When set, renders region detection overlays on the PDF pages */
@@ -147,6 +155,8 @@ export interface PdfViewerHandle {
   setZoom: (value: number) => void;
   rotateCw: () => void;
   rotateCcw: () => void;
+  /** Align the viewport to a display-frame point (PDF points, y-up). */
+  scrollToAnchor: (page: number, pdfY: number, opts?: { align?: 'top' | 'center' }) => void;
 }
 
 const PAGE_GAP = 16;
@@ -394,6 +404,8 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     onTextSelect,
     onSelectionClear,
     highlightTarget,
+  onViewportAnchor,
+  anchorHighlight,
     clearSelectionSignal,
     regionOverlays,
     drawingTool = null,
@@ -446,6 +458,13 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
   useEffect(() => { strokesRef.current = strokes; }, [strokes]);
   const onPagePointClickRef = useRef(onPagePointClick);
   useEffect(() => { onPagePointClickRef.current = onPagePointClick; }, [onPagePointClick]);
+  const onViewportAnchorRef = useRef(onViewportAnchor);
+  useEffect(() => { onViewportAnchorRef.current = onViewportAnchor; }, [onViewportAnchor]);
+  /** Per-page display geometry (scale-1 display size + fit scale), cached while
+   *  pages are laid out so scroll-anchor math stays synchronous. `w`/`h` are the
+   *  rotation-applied display dims in points — the same frame the backend's
+   *  paragraph bboxes live in. */
+  const pageMetricsRef = useRef<Map<number, { w: number; h: number; scale: number }>>(new Map());
 
   const [totalPages, setTotalPages] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -902,6 +921,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     svgMapRef.current.clear();
     for (const [, w] of wrapperMapRef.current) w.remove();
     wrapperMapRef.current.clear();
+    pageMetricsRef.current.clear();
     container.innerHTML = '';
 
     for (let i = 1; i <= doc.numPages; i++) {
@@ -910,6 +930,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
       const fitScale = computeFitScale(vp1, mode, zoom, available);
       const height = Math.round(vp1.height * fitScale);
       slots.push({ pageNum: i, height });
+      pageMetricsRef.current.set(i, { w: vp1.width, h: vp1.height, scale: fitScale });
 
       // Create wrapper (always stays in DOM for stable scroll height)
       const wrapper = document.createElement('div');
@@ -933,9 +954,11 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
         doc.getPage(pageNum).then((p: any) => {
           const vp1 = p.getViewport({ scale: 1, rotation: pagesRotationRef.current });
           const fitScale = computeFitScale(vp1, zoomModeRef.current, zoomRef.current, containerSizeRef.current);
-          const viewport = p.getViewport({ scale: fitScale, rotation: pagesRotationRef.current });
-          const [pdfX, pdfY] = viewport.convertToPdfPoint(px, py);
-          cb(pageNum, pdfX, pdfY);
+          pageMetricsRef.current.set(pageNum, { w: vp1.width, h: vp1.height, scale: fitScale });
+          // Display-frame points, y-up: the rotation-applied frame the backend's
+          // paragraph bboxes live in. (`convertToPdfPoint` would hand back the
+          // unrotated content frame, which mismatches on /Rotate pages.)
+          cb(pageNum, px / fitScale, vp1.height - py / fitScale);
         }).catch(() => {});
       });
       // Lightweight placeholder
@@ -999,6 +1022,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
       const page = await doc.getPage(pageNum);
       const vp1 = page.getViewport({ scale: 1, rotation });
       const fitScale = computeFitScale(vp1, mode, zoom, available);
+      pageMetricsRef.current.set(pageNum, { w: vp1.width, h: vp1.height, scale: fitScale });
       const viewport = page.getViewport({ scale: fitScale, rotation });
 
       // Cap the canvas backing store (pdf.js default maxCanvasPixels):
@@ -1585,12 +1609,23 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
           currentPageRef.current = found;
           onPageChange?.(found);
         }
+
+        // Continuous anchor: the exact spot at the top of the viewport, in
+        // display-frame PDF points. Page changes alone cannot align a text pane
+        // to what is actually on screen (mid-page positions used to snap to the
+        // page's first paragraph).
+        const anchorCb = onViewportAnchorRef.current;
+        if (anchorCb) {
+          const a = getScrollAnchor();
+          const m = a ? pageMetricsRef.current.get(a.pageIndex) : undefined;
+          if (a && m) anchorCb({ page: a.pageIndex, pdfY: m.h * (1 - a.yRatio) });
+        }
         ticking = false;
       });
     };
     container.addEventListener('scroll', onScroll, { passive: true });
     return () => { container.removeEventListener('scroll', onScroll); clearTimeout(tid); };
-  }, [totalPages, onPageChange, updateVisiblePages]);
+  }, [totalPages, onPageChange, updateVisiblePages, getScrollAnchor]);
 
   // ── Text selection capture ──
   useEffect(() => {
@@ -2176,9 +2211,24 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     setZoom,
     rotateCw,
     rotateCcw,
+    /** Bring a display-frame point (PDF points, y-up) to the top of the
+     *  viewport, or center it. Used by the dual-pane sync. */
+    scrollToAnchor: (page: number, pdfY: number, opts?: { align?: 'top' | 'center' }) => {
+      const container = scrollRef.current;
+      const wrapper = wrapperMapRef.current.get(page);
+      const m = pageMetricsRef.current.get(page);
+      if (!container || !wrapper || !m) return;
+      const cssY = (m.h - pdfY) * m.scale;
+      const target =
+        (opts?.align ?? 'top') === 'center'
+          ? wrapper.offsetTop + cssY - container.clientHeight / 2
+          : wrapper.offsetTop + cssY - 12;
+      container.scrollTop = Math.max(0, target);
+    },
   }), [doZoom, setZoomMode, setZoom, rotateCw, rotateCcw]);
 
   const overlayRef = useRef<HTMLDivElement[]>([]);
+  const anchorOverlayRef = useRef<HTMLDivElement[]>([]);
 
   // ── Snippet highlight overlay ──
   useEffect(() => {
@@ -2236,6 +2286,41 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
       clearTimeout(showTimer);
     };
   }, [highlightTarget]);
+
+  // ── Dual-pane reading anchor: the block the text pane is showing ──
+  // Unlike the snippet highlight above this one never scrolls and has no
+  // delay: the sync code positions both panes, and a delayed scroll here would
+  // fight it. Repainted after zoom/rotation rebuilds (layoutVersion).
+  useEffect(() => {
+    for (const el of anchorOverlayRef.current) el.remove();
+    anchorOverlayRef.current = [];
+    if (!anchorHighlight) return;
+    const wrapper = wrapperMapRef.current.get(anchorHighlight.page);
+    const m = pageMetricsRef.current.get(anchorHighlight.page);
+    if (!wrapper || !m) return;
+    const [x0, y0, x1, y1] = anchorHighlight.bbox;
+    const wRect = wrapper.getBoundingClientRect();
+    const left = (Math.max(0, Math.min(x0, x1)) / m.w) * wRect.width;
+    // y-up bbox: the top edge is y1, so the distance from the page top is h - y1.
+    const top = (Math.max(0, m.h - Math.max(y0, y1)) / m.h) * wRect.height;
+    const box = document.createElement('div');
+    box.className = 'dual-pane-anchor';
+    box.style.cssText = `
+      position: absolute;
+      left: ${left}px;
+      top: ${top}px;
+      width: ${Math.max((Math.abs(x1 - x0) / m.w) * wRect.width, 6)}px;
+      height: ${Math.max((Math.abs(y1 - y0) / m.h) * wRect.height, 6)}px;
+      background: rgba(245, 158, 11, 0.16);
+      border: 1px solid rgba(245, 158, 11, 0.45);
+      border-radius: 3px;
+      pointer-events: none;
+      z-index: 1;
+      transition: opacity 0.15s ease;
+    `;
+    wrapper.appendChild(box);
+    anchorOverlayRef.current.push(box);
+  }, [anchorHighlight, layoutVersion]);
 
   // ── Region detection overlays ──
   useEffect(() => {

@@ -2,6 +2,7 @@ import { useCallback, useState, useEffect, useRef } from 'react';
 import { useRouterState, useNavigate } from '@tanstack/react-router';
 import { Sidebar } from './Sidebar';
 import { TitleBar } from './TitleBar';
+import { TabSwitcher } from './TabSwitcher';
 import { SkeletonShell } from './SkeletonShell';
 import { Dialog } from '@/components/ui/Dialog';
 import { Pet } from '@/components/pet/Pet';
@@ -303,6 +304,7 @@ export function AppShell({ children }: AppShellProps) {
       style={{ position: 'relative' }}
     >
       <TitleBar />
+      <TabSwitcher />
 
       {/* Toast feedback */}
       {toast && (

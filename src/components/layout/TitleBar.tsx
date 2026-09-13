@@ -1,4 +1,4 @@
-import { Minus, Square, Copy, X, FileText, Search, Bookmark, Star, Menu, CircleHelp } from 'lucide-react';
+import { Minus, Square, Copy, X, FileText, Search, Bookmark, Star, Menu, CircleHelp, Home, Bot, FolderOpen, Folder, Clock, Network, FlaskConical, BookOpen, FileType2, Settings } from 'lucide-react';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -40,6 +40,28 @@ const applyZoom = async (delta: number) => {
     await getCurrentWebview().setZoom(currentZoom);
   }
 };
+
+/** Small icon for a tab, from its `icon` key (see tabStore's route config).
+ *  With the strip scrolling instead of squeezing, a tab can still be narrow —
+ *  the icon is what keeps it identifiable. */
+function tabIcon(icon?: string) {
+  const common = { size: 13, className: 'shrink-0 opacity-70' } as const;
+  switch (icon) {
+    case 'home': return <Home {...common} />;
+    case 'chat': return <Bot {...common} />;
+    case 'note': return <FileText {...common} />;
+    case 'knowledge': return <FolderOpen {...common} />;
+    case 'files': return <Folder {...common} />;
+    case 'research': return <FlaskConical {...common} />;
+    case 'graph': return <Network {...common} />;
+    case 'bookmark': return <Bookmark {...common} />;
+    case 'clock': return <Clock {...common} />;
+    case 'paper':
+    case 'pdf': return <BookOpen {...common} />;
+    case 'settings': return <Settings {...common} />;
+    default: return <FileType2 {...common} />;
+  }
+}
 
 export function TitleBar() {
   const [inTauri, setInTauri] = useState(false);
@@ -145,12 +167,23 @@ export function TitleBar() {
     }
   }, [navigate]);
 
+  const tabRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const tabStripRef = useRef<HTMLDivElement | null>(null);
+  const stripDragRef = useRef<{ x: number; left: number } | null>(null);
+
   const handleActivateTab = useCallback((tabId: string) => {
     const tab = useTabStore.getState().findById(tabId);
     if (!tab) return;
     activate(tabId);
     navigate({ to: tab.route, params: tab.params, search: tab.search });
   }, [activate, navigate]);
+
+  // A tab that is activated from elsewhere (menu, Ctrl+Tab, a link) must not
+  // stay scrolled out of sight.
+  useEffect(() => {
+    if (!activeTabId) return;
+    tabRefs.current.get(activeTabId)?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+  }, [activeTabId]);
 
   const handleCloseTab = useCallback((e: React.MouseEvent, tabId: string) => {
     e.stopPropagation();
@@ -444,7 +477,40 @@ export function TitleBar() {
             })(),
             document.body
           )}
-        <div className="flex items-center h-full overflow-hidden">
+        {/* Tab strip: tabs keep a minimum width and the strip scrolls instead of
+            squeezing them — compressing titles until they read "笔" hides the
+            only thing that identifies a tab. It has no scrollbar, so the strip is
+            driven by the wheel and by dragging its background; when there is
+            nothing to scroll the press is left to the window-drag region. */}
+        <div
+          ref={tabStripRef}
+          className="flex items-center h-full overflow-x-auto overflow-y-hidden tabstrip"
+          onWheel={(e) => {
+            if (e.deltaY === 0) return;
+            e.currentTarget.scrollLeft += e.deltaY;
+          }}
+          onPointerDown={(e) => {
+            const el = e.currentTarget;
+            if (el.scrollWidth <= el.clientWidth) return;
+            if ((e.target as HTMLElement).closest('[data-no-drag]')) return;
+            stripDragRef.current = { x: e.clientX, left: el.scrollLeft };
+            el.setPointerCapture(e.pointerId);
+          }}
+          onPointerMove={(e) => {
+            const drag = stripDragRef.current;
+            if (!drag) return;
+            e.currentTarget.scrollLeft = drag.left - (e.clientX - drag.x);
+          }}
+          onPointerUp={(e) => {
+            stripDragRef.current = null;
+            if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+              e.currentTarget.releasePointerCapture(e.pointerId);
+            }
+          }}
+          onPointerCancel={() => {
+            stripDragRef.current = null;
+          }}
+        >
           {tabs.map((tab) => {
             const isActive = tab.id === activeTabId;
             return (
@@ -454,12 +520,18 @@ export function TitleBar() {
                 data-tauri-drag-region="false"
                 onClick={() => handleActivateTab(tab.id)}
                 onContextMenu={(e) => handleTabContextMenu(e, tab.id)}
-                className={`flex items-center gap-1.5 px-3 h-[28px] text-xs cursor-pointer border-r border-surface-hover transition-colors min-w-0 max-w-[180px] group select-none ${
+                ref={(el) => {
+                  if (el) tabRefs.current.set(tab.id, el);
+                  else tabRefs.current.delete(tab.id);
+                }}
+                className={`flex items-center gap-1.5 px-2.5 h-[28px] text-xs cursor-pointer border-r border-surface-hover transition-colors shrink-0 min-w-[104px] max-w-[190px] group select-none ${
                   isActive
                     ? 'bg-background text-text-primary border-t-2 border-t-primary'
                     : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
                 }`}
+                title={tab.title}
               >
+                {tabIcon(tab.icon)}
                 <span className="truncate flex-1">{tab.title}</span>
                 {tab.closable !== false && (
                   <button

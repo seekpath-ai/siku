@@ -52,6 +52,17 @@ body.in-tauri {
   background: #3E3E46;
 }
 
+/* The tab strip scrolls horizontally instead of squeezing tabs, but it has no
+   scrollbar: any bar (and WebKitGTK's scrollbar arrows) is far too heavy for a
+   32px title bar. The strip is driven by the wheel and by dragging its
+   background instead — see TitleBar's pointer handlers. */
+.tabstrip {
+  scrollbar-width: none;
+}
+.tabstrip::-webkit-scrollbar {
+  display: none;
+}
+
 /* ===== pdf.js TextLayer styles ===== */
 .pdf-text-layer {
   position: absolute;

@@ -455,3 +455,88 @@ fn single_column_page_lines_are_not_split_mid_line() {
         "被劈开的整行没有恢复"
     );
 }
+
+#[cfg(test)]
+mod raw_dump {
+    use std::fmt::Write as _;
+    use std::path::Path;
+
+    /// Write every page of the demo corpus three times over: pdfium's raw
+    /// `text_page.all()`, pdf_oxide's `extract_text()`, and this pipeline's
+    /// geometry-first output — one file per document and source, with page
+    /// markers, so the three can be read side by side.
+    ///
+    /// `SIKU_RAW_OUT=<dir>` selects the destination; without it the test is a
+    /// no-op, so it never writes during a normal `cargo test`.
+    #[test]
+    fn dump_all_demos() {
+        let Ok(out_dir) = std::env::var("SIKU_RAW_OUT") else { return };
+        let Some(corpus) = super::Corpus::locate() else { return };
+        let dir = Path::new(&out_dir);
+        std::fs::create_dir_all(dir).expect("create out dir");
+
+        for name in ["demo0.pdf", "demo1.pdf", "demo2.pdf"] {
+            let pdf = corpus.pdf(name);
+            let stem = name.trim_end_matches(".pdf");
+            let bytes = std::fs::read(&pdf).expect("read pdf");
+
+            let mut pdfium_out = String::new();
+            let mut pdfium_pages = 0usize;
+            {
+                let guard = crate::pdf::bindings::pdfium_guard();
+                let _ = &guard;
+                if let Ok(doc) = crate::pdf::bindings::pdfium()
+                    .and_then(|p| p.load_pdf_from_file(&pdf, None).map_err(|e| e.to_string()))
+                {
+                    let pages = doc.pages();
+                    for (index, page) in pages.iter().enumerate() {
+                        let text = page.text().map(|t| t.all()).unwrap_or_default();
+                        pdfium_pages += 1;
+                        let _ = writeln!(pdfium_out, "\n===== page {} =====\n{}", index + 1, text);
+                    }
+                }
+            }
+
+            let mut oxide_out = String::new();
+            let mut oxide_pages = 0usize;
+            match pdf_oxide::PdfDocument::from_bytes(bytes) {
+                Ok(doc) => {
+                    let count = doc.page_count().unwrap_or(0);
+                    for index in 0..count {
+                        let text = doc.extract_text(index).unwrap_or_default();
+                        oxide_pages += 1;
+                        let _ = writeln!(oxide_out, "\n===== page {} =====\n{}", index + 1, text);
+                    }
+                }
+                Err(e) => {
+                    let _ = writeln!(oxide_out, "pdf_oxide failed to open: {e}");
+                }
+            }
+
+            let mut ours_out = String::new();
+            let mut ours_pages = 0usize;
+            if let Ok(pages) = super::extract_text(&pdf) {
+                for p in &pages {
+                    ours_pages += 1;
+                    let _ = writeln!(ours_out, "\n===== page {} =====\n{}", p.page, p.text);
+                }
+            }
+
+            for (label, body, pages) in [
+                ("pdfium", &pdfium_out, pdfium_pages),
+                ("oxide", &oxide_out, oxide_pages),
+                ("ours", &ours_out, ours_pages),
+            ] {
+                let path = dir.join(format!("{stem}.{label}.txt"));
+                std::fs::write(&path, body).expect("write dump");
+                eprintln!(
+                    "WROTE {} pages={} chars={} lines={}",
+                    path.display(),
+                    pages,
+                    body.chars().count(),
+                    body.lines().count()
+                );
+            }
+        }
+    }
+}

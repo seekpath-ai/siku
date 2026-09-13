@@ -11,7 +11,7 @@ interface Props {
   /** Paragraph hit by the last PDF-side click: flashed and scrolled into
    *  view. Index into the paragraphs array. */
   activeIndex: number | null;
-  onParagraphClick: (index: number, p: PaperParagraph) => void;
+  onParagraphClick: (index: number, p: PaperParagraph, lineIndex?: number) => void;
   /** True while the PDF side is driving the sync: this pane then follows the
    *  PDF instead of reporting its own position back. */
   followingPdf?: boolean;
@@ -243,9 +243,23 @@ export function ComparePanel({
                 if (el) paraRefs.current.set(i, el);
                 else paraRefs.current.delete(i);
               }}
-              onClick={() => {
+              onClick={(e) => {
                 lastClickAtRef.current = Date.now();
-                onParagraphClick(i, p);
+                // One node per line, so the clicked line can be resolved from
+                // the pointer and the PDF aligned to that exact line.
+                let lineIndex: number | undefined;
+                if (slices) {
+                  for (let li = 0; li < (p.lines?.length ?? 0); li++) {
+                    const node = lineRefs.current.get(`${i}:${li}`);
+                    if (!node) continue;
+                    const r = node.getBoundingClientRect();
+                    if (e.clientY >= r.top && e.clientY <= r.bottom) {
+                      lineIndex = li;
+                      break;
+                    }
+                  }
+                }
+                onParagraphClick(i, p, lineIndex);
               }}
               className={`my-1.5 px-2 py-1.5 rounded text-[13px] leading-relaxed cursor-pointer transition-colors whitespace-pre-wrap [overflow-wrap:anywhere] ${
                 activeIndex === i && !activeLine

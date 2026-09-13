@@ -95,6 +95,12 @@ function ReaderView({ paperId }: { paperId: string }) {
    *  scroll events must be ignored or the two panes push each other. */
   const syncSourceRef = useRef<{ source: 'pdf' | 'text'; at: number } | null>(null);
   const SYNC_LOCK_MS = 150;
+  /** Clicked blocks win over scroll-derived activation for a moment: the reveal
+   *  that follows a click re-derives "what is at the top of the viewport", which
+   *  is how a click used to end up highlighting the first paragraph of the page
+   *  instead of the clicked one. */
+  const stickyRef = useRef<{ para: number; line: number | null; until: number } | null>(null);
+  const STICKY_MS = 2000;
   /** True while the PDF is the driver: the text pane then aligns instantly to
    *  the top instead of smooth-centering (which lags behind a fast scroll). */
   const [pdfDrivenSync, setPdfDrivenSync] = useState(false);
@@ -283,33 +289,51 @@ function ReaderView({ paperId }: { paperId: string }) {
       .catch((e) => setCompareError(String(e)));
   }, [panel, paperId, compareParagraphs, compareError]);
 
-  // Markdown → PDF: jump to the paragraph's page and paint its bbox.
-  const handleParagraphClick = async (_index: number, p: PaperParagraph) => {
-    setActiveParagraph(null);
-    setActiveLine(null);
+  // Markdown → PDF: land on the clicked paragraph (and line) and mark it as the
+  // active block on both sides.
+  const handleParagraphClick = async (
+    index: number,
+    p: PaperParagraph,
+    lineIndex?: number,
+  ) => {
+    const line = lineIndex != null ? p.lines?.[lineIndex] : undefined;
+    stickyRef.current = { para: index, line: lineIndex ?? null, until: Date.now() + STICKY_MS };
+    setPdfDrivenSync(false);
+    setActiveParagraph(index);
+    setActiveLine(lineIndex != null ? { paragraph: index, line: lineIndex } : null);
+    // The anchor highlight below marks exactly what was clicked; drop any older
+    // snippet emphasis so two boxes never fight over the same area.
+    setHighlightTarget(null);
     if (!p.bbox) {
       pdfViewerRef.current?.jumpToPage(p.page);
       return;
     }
-    const dims = await pdfViewerRef.current?.getPageTextContent(p.page);
-    if (!dims || dims.width <= 0 || dims.height <= 0) {
-      pdfViewerRef.current?.jumpToPage(p.page);
-      return;
-    }
-    const [x0, y0, x1, y1] = p.bbox; // PDF points, y-up
-    const rect: SnippetRect = {
-      xRatio: (x0 + x1) / 2 / dims.width,
-      // PDF y grows upward; SnippetRect y is measured from the page top.
-      yRatio: (dims.height - (y0 + y1) / 2) / dims.height,
-      widthRatio: (x1 - x0) / dims.width,
-      heightRatio: (y1 - y0) / dims.height,
-    };
-    setHighlightTarget([{ pageIndex: p.page, rects: [rect] }]);
-    pdfViewerRef.current?.jumpToPage(p.page);
+    // Land on the clicked line. Jumping to the page top is what let the scroll
+    // sync decide the page's first paragraph was the active block.
+    const top = line ? Math.max(line.bbox[1], line.bbox[3]) : Math.max(p.bbox[1], p.bbox[3]);
+    pdfViewerRef.current?.scrollToAnchor(p.page, top, { align: 'center' });
   };
 
   // PDF → Markdown: hit-test the clicked point against paragraph bboxes on
   // that page; fall back to the nearest paragraph above the point.
+  /** Which line of a paragraph sits at a display-frame y (y-up). */
+  const lineAtY = useCallback((p: PaperParagraph, pdfY: number): number => {
+    const lines = p.lines;
+    if (!lines || lines.length === 0) return 0;
+    let best = 0;
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < lines.length; i++) {
+      const [, y0, , y1] = lines[i].bbox;
+      if (pdfY >= y0 - 2 && pdfY <= y1 + 2) return i;
+      const dist = Math.min(Math.abs(pdfY - y0), Math.abs(pdfY - y1));
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = i;
+      }
+    }
+    return best;
+  }, []);
+
   /**
    * Paragraph at a display-frame PDF point (y-up). With `pdfX` the point must
    * fall inside the bbox; the scroll sync only knows the vertical position, so
@@ -353,34 +377,22 @@ function ReaderView({ paperId }: { paperId: string }) {
   const handlePagePointClick = (pageNum: number, pdfX: number, pdfY: number) => {
     if (panel !== 'compare' || !compareParagraphs) return;
     const idx = paragraphAtPoint(pageNum, pdfY, pdfX);
-    if (idx != null) {
-      syncSourceRef.current = { source: 'pdf', at: Date.now() };
-      setActiveParagraph(idx);
-    }
+    if (idx == null) return;
+    const p = compareParagraphs[idx];
+    const line = p?.lines?.length ? lineAtY(p, pdfY) : null;
+    stickyRef.current = { para: idx, line, until: Date.now() + STICKY_MS };
+    syncSourceRef.current = { source: 'pdf', at: Date.now() };
+    setPdfDrivenSync(true);
+    setActiveParagraph(idx);
+    setActiveLine(line == null ? null : { paragraph: idx, line });
   };
-
-  /** Which line of a paragraph sits at a display-frame y (y-up). */
-  const lineAtY = useCallback((p: PaperParagraph, pdfY: number): number => {
-    const lines = p.lines;
-    if (!lines || lines.length === 0) return 0;
-    let best = 0;
-    let bestDist = Number.POSITIVE_INFINITY;
-    for (let i = 0; i < lines.length; i++) {
-      const [, y0, , y1] = lines[i].bbox;
-      if (pdfY >= y0 - 2 && pdfY <= y1 + 2) return i;
-      const dist = Math.min(Math.abs(pdfY - y0), Math.abs(pdfY - y1));
-      if (dist < bestDist) {
-        bestDist = dist;
-        best = i;
-      }
-    }
-    return best;
-  }, []);
 
   /** PDF scrolled: move the text pane to the line under the viewport top. */
   const handleViewportAnchor = useCallback(
     ({ page, pdfY }: { page: number; pdfY: number }) => {
       if (!syncScroll || panel !== 'compare' || anchoredByPage.size === 0) return;
+      const sticky = stickyRef.current;
+      if (sticky && Date.now() < sticky.until) return;
       const lock = syncSourceRef.current;
       if (lock && lock.source === 'text' && Date.now() - lock.at < SYNC_LOCK_MS) return;
       syncSourceRef.current = { source: 'pdf', at: Date.now() };
@@ -402,6 +414,8 @@ function ReaderView({ paperId }: { paperId: string }) {
   const handleVisibleParagraph = useCallback(
     (index: number, p: PaperParagraph, lineIndex?: number) => {
       if (!syncScroll || panel !== 'compare') return;
+      const sticky = stickyRef.current;
+      if (sticky && Date.now() < sticky.until) return;
       const lock = syncSourceRef.current;
       if (lock && lock.source === 'pdf' && Date.now() - lock.at < SYNC_LOCK_MS) return;
       syncSourceRef.current = { source: 'text', at: Date.now() };
@@ -455,6 +469,8 @@ function ReaderView({ paperId }: { paperId: string }) {
   const evidenceReq = useEvidenceStore((s) => s.request);
   useEffect(() => {
     if (!evidenceReq || evidenceReq.paperId !== paperId || !pdfDoc) return;
+    // The evidence reveal is deliberate: let the panes follow it.
+    stickyRef.current = null;
     let cancelled = false;
     (async () => {
       const hit = await pdfViewerRef.current?.locateQuote(evidenceReq.page ?? 1, evidenceReq.exact);

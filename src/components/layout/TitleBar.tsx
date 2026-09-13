@@ -1,5 +1,6 @@
-import { Minus, Square, Copy, X, FileText, Search, Bookmark, Star, Menu, CircleHelp, Home, Bot, FolderOpen, Folder, Clock, Network, FlaskConical, BookOpen, FileType2, Settings } from 'lucide-react';
+import { Minus, Square, Copy, X, FileText, Search, Bookmark, Star, Menu, CircleHelp } from 'lucide-react';
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { tabIconNode } from '@/lib/tabIcons';
 import { createPortal } from 'react-dom';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useRouterState, useNavigate } from '@tanstack/react-router';
@@ -40,28 +41,6 @@ const applyZoom = async (delta: number) => {
     await getCurrentWebview().setZoom(currentZoom);
   }
 };
-
-/** Small icon for a tab, from its `icon` key (see tabStore's route config).
- *  With the strip scrolling instead of squeezing, a tab can still be narrow —
- *  the icon is what keeps it identifiable. */
-function tabIcon(icon?: string) {
-  const common = { size: 13, className: 'shrink-0 opacity-70' } as const;
-  switch (icon) {
-    case 'home': return <Home {...common} />;
-    case 'chat': return <Bot {...common} />;
-    case 'note': return <FileText {...common} />;
-    case 'knowledge': return <FolderOpen {...common} />;
-    case 'files': return <Folder {...common} />;
-    case 'research': return <FlaskConical {...common} />;
-    case 'graph': return <Network {...common} />;
-    case 'bookmark': return <Bookmark {...common} />;
-    case 'clock': return <Clock {...common} />;
-    case 'paper':
-    case 'pdf': return <BookOpen {...common} />;
-    case 'settings': return <Settings {...common} />;
-    default: return <FileType2 {...common} />;
-  }
-}
 
 export function TitleBar() {
   const [inTauri, setInTauri] = useState(false);
@@ -531,7 +510,7 @@ export function TitleBar() {
                 }`}
                 title={tab.title}
               >
-                {tabIcon(tab.icon)}
+                {tabIconNode(tab)}
                 <span className="truncate flex-1">{tab.title}</span>
                 {tab.closable !== false && (
                   <button

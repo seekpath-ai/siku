@@ -29,11 +29,11 @@ interface TabState {
   updateTab: (id: string, patch: Partial<Pick<Tab, 'title' | 'icon'>>) => void;
 }
 
-const HOME_TAB_ID = 'home';
+export const HOME_TAB_ID = 'home';
 const DEFAULT_HOME_ROUTE = '/library';
 
 const HOME_ROUTE_CONFIG: Record<string, Pick<Tab, 'title' | 'icon'>> = {
-  '/library': { title: '图书馆', icon: 'home' },
+  '/library': { title: '图书馆', icon: 'library' },
   '/chat': { title: '对话', icon: 'chat' },
   '/notes': { title: '笔记', icon: 'note' },
   '/knowledge': { title: '知识库', icon: 'knowledge' },

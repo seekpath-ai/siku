@@ -1,17 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import {
-  Library,
-  Bot,
-  GitGraph,
-  Settings,
-  StickyNote,
-  FolderOpen,
-  FlaskConical,
-  Folder,
-  Clock,
-  Bookmark,
-  Home,
-} from 'lucide-react';
+import { Home, Settings } from 'lucide-react';
 import { useLocation, useNavigate } from '@tanstack/react-router';
 import { useTabStore } from '@/stores/tabStore';
 import { settingsAppGet, settingsAppSave } from '@/lib/tauri';
@@ -31,6 +19,7 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
+import { navIcon } from '@/lib/tabIcons';
 
 interface NavItem {
   label: string;
@@ -40,21 +29,21 @@ interface NavItem {
 }
 
 const defaultPrimaryItems: NavItem[] = [
-  { label: '图书馆', path: '/library', icon: <Library size={18} />, tabIcon: 'home' },
-  { label: '对话', path: '/chat', icon: <Bot size={18} />, tabIcon: 'chat' },
-  { label: '笔记', path: '/notes', icon: <StickyNote size={18} />, tabIcon: 'note' },
-  { label: '知识库', path: '/knowledge', icon: <FolderOpen size={18} />, tabIcon: 'knowledge' },
-  { label: '科研追踪', path: '/research', icon: <FlaskConical size={18} />, tabIcon: 'research' },
-  { label: '知识图谱', path: '/graph', icon: <GitGraph size={18} />, tabIcon: 'graph' },
+  { label: '图书馆', path: '/library', icon: navIcon('/library'), tabIcon: 'library' },
+  { label: '对话', path: '/chat', icon: navIcon('/chat'), tabIcon: 'chat' },
+  { label: '笔记', path: '/notes', icon: navIcon('/notes'), tabIcon: 'note' },
+  { label: '知识库', path: '/knowledge', icon: navIcon('/knowledge'), tabIcon: 'knowledge' },
+  { label: '科研追踪', path: '/research', icon: navIcon('/research'), tabIcon: 'research' },
+  { label: '知识图谱', path: '/graph', icon: navIcon('/graph'), tabIcon: 'graph' },
 ];
 
 const defaultSecondaryItems: NavItem[] = [
-  { label: '书签', path: '/bookmarks', icon: <Bookmark size={18} />, tabIcon: 'bookmark' },
-  { label: '时间轴', path: '/timeline', icon: <Clock size={18} />, tabIcon: 'clock' },
-  { label: '文件列表', path: '/files', icon: <Folder size={18} />, tabIcon: 'files' },
+  { label: '书签', path: '/bookmarks', icon: navIcon('/bookmarks'), tabIcon: 'bookmark' },
+  { label: '时间轴', path: '/timeline', icon: navIcon('/timeline'), tabIcon: 'clock' },
+  { label: '文件列表', path: '/files', icon: navIcon('/files'), tabIcon: 'files' },
 ];
 
-const settingsItem: NavItem = { label: '设置', path: '/settings', icon: <Settings size={18} />, tabIcon: 'settings' };
+const settingsItem: NavItem = { label: '设置', path: '/settings', icon: navIcon('/settings'), tabIcon: 'settings' };
 
 function applyOrder(items: NavItem[], order: string[] | null | undefined): NavItem[] {
   if (!order || order.length === 0) return items;

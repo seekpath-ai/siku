@@ -325,9 +325,19 @@ pub fn chars_to_lines(
         }
     }
     let median_gap = median(gaps.clone());
+    let min_gap = gutter_min_gap(&gaps);
     let gutter = detect_gutter_from_gaps(&groups, page_width, &gaps)
         .or_else(|| find_gutter(&rough, page_width, body_font))
-        .or_else(|| detect_gutter_chars(&rough_to_chars(&groups), page_width));
+        .or_else(|| detect_gutter_chars(&rough_to_chars(&groups), page_width))
+        // Every detector's answer has to pass the same evidence test: a real
+        // gutter has a wide gap on many rows and almost no ink there. The three
+        // detectors look for different things, so on a single-column page any of
+        // them can land mid-line — which cuts body lines in half (demo1 p2: a
+        // candidate at x=225 with ink ≈ the whole column).
+        .filter(|x| {
+            let (ink, support) = gutter_evidence(&groups, min_gap, *x);
+            ink == 0 || ink <= support
+        });
     tracing::debug!(
         gutter = ?gutter,
         median_gap,
@@ -340,6 +350,47 @@ pub fn chars_to_lines(
         lines.extend(split_line_segments(g, *y, gutter));
     }
     (lines, gutter)
+}
+
+/// The yardstick that separates a word space from a column gutter: well above
+/// the bulk of the gap distribution, because justified text stretches word
+/// spaces a long way (measured p95 ≈ 6pt, p99 ≈ 8pt on demo2 p6).
+fn gutter_min_gap(gaps: &[f32]) -> f32 {
+    let mut sorted = gaps.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p95 = if sorted.is_empty() {
+        2.0
+    } else {
+        sorted[((sorted.len() - 1) as f32 * 0.95) as usize]
+    };
+    (p95 * 1.5).max(8.0)
+}
+
+/// Evidence for one candidate x: (glyphs whose box covers x, rows whose gap at x
+/// is wide enough to be a gutter). A real gutter has a wide gap on many rows and
+/// almost no ink; a single-column page can offer a well-supported candidate in
+/// the middle of a line, where the ink count is the whole column (measured on
+/// demo1 p2: x=225 with ink ≈ 40 against support ≈ 7).
+fn gutter_evidence(groups: &[(f32, Vec<RawChar>)], min_gap: f32, x: f32) -> (usize, usize) {
+    let mut ink = 0usize;
+    let mut support = 0usize;
+    for (_, g) in groups {
+        let mut row_gap = false;
+        for w in g.windows(2) {
+            if w[0].right < x && w[1].x > x && w[1].x - w[0].right >= min_gap {
+                row_gap = true;
+            }
+        }
+        if row_gap {
+            support += 1;
+        }
+        for c in g {
+            if !c.ch.is_whitespace() && c.x <= x && c.right >= x {
+                ink += 1;
+            }
+        }
+    }
+    (ink, support)
 }
 
 /// A baseline group collapsed to one rough line — only the geometry is used

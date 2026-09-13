@@ -424,3 +424,34 @@ fn subscripts_stay_on_their_line() {
     );
     assert!(p3.contains("routing label rt = R(xt, ct)"), "公式行被切断");
 }
+
+/// demo1 p2 is a single-column page. A gutter candidate at x=225 — supported by
+/// a handful of mid-line word gaps against ink covering the whole column — used to
+/// split body lines in half, so the tails became paragraphs of their own
+/// ("unified programming interface to curate high-quality SRE problems by",
+/// len=68) while the heads ended up in other paragraphs. Asserted on the
+/// paragraph anchors, because joining the pieces back into one paragraph would
+/// hide the split.
+#[test]
+fn single_column_page_lines_are_not_split_mid_line() {
+    let Some(corpus) = Corpus::locate() else { return };
+    let anchors =
+        crate::pdf::extractor::extract_paragraphs(&corpus.pdf("demo1.pdf")).expect("anchors");
+    let page2: Vec<_> = anchors.iter().filter(|a| a.page == 2).collect();
+
+    for tail in [
+        "unified programming interface to curate high-quality SRE problems",
+        "instance, noises must be composed alongside target failures",
+    ] {
+        assert!(
+            !page2.iter().any(|a| a.text.trim_start().starts_with(tail)),
+            "正文行被从中间劈开，尾部变成了独立段落: {tail:?}"
+        );
+    }
+    assert!(
+        page2.iter().any(|a| a
+            .text
+            .contains("events. SREGYM provides a unified programming interface to curate high-quality SRE problems")),
+        "被劈开的整行没有恢复"
+    );
+}

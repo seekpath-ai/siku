@@ -285,26 +285,96 @@ function escapeHtml(text: string): string {
     .replace(/>/g, '&gt;');
 }
 
+/**
+ * Inline markdown inside a rendered table cell.
+ *
+ * The live preview styles inline constructs through CodeMirror decorations,
+ * which cannot reach widget DOM — so cells were plain `escapeHtml` and a cell
+ * like `` `previous_response_id` `` kept its backticks, while the reading view
+ * (react-markdown) rendered it as code. HTML is escaped first, then the few
+ * inline forms that actually show up in table cells are turned into elements.
+ * Italic is deliberately not handled: `_` appears inside identifiers
+ * (`previous_response_id`), where a naive `_x_` rule would italicise the middle
+ * of a word.
+ */
+function inlineCellHtml(text: string): string {
+  // The classes are the live preview's own (see index.css): widget DOM sits
+  // outside CodeMirror's decorations, so reusing them is what keeps a cell's
+  // inline code looking like inline code elsewhere in the editor.
+  let html = escapeHtml(text);
+  html = html.replace(/`([^`]+)`/g, '<code class="cm-live-code">$1</code>');
+  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong class="cm-live-strong">$1</strong>');
+  html = html.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+    '<a class="cm-live-link" href="$2" target="_blank" rel="noreferrer">$1</a>'
+  );
+  return html;
+}
+
+/**
+ * Split one table row into cells.
+ *
+ * A naive `split('|')` cuts a cell like `` `a|b` `` in half, and pipes inside
+ * inline code are common (shell pipelines, `a || b`, type unions). The reading
+ * view (remark-gfm) keeps them, so the live preview has to as well: pipes
+ * inside a backtick span are ignored, and GFM's `\|` escape yields a literal
+ * `|`. Backtick runs are matched by length, so `` ``a|b`` `` works too.
+ */
+function splitTableRow(line: string): string[] {
+  let row = line.trim();
+  if (row.startsWith('|')) row = row.slice(1);
+  if (row.endsWith('|') && !row.endsWith('\\|')) row = row.slice(0, -1);
+
+  const out: string[] = [];
+  let cur = '';
+  let fence: string | null = null;
+  for (let i = 0; i < row.length; i++) {
+    const ch = row[i];
+    if (ch === '\\' && row[i + 1] === '|') {
+      cur += '|';
+      i += 1;
+      continue;
+    }
+    if (ch === '`') {
+      let n = 1;
+      while (row[i + n] === '`') n += 1;
+      const run = '`'.repeat(n);
+      if (fence === null) fence = run;
+      else if (run === fence) fence = null;
+      cur += run;
+      i += n - 1;
+      continue;
+    }
+    if (ch === '|' && fence === null) {
+      out.push(cur.trim());
+      cur = '';
+      continue;
+    }
+    cur += ch;
+  }
+  out.push(cur.trim());
+  return out;
+}
+
 /** Render a GFM table block (lines of `|`-separated cells) as HTML.
  *  Each cell gets a hover-only copy button (rendered tables swallow
  *  mousedown for click-to-edit, so without it cell text cannot be copied
  *  at all). */
 function parseMarkdownTable(text: string): string {
   const lines = text.split('\n').map((l) => l.trim());
-  const cells = (line: string) =>
-    line.replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+  const cells = (line: string) => splitTableRow(line);
   const header = cells(lines[0]);
   const isAlignRow = lines.length > 1 && /^[\s:|-]+$/.test(lines[1]) && lines[1].includes('-');
   const body = lines.slice(isAlignRow ? 2 : 1);
   const cellBtn = `<button class="cm-live-table-cellcopy" title="复制单元格">${COPY_ICON}</button>`;
 
   let html = '<table><thead><tr>';
-  html += header.map((c) => `<th>${escapeHtml(c)}${cellBtn}</th>`).join('');
+  html += header.map((c) => `<th>${inlineCellHtml(c)}${cellBtn}</th>`).join('');
   html += '</tr></thead>';
   if (body.length > 0) {
     html += '<tbody>';
     for (const row of body) {
-      html += '<tr>' + cells(row).map((c) => `<td>${escapeHtml(c)}${cellBtn}</td>`).join('') + '</tr>';
+      html += '<tr>' + cells(row).map((c) => `<td>${inlineCellHtml(c)}${cellBtn}</td>`).join('') + '</tr>';
     }
     html += '</tbody>';
   }

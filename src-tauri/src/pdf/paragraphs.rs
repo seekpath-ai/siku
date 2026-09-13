@@ -362,15 +362,39 @@ fn detect_gutter_from_gaps(groups: &[(f32, Vec<RawChar>)], page_width: f32, gaps
         }
     }
 
+    // How much glyph ink covers each candidate x. The gap histogram alone is
+    // not a reliable gutter test: an equation-heavy column is full of wide
+    // internal gaps that out-support the real gutter, and picking one of those
+    // (measured on demo2 p4: x=335 at ink 21 vs support 6, inside the right
+    // column, instead of the real gutter at ~306) leaves every left+right row
+    // merged. A handful of glyphs may still graze a real gutter — a table row
+    // or an indented block legitimately crosses it (demo2 p6: ink 20 vs support
+    // 30) — so ink is compared against the gap support rather than required to
+    // be zero.
+    let mut ink = vec![0usize; nb];
+    for (_, g) in groups {
+        for c in g {
+            if c.ch.is_whitespace() {
+                continue;
+            }
+            let i0 = (((c.x - lo) / step).ceil().max(0.0)) as usize;
+            let i1 = (((c.right - lo) / step).floor().max(0.0)) as usize;
+            for slot in ink.iter_mut().take(i1.min(nb - 1) + 1).skip(i0) {
+                *slot += 1;
+            }
+        }
+    }
+
     let mut best: Option<(f32, usize, f32)> = None; // (x, support, score)
     for i in 0..nb {
-        if support[i] < 5 {
+        if support[i] < 5 || ink[i] > support[i] {
             continue;
         }
         let x = lo + step * i as f32;
-        // A gutter is well-supported AND near the middle: a table's internal
-        // cell boundary can be supported by more rows than the real gutter is
-        // by body lines (demo2 p6), so proximity to the centre breaks that tie.
+        // A gutter is well-supported, empty of ink, AND near the middle: a
+        // table's internal cell boundary can be supported by more rows than the
+        // real gutter is by body lines (demo2 p6), so proximity to the centre
+        // breaks that tie.
         let score = support[i] as f32 - (page_width / 2.0 - x).abs() * 0.5;
         if best.map(|(_, _, s)| score > s).unwrap_or(true) {
             best = Some((x, support[i], score));

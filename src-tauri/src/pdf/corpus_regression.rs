@@ -385,3 +385,24 @@ fn paragraph_line_anchors_tile_the_text() {
     );
     assert!(boxes_checked > 1000, "校验到的行框太少：{boxes_checked}");
 }
+
+/// demo2 p4 is equation-heavy: the widest-gap rule alone picked a gap *inside*
+/// the right column (x=335, measured ink 21 vs gap support 6), so every row
+/// holding both columns stayed merged and the left column's sentence was cut
+/// open by the right column's words.
+#[test]
+fn demo2_page4_columns_stay_separate() {
+    let Some(corpus) = Corpus::locate() else { return };
+    let pages = extract_text(&corpus.pdf("demo2.pdf")).expect("extract");
+    let p4 = flat(&pages.iter().find(|p| p.page == 4).expect("page 4").text);
+
+    assert!(
+        p4.contains("Evidence-aware orchestration protects stage attribution"),
+        "p4 左栏被右栏切断"
+    );
+    assert!(!p4.contains("Evidence-aware or-"), "p4 仍有跨栏拼接");
+    assert!(
+        p4.contains("stage-level compensation that prevents one media failure"),
+        "p4 右栏内容不完整"
+    );
+}

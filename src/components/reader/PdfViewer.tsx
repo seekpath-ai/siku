@@ -1535,6 +1535,39 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     container.scrollTop = wrapper.offsetTop + wrapper.offsetHeight * anchor.yRatio - 4;
   }, []);
 
+  /** Where the viewport must end up because the user asked for a specific
+   *  passage (evidence citation, search hit, snippet). Lazy rendering changes
+   *  page heights, and the scroll-preservation below would otherwise put the
+   *  scroll back where it was — which is exactly how a highlight ended up
+   *  outside the viewport. While a reveal is pending this anchor wins; any real
+   *  user scroll releases it. */
+  const revealRef = useRef<{ page: number; yRatio: number; until: number } | null>(null);
+
+  const applyReveal = useCallback(() => {
+    const reveal = revealRef.current;
+    const container = scrollRef.current;
+    if (!reveal || !container) return false;
+    const wrapper = wrapperMapRef.current.get(reveal.page);
+    if (!wrapper) return false;
+    const desired =
+      wrapper.offsetTop + wrapper.offsetHeight * reveal.yRatio - container.clientHeight * 0.3;
+    if (Math.abs(container.scrollTop - desired) > 2) {
+      container.scrollTop = Math.max(0, desired);
+    }
+    return true;
+  }, []);
+
+  /** Show a passage: put it about a third down the viewport and keep it there
+   *  while the pages around it finish laying out. */
+  const revealPoint = useCallback(
+    (page: number, yRatio: number) => {
+      revealRef.current = { page, yRatio, until: performance.now() + 1500 };
+      applyReveal();
+      requestAnimationFrame(applyReveal);
+    },
+    [applyReveal],
+  );
+
   // ── Manage visible pages (with scroll position preservation) ──
   const updateVisiblePages = useCallback(() => {
     if (!pdfDocRef.current || wrapperMapRef.current.size === 0) return;
@@ -1563,16 +1596,28 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
       renderPageInto(pn);
     }
 
-    // Restore scroll position if layout shifted
-    if (container.scrollHeight !== savedScrollHeight) {
+    // Restore scroll position if layout shifted — unless the user just asked to
+    // see a specific passage, in which case keep that passage in view.
+    const reveal = revealRef.current;
+    if (reveal && performance.now() < reveal.until) {
+      applyReveal();
+    } else if (container.scrollHeight !== savedScrollHeight) {
       container.scrollTop = savedScrollTop;
     }
-  }, [getVisibleRange]);
+  }, [getVisibleRange, applyReveal]);
 
   // ── Scroll: track current page + manage visible ──
   useEffect(() => {
     const container = scrollRef.current;
     if (!container || totalPages === 0) return;
+
+    // A deliberate scroll wins over a pending reveal immediately.
+    const releaseReveal = () => {
+      revealRef.current = null;
+    };
+    container.addEventListener('wheel', releaseReveal, { passive: true });
+    container.addEventListener('touchstart', releaseReveal, { passive: true });
+    container.addEventListener('pointerdown', releaseReveal, { passive: true });
 
     // Initial render
     const tid = setTimeout(updateVisiblePages, 200);
@@ -1624,7 +1669,13 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
       });
     };
     container.addEventListener('scroll', onScroll, { passive: true });
-    return () => { container.removeEventListener('scroll', onScroll); clearTimeout(tid); };
+    return () => {
+      container.removeEventListener('scroll', onScroll);
+      container.removeEventListener('wheel', releaseReveal);
+      container.removeEventListener('touchstart', releaseReveal);
+      container.removeEventListener('pointerdown', releaseReveal);
+      clearTimeout(tid);
+    };
   }, [totalPages, onPageChange, updateVisiblePages, getScrollAnchor]);
 
   // ── Text selection capture ──
@@ -2152,8 +2203,11 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
       for (const pn of candidates) {
         const wrapper = wrapperMapRef.current.get(pn);
         if (!wrapper) continue;
-        // Pages render lazily on visibility; scrolling there triggers it.
-        wrapper.scrollIntoView({ behavior: 'auto', block: 'start' });
+        // Pages render lazily on visibility; bringing the page into view
+        // triggers it. Use the reveal anchor rather than scrollIntoView: the
+        // layout pass that rendering causes would otherwise restore the old
+        // scroll position and the text layer would never appear here.
+        revealPoint(pn, 0);
         const tl = await waitForTextLayer(pn);
         if (!tl) continue;
 
@@ -2235,16 +2289,28 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     if (!highlightTarget || highlightTarget.length === 0) return;
 
     const first = highlightTarget[0];
+    const firstRect = first.rects[0];
 
-    // Jump to the first target's page
-    const wrapper = wrapperMapRef.current.get(first.pageIndex);
-    if (wrapper) {
-      wrapper.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
+    // Bring the passage itself into view, about a third down the viewport, and
+    // hold it there while the pages around it finish laying out. A plain
+    // scrollIntoView here used to be undone by the layout pass that lazy
+    // rendering triggers, leaving the highlight outside the viewport.
+    revealPoint(first.pageIndex, firstRect ? firstRect.yRatio : 0);
 
-    // Wait a tick for scroll + render, then show overlays on every target
-    // page that is currently rendered.
-    const showTimer = setTimeout(() => {
+    // Paint once the target page is actually rendered: a fixed delay was not
+    // enough on a cold page, where the canvas can take much longer.
+    let showTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempts = 0;
+
+    const paint = () => {
+      const target = wrapperMapRef.current.get(first.pageIndex);
+      if (target && !target.querySelector('canvas') && attempts < 12) {
+        attempts += 1;
+        applyReveal();
+        showTimer = setTimeout(paint, 150);
+        return;
+      }
+
       // Remove previous overlays wherever they were
       for (const el of overlayRef.current) el.remove();
       overlayRef.current = [];
@@ -2279,13 +2345,15 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
         w.appendChild(group);
         overlayRef.current.push(group);
       }
+      applyReveal();
+    };
 
-    }, 300);
+    showTimer = setTimeout(paint, 60);
 
     return () => {
-      clearTimeout(showTimer);
+      if (showTimer) clearTimeout(showTimer);
     };
-  }, [highlightTarget]);
+  }, [highlightTarget, revealPoint, applyReveal]);
 
   // ── Dual-pane reading anchor: the block the text pane is showing ──
   // Unlike the snippet highlight above this one never scrolls and has no

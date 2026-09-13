@@ -8,7 +8,7 @@ import { useNavigate } from '@tanstack/react-router';
 import { emit } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { MarkdownCode, MarkdownPre } from '@/components/chat/CodeBlock';
-import { open } from '@tauri-apps/plugin-shell';
+import { openInBrowser } from '@/lib/externalLinks';
 import { resolveImageUrl } from '@/lib/imageCache';
 import { parseReaderUrl } from '@/lib/evidence';
 import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
@@ -290,10 +290,7 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
             href={href}
             onClick={(e) => {
               e.preventDefault();
-              open(href).catch(() => {
-                // Fallback when running outside Tauri (browser dev/tests).
-                window.open(href, '_blank', 'noopener');
-              });
+              openInBrowser(href);
             }}
             className="text-primary hover:underline"
           />

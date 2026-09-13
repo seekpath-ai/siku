@@ -2,6 +2,7 @@ mod ai;
 mod commands;
 mod core;
 mod file_store;
+mod navigation_guard;
 mod pdf;
 mod sync;
 
@@ -614,6 +615,9 @@ pub fn run() {
 
             Ok(())
         })
+        // Backstop for the frontend link routing: nothing but the app
+        // itself may ever be loaded into a webview. See navigation_guard.
+        .plugin(navigation_guard::plugin())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())

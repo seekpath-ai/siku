@@ -2,6 +2,8 @@
 import { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle } from 'react';
 import { Loader2 } from 'lucide-react';
 import { FindBar } from './FindBar';
+import { ContextMenu } from '@/components/ui/ContextMenu';
+import { openInBrowser, routeLink } from '@/lib/externalLinks';
 import { TextHighlighter } from './TextHighlighter';
 import { PasswordPrompt } from './PasswordPrompt';
 import type { DetectedRegion, PageRegionResult, LlmRegionRequest } from './regions';
@@ -259,11 +261,12 @@ class SimpleReaderLinkService extends SimpleLinkService {
 
   override addLinkAttributes(link: HTMLAnchorElement, url: string, newWindow = false) {
     link.href = url;
-    if (newWindow || this.externalLinkTarget === 2) {
-      link.target = '_blank';
-    } else if (this.externalLinkTarget === 1) {
-      link.target = '_self';
-    }
+    // Always a target: pdf.js defaults `externalLinkTarget` to NONE, and a link
+    // annotation without one navigates the webview itself — which replaced the
+    // whole app with the destination page. Clicks are intercepted before this
+    // matters (see installExternalLinkGuard); this is the fallback for anything
+    // that slips past it.
+    link.target = this.externalLinkTarget === 1 && !newWindow ? '_self' : '_blank';
     link.rel = this.externalLinkRel;
   }
 
@@ -356,6 +359,21 @@ function injectInferredLinks(
       // ignore invalid ranges
     }
   }
+}
+
+/** Show the link confirmation for a moment, replacing the hover status line.
+ *  Module scope so the context menu items stay plain closures. */
+function showLinkToast(
+  set: (value: string | null) => void,
+  timerRef: { current: number | null },
+  text: string
+) {
+  set(text);
+  if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+  timerRef.current = window.setTimeout(() => {
+    timerRef.current = null;
+    set(null);
+  }, 2000);
 }
 
 /** Parse "#rrggbb" into [r, g, b], or null for anything else. */
@@ -483,6 +501,12 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
   const [searchMatchIndex, setSearchMatchIndex] = useState(-1);
   const [searchTotalMatches, setSearchTotalMatches] = useState(0);
   const [caseSensitive, setCaseSensitive] = useState(false);
+
+  // ── Link affordances (hover status line, right-click menu) ──
+  const [linkHint, setLinkHint] = useState<string | null>(null);
+  const [linkToast, setLinkToast] = useState<string | null>(null);
+  const [linkMenu, setLinkMenu] = useState<{ x: number; y: number; url: string } | null>(null);
+  const linkToastTimerRef = useRef<number | null>(null);
 
   // ── Password state ──
   const [passwordNeeded, setPasswordNeeded] = useState(false);
@@ -644,6 +668,55 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     };
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  // Links inside a paper get the browser treatment: the destination is shown
+  // while hovering, and right-click offers open/copy. The activation itself is
+  // routed by the app-wide guard (installExternalLinkGuard).
+  useEffect(() => {
+    const inside = (target: EventTarget | null) => {
+      const el = target as Node | null;
+      return !!el && !!containerRef.current?.contains(el);
+    };
+    const hrefOf = (target: EventTarget | null) => {
+      const el = target as HTMLElement | null;
+      const anchor = el && typeof el.closest === 'function' ? el.closest('a[href]') : null;
+      return anchor?.getAttribute('href') ?? null;
+    };
+
+    const onMouseOver = (e: MouseEvent) => {
+      if (!inside(e.target)) return;
+      const href = hrefOf(e.target);
+      // The app's own destinations (pdf.js `#…` jumps, internal routes) are not
+      // "somewhere else", so they get no status line.
+      setLinkHint(href && routeLink(href) === 'external' ? href : null);
+    };
+    const onMouseOut = (e: MouseEvent) => {
+      if (!inside(e.target)) return;
+      if (inside(e.relatedTarget)) return; // moved within the viewer
+      setLinkHint(null);
+    };
+    const onContextMenu = (e: MouseEvent) => {
+      if (!inside(e.target)) return;
+      const href = hrefOf(e.target);
+      if (!href || routeLink(href) !== 'external') return;
+      e.preventDefault();
+      e.stopPropagation();
+      setLinkMenu({ x: e.clientX, y: e.clientY, url: href });
+    };
+
+    document.addEventListener('mouseover', onMouseOver);
+    document.addEventListener('mouseout', onMouseOut);
+    document.addEventListener('contextmenu', onContextMenu, true);
+    return () => {
+      document.removeEventListener('mouseover', onMouseOver);
+      document.removeEventListener('mouseout', onMouseOut);
+      document.removeEventListener('contextmenu', onContextMenu, true);
+      if (linkToastTimerRef.current !== null) {
+        window.clearTimeout(linkToastTimerRef.current);
+        linkToastTimerRef.current = null;
+      }
+    };
   }, []);
 
   // ── Custom selection overlay ──
@@ -2455,6 +2528,38 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
         tabIndex={0}
       >
       </div>
+      {/* Browser-style link affordances: the destination is visible before the
+          click, and the confirmation replaces it for a moment afterwards. */}
+      {(linkHint || linkToast) && (
+        <div className="pointer-events-none absolute inset-x-2 bottom-1 z-20 flex">
+          <span className="max-w-full truncate rounded border border-surface-hover bg-surface/95 px-2 py-0.5 text-[11px] text-text-secondary shadow">
+            {linkToast ?? linkHint}
+          </span>
+        </div>
+      )}
+      {linkMenu && (
+        <ContextMenu
+          x={linkMenu.x}
+          y={linkMenu.y}
+          onClose={() => setLinkMenu(null)}
+          items={[
+            {
+              label: '在浏览器中打开',
+              onClick: () => {
+                openInBrowser(linkMenu.url);
+                showLinkToast(setLinkToast, linkToastTimerRef, '已在浏览器中打开');
+              },
+            },
+            {
+              label: '复制链接地址',
+              onClick: () => {
+                navigator.clipboard.writeText(linkMenu.url).catch(() => { /* ignore */ });
+                showLinkToast(setLinkToast, linkToastTimerRef, '链接已复制');
+              },
+            },
+          ]}
+        />
+      )}
       {passwordNeeded && (
         <PasswordPrompt
           error={passwordError}

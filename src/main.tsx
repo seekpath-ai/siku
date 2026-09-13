@@ -5,6 +5,7 @@ import { RouterProvider, createRouter } from '@tanstack/react-router';
 import { routeTree } from './routes/routeTree';
 import { settingsGetAll, settingsSet } from './lib/tauri';
 import { openNoteTab } from './lib/openNote';
+import { installExternalLinkGuard } from './lib/externalLinks';
 import { OnboardingWizard } from './components/layout/OnboardingWizard';
 import { PetBallWindow } from './components/pet/PetBallWindow';
 import { PetBubbleWindow } from './components/pet/PetBubbleWindow';
@@ -14,6 +15,11 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import 'katex/dist/katex.min.css';
 import 'pdfjs-dist/legacy/web/pdf_viewer.css';
 import './index.css';
+
+// App-wide link guard, installed before anything renders: a click on a link
+// that leaves the app opens in the system browser instead of navigating the
+// webview and replacing the UI. This runs in every window (main, pet, note).
+installExternalLinkGuard();
 
 const queryClient = new QueryClient({
   defaultOptions: {

@@ -108,23 +108,27 @@ export function CodeBlock({ code, language = 'text', inline }: CodeBlockProps) {
     <div className="not-prose group relative my-3.5 rounded-md bg-black/30 overflow-hidden">
       <div className="absolute top-1.5 right-2.5 z-10 flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity select-none">
         <span className="font-mono text-[10px] text-text-secondary">{language}</span>
+        {/* Both buttons share one box: icon-only gets a square, the labelled one
+            keeps the same height. `leading-none` matters — `text-[10px]` only sets
+            the font size, so without it the labelled button was stretched to the
+            inherited line height and sat taller than the icon-only one. */}
         <button
           onClick={() => setWrapped((w) => !w)}
           title={wrapped ? '取消折行' : '自动折行'}
-          className={`flex items-center rounded px-1.5 py-0.5 border text-[10px] transition-colors ${
+          className={`flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded border leading-none transition-colors ${
             wrapped
               ? 'border-primary/40 text-primary'
               : 'border-white/15 text-text-secondary hover:text-text-primary hover:border-white/30'
           }`}
         >
-          <WrapText size={10} />
+          <WrapText size={11} />
         </button>
         <button
           onClick={handleCopy}
-          className="flex items-center gap-1 rounded px-1.5 py-0.5 border border-white/15 text-[10px] text-text-secondary hover:text-text-primary hover:border-white/30 transition-colors"
+          className="flex h-[18px] shrink-0 items-center gap-1 rounded border border-white/15 px-1.5 text-[10px] leading-none text-text-secondary hover:text-text-primary hover:border-white/30 transition-colors"
         >
-          {copied ? <Check size={10} className="text-accent" /> : <Copy size={10} />}
-          {copied ? '已复制' : '复制'}
+          {copied ? <Check size={11} className="text-accent" /> : <Copy size={11} />}
+          <span>{copied ? '已复制' : '复制'}</span>
         </button>
       </div>
       <div className={`px-2.5 py-1.5 ${wrapped ? '' : 'overflow-x-auto'}`}>

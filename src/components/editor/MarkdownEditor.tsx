@@ -813,16 +813,22 @@ function buildBlockDecorations(state: EditorState): DecorationSet {
     selectedLineRanges.some((l) => from <= l.to && to >= l.from);
 
   // Code ranges — math / table lines inside fenced or inline code stay raw.
-  const codeRanges: { from: number; to: number }[] = [];
+  const codeRanges: { from: number; to: number; block: boolean }[] = [];
   syntaxTree(state).iterate({
     enter(node) {
       if (node.name === 'FencedCode' || node.name === 'InlineCode') {
-        codeRanges.push({ from: node.from, to: node.to });
+        codeRanges.push({ from: node.from, to: node.to, block: node.name === 'FencedCode' });
       }
     },
   });
-  const inCode = (from: number, to: number) =>
-    codeRanges.some((r) => from < r.to && to > r.from);
+  // Block widgets (tables, $$…$$) are only blocked by *block* code. Gating them
+  // on InlineCode too broke valid tables: one stray backtick above the table
+  // makes Lezer extend an InlineCode node over it, so the table fell back to
+  // source — while the reading view (remark) renders it fine, because an
+  // unmatched backtick stays literal text there. Inline code is a span and
+  // cannot contain a block, so it must not block a block widget.
+  const inFencedCode = (from: number, to: number) =>
+    codeRanges.some((r) => r.block && from < r.to && to > r.from);
 
   const text = state.doc.toString();
   let m: RegExpExecArray | null;
@@ -832,7 +838,7 @@ function buildBlockDecorations(state: EditorState): DecorationSet {
   while ((m = blockMathRe.exec(text))) {
     const from = m.index;
     const to = from + m[0].length;
-    if (inCode(from, to) || overlapsSelection(from, to)) continue;
+    if (inFencedCode(from, to) || overlapsSelection(from, to)) continue;
     const lineFrom = state.doc.lineAt(from).from;
     const lineTo = state.doc.lineAt(to).to;
     const widget = new MathWidget(m[1].trim(), true);
@@ -858,7 +864,7 @@ function buildBlockDecorations(state: EditorState): DecorationSet {
     while (end < state.doc.lines && tableLineRe.test(state.doc.line(end + 1).text)) end += 1;
     const from = state.doc.line(row).from;
     const to = state.doc.line(end).to;
-    if (end > row && !inCode(from, to) && !overlapsSelection(from, to)) {
+    if (end > row && !inFencedCode(from, to) && !overlapsSelection(from, to)) {
       adds.push({
         from,
         to,

@@ -518,6 +518,7 @@ body.in-tauri {
   display: none;
 }
 @media print {
+  /* ── 页面基础 ─────────────────────────────────────────────────────── */
   html,
   body {
     background: #fff !important;
@@ -530,35 +531,169 @@ body.in-tauri {
   #root {
     display: none !important;
   }
+
   #siku-print-root {
     display: block !important;
     color: #111;
     background: #fff;
+    /* 正文：中文宋体（衬线）+ 西文衬线；行距与字号按中文出版物习惯 */
+    font-family: "Times New Roman", Georgia, "Source Han Serif SC",
+      "Noto Serif CJK SC", "Songti SC", "SimSun", serif;
     font-size: 12pt;
-    line-height: 1.7;
+    line-height: 1.8;
+    /* 中文两端对齐：标点不被拉散，行末允许断字但不加连字符 */
+    text-align: justify;
+    text-justify: inter-ideograph;
+    hyphens: none;
   }
+
+  /* ── 标题：黑体系（与正文分族） ──────────────────────────────────── */
+  #siku-print-root h1,
+  #siku-print-root h2,
+  #siku-print-root h3,
+  #siku-print-root h4,
+  #siku-print-root h5,
+  #siku-print-root h6 {
+    font-family: "Helvetica Neue", Arial, "Source Han Sans SC",
+      "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    text-align: left;
+    text-indent: 0;
+    line-height: 1.4;
+    break-after: avoid;
+    break-inside: avoid;
+  }
+  #siku-print-root h1 { font-size: 16pt; margin: 22pt 0 9pt; }
+  #siku-print-root h2 { font-size: 15pt; margin: 20pt 0 8pt; }
+  #siku-print-root h3 { font-size: 13pt; margin: 16pt 0 6pt; }
+  #siku-print-root h4 { font-size: 12pt; margin: 13pt 0 5pt; }
+  #siku-print-root h5,
+  #siku-print-root h6 { font-size: 11pt; margin: 11pt 0 4pt; }
+  /* 笔记标题（.siku-print-title）单独一套，放在最后以便覆盖通用 h1 */
   #siku-print-root .siku-print-title {
-    font-size: 20pt;
+    font-size: 19pt;
     font-weight: 700;
-    margin: 0 0 14pt;
-    padding-bottom: 6pt;
-    border-bottom: 1px solid #ddd;
+    margin: 0 0 6pt;
+    padding-bottom: 8pt;
+    border-bottom: 1.5px solid #333;
   }
+
+  /* ── 正文段落：首行缩进两字 ──────────────────────────────────────── */
+  #siku-print-root p {
+    margin: 0 0 0.35em;
+    text-indent: 2em;
+    orphans: 2;
+    widows: 2;
+  }
+  /* 这些场合不缩进：列表内、表格内、引用内、图注、公式、代码块内嵌段落 */
+  #siku-print-root li p,
+  #siku-print-root td p,
+  #siku-print-root th p,
+  #siku-print-root blockquote p,
+  #siku-print-root figcaption,
+  #siku-print-root .katex-display,
+  #siku-print-root .not-prose p {
+    text-indent: 0;
+  }
+
+  /* ── 行间公式：居中并留白 ────────────────────────────────────────── */
+  #siku-print-root .katex-display {
+    text-align: center;
+    text-indent: 0;
+    margin: 0.9em 0;
+  }
+
+  /* ── 列表 ────────────────────────────────────────────────────────── */
+  #siku-print-root ul,
+  #siku-print-root ol {
+    margin: 0.3em 0 0.6em;
+    padding-left: 1.7em;
+  }
+  #siku-print-root li { margin: 0.15em 0; }
+
+  /* ── 引用块 ──────────────────────────────────────────────────────── */
+  #siku-print-root blockquote {
+    margin: 0.6em 0;
+    padding: 0.2em 0 0.2em 0.9em;
+    border-left: 3px solid #ccc;
+    color: #333;
+    break-inside: avoid;
+  }
+
+  /* ── 表格：细线、表头跨页重复 ────────────────────────────────────── */
+  #siku-print-root table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 10.5pt;
+    margin: 0.6em 0;
+    break-inside: avoid;
+  }
+  #siku-print-root thead { display: table-header-group; }
+  #siku-print-root th,
+  #siku-print-root td {
+    border: 0.5pt solid #bbb;
+    padding: 3pt 5pt;
+    text-align: left;
+    text-indent: 0;
+  }
+  #siku-print-root th { background: #f3f4f6; font-weight: 600; }
+
+  /* ── 链接、图片 ──────────────────────────────────────────────────── */
   #siku-print-root a {
     color: #111;
     text-decoration: none;
   }
   #siku-print-root img {
     max-width: 100%;
-  }
-  #siku-print-root pre,
-  #siku-print-root table,
-  #siku-print-root img,
-  #siku-print-root blockquote,
-  #siku-print-root .katex-display {
     break-inside: avoid;
+  }
+
+  /* Code blocks: print cannot scroll, so a long line used to be clipped twice
+     over — the wrapper's overflow-hidden and the inner overflow-x-auto. Wrap the
+     lines instead, and let a tall block break across pages (break-inside: avoid
+     would push a wrapped block whole to the next page and clip it anyway). */
+  #siku-print-root .not-prose.overflow-hidden,
+  #siku-print-root .overflow-x-auto {
+    overflow: visible !important;
+  }
+  #siku-print-root pre {
+    white-space: pre-wrap !important;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    break-inside: auto;
+  }
+  #siku-print-root pre code {
+    white-space: inherit !important;
+  }
+
+  /* The on-screen code theme is light text on a dark background: on paper that
+     wastes ink and turns unreadable as soon as the background is dropped, so
+     print gets a light block with a single dark colour (syntax colours are
+     tuned for the dark theme and are dropped). */
+  #siku-print-root pre {
+    background: #f6f8fa !important;
+    color: #111 !important;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+    padding: 6pt 8pt;
+    font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: 10pt;
+    line-height: 1.5;
+    text-indent: 0;
+    text-align: left;
+  }
+  #siku-print-root pre * {
+    color: #111 !important;
+  }
+  #siku-print-root code {
+    background: #f2f3f5 !important;
+    color: #111 !important;
+  }
+  /* 代码块右上角的语言标签与复制/折行按钮是交互控件，不上纸 */
+  #siku-print-root .not-prose .absolute {
+    display: none !important;
   }
 }
 @page {
-  margin: 2cm;
+  size: A4;
+  margin: 20mm 22mm;
 }

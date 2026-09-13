@@ -406,3 +406,21 @@ fn demo2_page4_columns_stay_separate() {
         "p4 右栏内容不完整"
     );
 }
+
+/// demo2 p3: the subscripts of x_t / c_t / s_t / r_t sit 5.3pt below a 10pt line
+/// — just past the 5pt baseline-clustering tolerance — so each one used to become
+/// a stray one-character line and cut the sentence apart in the dual-pane view.
+#[test]
+fn subscripts_stay_on_their_line() {
+    let Some(corpus) = Corpus::locate() else { return };
+    let pages = extract_text(&corpus.pdf("demo2.pdf")).expect("extract");
+    let p3 = flat(&pages.iter().find(|p| p.page == 3).expect("page 3").text);
+
+    assert!(
+        p3.contains(
+            "Let the user input be xt, the session context be ct, and the clinical assessment state be st."
+        ),
+        "下标被切出了正文行"
+    );
+    assert!(p3.contains("routing label rt = R(xt, ct)"), "公式行被切断");
+}

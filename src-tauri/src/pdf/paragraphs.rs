@@ -260,6 +260,49 @@ pub fn chars_to_lines(
         groups.push((group_y, group));
     }
 
+    // Sub/superscript glyphs sit on their own baseline a fraction of an em off the
+    // body line, so they arrive here as separate groups: on demo2 p3 the subscripts
+    // of x_t / c_t / s_t sit 5.3pt below a 10pt line, just past the 5pt clustering
+    // tolerance, and each became a stray one-character line ("… the session" / "t"
+    // / "context be …"). Fold such a group back into the line it belongs to.
+    //
+    // The test is deliberately narrow — smaller glyphs, an offset well under a line
+    // step, and horizontally inside the line's span — because that page's leading
+    // is only 8.1pt: simply widening the tolerance would glue neighbouring lines
+    // together.
+    let mut merged: Vec<(f32, Vec<RawChar>)> = Vec::with_capacity(groups.len());
+    for (y, g) in groups {
+        let font_of = |chars: &[RawChar]| {
+            median(chars.iter().map(|c| c.font).filter(|&f| f >= 2.0).collect())
+        };
+        let span_of = |chars: &[RawChar]| {
+            chars.iter().fold((f32::MAX, f32::MIN), |(a, b), c| {
+                (a.min(c.x), b.max(c.right))
+            })
+        };
+        let (x0, x1) = span_of(&g);
+        let font = font_of(&g);
+        let attach = merged
+            .last()
+            .map(|(py, pg)| {
+                let pfont = font_of(pg);
+                let (px0, px1) = span_of(pg);
+                let smaller = font > 0.0 && pfont > 0.0 && font < pfont * 0.85;
+                let near = (py - y).abs() <= pfont * 0.6;
+                let inside = x0 >= px0 - 1.0 && x1 <= px1 + 1.0;
+                smaller && near && inside
+            })
+            .unwrap_or(false);
+        if attach {
+            let (_, pg) = merged.last_mut().expect("checked above");
+            pg.extend(g);
+            pg.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+            continue;
+        }
+        merged.push((y, g));
+    }
+    let groups = merged;
+
     // Column gutter has to be known BEFORE splitting, because the split is what
     // separates the two columns sharing a baseline. The line-geometry detector
     // (widest empty vertical band) comes first: the char x-histogram misreads a

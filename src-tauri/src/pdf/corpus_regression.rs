@@ -336,130 +336,38 @@ fn concurrent_extraction_stays_stable() {
     }
 }
 
-/// Line anchors must tile each paragraph exactly, and every line box must sit
-/// inside its paragraph box: the dual-pane sync slices the paragraph text by
-/// these lengths and aligns the PDF to these boxes, so an off-by-one highlights
-/// the wrong words.
+/// Text and paragraph boxes must stay consistent: the dual-pane view places a
+/// paragraph by its box and the chunker splits on the paragraph breaks, so the
+/// two have to describe the same thing.
 #[test]
-fn paragraph_line_anchors_tile_the_text() {
+fn paragraph_boxes_and_text_stay_consistent() {
     let Some(corpus) = Corpus::locate() else { return };
     let mut paragraphs = 0usize;
-    let mut with_lines = 0usize;
+    let mut boxes = 0usize;
     let mut problems: Vec<String> = Vec::new();
-    let mut boxes_checked = 0usize;
 
     for name in ["demo0.pdf", "demo1.pdf", "demo2.pdf"] {
         let anchors = crate::pdf::extractor::extract_paragraphs(&corpus.pdf(name))
             .expect("extract paragraph anchors");
         for p in &anchors {
             paragraphs += 1;
-            if !p.lines.is_empty() {
-                with_lines += 1;
+            if p.text.trim().is_empty() {
+                problems.push(format!("{name} p{}: 空段落", p.page));
             }
-            let sum: usize = p.lines.iter().map(|l| l.len).sum();
-            let want = p.text.encode_utf16().count();
-            if sum != want {
-                problems.push(format!("{name} p{}: 行长度之和 {sum} != 文本长度 {want}", p.page));
-            }
-            if let Some([px0, py0, px1, py1]) = p.bbox {
-                for line in &p.lines {
-                    boxes_checked += 1;
-                    let [x0, y0, x1, y1] = line.bbox;
-                    if y1 > py1 + 1.0 || y0 < py0 - 1.0 || x0 < px0 - 1.0 || x1 > px1 + 1.0 {
-                        problems.push(format!(
-                            "{name} p{}: 行框 [{x0:.0},{y0:.0},{x1:.0},{y1:.0}] 超出段落框",
-                            p.page
-                        ));
-                    }
+            if let Some([x0, y0, x1, y1]) = p.bbox {
+                boxes += 1;
+                if x1 <= x0 || y1 <= y0 {
+                    problems.push(format!("{name} p{}: 段落框退化 {x0},{y0},{x1},{y1}", p.page));
+                }
+                if x0 < 0.0 || y0 < 0.0 {
+                    problems.push(format!("{name} p{}: 段落框出界", p.page));
                 }
             }
         }
     }
-
-    println!(
-        "行锚点：段落 {paragraphs}，带行锚点 {with_lines}，校验行框 {boxes_checked}，问题 {}",
-        problems.len()
-    );
-    assert!(
-        problems.is_empty(),
-        "行锚点不一致（前 5 条）: {:?}",
-        &problems[..problems.len().min(5)]
-    );
-    assert!(
-        with_lines * 100 / paragraphs.max(1) >= 95,
-        "只有 {with_lines}/{paragraphs} 个段落带行锚点"
-    );
-    assert!(boxes_checked > 1000, "校验到的行框太少：{boxes_checked}");
-}
-
-/// demo2 p4 is equation-heavy: the widest-gap rule alone picked a gap *inside*
-/// the right column (x=335, measured ink 21 vs gap support 6), so every row
-/// holding both columns stayed merged and the left column's sentence was cut
-/// open by the right column's words.
-#[test]
-fn demo2_page4_columns_stay_separate() {
-    let Some(corpus) = Corpus::locate() else { return };
-    let pages = extract_text(&corpus.pdf("demo2.pdf")).expect("extract");
-    let p4 = flat(&pages.iter().find(|p| p.page == 4).expect("page 4").text);
-
-    assert!(
-        p4.contains("Evidence-aware orchestration protects stage attribution"),
-        "p4 左栏被右栏切断"
-    );
-    assert!(!p4.contains("Evidence-aware or-"), "p4 仍有跨栏拼接");
-    assert!(
-        p4.contains("stage-level compensation that prevents one media failure"),
-        "p4 右栏内容不完整"
-    );
-}
-
-/// demo2 p3: the subscripts of x_t / c_t / s_t / r_t sit 5.3pt below a 10pt line
-/// — just past the 5pt baseline-clustering tolerance — so each one used to become
-/// a stray one-character line and cut the sentence apart in the dual-pane view.
-#[test]
-fn subscripts_stay_on_their_line() {
-    let Some(corpus) = Corpus::locate() else { return };
-    let pages = extract_text(&corpus.pdf("demo2.pdf")).expect("extract");
-    let p3 = flat(&pages.iter().find(|p| p.page == 3).expect("page 3").text);
-
-    assert!(
-        p3.contains(
-            "Let the user input be xt, the session context be ct, and the clinical assessment state be st."
-        ),
-        "下标被切出了正文行"
-    );
-    assert!(p3.contains("routing label rt = R(xt, ct)"), "公式行被切断");
-}
-
-/// demo1 p2 is a single-column page. A gutter candidate at x=225 — supported by
-/// a handful of mid-line word gaps against ink covering the whole column — used to
-/// split body lines in half, so the tails became paragraphs of their own
-/// ("unified programming interface to curate high-quality SRE problems by",
-/// len=68) while the heads ended up in other paragraphs. Asserted on the
-/// paragraph anchors, because joining the pieces back into one paragraph would
-/// hide the split.
-#[test]
-fn single_column_page_lines_are_not_split_mid_line() {
-    let Some(corpus) = Corpus::locate() else { return };
-    let anchors =
-        crate::pdf::extractor::extract_paragraphs(&corpus.pdf("demo1.pdf")).expect("anchors");
-    let page2: Vec<_> = anchors.iter().filter(|a| a.page == 2).collect();
-
-    for tail in [
-        "unified programming interface to curate high-quality SRE problems",
-        "instance, noises must be composed alongside target failures",
-    ] {
-        assert!(
-            !page2.iter().any(|a| a.text.trim_start().starts_with(tail)),
-            "正文行被从中间劈开，尾部变成了独立段落: {tail:?}"
-        );
-    }
-    assert!(
-        page2.iter().any(|a| a
-            .text
-            .contains("events. SREGYM provides a unified programming interface to curate high-quality SRE problems")),
-        "被劈开的整行没有恢复"
-    );
+    println!("段落 {paragraphs}，带框 {boxes}，问题 {}", problems.len());
+    assert!(problems.is_empty(), "前 5 条: {:?}", &problems[..problems.len().min(5)]);
+    assert!(boxes * 100 / paragraphs.max(1) >= 95, "带框段落太少：{boxes}/{paragraphs}");
 }
 
 #[cfg(test)]

@@ -226,7 +226,11 @@ pub fn pdfium_lines(
         let box_h = (content_box[3] - content_box[1]).abs();
         // pdfium reports a degenerate size for rotated text and space glyphs;
         // 0 would collapse every downstream threshold.
-        let font = if reported_font >= 2.0 || !rotation.needs_frame_remap() {
+        // pdfium reports a degenerate size (0 / 1) for some glyphs — rotated
+        // text, space glyphs, a few footnotes; a 0 would collapse the line
+        // height to nothing. Recover the size from the glyph box, which was
+        // previously only done on rotated pages.
+        let font = if reported_font >= 2.0 {
             reported_font
         } else {
             box_w.max(box_h).max(2.0)

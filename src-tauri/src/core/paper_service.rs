@@ -426,10 +426,10 @@ pub async fn reprocess_paper_index(
 // 4: paragraphs carry per-line anchors (bbox + UTF-16 length) for the
 // dual-pane line-level sync; older cached JSON has no `lines` and must be
 // re-extracted.
-// 5: text and reading order come from pdfium's own lines; the geometry pipeline
+// 6: paragraphs only — no per-line anchors; text/order from pdfium's own lines (5)
 // (gutter detection, baseline reordering, paragraphisation) is gone, so every
 // cached paragraph list is obsolete.
-const PARAGRAPH_EXTRACTOR_VERSION: i32 = 5;
+const PARAGRAPH_EXTRACTOR_VERSION: i32 = 6;
 
 /// Anchored paragraphs (page + bbox + text) for the reader's dual-pane view.
 /// Computed from the PDF on first request and cached in the device-local

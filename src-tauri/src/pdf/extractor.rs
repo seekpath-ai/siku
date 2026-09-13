@@ -18,23 +18,6 @@ pub struct AnchoredParagraph {
     /// bottom-left page corner).
     pub bbox: Option<[f32; 4]>,
     pub text: String,
-    /// One entry per extracted line, in reading order. Defaulted so caches
-    /// written before line anchors existed still deserialize.
-    #[serde(default)]
-    pub lines: Vec<AnchoredLine>,
-}
-
-/// One line of a paragraph. Only the box and the length of the line's slice of
-/// `AnchoredParagraph::text` travel over IPC: the pane renders the paragraph as
-/// a single text node and slices by `len` (UTF-16 code units) to address a
-/// line, which keeps a 700-page book from becoming tens of thousands of DOM
-/// nodes.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AnchoredLine {
-    /// [x0, y0(bottom), x1, y1(top)] in PDF points, y-up.
-    pub bbox: [f32; 4],
-    /// Length of this line's slice of the paragraph text, in UTF-16 code units.
-    pub len: usize,
 }
 
 /// Bbox of one geometric line, in display-frame PDF points (y-up). Same padding
@@ -54,7 +37,11 @@ fn anchor_paragraph(
     page: u16,
     para: &[crate::pdf::paragraphs::GeoLine],
 ) -> Option<AnchoredParagraph> {
-    let (text, lengths) = crate::pdf::paragraphs::line_segments(para);
+    // The paragraph's own text: its lines joined with the word-space and
+    // de-hyphenation rules (see `line_segments`). Line structure is not exposed
+    // — the dual-pane view compares paragraphs, and the chunker only needs the
+    // paragraph breaks.
+    let (text, _lengths) = crate::pdf::paragraphs::line_segments(para);
     if text.trim().is_empty() {
         return None;
     }
@@ -67,11 +54,6 @@ fn anchor_paragraph(
         page,
         bbox: Some([x0, y0, x1, y1]),
         text,
-        lines: boxes
-            .into_iter()
-            .zip(lengths)
-            .map(|(bbox, len)| AnchoredLine { bbox, len })
-            .collect(),
     })
 }
 
@@ -119,7 +101,6 @@ pub fn extract_paragraphs(path: &Path) -> Result<Vec<AnchoredParagraph>> {
                     page: page.page,
                     bbox: None,
                     text: block.trim().to_string(),
-                    lines: Vec::new(),
                 })
                 .collect::<Vec<_>>()
         })

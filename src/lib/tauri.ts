@@ -221,19 +221,11 @@ export async function agentSetSessionModel(
 }
 
 /** Anchored paragraph from the dual-pane extraction (bbox 为 PDF 点坐标，y 自下而上). */
-export interface PaperLineAnchor {
-  /** [x0, y0(bottom), x1, y1(top)] PDF points（y 向上）。 */
-  bbox: [number, number, number, number];
-  /** 该行在段落文本里的切片长度（UTF-16 码元），与 `text.slice` 直接对应。 */
-  len: number;
-}
 export interface PaperParagraph {
   page: number;
   /** [x0, y0(bottom), x1, y1(top)] PDF points; null = 仅页级锚定。 */
   bbox: [number, number, number, number] | null;
   text: string;
-  /** 行锚点，行级同步用；缺失时退化为段落级。 */
-  lines?: PaperLineAnchor[];
 }
 
 /** Anchored paragraphs for the reader's dual-pane view (懒计算+本地缓存). */

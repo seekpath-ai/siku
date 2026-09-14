@@ -17,7 +17,7 @@ impl Tool for NoteReadTool {
     fn readonly(&self) -> bool { true }
 
     fn description(&self) -> &str {
-        "Read a note by its ID or search notes by title/content (full-text). If note_id is provided, returns that note. Otherwise searches all notes."
+        "Read a note by its ID or search notes by title/content (full-text). If note_id is provided, returns that note; long notes are truncated with a continuation hint — call again with offset_chars to keep reading. Otherwise searches all notes."
     }
 
     fn parameters(&self) -> Vec<ToolParameter> {
@@ -25,6 +25,10 @@ impl Tool for NoteReadTool {
             ToolParameter {
                 name: "note_id".into(), param_type: "string".into(),
                 description: "Optional UUID of a specific note to read".into(), required: false,
+            },
+            ToolParameter {
+                name: "offset_chars".into(), param_type: "integer".into(),
+                description: "Character offset into the note body when reading by note_id (default 0). Use the value from a truncation hint to continue reading a long note.".into(), required: false,
             },
             ToolParameter {
                 name: "search".into(), param_type: "string".into(),
@@ -52,15 +56,25 @@ impl Tool for NoteReadTool {
             // Reading by id returns the note body itself, not a search
             // preview — floor the cap at 8000 chars so the (small) search
             // preview setting can't cut off legitimate full-content reads.
+            // Long notes stay fully reachable via offset_chars pagination.
             let limit = (crate::core::settings_service::cached_settings()
                 .tool_note_read_max_chars
                 .max(1) as usize)
                 .max(8000);
+            let offset = (args["offset_chars"].as_u64().unwrap_or(0) as usize)
+                .min(note.content.chars().count());
             let total = note.content.chars().count();
-            let body: String = note.content.chars().take(limit).collect();
-            let mut out = format!("**{}**\n\n{}", note.title, body);
-            if total > limit {
-                out.push_str(&format!("\n(truncated, {total} chars total)"));
+            let body: String = note.content.chars().skip(offset).take(limit).collect();
+            let end = offset + body.chars().count();
+            let mut out = if offset > 0 {
+                format!("**{}**\n\n(from char {offset})\n{}", note.title, body)
+            } else {
+                format!("**{}**\n\n{}", note.title, body)
+            };
+            if end < total {
+                out.push_str(&format!(
+                    "\n(truncated at char {end} of {total} — call again with offset_chars={end} to continue reading)"
+                ));
             }
             return Ok(out);
         }

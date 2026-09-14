@@ -13,6 +13,7 @@ import { ToolCallCard } from './ToolCallCard';
 import { ReasoningProcessCard } from './ReasoningProcessCard';
 import { ReasoningBlock } from './ReasoningBlock';
 import { TurnContextDialog } from './TurnContextDialog';
+import { AttachmentImage } from '@/components/ui/AttachmentImage';
 import { ExternalLink } from '@/components/ui/ExternalLink';
 import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
 
@@ -231,19 +232,12 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
             {message.attachments && (
               <div className="flex flex-wrap gap-2 mt-2">
                 {parseAttachments(message.attachments).map((att, idx) => (
-                  <a
+                  <AttachmentImage
                     key={idx}
-                    href={`data:${att.mime};base64,${att.base64}`}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="block"
-                  >
-                    <img
-                      src={`data:${att.mime};base64,${att.base64}`}
-                      alt={att.name || `图片 ${idx + 1}`}
-                      className="max-w-[120px] max-h-[120px] object-cover rounded-lg border border-codex-border/50"
-                    />
-                  </a>
+                    att={att}
+                    alt={att.name || `图片 ${idx + 1}`}
+                    className="max-w-[120px] max-h-[120px] object-cover rounded-lg border border-codex-border/50"
+                  />
                 ))}
               </div>
             )}

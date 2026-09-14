@@ -54,7 +54,7 @@ async fn wait_for_peer_online(
             Ok(Some(RelayServerMsg::Error { payload })) => {
                 anyhow::bail!("relay error {}: {}", payload.code, payload.message);
             }
-            Ok(Some(other)) => warn!(msg = ?other, "unexpected msg"),
+            Ok(Some(other)) => warn!(kind = other.kind_name(), "unexpected msg"),
             Ok(None) => anyhow::bail!("relay closed before peer online"),
             Err(_) => continue, // deadline re-checked at loop top
         }

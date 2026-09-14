@@ -37,6 +37,25 @@ pub enum RelayServerMsg {
     ServerHello { payload: ServerHelloPayload },
 }
 
+impl RelayServerMsg {
+    /// Kind label for logs. Never Debug-dump a whole message: MailboxBatch
+    /// carries base64 ciphertext (potentially MBs) that would flood the log.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            RelayServerMsg::PeerOnline { .. } => "peer_online",
+            RelayServerMsg::PeerOffline { .. } => "peer_offline",
+            RelayServerMsg::Presence { .. } => "presence",
+            RelayServerMsg::Signal { .. } => "signal",
+            RelayServerMsg::Relay { .. } => "relay",
+            RelayServerMsg::Ping => "ping",
+            RelayServerMsg::Error { .. } => "error",
+            RelayServerMsg::MailboxBatch { .. } => "mailbox_batch",
+            RelayServerMsg::MailboxDepositAck { .. } => "mailbox_deposit_ack",
+            RelayServerMsg::ServerHello { .. } => "server_hello",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerHelloPayload {
     pub protocol: u32,

@@ -19,6 +19,7 @@ import { ApprovalPolicySwitch } from '@/components/chat/ApprovalPolicySwitch';
 import { parseAttachments } from '@/lib/attachments';
 import { ReasoningProcessCard } from '@/components/chat/ReasoningProcessCard';
 import { ExternalLink } from '@/components/ui/ExternalLink';
+import { AttachmentImage } from '@/components/ui/AttachmentImage';
 import { useImageAttachments } from '@/hooks/useImageAttachments';
 import { useAgentEventStream } from '@/hooks/useAgentEventStream';
 import { streamingToPhases, stepsToPhases } from '@/lib/agentPhases';
@@ -199,19 +200,12 @@ function PetMessage({ msg, onCitation, onSaveNote, saving }: {
           {images.length > 0 && (
             <div className="flex flex-wrap gap-1.5 mt-1.5">
               {images.map((att, idx) => (
-                <a
+                <AttachmentImage
                   key={idx}
-                  href={`data:${att.mime};base64,${att.base64}`}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="block"
-                >
-                  <img
-                    src={`data:${att.mime};base64,${att.base64}`}
-                    alt={att.name || `图片 ${idx + 1}`}
-                    className="max-w-[96px] max-h-[96px] object-cover rounded-lg border border-surface-hover"
-                  />
-                </a>
+                  att={att}
+                  alt={att.name || `图片 ${idx + 1}`}
+                  className="max-w-[96px] max-h-[96px] object-cover rounded-lg border border-surface-hover"
+                />
               ))}
             </div>
           )}

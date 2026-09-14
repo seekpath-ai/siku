@@ -195,8 +195,14 @@ impl RelayClient {
                         }
                         // Unknown message types from a NEWER relay land here
                         // and are ignored, keeping old clients forward-
-                        // compatible.
-                        Err(e) => warn!(error = %e, text = %text, "failed to parse relay msg"),
+                        // compatible. Cap the logged text: mailbox batches
+                        // carry base64 ciphertext that would flood the log.
+                        Err(e) => warn!(
+                            error = %e,
+                            text_len = text.len(),
+                            text_prefix = %text.chars().take(160).collect::<String>(),
+                            "failed to parse relay msg"
+                        ),
                     }
                 }
             }
@@ -356,7 +362,7 @@ impl RelayClient {
                     anyhow::bail!("relay error {}: {}", payload.code, payload.message);
                 }
                 Some(other) => {
-                    warn!(msg = ?other, "unexpected relay msg while waiting for signal");
+                    warn!(kind = other.kind_name(), "unexpected relay msg while waiting for signal");
                 }
                 None => anyhow::bail!("relay closed"),
             }

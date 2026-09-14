@@ -154,6 +154,29 @@ pub enum SyncMessage {
     },
 }
 
+impl SyncMessage {
+    /// Kind label for logs. Never Debug-dump a whole message: attachment
+    /// variants carry multi-MB base64 payloads that would flood the log.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            SyncMessage::Changeset(_) => "changeset",
+            SyncMessage::FullSnapshot { .. } => "full_snapshot",
+            SyncMessage::Chunk { .. } => "chunk",
+            SyncMessage::Pull => "pull",
+            SyncMessage::AttachmentRequest { .. } => "attachment_request",
+            SyncMessage::AttachmentPayload { .. } => "attachment_payload",
+            SyncMessage::AttachmentChunkRequest { .. } => "attachment_chunk_request",
+            SyncMessage::AttachmentChunk { .. } => "attachment_chunk",
+        }
+    }
+}
+
+/// Short capped prefix of a raw wire message for parse-failure logs — the full
+/// text can be a multi-MB base64 attachment frame.
+fn wire_prefix(text: &str) -> String {
+    text.chars().take(160).collect()
+}
+
 /// DataChannel messages above this size are split into chunks: WebRTC SCTP
 /// rejects oversized datagrams (default max message size is 16KB, so keep a
 /// conservative threshold — snapshots with hundreds of rows easily exceed it).
@@ -815,7 +838,7 @@ impl SyncEngine {
                     warn!(error = %e, from = %mb_msg.from_device_id, "mailbox attachment message failed");
                 }
             }
-            other => warn!(msg = ?other, "ignoring unsupported mailbox message"),
+            other => warn!(kind = other.kind_name(), "ignoring unsupported mailbox message"),
         }
         mailbox.ack(vec![mb_msg.id]).await.ok();
         self.set_transport("mailbox").await;
@@ -1022,7 +1045,7 @@ impl SyncEngine {
                                         warn!(error = %e, "handle chunked attachment message failed");
                                     }
                                 }
-                                Ok(other) => warn!(msg = ?other, "unexpected chunked message"),
+                                Ok(other) => warn!(kind = other.kind_name(), "unexpected chunked message"),
                                 Err(e) => warn!(error = %e, "parse chunked message failed"),
                             }
                         }
@@ -1061,7 +1084,7 @@ impl SyncEngine {
                             warn!(error = %e, "handle attachment message failed");
                         }
                     }
-                    Err(e) => warn!(error = %e, text = %text, "failed to parse sync message"),
+                    Err(e) => warn!(error = %e, text_len = text.len(), text_prefix = %wire_prefix(&text), "failed to parse sync message"),
                 }
             });
         });
@@ -1685,7 +1708,7 @@ pub async fn handle_mailbox_batch(
                     warn!(error = %e, from = %mb_msg.from_device_id, "mailbox attachment message failed");
                 }
             }
-            other => warn!(msg = ?other, "ignoring unsupported mailbox message"),
+            other => warn!(kind = other.kind_name(), "ignoring unsupported mailbox message"),
         }
     }
     if !ack_ids.is_empty() {

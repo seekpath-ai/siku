@@ -1,6 +1,7 @@
 import { useState, useCallback, useMemo, useRef, useEffect } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import {
   Search,
   Plus,
@@ -747,6 +748,8 @@ export function PaperList() {
   const { data: collections } = useCollections();
   const queryClient = useQueryClient();
   const listRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLDivElement>(null);
+  const [headerHeight, setHeaderHeight] = useState(33);
   const [focusedIndex, setFocusedIndex] = useState<number>(-1);
   const [showFilters, setShowFilters] = useState(false);
   const hiddenColumns = useLibraryStore((s) => s.hiddenColumns);
@@ -849,6 +852,18 @@ export function PaperList() {
     return () => ro.disconnect();
   }, [viewMode, papers?.length]);
 
+  // Track the sticky header's height so virtualized scroll-into-view leaves
+  // clearance for it (scrollPaddingStart).
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      setHeaderHeight(entries[0].contentRect.height);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [viewMode, papers?.length]);
+
   /** Columns actually rendered: manually hidden columns and columns
    * auto-hidden because the list got too narrow are both excluded. */
   const visibleColumns = useMemo<Set<ColumnKey>>(() => {
@@ -886,6 +901,19 @@ export function PaperList() {
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
   };
+
+  /** Virtualized rows: only the viewport ± overscan is mounted, so libraries
+   *  with thousands of papers render as cheaply as small ones. Row heights
+   *  are measured (expanded child rows are taller than the estimate).
+   *  scrollPaddingStart keeps scrolled-to rows clear of the sticky header. */
+  const rowVirtualizer = useVirtualizer({
+    count: papers?.length ?? 0,
+    getScrollElement: () => listRef.current,
+    estimateSize: () => 37,
+    overscan: 15,
+    getItemKey: (index) => papers?.[index]?.id ?? index,
+    scrollPaddingStart: headerHeight,
+  });
 
   // Focus the list only when view mode changes, not when papers data changes,
   // so that typing in the search box is not interrupted.
@@ -1000,8 +1028,7 @@ export function PaperList() {
   };
 
   const scrollRowIntoView = (index: number) => {
-    const row = listRef.current?.querySelector(`[data-row-index="${index}"]`) as HTMLElement | null;
-    row?.scrollIntoView({ block: 'nearest' });
+    rowVirtualizer.scrollToIndex(index, { align: 'auto' });
   };
 
   const [importMenuOpen, setImportMenuOpen] = useState(false);
@@ -1230,6 +1257,7 @@ export function PaperList() {
         >
           {/* Column headers (right-click to show/hide columns) */}
           <div
+            ref={headerRef}
             className="sticky top-0 z-10 flex items-center gap-2 px-3 py-2 border-b border-surface-hover bg-surface/80 backdrop-blur text-xs text-text-secondary/70"
             onClick={(e) => e.stopPropagation()}
             onContextMenu={(e) => {
@@ -1288,36 +1316,53 @@ export function PaperList() {
             })}
           </div>
 
-          {/* Rows */}
-          {papers.map((paper, index) => (
-            <div
-              key={paper.id}
-              data-row-index={index}
-              onClick={(e) => {
-                e.stopPropagation();
-                setFocusedIndex(index);
-              }}
-              className={focusedIndex === index ? 'ring-1 ring-inset ring-primary/30' : ''}
-            >
-              <PaperRow
-                paper={paper}
-                isSelected={selectedIds.includes(paper.id)}
-                selectedIds={selectedIds}
-                onSelect={handleSelect}
-                onRangeSelect={handleRangeSelect}
-                index={index}
-                onDelete={handleDelete}
-                onRestore={handleRestore}
-                onPurge={handlePurge}
-                onToggleFavorite={handleToggleFavorite}
-                onSetReadStatus={handleSetReadStatus}
-                activeFilter={activeFilter}
-                collections={collections}
-                visibleColumns={visibleColumns}
-                columnWidths={columnWidths}
-              />
-            </div>
-          ))}
+          {/* Rows (virtualized — only viewport rows are mounted) */}
+          <div style={{ height: rowVirtualizer.getTotalSize(), position: 'relative' }}>
+            {rowVirtualizer.getVirtualItems().map((vi) => {
+              const paper = papers[vi.index];
+              if (!paper) return null;
+              return (
+                <div
+                  key={vi.key}
+                  data-index={vi.index}
+                  ref={rowVirtualizer.measureElement}
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    width: '100%',
+                    transform: `translateY(${vi.start}px)`,
+                  }}
+                >
+                  <div
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setFocusedIndex(vi.index);
+                    }}
+                    className={focusedIndex === vi.index ? 'ring-1 ring-inset ring-primary/30' : ''}
+                  >
+                    <PaperRow
+                      paper={paper}
+                      isSelected={selectedIds.includes(paper.id)}
+                      selectedIds={selectedIds}
+                      onSelect={handleSelect}
+                      onRangeSelect={handleRangeSelect}
+                      index={vi.index}
+                      onDelete={handleDelete}
+                      onRestore={handleRestore}
+                      onPurge={handlePurge}
+                      onToggleFavorite={handleToggleFavorite}
+                      onSetReadStatus={handleSetReadStatus}
+                      activeFilter={activeFilter}
+                      collections={collections}
+                      visibleColumns={visibleColumns}
+                      columnWidths={columnWidths}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
       ) : (
         <div className="flex-1 overflow-y-auto p-4" onClick={clearSelection}>

@@ -150,14 +150,16 @@ impl Tool for PaperSearchTool {
             return Ok("没有匹配的论文（收藏夹/标签筛选无结果）。".to_string());
         }
         let id_clause = id_filter_clause(&filter_ids);
+        // Trashed papers must not surface in agent bibliographic search.
+        const NOT_DELETED: &str = " AND p.deleted_at IS NULL";
 
         let (papers, total): (Vec<crate::core::models::Paper>, i64) = if query.is_empty() {
             // List path: most recently imported first.
             let list_sql = format!(
-                "SELECT p.* FROM papers p WHERE 1=1{id_clause} \
+                "SELECT p.* FROM papers p WHERE 1=1{id_clause}{NOT_DELETED} \
                  ORDER BY p.imported_at DESC LIMIT ? OFFSET ?"
             );
-            let count_sql = format!("SELECT count(*) FROM papers p WHERE 1=1{id_clause}");
+            let count_sql = format!("SELECT count(*) FROM papers p WHERE 1=1{id_clause}{NOT_DELETED}");
             let papers = sqlx::query_as::<_, crate::core::models::Paper>(&list_sql)
                 .bind(limit)
                 .bind(offset)
@@ -173,12 +175,12 @@ impl Tool for PaperSearchTool {
             // FTS path, falling back to LIKE when FTS rejects the query.
             let fts_sql = format!(
                 "SELECT p.* FROM papers_fts f JOIN papers p ON p.rowid = f.rowid \
-                 WHERE papers_fts MATCH ?{id_clause} \
+                 WHERE papers_fts MATCH ?{id_clause}{NOT_DELETED} \
                  ORDER BY bm25(papers_fts) LIMIT ? OFFSET ?"
             );
             let fts_count_sql = format!(
                 "SELECT count(*) FROM papers_fts f JOIN papers p ON p.rowid = f.rowid \
-                 WHERE papers_fts MATCH ?{id_clause}"
+                 WHERE papers_fts MATCH ?{id_clause}{NOT_DELETED}"
             );
             match sqlx::query_as::<_, crate::core::models::Paper>(&fts_sql)
                 .bind(fts_query(&query))
@@ -199,12 +201,12 @@ impl Tool for PaperSearchTool {
                     let pattern = format!("%{query}%");
                     let like_sql = format!(
                         "SELECT p.* FROM papers p \
-                         WHERE (p.title LIKE ? OR p.authors LIKE ? OR p.keywords LIKE ? OR p.abstract LIKE ?){id_clause} \
+                         WHERE (p.title LIKE ? OR p.authors LIKE ? OR p.keywords LIKE ? OR p.abstract LIKE ?){id_clause}{NOT_DELETED} \
                          ORDER BY p.imported_at DESC LIMIT ? OFFSET ?"
                     );
                     let like_count_sql = format!(
                         "SELECT count(*) FROM papers p \
-                         WHERE (p.title LIKE ? OR p.authors LIKE ? OR p.keywords LIKE ? OR p.abstract LIKE ?){id_clause}"
+                         WHERE (p.title LIKE ? OR p.authors LIKE ? OR p.keywords LIKE ? OR p.abstract LIKE ?){id_clause}{NOT_DELETED}"
                     );
                     let papers = sqlx::query_as::<_, crate::core::models::Paper>(&like_sql)
                         .bind(&pattern)

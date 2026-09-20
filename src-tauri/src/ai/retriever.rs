@@ -106,7 +106,7 @@ async fn keyword_search(
          FROM {table} fts
          JOIN chunks c ON fts.rowid = c.rowid
          JOIN papers p ON c.paper_id = p.id
-         WHERE {table} MATCH ? AND (? = 1 OR c.is_tail = 0)
+         WHERE {table} MATCH ? AND (? = 1 OR c.is_tail = 0) AND p.deleted_at IS NULL
          ORDER BY rank
          LIMIT ?"
     );
@@ -164,7 +164,7 @@ struct CachedVector {
 /// table row counts, which change on import / re-index / delete.
 struct VectorCache {
     model: String,
-    stamp: (i64, i64),
+    stamp: (i64, i64, i64),
     entries: Vec<CachedVector>,
 }
 
@@ -181,7 +181,7 @@ static VECTOR_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<VectorCache>>> 
 /// belongs here.
 const MIN_COSINE: f32 = 0.25;
 
-async fn vector_cache_stamp(db: &SqlitePool) -> Result<(i64, i64), String> {
+async fn vector_cache_stamp(db: &SqlitePool) -> Result<(i64, i64, i64), String> {
     let embeddings: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM embeddings")
         .fetch_one(db)
         .await
@@ -190,7 +190,13 @@ async fn vector_cache_stamp(db: &SqlitePool) -> Result<(i64, i64), String> {
         .fetch_one(db)
         .await
         .map_err(|e| format!("db: {e}"))?;
-    Ok((embeddings.0, chunks.0))
+    // Soft-deleting/restoring a paper changes neither count above, but the
+    // cache must still be rebuilt: trashed papers are excluded from the join.
+    let trashed: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM papers WHERE deleted_at IS NOT NULL")
+        .fetch_one(db)
+        .await
+        .map_err(|e| format!("db: {e}"))?;
+    Ok((embeddings.0, chunks.0, trashed.0))
 }
 
 /// Vector similarity search on stored embeddings.
@@ -229,7 +235,7 @@ async fn vector_search(
          FROM embeddings e
          JOIN chunks c ON e.chunk_id = c.id
          JOIN papers p ON c.paper_id = p.id
-         WHERE e.model = ?",
+         WHERE e.model = ? AND p.deleted_at IS NULL",
     )
     .bind(&model)
     .fetch_all(db)
@@ -494,6 +500,43 @@ mod tests {
         let neighbour = hits.iter().find(|h| h.is_neighbor).expect("相邻块应被补齐");
         assert_eq!(neighbour.chunk_id, "c1");
         assert!(neighbour.score < hits[0].score);
+    }
+
+    #[tokio::test]
+    async fn trashed_paper_is_excluded_from_search() {
+        let db = test_db().await;
+        sqlx::query("UPDATE papers SET deleted_at = 't' WHERE id = 'p1'")
+            .execute(&db)
+            .await
+            .unwrap();
+        let hits = hybrid_search_with(&db, "方法", 10, false).await.unwrap();
+        assert!(hits.is_empty(), "回收站文献不应被检索到: {:?}",
+            hits.iter().map(|h| h.chunk_id.as_str()).collect::<Vec<_>>());
+        // Restoring makes the chunks searchable again (soft delete keeps them).
+        sqlx::query("UPDATE papers SET deleted_at = NULL WHERE id = 'p1'")
+            .execute(&db)
+            .await
+            .unwrap();
+        let hits = hybrid_search_with(&db, "方法", 10, false).await.unwrap();
+        assert_eq!(hits.first().map(|h| h.chunk_id.as_str()), Some("c0"));
+    }
+
+    #[tokio::test]
+    async fn purged_paper_cascades_chunks() {
+        let db = test_db().await;
+        // Permanent delete must cascade to chunks (FK ON DELETE CASCADE) so no
+        // orphan chunks/FTS rows keep surfacing in retrieval.
+        sqlx::query("DELETE FROM papers WHERE id = 'p1'")
+            .execute(&db)
+            .await
+            .unwrap();
+        let chunks: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM chunks")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(chunks.0, 0, "永久删除应级联删除分块");
+        let hits = hybrid_search_with(&db, "方法", 10, false).await.unwrap();
+        assert!(hits.is_empty());
     }
 
     #[tokio::test]

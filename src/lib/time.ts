@@ -13,6 +13,18 @@ export function isoToDisplay(iso: string): string {
 }
 
 /**
+ * Convert ISO 8601 UTC string to the full library-list date format.
+ * "2026-06-16T10:00:00Z" → "2026/06/16 10:00:00"
+ */
+export function isoToDisplayFull(iso: string): string {
+  try {
+    return format(parseISO(iso), 'yyyy/MM/dd HH:mm:ss');
+  } catch {
+    return iso;
+  }
+}
+
+/**
  * Convert ISO 8601 UTC string to date-only format.
  * "2026-06-16T10:00:00Z" → "2026-06-16"
  */

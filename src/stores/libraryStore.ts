@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
-type SortField = 'title' | 'year' | 'imported_at';
+type SortField = 'title' | 'year' | 'imported_at' | 'updated_at' | 'last_read_at';
 type SortOrder = 'asc' | 'desc';
 type ViewMode = 'table' | 'card';
 
@@ -36,6 +36,10 @@ interface LibraryState {
   /** Paper-list columns hidden via the header context menu (title exempt). */
   hiddenColumns: string[];
 
+  /** User-adjusted paper-list column widths (px), keyed by column key.
+   *  Columns absent here use their default width. */
+  columnWidths: Record<string, number>;
+
   // Panel widths (px)
   leftPanelWidth: number;
   rightPanelWidth: number;
@@ -67,6 +71,8 @@ interface LibraryState {
   toggleSort: (field: SortField) => void;
   setViewMode: (mode: ViewMode) => void;
   toggleHiddenColumn: (key: string) => void;
+  setColumnWidth: (key: string, width: number) => void;
+  resetColumnWidth: (key: string) => void;
   selectPaper: (id: string, multi?: boolean, range?: boolean) => void;
   clearSelection: () => void;
   setLeftPanelWidth: (width: number) => void;
@@ -100,6 +106,7 @@ export const useLibraryStore = create<LibraryState>()(
       lastSelectedId: null,
       viewMode: 'table',
       hiddenColumns: [],
+      columnWidths: {},
       leftPanelWidth: 256,
       rightPanelWidth: 320,
       rightPanelCollapsed: false,
@@ -198,6 +205,14 @@ export const useLibraryStore = create<LibraryState>()(
             ? state.hiddenColumns.filter((k) => k !== key)
             : [...state.hiddenColumns, key],
         })),
+      setColumnWidth: (key, width) =>
+        set((state) => ({ columnWidths: { ...state.columnWidths, [key]: width } })),
+      resetColumnWidth: (key) =>
+        set((state) => {
+          const next = { ...state.columnWidths };
+          delete next[key];
+          return { columnWidths: next };
+        }),
       selectPaper: (id, multi, range) => {
         const { selectedPaperIds, lastSelectedId } = get();
         if (multi) {
@@ -236,6 +251,7 @@ export const useLibraryStore = create<LibraryState>()(
         rightPanelCollapsed: state.rightPanelCollapsed,
         viewMode: state.viewMode,
         hiddenColumns: state.hiddenColumns,
+        columnWidths: state.columnWidths,
         sortBy: state.sortBy,
         sortOrder: state.sortOrder,
         expandedCollectionIds: state.expandedCollectionIds,

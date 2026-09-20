@@ -621,6 +621,11 @@ pub async fn list_papers(db: &SqlitePool, params: ListPapersParams) -> Result<Ve
     if let Some(status) = params.read_status.as_deref().filter(|s| !s.is_empty()) {
         sql.push_str(" AND read_status = ?");
     }
+    // "Recently read" filter: only papers actually opened. Independent of
+    // sort_by so sorting by last_read_at alone doesn't hide unread papers.
+    if params.has_been_read.unwrap_or(false) {
+        sql.push_str(" AND last_read_at IS NOT NULL");
+    }
 
     // Year range filter (inclusive).
     if let Some(y) = params.year_from {
@@ -702,15 +707,13 @@ pub async fn list_papers(db: &SqlitePool, params: ListPapersParams) -> Result<Ve
         }
     }
 
-    // Valid sort fields. last_read_at only makes sense for papers that have
-    // actually been opened, so exclude NULLs in that case.
+    // Valid sort fields. Sorting by last_read_at keeps unread papers (NULLs
+    // last) — hiding them is the has_been_read filter's job, done above.
     let sort_by = match params.sort_by.as_deref() {
         Some("title") => "title",
         Some("year") => "year",
-        Some("last_read_at") => {
-            sql.push_str(" AND last_read_at IS NOT NULL");
-            "last_read_at"
-        }
+        Some("last_read_at") => "last_read_at",
+        Some("updated_at") => "updated_at",
         Some("imported_at") => "imported_at",
         _ => "imported_at",
     };
@@ -719,7 +722,11 @@ pub async fn list_papers(db: &SqlitePool, params: ListPapersParams) -> Result<Ve
         _ => "DESC",
     };
 
-    sql.push_str(&format!(" ORDER BY {} {}", sort_by, sort_order));
+    if sort_by == "last_read_at" {
+        sql.push_str(&format!(" ORDER BY {} {} NULLS LAST", sort_by, sort_order));
+    } else {
+        sql.push_str(&format!(" ORDER BY {} {}", sort_by, sort_order));
+    }
 
     if let Some(limit) = params.limit {
         sql.push_str(&format!(" LIMIT {}", limit));

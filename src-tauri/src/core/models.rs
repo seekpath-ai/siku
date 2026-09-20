@@ -351,6 +351,11 @@ pub struct ListPapersParams {
     /// List papers related to this paper id.
     #[serde(default)]
     pub related_to: Option<String>,
+    /// When true, list only papers that have been opened (last_read_at IS NOT
+    /// NULL). Used by the "recently read" filter — kept separate from
+    /// sort_by=last_read_at so column sorting doesn't hide unread papers.
+    #[serde(default)]
+    pub has_been_read: Option<bool>,
 }
 
 /// A saved (named) advanced search, stored device-locally.

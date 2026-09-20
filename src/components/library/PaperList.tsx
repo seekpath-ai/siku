@@ -53,7 +53,7 @@ import { useTabStore } from '@/stores/tabStore';
 import { openNoteTab } from '@/lib/openNote';
 import { useDialog } from '@/hooks/useDialog';
 import { parseJsonArray } from '@/lib/types';
-import { isoToDisplay } from '@/lib/time';
+import { isoToDisplayFull } from '@/lib/time';
 import type { ActiveFilter } from '@/stores/libraryStore';
 import {
   openPaperInSystem,
@@ -70,28 +70,35 @@ import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
 import { PaperCard } from './PaperCard';
 import type { Paper, ListPapersParams, Note, Collection } from '@/lib/types';
 
-type SortField = 'title' | 'year' | 'imported_at';
+type SortField = 'title' | 'year' | 'imported_at' | 'updated_at' | 'last_read_at';
 
 /** Toggleable paper-list columns (the title column is always visible).
- *  Order matches the row layout. */
-type ColumnKey = 'authors' | 'year' | 'journal' | 'pages' | 'date';
+ *  Order matches the row layout. Date columns are ordered by display
+ *  priority: 最后阅读 > 修改日期 > 导入日期. */
+type ColumnKey = 'authors' | 'year' | 'journal' | 'pages' | 'lastRead' | 'modified' | 'date';
 
 const COLUMN_DEFS: { key: ColumnKey; label: string }[] = [
   { key: 'authors', label: '作者' },
   { key: 'year', label: '年份' },
   { key: 'journal', label: '期刊' },
   { key: 'pages', label: '页数' },
-  { key: 'date', label: '日期' },
+  { key: 'lastRead', label: '最后阅读' },
+  { key: 'modified', label: '修改日期' },
+  { key: 'date', label: '导入日期' },
 ];
 
 /** Container-width thresholds: below `below` px the listed columns
  * auto-hide (least valuable first), so the title column is squeezed last.
- * Applied cumulatively — the first matching (narrowest) band wins. */
+ * Applied cumulatively — the first matching (narrowest) band wins.
+ * Date columns hide in reverse display priority: 导入日期 → 修改日期 →
+ * 最后阅读. */
 const AUTO_HIDE_BANDS: { below: number; keys: ColumnKey[] }[] = [
-  { below: 520, keys: ['pages', 'journal', 'date', 'authors'] },
-  { below: 680, keys: ['pages', 'journal', 'date'] },
-  { below: 800, keys: ['pages', 'journal'] },
-  { below: 900, keys: ['pages'] },
+  { below: 460, keys: ['pages', 'journal', 'date', 'modified', 'authors', 'lastRead'] },
+  { below: 580, keys: ['pages', 'journal', 'date', 'modified', 'authors'] },
+  { below: 700, keys: ['pages', 'journal', 'date', 'modified'] },
+  { below: 800, keys: ['pages', 'journal', 'date'] },
+  { below: 920, keys: ['pages', 'journal'] },
+  { below: 1020, keys: ['pages'] },
 ];
 
 function autoHiddenColumns(width: number): Set<ColumnKey> {
@@ -100,6 +107,37 @@ function autoHiddenColumns(width: number): Set<ColumnKey> {
     if (width < band.below) return new Set(band.keys);
   }
   return new Set();
+}
+
+/** Default / minimum widths (px) for the resizable secondary columns.
+ *  Title always takes the remaining space (flex-1). */
+const DEFAULT_COL_WIDTHS: Record<ColumnKey, number> = {
+  authors: 128, year: 64, journal: 144, pages: 56, lastRead: 144, modified: 144, date: 144,
+};
+const MIN_COL_WIDTHS: Record<ColumnKey, number> = {
+  authors: 56, year: 44, journal: 56, pages: 40, lastRead: 96, modified: 96, date: 96,
+};
+
+/** Header cell config, in row order. `sortField` marks click-to-sort
+ *  columns (disabled in the "recently read" filter, which has a fixed order). */
+const HEADER_COLS: {
+  key: ColumnKey;
+  label: string;
+  align: 'left' | 'center' | 'right';
+  sortField?: SortField;
+  icon: React.ReactNode;
+}[] = [
+  { key: 'authors', label: '作者', align: 'left', icon: <User size={12} /> },
+  { key: 'year', label: '年份', align: 'center', sortField: 'year', icon: <Calendar size={12} /> },
+  { key: 'journal', label: '期刊', align: 'left', icon: <BookOpen size={12} /> },
+  { key: 'pages', label: '页数', align: 'center', icon: <FileText size={12} /> },
+  { key: 'lastRead', label: '最后阅读', align: 'right', sortField: 'last_read_at', icon: null },
+  { key: 'modified', label: '修改日期', align: 'right', sortField: 'updated_at', icon: null },
+  { key: 'date', label: '导入日期', align: 'right', sortField: 'imported_at', icon: null },
+];
+
+function colWidthOf(columnWidths: Record<string, number>, key: ColumnKey): number {
+  return columnWidths[key] ?? DEFAULT_COL_WIDTHS[key];
 }
 
 function SortIcon({ field, current, order }: { field: SortField; current: SortField; order: 'asc' | 'desc' }) {
@@ -242,6 +280,7 @@ function PaperRow({
   activeFilter,
   collections,
   visibleColumns,
+  columnWidths,
 }: {
   paper: Paper;
   isSelected: boolean;
@@ -249,15 +288,17 @@ function PaperRow({
   onSelect: (e: React.MouseEvent, id: string) => void;
   onRangeSelect: (toIndex: number) => void;
   index: number;
-  onDelete: (id: string) => void;
-  onRestore: (id: string) => void;
-  onPurge: (id: string) => void;
-  onToggleFavorite: (id: string, favorite: boolean) => void;
-  onSetReadStatus: (id: string, status: string) => void;
+  onDelete: (ids: string[]) => void;
+  onRestore: (ids: string[]) => void;
+  onPurge: (ids: string[]) => void;
+  onToggleFavorite: (ids: string[], favorite: boolean) => void;
+  onSetReadStatus: (ids: string[], status: string) => void;
   activeFilter: ActiveFilter;
   collections: Collection[] | undefined;
   /** Columns currently visible (manual hide ∪ container-width auto-hide). */
   visibleColumns: Set<ColumnKey>;
+  /** User-adjusted column widths (missing keys use defaults). */
+  columnWidths: Record<string, number>;
 }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -518,12 +559,12 @@ function PaperRow({
     {
       label: paper.is_favorite ? '取消星标' : '星标',
       icon: <Star size={14} />,
-      onClick: () => onToggleFavorite(paper.id, paper.is_favorite !== 1),
+      onClick: () => onToggleFavorite(targetPaperIds, paper.is_favorite !== 1),
     },
     {
       label: paper.read_status === 'read' ? '标记为未读' : '标记为已读',
       icon: <BookOpen size={14} />,
-      onClick: () => onSetReadStatus(paper.id, paper.read_status === 'read' ? 'unread' : 'read'),
+      onClick: () => onSetReadStatus(targetPaperIds, paper.read_status === 'read' ? 'unread' : 'read'),
     },
     {
       label: '导入 BibTeX 元数据',
@@ -566,23 +607,23 @@ function PaperRow({
     ...(activeFilter.type === 'trash'
       ? [
           {
-            label: '恢复',
+            label: `恢复${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
             icon: <RotateCcw size={14} />,
-            onClick: () => onRestore(paper.id),
+            onClick: () => onRestore(targetPaperIds),
           },
           {
-            label: '永久删除',
+            label: `永久删除${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
             icon: <Trash2 size={14} />,
             destructive: true,
-            onClick: () => onPurge(paper.id),
+            onClick: () => onPurge(targetPaperIds),
           },
         ]
       : [
           {
-            label: '删除文献',
+            label: `删除文献${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
             icon: <Trash2 size={14} />,
             destructive: true,
-            onClick: () => onDelete(paper.id),
+            onClick: () => onDelete(targetPaperIds),
           },
         ]),
   ];
@@ -618,7 +659,7 @@ function PaperRow({
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                onToggleFavorite(paper.id, paper.is_favorite !== 1);
+                onToggleFavorite([paper.id], paper.is_favorite !== 1);
               }}
               className={`shrink-0 transition-colors ${
                 paper.is_favorite ? 'text-amber-400' : 'text-text-secondary/40 hover:text-text-secondary'
@@ -632,36 +673,47 @@ function PaperRow({
           </div>
         </div>
 
-        {/* Secondary columns: authors/journal shrink (with truncation) before
-            the title does; year/pages/date stay fixed since their content is
-            short. Visibility is container-width driven, not viewport. */}
+        {/* Secondary columns: width comes from the resizable header (user
+            drag), falling back to defaults. Text columns truncate. */}
         {visibleColumns.has('authors') && (
-          <div className="w-32 shrink min-w-12">
+          <div className="shrink-0 min-w-0" style={{ width: colWidthOf(columnWidths, 'authors') }}>
             <span className="block truncate text-xs text-text-secondary">{displayAuthors}</span>
           </div>
         )}
 
         {visibleColumns.has('year') && (
-          <div className="w-16 shrink-0 text-xs text-text-secondary text-center">
+          <div className="shrink-0 text-xs text-text-secondary text-center" style={{ width: colWidthOf(columnWidths, 'year') }}>
             {paper.year || '—'}
           </div>
         )}
 
         {visibleColumns.has('journal') && (
-          <div className="w-36 shrink min-w-12">
+          <div className="shrink-0 min-w-0" style={{ width: colWidthOf(columnWidths, 'journal') }}>
             <span className="block truncate text-xs text-text-secondary">{paper.journal || '—'}</span>
           </div>
         )}
 
         {visibleColumns.has('pages') && (
-          <div className="w-14 shrink-0 text-xs text-text-secondary text-center">
+          <div className="shrink-0 text-xs text-text-secondary text-center" style={{ width: colWidthOf(columnWidths, 'pages') }}>
             {paper.page_count || '—'}
           </div>
         )}
 
+        {visibleColumns.has('lastRead') && (
+          <div className="shrink-0 text-xs text-text-secondary/60 text-right" style={{ width: colWidthOf(columnWidths, 'lastRead') }}>
+            {paper.last_read_at ? isoToDisplayFull(paper.last_read_at) : '—'}
+          </div>
+        )}
+
+        {visibleColumns.has('modified') && (
+          <div className="shrink-0 text-xs text-text-secondary/60 text-right" style={{ width: colWidthOf(columnWidths, 'modified') }}>
+            {paper.updated_at ? isoToDisplayFull(paper.updated_at) : '—'}
+          </div>
+        )}
+
         {visibleColumns.has('date') && (
-          <div className="w-24 shrink-0 text-xs text-text-secondary/60 text-right">
-            {isoToDisplay(paper.imported_at).split(' ')[0]}
+          <div className="shrink-0 text-xs text-text-secondary/60 text-right" style={{ width: colWidthOf(columnWidths, 'date') }}>
+            {paper.imported_at ? isoToDisplayFull(paper.imported_at) : '—'}
           </div>
         )}
       </div>
@@ -699,6 +751,9 @@ export function PaperList() {
   const [showFilters, setShowFilters] = useState(false);
   const hiddenColumns = useLibraryStore((s) => s.hiddenColumns);
   const toggleHiddenColumn = useLibraryStore((s) => s.toggleHiddenColumn);
+  const columnWidths = useLibraryStore((s) => s.columnWidths);
+  const setColumnWidth = useLibraryStore((s) => s.setColumnWidth);
+  const resetColumnWidth = useLibraryStore((s) => s.resetColumnWidth);
   const [listWidth, setListWidth] = useState(0);
   const [colMenu, setColMenu] = useState<{ x: number; y: number } | null>(null);
 
@@ -713,11 +768,15 @@ export function PaperList() {
   const clearAdvancedFilters = useLibraryStore((s) => s.clearAdvancedFilters);
 
   const handleToggleFavorite = useCallback(
-    (id: string, favorite: boolean) => favoriteMutation.mutate({ id, favorite }),
+    (ids: string[], favorite: boolean) => {
+      for (const id of ids) favoriteMutation.mutate({ id, favorite });
+    },
     [favoriteMutation]
   );
   const handleSetReadStatus = useCallback(
-    (id: string, status: string) => readStatusMutation.mutate({ id, status }),
+    (ids: string[], status: string) => {
+      for (const id of ids) readStatusMutation.mutate({ id, status });
+    },
     [readStatusMutation]
   );
 
@@ -752,7 +811,9 @@ export function PaperList() {
       return base;
     }
     if (activeFilter.type === 'recent') {
-      // list_papers excludes last_read_at IS NULL when sorting by it.
+      // Only papers actually opened; sorting by last_read_at alone no longer
+      // excludes unread papers (column sorting must not hide rows).
+      base.has_been_read = true;
       return base;
     }
     if (activeFilter.type === 'collection') base.collection_id = activeFilter.id;
@@ -807,6 +868,25 @@ export function PaperList() {
     onClick: () => toggleHiddenColumn(col.key),
   }));
 
+  /** Drag-to-resize a column header (Zotero-style). Double-clicking the
+   *  handle resets to the default width. */
+  const startColumnResize = (e: React.MouseEvent, key: ColumnKey) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX;
+    const startWidth = colWidthOf(columnWidths, key);
+    const minW = MIN_COL_WIDTHS[key];
+    const onMove = (ev: MouseEvent) => {
+      setColumnWidth(key, Math.max(minW, Math.round(startWidth + ev.clientX - startX)));
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  };
+
   // Focus the list only when view mode changes, not when papers data changes,
   // so that typing in the search box is not interrupted.
   useEffect(() => {
@@ -831,26 +911,38 @@ export function PaperList() {
   };
 
   const handleDelete = useCallback(
-    async (id: string) => {
-      const ok = await confirm('删除后可在「回收站」恢复，确定删除该文献？', '删除文献');
+    async (ids: string[]) => {
+      const ok = await confirm(
+        ids.length > 1
+          ? `删除后可在「回收站」恢复，确定删除选中的 ${ids.length} 篇文献？`
+          : '删除后可在「回收站」恢复，确定删除该文献？',
+        '删除文献'
+      );
       if (!ok) return;
-      deleteMutation.mutate(id);
+      for (const id of ids) deleteMutation.mutate(id);
     },
     [confirm, deleteMutation]
   );
 
   const restoreMutation = useRestorePaper();
   const handleRestore = useCallback(
-    (id: string) => restoreMutation.mutate(id),
+    (ids: string[]) => {
+      for (const id of ids) restoreMutation.mutate(id);
+    },
     [restoreMutation]
   );
 
   const purgeMutation = usePurgePaper();
   const handlePurge = useCallback(
-    async (id: string) => {
-      const ok = await confirm('永久删除后不可恢复（附件、笔记、标注一并删除），确定？', '永久删除');
+    async (ids: string[]) => {
+      const ok = await confirm(
+        ids.length > 1
+          ? `永久删除后不可恢复（附件、笔记、标注一并删除），确定删除选中的 ${ids.length} 篇文献？`
+          : '永久删除后不可恢复（附件、笔记、标注一并删除），确定？',
+        '永久删除'
+      );
       if (!ok) return;
-      purgeMutation.mutate(id);
+      for (const id of ids) purgeMutation.mutate(id);
     },
     [confirm, purgeMutation]
   );
@@ -896,9 +988,13 @@ export function PaperList() {
       }
     } else if (e.key === 'Delete' || e.key === 'Backspace') {
       e.preventDefault();
-      const idx = focusedIndex >= 0 ? focusedIndex : selectedIds.length === 1 ? paperIds.indexOf(selectedIds[0]) : -1;
-      if (idx >= 0 && papers[idx]) {
-        handleDelete(papers[idx].id);
+      if (selectedIds.length > 0) {
+        handleDelete(selectedIds);
+      } else {
+        const idx = focusedIndex >= 0 ? focusedIndex : -1;
+        if (idx >= 0 && papers[idx]) {
+          handleDelete([papers[idx].id]);
+        }
       }
     }
   };
@@ -1152,43 +1248,44 @@ export function PaperList() {
                 <FileText size={12} /> 标题 <SortIcon field="title" current={sortBy} order={sortOrder} />
               </button>
             )}
-            {visibleColumns.has('authors') && (
-              <div className="w-32 shrink min-w-12 flex items-center gap-1">
-                <User size={12} /> 作者
-              </div>
-            )}
-            {visibleColumns.has('year') && (
-              activeFilter.type === 'recent' ? (
-                <div className="w-16 shrink-0 flex items-center justify-center gap-1">
-                  <Calendar size={12} /> 年份
+            {HEADER_COLS.filter((c) => visibleColumns.has(c.key)).map((col) => {
+              const sortable = col.sortField && activeFilter.type !== 'recent';
+              const alignCls =
+                col.align === 'center' ? 'justify-center' : col.align === 'right' ? 'justify-end' : '';
+              return (
+                <div
+                  key={col.key}
+                  className="relative shrink-0 flex items-center min-w-0"
+                  style={{ width: colWidthOf(columnWidths, col.key) }}
+                >
+                  {sortable ? (
+                    <button
+                      onClick={() => toggleSort(col.sortField!)}
+                      className={`flex-1 min-w-0 flex items-center gap-1 ${alignCls} hover:text-text-secondary`}
+                    >
+                      {col.icon}
+                      <span className="truncate">{col.label}</span>
+                      <SortIcon field={col.sortField!} current={sortBy} order={sortOrder} />
+                    </button>
+                  ) : (
+                    <span className={`flex-1 min-w-0 flex items-center gap-1 ${alignCls}`}>
+                      {col.icon}
+                      <span className="truncate">{col.label}</span>
+                    </span>
+                  )}
+                  <span
+                    onMouseDown={(e) => startColumnResize(e, col.key)}
+                    onDoubleClick={(e) => {
+                      e.stopPropagation();
+                      resetColumnWidth(col.key);
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                    className="absolute -right-1.5 top-0 bottom-0 w-3 z-10 cursor-col-resize touch-none rounded hover:bg-primary/30"
+                    title="拖动调整列宽，双击恢复默认"
+                  />
                 </div>
-              ) : (
-                <button onClick={() => toggleSort('year')} className="w-16 shrink-0 flex items-center justify-center gap-1 hover:text-text-secondary">
-                  <Calendar size={12} /> 年份 <SortIcon field="year" current={sortBy} order={sortOrder} />
-                </button>
-              )
-            )}
-            {visibleColumns.has('journal') && (
-              <div className="w-36 shrink min-w-12 flex items-center gap-1">
-                <BookOpen size={12} /> 期刊
-              </div>
-            )}
-            {visibleColumns.has('pages') && (
-              <div className="w-14 shrink-0 flex items-center justify-center gap-1">
-                <FileText size={12} /> 页数
-              </div>
-            )}
-            {visibleColumns.has('date') && (
-              activeFilter.type === 'recent' ? (
-                <div className="w-24 shrink-0 flex items-center justify-end gap-1">
-                  最近阅读
-                </div>
-              ) : (
-                <button onClick={() => toggleSort('imported_at')} className="w-24 shrink-0 flex items-center justify-end gap-1 hover:text-text-secondary">
-                  导入日期 <SortIcon field="imported_at" current={sortBy} order={sortOrder} />
-                </button>
-              )
-            )}
+              );
+            })}
           </div>
 
           {/* Rows */}
@@ -1217,6 +1314,7 @@ export function PaperList() {
                 activeFilter={activeFilter}
                 collections={collections}
                 visibleColumns={visibleColumns}
+                columnWidths={columnWidths}
               />
             </div>
           ))}

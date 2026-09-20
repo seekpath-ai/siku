@@ -96,8 +96,10 @@ export interface ListPapersParams {
   collection_id?: string;
   tag_ids?: string[];
   tag_logic?: 'and' | 'or';
-  sort_by?: 'title' | 'year' | 'imported_at' | 'last_read_at';
+  sort_by?: 'title' | 'year' | 'imported_at' | 'updated_at' | 'last_read_at';
   sort_order?: 'asc' | 'desc';
+  /** Only papers that have been opened (last_read_at IS NOT NULL). */
+  has_been_read?: boolean;
   limit?: number;
   offset?: number;
   /** List only trashed papers when true (default: active only). */

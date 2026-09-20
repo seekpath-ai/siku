@@ -21,13 +21,18 @@ const OUTPUT_LIMIT_CHARS: usize = 20_000;
 struct Shell {
     program: std::path::PathBuf,
     args: Vec<&'static str>,
+    /// Prepended to every command so the console emits UTF-8. zh-CN Windows
+    /// defaults to GBK (cp936): any non-ASCII byte in the output fails strict
+    /// UTF-8 decoding downstream and the whole stdout vanishes.
+    utf8_prefix: &'static str,
 }
 
 impl Shell {
-    fn new(program: impl Into<std::path::PathBuf>, args: Vec<&'static str>) -> Self {
+    fn new(program: impl Into<std::path::PathBuf>, args: Vec<&'static str>, utf8_prefix: &'static str) -> Self {
         Self {
             program: program.into(),
             args,
+            utf8_prefix,
         }
     }
 }
@@ -44,20 +49,21 @@ fn resolve_shell(requested: Option<&str>) -> Result<Shell, String> {
             return Ok(Shell::new(
                 "powershell.exe",
                 vec!["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command"],
+                "[Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8;",
             ));
         }
         "cmd" => {
-            return Ok(Shell::new("cmd.exe", vec!["/c"]));
+            return Ok(Shell::new("cmd.exe", vec!["/c"], "chcp 65001 >nul & "));
         }
         "bash" => {
             return Ok(find_bash()
-                .map(|p| Shell::new(p, vec!["-lc"]))
+                .map(|p| Shell::new(p, vec!["-lc"], ""))
                 .ok_or_else(|| {
                     "bash not found: install Git for Windows and add bash.exe to PATH, or use powershell/cmd".to_string()
                 })?);
         }
         "sh" => {
-            return Ok(Shell::new("sh", vec!["-lc"]));
+            return Ok(Shell::new("sh", vec!["-lc"], ""));
         }
         "" => {} // fall through to platform defaults
         _ => return Err(format!("unsupported shell: {name}")),
@@ -68,9 +74,10 @@ fn resolve_shell(requested: Option<&str>) -> Result<Shell, String> {
         Ok(Shell::new(
             "powershell.exe",
             vec!["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command"],
+            "[Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8;",
         ))
     } else {
-        Ok(Shell::new("sh", vec!["-lc"]))
+        Ok(Shell::new("sh", vec!["-lc"], ""))
     }
 }
 
@@ -106,11 +113,24 @@ pub struct BashTool {
     output_dir: PathBuf,
     /// 归属会话 id：run_background 产生的 TaskInfo 会带上它
     session_id: Option<String>,
+    desc: String,
 }
 
 impl BashTool {
     pub fn new(tasks: TaskStore, output_dir: PathBuf, session_id: Option<String>) -> Self {
-        Self { tasks, output_dir, session_id }
+        Self { tasks, output_dir, session_id, desc: build_description() }
+    }
+}
+
+fn build_description() -> String {
+    const BASE: &str = "Execute a shell command. Windows defaults to PowerShell; Unix-like systems default to sh. Use shell=bash|powershell|cmd|sh to override. Requires approval. Commands run in the working directory by default when one is set (otherwise the process cwd). run_in_background=true returns a task id immediately; otherwise waits for completion. The timeout (default 60s, max 5min) applies to background tasks too.";
+    // LLMs write far more reliable bash than PowerShell; when Git Bash is
+    // installed, say so and steer Unix-style work to it instead of keeping
+    // bash as a fallback the model never thinks to use.
+    if cfg!(windows) && find_bash().is_some() {
+        format!("{BASE} Git Bash IS available on this machine: prefer shell=bash for Unix-style work (pipes, grep/sed/awk, globbing, file inspection); use PowerShell only for Windows-specific tasks (registry, services, WMI, systeminfo).")
+    } else {
+        BASE.to_string()
     }
 }
 
@@ -121,7 +141,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command. Windows defaults to PowerShell; Unix-like systems default to sh. Use shell=bash|powershell|cmd|sh to override. Requires approval. Commands run in the working directory by default when one is set (otherwise the process cwd). run_in_background=true returns a task id immediately; otherwise waits for completion. The timeout (default 60s, max 5min) applies to background tasks too."
+        &self.desc
     }
 
     fn parameters(&self) -> Vec<ToolParameter> {
@@ -170,12 +190,14 @@ impl Tool for BashTool {
         let background = args["run_in_background"].as_bool().unwrap_or(false);
         let shell = resolve_shell(args["shell"].as_str())?;
         let wd = working_dir_from_args(&args);
+        // Force the console to UTF-8 (no-op prefix on bash/sh).
+        let command = format!("{}{}", shell.utf8_prefix, command);
 
         let mut cmd = Command::new(&shell.program);
         for arg in &shell.args {
             cmd.arg(arg);
         }
-        cmd.arg(command);
+        cmd.arg(&command);
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         // Explicit cwd: fail loudly — the caller asked for that directory.
@@ -202,7 +224,7 @@ impl Tool for BashTool {
         }
 
         if background {
-            return self.run_background(&mut cmd, command, &args, cwd_fallback).await;
+            return self.run_background(&mut cmd, &args, cwd_fallback).await;
         }
 
         // Foreground: capture output with a hard timeout.
@@ -215,21 +237,27 @@ impl Tool for BashTool {
         let stderr = child.stderr.take();
 
         let run = async {
-            let mut out = String::new();
-            let mut err = String::new();
+            // Read raw bytes and decode lossily: a stray non-UTF-8 byte must
+            // degrade to �, never discard the whole output (read_to_string
+            // errors out and leaves the buffer empty — the "PowerShell stdout
+            // never arrives" bug).
+            let mut out_bytes = Vec::new();
+            let mut err_bytes = Vec::new();
             let _ = tokio::join!(
                 async {
                     if let Some(mut s) = stdout {
-                        let _ = s.read_to_string(&mut out).await;
+                        let _ = s.read_to_end(&mut out_bytes).await;
                     }
                 },
                 async {
                     if let Some(mut s) = stderr {
-                        let _ = s.read_to_string(&mut err).await;
+                        let _ = s.read_to_end(&mut err_bytes).await;
                     }
                 },
             );
             let status = child.wait().await.ok();
+            let out = String::from_utf8_lossy(&out_bytes).into_owned();
+            let err = String::from_utf8_lossy(&err_bytes).into_owned();
             (status.and_then(|s| s.code()), out, err)
         };
 
@@ -265,7 +293,6 @@ impl BashTool {
     async fn run_background(
         &self,
         cmd: &mut Command,
-        command: &str,
         args: &serde_json::Value,
         cwd_fallback: Option<String>,
     ) -> Result<String, String> {

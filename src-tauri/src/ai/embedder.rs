@@ -16,6 +16,12 @@ pub const RECOMMENDED_LOCAL_MODEL: &str = "BAAI/bge-small-zh-v1.5";
 pub const PLACEHOLDER_MODEL: &str = "placeholder-hash";
 pub const DEFAULT_DIMENSIONS: usize = 512;
 
+/// Batch imports (folder / Zotero) spawn one embedding task per imported
+/// paper; without a gate a 200-file import fires 200 concurrent request
+/// streams at the embeddings endpoint. Two at a time keeps the endpoint and
+/// the UI responsive while still overlapping network waits.
+static EMBED_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 /// Generate embeddings for text chunks and store them in the database.
 /// The active backend comes from app settings: "api" uses an OpenAI-compatible
 /// embeddings endpoint (e.g. OpenAI / Ollama / local server), "hash" (default)
@@ -37,6 +43,9 @@ pub async fn generate_embeddings_for_paper(
         );
         return Ok(0);
     }
+
+    // Queue behind the batch-import concurrency gate (see EMBED_GATE).
+    let _permit = EMBED_GATE.acquire().await.map_err(|e| e.to_string())?;
 
     // Chunks that need a vector: never embedded, or embedded by a DIFFERENT
     // model. The old query only looked for missing rows, so switching the

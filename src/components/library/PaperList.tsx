@@ -36,6 +36,8 @@ import {
   FolderMinus,
   RefreshCw,
   Check,
+  FolderInput,
+  BookCopy,
 } from 'lucide-react';
 import {
   usePapers,
@@ -1102,6 +1104,26 @@ export function PaperList() {
               >
                 <File size={13} />
                 导入 PDF
+              </button>
+              <button
+                onClick={() => {
+                  setImportMenuOpen(false);
+                  window.dispatchEvent(new CustomEvent('siku:import-folder'));
+                }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-text-secondary hover:text-text-primary hover:bg-surface-hover text-left"
+              >
+                <FolderInput size={13} />
+                从文件夹导入
+              </button>
+              <button
+                onClick={() => {
+                  setImportMenuOpen(false);
+                  window.dispatchEvent(new CustomEvent('siku:import-zotero'));
+                }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-text-secondary hover:text-text-primary hover:bg-surface-hover text-left"
+              >
+                <BookCopy size={13} />
+                从 Zotero 导入
               </button>
               <button
                 onClick={() => {

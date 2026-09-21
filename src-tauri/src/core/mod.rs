@@ -1,5 +1,6 @@
 pub mod agent_memory_service;
 pub mod annotation_service;
+pub mod batch_import;
 pub mod bibtex;
 pub mod bookmark_service;
 pub mod citation_export;
@@ -30,3 +31,4 @@ pub mod tasks;
 pub mod timeline_service;
 pub mod time;
 pub mod vault_service;
+pub mod zotero_import;

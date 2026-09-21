@@ -8,6 +8,9 @@ import { Dialog } from '@/components/ui/Dialog';
 import { Pet } from '@/components/pet/Pet';
 import { GlobalSearch } from '@/components/search/GlobalSearch';
 import { ImportFromLinkDialog } from '@/components/library/ImportFromLinkDialog';
+import { BatchImportDialog } from '@/components/library/BatchImportDialog';
+import { ZoteroImportDialog } from '@/components/library/ZoteroImportDialog';
+import { runFileBatch, useBatchImportStore } from '@/stores/batchImportStore';
 import { useImportPaper } from '@/hooks/useLibrary';
 import { useShellStore } from '@/stores/shellStore';
 import { useTabStore } from '@/stores/tabStore';
@@ -31,6 +34,7 @@ export function AppShell({ children }: AppShellProps) {
   const [toast, setToast] = useState<{ message: string; type: 'info' | 'warning' } | null>(null);
   const toastTimerRef = useRef<number | null>(null);
   const [importLinkOpen, setImportLinkOpen] = useState(false);
+  const [importZoteroOpen, setImportZoteroOpen] = useState(false);
   const [isShuttingDown, setIsShuttingDown] = useState(false);
   const isReader = useIsReaderRoute();
   const { location } = useRouterState();
@@ -79,6 +83,8 @@ export function AppShell({ children }: AppShellProps) {
   // Listen for menu events
   useEffect(() => {
     const handleImport = () => selectAndImport();
+    const handleImportFolder = () => selectFolderAndImport();
+    const handleImportZotero = () => setImportZoteroOpen(true);
     const handleImportFromLink = () => setImportLinkOpen(true);
     const handleBookmarks = () => {
       openRoute('/bookmarks', { title: '书签', icon: 'bookmark' });
@@ -91,11 +97,15 @@ export function AppShell({ children }: AppShellProps) {
       }
     };
     window.addEventListener('siku:import-pdf', handleImport);
+    window.addEventListener('siku:import-folder', handleImportFolder);
+    window.addEventListener('siku:import-zotero', handleImportZotero);
     window.addEventListener('siku:import-from-link', handleImportFromLink);
     window.addEventListener('siku:bookmarks', handleBookmarks);
     window.addEventListener('siku:toggle-translation', handleToggleTranslation);
     return () => {
       window.removeEventListener('siku:import-pdf', handleImport);
+      window.removeEventListener('siku:import-folder', handleImportFolder);
+      window.removeEventListener('siku:import-zotero', handleImportZotero);
       window.removeEventListener('siku:import-from-link', handleImportFromLink);
       window.removeEventListener('siku:bookmarks', handleBookmarks);
       window.removeEventListener('siku:toggle-translation', handleToggleTranslation);
@@ -123,16 +133,21 @@ export function AppShell({ children }: AppShellProps) {
     return () => unlisten?.();
   }, []);
 
-  // Drag-and-drop PDF import
+  // Drag-and-drop PDF import (single file → direct import; several → batch)
   useEffect(() => {
     if (!isTauri()) return;
     const handler = async (e: DragEvent) => {
       e.preventDefault();
-      const file = e.dataTransfer?.files?.[0];
-      if (file && (file.name.endsWith('.pdf') || file.type === 'application/pdf')) {
-        const path = (file as File & { path?: string }).path;
-        if (path) { setToast(null); importPaper(path); }
-      }
+      const files = Array.from(e.dataTransfer?.files ?? []).filter(
+        (f) => f.name.toLowerCase().endsWith('.pdf') || f.type === 'application/pdf'
+      );
+      const paths = files
+        .map((f) => (f as File & { path?: string }).path)
+        .filter((p): p is string => !!p);
+      if (paths.length === 0) return;
+      setToast(null);
+      if (paths.length === 1) importPaper(paths[0]);
+      else runFileBatch(paths).catch(() => {});
     };
     const prevent = (e: DragEvent) => e.preventDefault();
     window.addEventListener('dragover', prevent);
@@ -145,10 +160,25 @@ export function AppShell({ children }: AppShellProps) {
     setToast(null);
     try {
       const { open } = await import('@tauri-apps/plugin-dialog');
-      const selected = await open({ multiple: false, filters: [{ name: 'PDF', extensions: ['pdf'] }] });
-      if (selected && typeof selected === 'string') importPaper(selected);
+      const selected = await open({ multiple: true, filters: [{ name: 'PDF', extensions: ['pdf'] }] });
+      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+      if (paths.length === 1) importPaper(paths[0]);
+      else if (paths.length > 1) runFileBatch(paths).catch(() => {});
     } catch (err) { showToast(`打开文件对话框失败: ${err}`, 'warning'); }
   }, [importPaper, showToast]);
+
+  // Folder batch import: pick a directory, scan it for PDFs, import them all.
+  const selectFolderAndImport = useCallback(async () => {
+    if (!isTauri()) { showToast('仅桌面应用支持', 'warning'); return; }
+    setToast(null);
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const selected = await open({ directory: true, title: '选择要导入的文件夹（含子目录）' });
+      if (typeof selected !== 'string') return;
+      const found = await useBatchImportStore.getState().runFolder(selected);
+      if (found === 0) showToast('该文件夹（含子目录）中没有 PDF 文件', 'warning');
+    } catch (err) { showToast(`打开文件夹失败: ${err}`, 'warning'); }
+  }, [showToast]);
 
   const applyWebviewZoom = useCallback(async (next: number) => {
     zoomRef.current = Math.max(0.5, Math.min(2, next));
@@ -362,6 +392,8 @@ export function AppShell({ children }: AppShellProps) {
 
       <Dialog />
       <ImportFromLinkDialog open={importLinkOpen} onClose={() => setImportLinkOpen(false)} />
+      <ZoteroImportDialog open={importZoteroOpen} onClose={() => setImportZoteroOpen(false)} />
+      <BatchImportDialog />
       <Pet />
       <GlobalSearch onImportPdf={selectAndImport} />
     </div>

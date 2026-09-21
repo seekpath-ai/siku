@@ -244,6 +244,8 @@ export function TitleBar() {
 
   const appMenu: MenuItem[] = [
     { label: '导入 PDF...', shortcut: 'Ctrl+I', action: () => dispatch('siku:import-pdf') },
+    { label: '从文件夹导入...', action: () => dispatch('siku:import-folder') },
+    { label: '从 Zotero 导入...', action: () => dispatch('siku:import-zotero') },
     { label: '从链接导入...', action: () => dispatch('siku:import-from-link') },
     { label: '新建笔记', shortcut: 'Ctrl+N', action: handleNewNote },
     { separator: true },

@@ -18,6 +18,71 @@ export async function importPaper(filePath: string): Promise<Paper> {
   return invoke<Paper>('import_paper', { filePath });
 }
 
+// ---- Batch import (multi-select / folder / Zotero) ----
+
+/** Progress payload emitted on `library:batch-import-progress`. */
+export interface BatchImportProgress {
+  batchId: string;
+  total: number;
+  current: number;
+  file: string;
+  lastStatus: 'imported' | 'skipped' | 'failed' | null;
+  error: string | null;
+  done: boolean;
+  cancelled: boolean;
+  imported: number;
+  skipped: number;
+  failed: number;
+}
+
+export interface BatchImportSummary {
+  total: number;
+  imported: number;
+  skipped: number;
+  failed: number;
+  cancelled: boolean;
+  errors: string[];
+}
+
+export const BATCH_IMPORT_PROGRESS_EVENT = 'library:batch-import-progress';
+
+/** Recursively list PDF files under a folder. */
+export async function libraryScanFolder(path: string, recursive = true): Promise<string[]> {
+  return invoke<string[]>('library_scan_folder', { path, recursive });
+}
+
+/** Batch import local PDFs; progress arrives on BATCH_IMPORT_PROGRESS_EVENT. */
+export async function importPapersBatch(paths: string[], batchId?: string): Promise<BatchImportSummary> {
+  return invoke<BatchImportSummary>('import_papers_batch', { paths, batchId });
+}
+
+/** Stop the running batch import after the current item. */
+export async function libraryCancelBatchImport(): Promise<void> {
+  return invoke<void>('library_cancel_batch_import');
+}
+
+export interface ZoteroPreview {
+  dataDir: string;
+  items: number;
+  withPdf: number;
+  collections: number;
+  tags: number;
+}
+
+/** Default Zotero data directory (~/Zotero), if present. */
+export async function zoteroDetect(): Promise<string | null> {
+  return invoke<string | null>('zotero_detect');
+}
+
+export async function zoteroPreview(path?: string): Promise<ZoteroPreview> {
+  return invoke<ZoteroPreview>('zotero_preview', { path: path ?? null });
+}
+
+/** Import a whole Zotero library (metadata + PDFs + collection tree + tags). */
+export async function zoteroImport(path?: string): Promise<BatchImportSummary> {
+  return invoke<BatchImportSummary>('zotero_import', { path: path ?? null });
+}
+
 /** Preview metadata for a link before importing. */
 export async function previewPaperFromLink(url: string): Promise<PaperLinkMetadata> {
   return invoke<PaperLinkMetadata>('preview_paper_from_link', { url });

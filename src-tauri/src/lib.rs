@@ -656,6 +656,12 @@ pub fn run() {
             commands::greet,
             // Library
             commands::library::import_paper,
+            commands::library::import_papers_batch,
+            commands::library::library_scan_folder,
+            commands::library::library_cancel_batch_import,
+            commands::library::zotero_detect,
+            commands::library::zotero_preview,
+            commands::library::zotero_import,
             commands::library::import_file_to_library,
             commands::library::list_papers,
             commands::library::get_paper,

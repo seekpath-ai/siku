@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use tauri::State;
+use tauri::{AppHandle, State};
 use tracing::instrument;
 
+use crate::core::batch_import::{self, BatchImportSummary};
 use crate::core::models::{ListPapersParams, Paper, PaperInput};
 use crate::core::paper_service;
 use crate::file_store;
@@ -17,6 +18,80 @@ pub async fn import_paper(
     paper_service::import_paper(&state.db, &state.app_data_dir, Path::new(&file_path))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// List PDF files under a folder (recursive by default) for batch import.
+#[tauri::command]
+#[instrument(skip_all)]
+pub fn library_scan_folder(path: String, recursive: Option<bool>) -> Result<Vec<String>, String> {
+    batch_import::scan_folder_pdfs(Path::new(&path), recursive.unwrap_or(true))
+}
+
+/// Batch import local PDF files serially. Emits `library:batch-import-progress`
+/// events; duplicate content (blob hash) is skipped.
+#[tauri::command]
+#[instrument(skip(app, state))]
+pub async fn import_papers_batch(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+    batch_id: Option<String>,
+) -> Result<BatchImportSummary, String> {
+    batch_import::run_pdf_batch(
+        &app,
+        &state.db,
+        &state.app_data_dir,
+        paths,
+        batch_id.as_deref().unwrap_or("files"),
+    )
+    .await
+}
+
+/// Ask the running batch import (files / folder / Zotero) to stop after the
+/// current item.
+#[tauri::command]
+#[instrument(skip_all)]
+pub fn library_cancel_batch_import() {
+    batch_import::request_cancel();
+}
+
+/// Detect the default Zotero data directory (~/Zotero) if it holds a DB.
+#[tauri::command]
+#[instrument(skip_all)]
+pub fn zotero_detect() -> Option<String> {
+    crate::core::zotero_import::detect_zotero_dir().map(|p| p.to_string_lossy().to_string())
+}
+
+/// Scan a Zotero data directory and report what an import would see.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn zotero_preview(
+    state: State<'_, AppState>,
+    path: Option<String>,
+) -> Result<crate::core::zotero_import::ZoteroPreview, String> {
+    let dir = zotero_dir_or_default(path)?;
+    crate::core::zotero_import::preview(&dir, &state.app_data_dir).await
+}
+
+/// Import a Zotero library (metadata + PDFs + collection tree + tags) with
+/// progress events on the shared batch channel.
+#[tauri::command]
+#[instrument(skip(app, state))]
+pub async fn zotero_import(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: Option<String>,
+) -> Result<BatchImportSummary, String> {
+    let dir = zotero_dir_or_default(path)?;
+    crate::core::zotero_import::import(&app, &state.db, &state.app_data_dir, &dir).await
+}
+
+fn zotero_dir_or_default(path: Option<String>) -> Result<std::path::PathBuf, String> {
+    if let Some(p) = path.filter(|p| !p.trim().is_empty()) {
+        return Ok(std::path::PathBuf::from(p));
+    }
+    crate::core::zotero_import::detect_zotero_dir()
+        .ok_or_else(|| "未检测到 Zotero 数据目录（默认 ~/Zotero），请手动选择".to_string())
 }
 
 /// Import a vault-managed file (from the notes file list) into the paper

@@ -66,6 +66,12 @@ function fmtTime(s: string): string {
   return d.toLocaleString('zh-CN', { hour12: false });
 }
 
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 interface Props {
   sessionId: string;
   onClose: () => void;
@@ -492,6 +498,12 @@ export function TaskCenterDialog({ sessionId, onClose }: Props) {
                           <span>{fmtTime(t.created_at)}</span>
                           {t.session_id && <span className="truncate">会话 {t.session_id.slice(0, 8)}</span>}
                           {t.exit_code !== null && <span>exit {t.exit_code}</span>}
+                          {t.log_bytes != null && (
+                            <span title={t.log_modified ? `最后写入 ${fmtTime(t.log_modified)}` : undefined}>
+                              日志 {formatBytes(t.log_bytes)}
+                              {t.status === 'running' && t.log_modified && ` · ${fmtTime(t.log_modified).split(' ').pop()} 更新`}
+                            </span>
+                          )}
                         </div>
                       </div>
                       <span className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${st.cls}`}>{st.label}</span>

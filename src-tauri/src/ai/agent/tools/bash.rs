@@ -63,7 +63,10 @@ fn resolve_shell(requested: Option<&str>) -> Result<Shell, String> {
                 })?);
         }
         "sh" => {
-            return Ok(Shell::new("sh", vec!["-lc"], ""));
+            // Non-login: sh is often dash, and a login shell sources
+            // /etc/profile.d — a single bashism in a user profile kills the
+            // command with "Syntax error" before it ever runs.
+            return Ok(Shell::new("sh", vec!["-c"], ""));
         }
         "" => {} // fall through to platform defaults
         _ => return Err(format!("unsupported shell: {name}")),
@@ -76,8 +79,13 @@ fn resolve_shell(requested: Option<&str>) -> Result<Shell, String> {
             vec!["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command"],
             "[Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8;",
         ))
+    } else if find_bash().is_some() {
+        // Prefer bash (login shell, for profile PATH) over sh: bash parses
+        // the bashisms common in user profiles that break dash, and models
+        // write more reliable bash anyway.
+        Ok(Shell::new(find_bash().unwrap(), vec!["-lc"], ""))
     } else {
-        Ok(Shell::new("sh", vec!["-lc"], ""))
+        Ok(Shell::new("sh", vec!["-c"], ""))
     }
 }
 
@@ -123,7 +131,7 @@ impl BashTool {
 }
 
 fn build_description() -> String {
-    const BASE: &str = "Execute a shell command. Windows defaults to PowerShell; Unix-like systems default to sh. Use shell=bash|powershell|cmd|sh to override. Requires approval. Commands run in the working directory by default when one is set (otherwise the process cwd). run_in_background=true returns a task id immediately; otherwise waits for completion. The timeout (default 60s, max 5min) applies to background tasks too.";
+    const BASE: &str = "Execute a shell command. Windows defaults to PowerShell; Unix-like systems default to bash (falling back to sh). Use shell=bash|powershell|cmd|sh to override. Requires approval. Commands run in the working directory by default when one is set (otherwise the process cwd). run_in_background=true returns a task id immediately; otherwise waits for completion. Foreground timeout: default 60s, max 5min. Background tasks accept timeout_ms=0 to disable the timeout entirely (long builds, watchers, servers).";
     // LLMs write far more reliable bash than PowerShell; when Git Bash is
     // installed, say so and steer Unix-style work to it instead of keeping
     // bash as a fallback the model never thinks to use.
@@ -131,6 +139,76 @@ fn build_description() -> String {
         format!("{BASE} Git Bash IS available on this machine: prefer shell=bash for Unix-style work (pipes, grep/sed/awk, globbing, file inspection); use PowerShell only for Windows-specific tasks (registry, services, WMI, systeminfo).")
     } else {
         BASE.to_string()
+    }
+}
+
+/// stdbuf (GNU coreutils) LD_PRELOADs libstdbuf into the shell, and the
+/// preload + env propagate to dynamically-linked descendants — forcing
+/// line-buffered stdout/stderr. Without it, output of a redirected (non-TTY)
+/// process sits in a 4–8KB block buffer and is LOST when the task is killed
+/// before flush: the classic "background task log is empty" bug.
+#[cfg(unix)]
+fn stdbuf_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new("stdbuf")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Build the command for a shell invocation, applying the shared process
+/// setup: unbuffered-output env hints, a dedicated Unix process group (so
+/// stop/timeout can kill the whole tree), and the stdbuf wrapper.
+fn build_command(shell: &Shell, command: &str) -> Command {
+    #[cfg(unix)]
+    let mut cmd = if stdbuf_available() {
+        // stdbuf execs the shell, so the pid (and process group) is unchanged.
+        let mut c = Command::new("stdbuf");
+        c.arg("-oL").arg("-eL").arg(&shell.program);
+        c
+    } else {
+        Command::new(&shell.program)
+    };
+    #[cfg(not(unix))]
+    let mut cmd = Command::new(&shell.program);
+
+    for arg in &shell.args {
+        cmd.arg(arg);
+    }
+    cmd.arg(command);
+    // Unbuffered-output hints for runtimes that read them (stdbuf can't
+    // reach interpreters that manage their own buffering).
+    cmd.env("PYTHONUNBUFFERED", "1");
+    cmd.env("PYTHONIOENCODING", "utf-8");
+    // Own process group on Unix: pgid == child pid, so stop/timeout can
+    // SIGKILL the whole tree instead of orphaning the shell's children.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd
+}
+
+/// Kill the whole process tree of a spawned child. `Child::kill` only
+/// terminates the shell itself; its children would survive as orphans and
+/// keep writing to the log after the task already reads "stopped".
+fn kill_process_tree(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    #[cfg(unix)]
+    {
+        // process_group(0) at spawn ⇒ pgid == pid. The `--` is required:
+        // without it kill(1) parses "-<pgid>" as options and does nothing.
+        let _ = std::process::Command::new("kill")
+            .args(["-9", "--", &format!("-{pid}")])
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .status();
     }
 }
 
@@ -161,7 +239,7 @@ impl Tool for BashTool {
             ToolParameter {
                 name: "timeout_ms".into(),
                 param_type: "integer".into(),
-                description: "Timeout in milliseconds (default 60000, max 300000)".into(),
+                description: "Timeout in milliseconds (default 60000, max 300000; background tasks accept 0 = no timeout)".into(),
                 required: false,
             },
             ToolParameter {
@@ -193,11 +271,7 @@ impl Tool for BashTool {
         // Force the console to UTF-8 (no-op prefix on bash/sh).
         let command = format!("{}{}", shell.utf8_prefix, command);
 
-        let mut cmd = Command::new(&shell.program);
-        for arg in &shell.args {
-            cmd.arg(arg);
-        }
-        cmd.arg(&command);
+        let mut cmd = build_command(&shell, &command);
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         // Explicit cwd: fail loudly — the caller asked for that directory.
@@ -227,12 +301,19 @@ impl Tool for BashTool {
             return self.run_background(&mut cmd, &args, cwd_fallback).await;
         }
 
-        // Foreground: capture output with a hard timeout.
-        let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1_000, MAX_TIMEOUT_MS);
+        // Foreground: capture output with a hard timeout. timeout_ms=0 means
+        // "no timeout" for background tasks only; foreground treats it as
+        // "default" (a 1s clamp would surprise the caller).
+        let timeout_ms = args["timeout_ms"]
+            .as_u64()
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .clamp(1_000, MAX_TIMEOUT_MS);
         let timeout = std::time::Duration::from_millis(timeout_ms);
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+        let child_pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
@@ -278,7 +359,10 @@ impl Tool for BashTool {
                 Ok(msg)
             }
             Err(_) => {
-                // kill_on_drop terminates the child when `run` is dropped.
+                // kill_on_drop terminates the shell when `run` is dropped;
+                // sweep the rest of the tree so spawned children don't
+                // survive the timeout as orphans.
+                kill_process_tree(child_pid);
                 let mut msg = format!("Command timed out after {timeout_ms}ms");
                 if let Some(w) = cwd_fallback {
                     msg = format!("[warning: {w}]\n{msg}");
@@ -315,6 +399,9 @@ impl BashTool {
             output_path: Some(log_path.to_string_lossy().to_string()),
             session_id: self.session_id.clone(),
             created_at: crate::core::time::now_iso(),
+            // Filled live at snapshot time.
+            log_bytes: None,
+            log_modified: None,
         };
         self.tasks.lock().await.insert(
             id.clone(),
@@ -328,22 +415,28 @@ impl BashTool {
         let cancel2 = cancel.clone();
         let log_path2 = log_path.clone();
         let task_id = id.clone();
-        // Background tasks honor the same timeout as foreground ones
-        // (default 60s, max 5min): kill the process and mark the log.
-        let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(DEFAULT_TIMEOUT_MS).clamp(1_000, MAX_TIMEOUT_MS);
+        // Background tasks are for long-running work: timeout_ms=0 disables
+        // the timeout entirely; an explicit value keeps the 5min cap; absent
+        // means the 60s default (foreground semantics, least surprise).
+        let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(DEFAULT_TIMEOUT_MS);
+        let deadline = (timeout_ms > 0).then(|| {
+            std::time::Instant::now()
+                + std::time::Duration::from_millis(timeout_ms.clamp(1_000, MAX_TIMEOUT_MS))
+        });
         tokio::spawn(async move {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
             let mut timed_out = false;
             // Watch for cancellation, timeout, or completion.
             loop {
                 if cancel2.load(Ordering::Relaxed) {
-                    let _ = child.kill().await;
+                    kill_process_tree(child.id());
                     break;
                 }
-                if std::time::Instant::now() >= deadline {
-                    timed_out = true;
-                    let _ = child.kill().await;
-                    break;
+                if let Some(deadline) = deadline {
+                    if std::time::Instant::now() >= deadline {
+                        timed_out = true;
+                        kill_process_tree(child.id());
+                        break;
+                    }
                 }
                 if let Ok(Some(_)) = child.try_wait() {
                     break;
@@ -361,6 +454,8 @@ impl BashTool {
             }
             let status_str = if stopped {
                 "stopped"
+            } else if timed_out {
+                "timed_out"
             } else if status.map(|s| s.success()).unwrap_or(false) {
                 "completed"
             } else {
@@ -433,5 +528,38 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("working directory error"), "{err}");
         assert!(err.contains("no-such-dir"), "error must name the path: {err}");
+    }
+
+    /// A background task past its timeout must end as `timed_out` (not
+    /// `failed`), with the marker appended to the log.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_timeout_marks_timed_out() {
+        let tasks: TaskStore = Default::default();
+        let tool = BashTool::new(tasks.clone(), std::env::temp_dir(), None);
+        let out = tool
+            .execute(serde_json::json!({
+                "command": "sleep 30",
+                "run_in_background": true,
+                "timeout_ms": 1000,
+                "shell": "sh",
+            }))
+            .await
+            .expect("background spawn");
+        let id = out.split('`').nth(1).expect("task id in response").to_string();
+        // Poll until the watcher finishes (timeout 1s + poll interval).
+        let mut status = String::new();
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let map = tasks.lock().await;
+            if let Some(h) = map.get(&id) {
+                status = h.info.status.clone();
+            }
+            drop(map);
+            if status != "running" {
+                break;
+            }
+        }
+        assert_eq!(status, "timed_out", "task must end as timed_out");
     }
 }

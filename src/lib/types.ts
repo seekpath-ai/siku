@@ -232,6 +232,9 @@ export interface TaskInfo {
   output_path: string | null;
   created_at: string;
   session_id: string | null;
+  /** Log file size / last-write time (filled at snapshot time). */
+  log_bytes?: number | null;
+  log_modified?: string | null;
 }
 
 /** A structured question the agent asks the user (AskUserQuestion). */

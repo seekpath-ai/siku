@@ -64,8 +64,6 @@ interface LibraryState {
   setJournalFilter: (v: string) => void;
   setStatusFilter: (s: 'all' | 'favorites' | 'unread') => void;
   clearAdvancedFilters: () => void;
-  /** Apply a saved search: its params set search + advanced filters. */
-  applySavedSearch: (paramsJson: string) => void;
   setSortBy: (field: SortField) => void;
   setSortOrder: (order: SortOrder) => void;
   toggleSort: (field: SortField) => void;
@@ -163,31 +161,6 @@ export const useLibraryStore = create<LibraryState>()(
       setStatusFilter: (s) => set({ statusFilter: s }),
       clearAdvancedFilters: () =>
         set({ yearFrom: '', yearTo: '', journalFilter: '', statusFilter: 'all' }),
-      applySavedSearch: (paramsJson) => {
-        try {
-          const p = JSON.parse(paramsJson) as {
-            search?: string;
-            year_from?: number;
-            year_to?: number;
-            journal?: string;
-            read_status?: string;
-            is_favorite?: boolean;
-          };
-          set({
-            searchQuery: p.search ?? '',
-            yearFrom: p.year_from != null ? String(p.year_from) : '',
-            yearTo: p.year_to != null ? String(p.year_to) : '',
-            journalFilter: p.journal ?? '',
-            statusFilter:
-              p.is_favorite ? 'favorites' : p.read_status === 'unread' ? 'unread' : 'all',
-            activeFilter: { type: 'all', tagIds: [], tagLogic: 'or' },
-            selectedPaperIds: [],
-            lastSelectedId: null,
-          });
-        } catch {
-          // Ignore malformed saved params.
-        }
-      },
       setSortBy: (field) => set({ sortBy: field }),
       setSortOrder: (order) => set({ sortOrder: order }),
       toggleSort: (field) => {

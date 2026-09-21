@@ -20,7 +20,6 @@ import {
   Copy,
   Star,
   Filter,
-  BookmarkPlus,
   BookMarked,
   Download,
   ChevronDown,
@@ -62,7 +61,6 @@ import {
   openPaperInSystem,
   revealPaperInSystem,
   paperExport,
-  savedSearchesCreate,
   notesList,
   paperImportBibtex,
   paperReprocessIndex,
@@ -78,7 +76,7 @@ type SortField = 'title' | 'year' | 'imported_at' | 'updated_at' | 'last_read_at
 /** Toggleable paper-list columns (the title column is always visible).
  *  Order matches the row layout. Date columns are ordered by display
  *  priority: 最后阅读 > 修改日期 > 导入日期. */
-type ColumnKey = 'authors' | 'year' | 'journal' | 'pages' | 'lastRead' | 'modified' | 'date';
+type ColumnKey = 'title' | 'authors' | 'year' | 'journal' | 'pages' | 'lastRead' | 'modified' | 'date';
 
 const COLUMN_DEFS: { key: ColumnKey; label: string }[] = [
   { key: 'authors', label: '作者' },
@@ -112,13 +110,14 @@ function autoHiddenColumns(width: number): Set<ColumnKey> {
   return new Set();
 }
 
-/** Default / minimum widths (px) for the resizable secondary columns.
- *  Title always takes the remaining space (flex-1). */
+/** Default / minimum widths (px) for the resizable columns. Title is a fixed
+ *  column like the rest (Zotero-style); a trailing flex spacer absorbs any
+ *  leftover width. */
 const DEFAULT_COL_WIDTHS: Record<ColumnKey, number> = {
-  authors: 128, year: 64, journal: 144, pages: 56, lastRead: 144, modified: 144, date: 144,
+  title: 360, authors: 128, year: 64, journal: 144, pages: 56, lastRead: 144, modified: 144, date: 144,
 };
 const MIN_COL_WIDTHS: Record<ColumnKey, number> = {
-  authors: 56, year: 44, journal: 56, pages: 40, lastRead: 96, modified: 96, date: 96,
+  title: 96, authors: 56, year: 44, journal: 56, pages: 40, lastRead: 96, modified: 96, date: 96,
 };
 
 /** Header cell config, in row order. `sortField` marks click-to-sort
@@ -144,7 +143,7 @@ function colWidthOf(columnWidths: Record<string, number>, key: ColumnKey): numbe
 }
 
 function SortIcon({ field, current, order }: { field: SortField; current: SortField; order: 'asc' | 'desc' }) {
-  if (field !== current) return <span className="w-3.5" />;
+  if (field !== current) return <span className="inline-block w-3.5" />;
   return order === 'asc' ? <ChevronUp size={14} /> : <ChevronDown size={14} />;
 }
 
@@ -654,7 +653,7 @@ function PaperRow({
           {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         </button>
 
-        <div className="flex-1 min-w-24">
+        <div className="shrink-0 min-w-0" style={{ width: colWidthOf(columnWidths, 'title') }}>
           <div className="flex items-center gap-2">
             {paper.read_status === 'unread' && (
               <span className="w-1.5 h-1.5 rounded-full bg-primary shrink-0" title="未读" />
@@ -719,6 +718,10 @@ function PaperRow({
             {paper.imported_at ? isoToDisplayFull(paper.imported_at) : '—'}
           </div>
         )}
+
+        {/* Trailing spacer: absorbs leftover width now that every column is
+            fixed-width (Zotero-style). */}
+        <div className="flex-1" />
       </div>
 
       {expanded && <PaperChildren paper={paper} />}
@@ -741,14 +744,12 @@ export function PaperList() {
   const setViewMode = useLibraryStore((s) => s.setViewMode);
   const selectPaper = useLibraryStore((s) => s.selectPaper);
   const clearSelection = useLibraryStore((s) => s.clearSelection);
-  const setActiveFilter = useLibraryStore((s) => s.setActiveFilter);
   const deleteMutation = useDeletePaper();
   const favoriteMutation = usePaperSetFavorite();
   const readStatusMutation = usePaperSetReadStatus();
   const navigate = useNavigate();
-  const { confirm, prompt, alert } = useDialog();
+  const { confirm } = useDialog();
   const { data: collections } = useCollections();
-  const queryClient = useQueryClient();
   const listRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
   const [headerHeight, setHeaderHeight] = useState(33);
@@ -784,26 +785,6 @@ export function PaperList() {
     },
     [readStatusMutation]
   );
-
-  const handleSaveSearch = async () => {
-    const name = await prompt('保存当前搜索，输入名称：', { title: '保存搜索', placeholder: '例如：2024-2026 机器学习' });
-    if (!name) return;
-    const params = {
-      search: searchQuery || undefined,
-      year_from: yearFrom ? Number(yearFrom) : undefined,
-      year_to: yearTo ? Number(yearTo) : undefined,
-      journal: journalFilter || undefined,
-      read_status: statusFilter === 'unread' ? 'unread' : undefined,
-      is_favorite: statusFilter === 'favorites' ? true : undefined,
-    };
-    try {
-      await savedSearchesCreate(name.trim(), JSON.stringify(params));
-      queryClient.invalidateQueries({ queryKey: ['saved-searches'] });
-      await alert('已保存搜索', '保存搜索');
-    } catch (err) {
-      await alert(`保存搜索失败: ${err}`, '保存搜索');
-    }
-  };
 
   const params: ListPapersParams = useMemo(() => {
     const base: ListPapersParams = {
@@ -878,7 +859,9 @@ export function PaperList() {
   const columnMenuItems: ContextMenuItem[] = COLUMN_DEFS.map((col) => ({
     label: col.label,
     icon: hiddenColumns.includes(col.key) ? (
-      <span className="w-3.5" />
+      // inline-block: a bare span is inline, so w-3.5 collapsed to zero and
+      // unchecked menu items shifted left vs the checked ones.
+      <span className="inline-block w-3.5" />
     ) : (
       <Check size={14} className="text-primary" />
     ),
@@ -886,19 +869,24 @@ export function PaperList() {
   }));
 
   /** Drag-to-resize a column header (Zotero-style). Double-clicking the
-   *  handle resets to the default width. */
+   *  handle resets to the default width. While dragging, a live vertical
+   *  guide line tracks the cursor across the whole list. */
+  const [resizeGuide, setResizeGuide] = useState<{ x: number; top: number; height: number } | null>(null);
   const startColumnResize = (e: React.MouseEvent, key: ColumnKey) => {
     e.preventDefault();
     e.stopPropagation();
     const startX = e.clientX;
     const startWidth = colWidthOf(columnWidths, key);
     const minW = MIN_COL_WIDTHS[key];
+    const rect = listRef.current?.getBoundingClientRect();
     const onMove = (ev: MouseEvent) => {
       setColumnWidth(key, Math.max(minW, Math.round(startWidth + ev.clientX - startX)));
+      if (rect) setResizeGuide({ x: ev.clientX, top: rect.top, height: rect.height });
     };
     const onUp = () => {
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
+      setResizeGuide(null);
     };
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
@@ -1074,16 +1062,6 @@ export function PaperList() {
           <Filter size={14} />
         </button>
 
-        {activeFilter.type !== 'trash' && (
-          <button
-            onClick={handleSaveSearch}
-            title="保存当前搜索"
-            className="h-8 px-2.5 flex items-center justify-center rounded-lg bg-surface border border-surface-hover text-text-secondary hover:text-text-primary transition-colors"
-          >
-            <BookmarkPlus size={14} />
-          </button>
-        )}
-
         <div className="relative shrink-0" ref={importMenuRef}>
           <button
             onClick={() => setImportMenuOpen((o) => !o)}
@@ -1208,31 +1186,10 @@ export function PaperList() {
         </div>
       )}
 
-      {/* Active filter breadcrumb */}
-      {(activeFilter.type === 'collection' || activeFilter.type === 'recent' || activeFilter.tagIds.length > 0) && (
-        <div className="flex items-center gap-2 px-3 py-1.5 border-b border-surface-hover text-xs text-text-secondary bg-surface/20 shrink-0">
-          <span className="opacity-60">当前筛选：</span>
-          {activeFilter.type === 'collection' && (
-            <span className="px-2 py-0.5 rounded-full bg-primary/10 text-primary">
-              {collections?.find((c) => c.id === activeFilter.id)?.name ?? '集合'}
-            </span>
-          )}
-          {activeFilter.type === 'recent' && (
-            <span className="px-2 py-0.5 rounded-full bg-primary/10 text-primary">最近阅读</span>
-          )}
-          {activeFilter.tagIds.length > 0 && (
-            <span className="px-2 py-0.5 rounded-full bg-primary/10 text-primary">
-              标签 ×{activeFilter.tagIds.length}（{activeFilter.tagLogic === 'and' ? '全部' : '任一'}）
-            </span>
-          )}
-          <button
-            onClick={() => setActiveFilter({ type: 'all', tagIds: [], tagLogic: 'or' })}
-            className="hover:text-text-primary underline"
-          >
-            清除
-          </button>
-        </div>
-      )}
+      {/* Active-filter breadcrumb removed: the selected node in the left
+          collection tree is already highlighted (Zotero convention — the tree
+          selection IS the filter indicator), so the banner was duplicate
+          information occupying a permanent row. */}
 
       {/* Content */}
       {isLoading ? (
@@ -1289,15 +1246,34 @@ export function PaperList() {
             }}
           >
             <div className="w-5 shrink-0" />
-            {activeFilter.type === 'recent' ? (
-              <div className="flex-1 min-w-24 flex items-center gap-1">
-                <FileText size={12} /> 标题
-              </div>
-            ) : (
-              <button onClick={() => toggleSort('title')} className="flex-1 min-w-24 flex items-center gap-1 text-left hover:text-text-secondary">
-                <FileText size={12} /> 标题 <SortIcon field="title" current={sortBy} order={sortOrder} />
-              </button>
-            )}
+            {/* Title is a fixed-width resizable column like the others; the
+                trailing spacer at the end of the row absorbs leftover width. */}
+            <div
+              className="relative shrink-0 flex items-center min-w-0"
+              style={{ width: colWidthOf(columnWidths, 'title') }}
+            >
+              {activeFilter.type === 'recent' ? (
+                <div className="flex-1 min-w-0 flex items-center gap-1">
+                  <FileText size={12} /> 标题
+                </div>
+              ) : (
+                <button onClick={() => toggleSort('title')} className="flex-1 min-w-0 flex items-center gap-1 text-left hover:text-text-secondary">
+                  <FileText size={12} /> <span className="truncate">标题</span> <SortIcon field="title" current={sortBy} order={sortOrder} />
+                </button>
+              )}
+              <span
+                onMouseDown={(e) => startColumnResize(e, 'title')}
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  resetColumnWidth('title');
+                }}
+                onClick={(e) => e.stopPropagation()}
+                className="group absolute -right-1.5 top-0 bottom-0 w-3 z-10 cursor-col-resize touch-none"
+                title="拖动调整列宽，双击恢复默认"
+              >
+                <span className="absolute left-1/2 top-0 bottom-0 -translate-x-1/2 w-px bg-text-secondary/20 transition-all group-hover:w-0.5 group-hover:bg-primary/70" />
+              </span>
+            </div>
             {HEADER_COLS.filter((c) => visibleColumns.has(c.key)).map((col) => {
               const sortable = col.sortField && activeFilter.type !== 'recent';
               const alignCls =
@@ -1330,12 +1306,19 @@ export function PaperList() {
                       resetColumnWidth(col.key);
                     }}
                     onClick={(e) => e.stopPropagation()}
-                    className="absolute -right-1.5 top-0 bottom-0 w-3 z-10 cursor-col-resize touch-none rounded hover:bg-primary/30"
+                    className="group absolute -right-1.5 top-0 bottom-0 w-3 z-10 cursor-col-resize touch-none"
                     title="拖动调整列宽，双击恢复默认"
-                  />
+                  >
+                    {/* Resting-state 1px divider (Zotero-style); thickens and
+                        tints on hover. Without this the hit area was invisible
+                        until hovered — a 30% wash over 12px read as nothing. */}
+                    <span className="absolute left-1/2 top-0 bottom-0 -translate-x-1/2 w-px bg-text-secondary/20 transition-all group-hover:w-0.5 group-hover:bg-primary/70" />
+                  </span>
                 </div>
               );
             })}
+            {/* Trailing spacer — mirrors the row layout (all columns fixed). */}
+            <div className="flex-1" />
           </div>
 
           {/* Rows (virtualized — only viewport rows are mounted) */}
@@ -1385,6 +1368,14 @@ export function PaperList() {
               );
             })}
           </div>
+          {/* Live guide line while drag-resizing a column (Zotero-style):
+              fixed-position so it never scrolls with the list. */}
+          {resizeGuide && (
+            <div
+              className="fixed w-px bg-primary/70 z-[60] pointer-events-none"
+              style={{ left: resizeGuide.x, top: resizeGuide.top, height: resizeGuide.height }}
+            />
+          )}
         </div>
       ) : (
         <div className="flex-1 overflow-y-auto p-4" onClick={clearSelection}>
@@ -1407,6 +1398,15 @@ export function PaperList() {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Status bar (Zotero-style): item count for the current view, plus the
+          selection count when one exists. */}
+      {!isLoading && !isError && papers && (
+        <div className="flex items-center justify-end gap-3 px-3 py-1 border-t border-surface-hover text-[11px] text-text-secondary/60 shrink-0 tabular-nums">
+          {selectedIds.length > 0 && <span>已选中 {selectedIds.length} 条</span>}
+          <span>共 {papers.length} 条</span>
         </div>
       )}
 

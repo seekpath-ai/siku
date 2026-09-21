@@ -9,13 +9,9 @@ import {
   Trash2,
   Edit3,
   Palette,
-  Search,
-  X,
   Clock,
 } from 'lucide-react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useCollections, useCreateCollection, useUpdateCollection, useDeleteCollection, useAddPapersToCollection, useTags, useCreateTag, useDeleteTag, useUpdateTag } from '@/hooks/useLibrary';
-import { savedSearchesList, savedSearchesDelete } from '@/lib/tauri';
 import { useLibraryStore } from '@/stores/libraryStore';
 import { useDialog } from '@/hooks/useDialog';
 import type { Collection, Tag as TagType } from '@/lib/types';
@@ -277,19 +273,6 @@ export function CollectionTree() {
   const { prompt, confirm } = useDialog();
 
   const activeFilter = useLibraryStore((s) => s.activeFilter);
-  const applySavedSearch = useLibraryStore((s) => s.applySavedSearch);
-  const queryClient = useQueryClient();
-  const { data: savedSearches = [], isLoading: savedSearchesLoading } = useQuery({
-    queryKey: ['saved-searches'],
-    queryFn: () => savedSearchesList(),
-  });
-  const deleteSavedSearch = useCallback(
-    async (id: string) => {
-      await savedSearchesDelete(id).catch(() => {});
-      queryClient.invalidateQueries({ queryKey: ['saved-searches'] });
-    },
-    [queryClient]
-  );
   const setActiveCollection = useLibraryStore((s) => s.setActiveCollection);
   const toggleActiveTag = useLibraryStore((s) => s.toggleActiveTag);
   const setTagFilterLogic = useLibraryStore((s) => s.setTagFilterLogic);
@@ -526,36 +509,10 @@ export function CollectionTree() {
         )}
       </div>
 
-      {/* Saved searches */}
-      <div className="border-t border-surface-hover px-2 py-2 shrink-0 max-h-40 overflow-y-auto">
-        <div className="px-2 pb-1">
-          <span className="text-[11px] uppercase tracking-wide text-text-secondary/50">保存的搜索</span>
-        </div>
-        {savedSearchesLoading ? (
-          <div className="px-2 py-1 text-xs text-text-secondary/60">加载中...</div>
-        ) : savedSearches.length === 0 ? (
-          <div className="px-2 py-1 text-xs text-text-secondary/40">在搜索栏保存常用搜索</div>
-        ) : (
-          savedSearches.map((s) => (
-            <div key={s.id} className="group flex items-center">
-              <button
-                onClick={() => applySavedSearch(s.params_json)}
-                className="flex-1 text-left flex items-center gap-2 px-2 py-1 rounded text-xs text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors"
-              >
-                <Search size={12} className="shrink-0" />
-                <span className="truncate">{s.name}</span>
-              </button>
-              <button
-                onClick={() => deleteSavedSearch(s.id)}
-                className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-text-secondary/50 hover:text-red-400"
-                title="删除保存的搜索"
-              >
-                <X size={12} />
-              </button>
-            </div>
-          ))
-        )}
-      </div>
+      {/* Saved searches were removed: they were a filter-param snapshot, not
+          Zotero's rule engine, and the simple filters don't justify the
+          permanent sidebar section. The saved_searches table and any existing
+          rows are untouched. */}
 
       {/* Draggable divider between the collection tree and the tags section */}
       <ResizeHandle

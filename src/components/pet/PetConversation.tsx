@@ -9,7 +9,7 @@ import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors,
 import { usePetStore } from '@/stores/petStore';
 import type { PetContext } from '@/stores/petContextStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
-import { agentCancel, getChatMessages, getAgentSteps, notesCreate, noteCreateUnderPaper, readImageFile, settingsAppGet, settingsGet, settingsSet } from '@/lib/tauri';
+import { agentCancel, agentIsRunning, getChatMessages, getAgentSteps, notesCreate, noteCreateUnderPaper, readImageFile, settingsAppGet, settingsGet, settingsSet } from '@/lib/tauri';
 import { parseEvidence, buildNoteMarkdown } from '@/lib/evidence';
 import type { EvidenceEntry } from '@/lib/evidence';
 import { MarkdownCode, MarkdownPre } from '@/components/chat/CodeBlock';
@@ -613,6 +613,25 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
     onReasoning: onPetReasoning,
     onEvent: onPetEvent,
   });
+
+  // Heal a stale streaming flag when (re)attaching to a session. Minimizing
+  // the panel unmounts this component (Pet.tsx renders null when closed), so
+  // a turn that finishes while the panel is hidden leaves `streaming` stuck
+  // at true with the cancel token long gone — the stop button shows but does
+  // nothing (and the page-context rebind stays blocked by the same flag).
+  // The reverse also happens: reattaching to a session whose turn is still
+  // running must re-arm the stop button immediately instead of waiting for
+  // the next stream event. Mirrors the ChatPanel reconciliation.
+  useEffect(() => {
+    if (!petSessionId) return;
+    agentIsRunning(petSessionId)
+      .then((running) => {
+        const st = usePetStore.getState();
+        if (st.session?.id !== petSessionId) return; // switched again meanwhile
+        if (st.streaming !== running) st.setStreaming(running);
+      })
+      .catch(() => {});
+  }, [petSessionId]);
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior) => {
     bottomRef.current?.scrollIntoView({ behavior });

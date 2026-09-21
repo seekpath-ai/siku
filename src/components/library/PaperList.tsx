@@ -74,8 +74,9 @@ import type { Paper, ListPapersParams, Note, Collection } from '@/lib/types';
 type SortField = 'title' | 'year' | 'imported_at' | 'updated_at' | 'last_read_at';
 
 /** Toggleable paper-list columns (the title column is always visible).
- *  Order matches the row layout. Date columns are ordered by display
- *  priority: 最后阅读 > 修改日期 > 导入日期. */
+ *  Order matches the row layout. Hidden columns come only from the user's
+ *  manual choices in the header context menu — there is no width-based
+ *  auto-hide; narrow lists scroll horizontally instead (Zotero-style). */
 type ColumnKey = 'title' | 'authors' | 'year' | 'journal' | 'pages' | 'lastRead' | 'modified' | 'date';
 
 const COLUMN_DEFS: { key: ColumnKey; label: string }[] = [
@@ -87,28 +88,6 @@ const COLUMN_DEFS: { key: ColumnKey; label: string }[] = [
   { key: 'modified', label: '修改日期' },
   { key: 'date', label: '导入日期' },
 ];
-
-/** Container-width thresholds: below `below` px the listed columns
- * auto-hide (least valuable first), so the title column is squeezed last.
- * Applied cumulatively — the first matching (narrowest) band wins.
- * Date columns hide in reverse display priority: 导入日期 → 修改日期 →
- * 最后阅读. */
-const AUTO_HIDE_BANDS: { below: number; keys: ColumnKey[] }[] = [
-  { below: 460, keys: ['pages', 'journal', 'date', 'modified', 'authors', 'lastRead'] },
-  { below: 580, keys: ['pages', 'journal', 'date', 'modified', 'authors'] },
-  { below: 700, keys: ['pages', 'journal', 'date', 'modified'] },
-  { below: 800, keys: ['pages', 'journal', 'date'] },
-  { below: 920, keys: ['pages', 'journal'] },
-  { below: 1020, keys: ['pages'] },
-];
-
-function autoHiddenColumns(width: number): Set<ColumnKey> {
-  if (width <= 0) return new Set(); // not measured yet — show everything
-  for (const band of AUTO_HIDE_BANDS) {
-    if (width < band.below) return new Set(band.keys);
-  }
-  return new Set();
-}
 
 /** Default / minimum widths (px) for the resizable columns. Title is a fixed
  *  column like the rest (Zotero-style); a trailing flex spacer absorbs any
@@ -760,7 +739,6 @@ export function PaperList() {
   const columnWidths = useLibraryStore((s) => s.columnWidths);
   const setColumnWidth = useLibraryStore((s) => s.setColumnWidth);
   const resetColumnWidth = useLibraryStore((s) => s.resetColumnWidth);
-  const [listWidth, setListWidth] = useState(0);
   const [colMenu, setColMenu] = useState<{ x: number; y: number } | null>(null);
 
   const yearFrom = useLibraryStore((s) => s.yearFrom);
@@ -823,19 +801,7 @@ export function PaperList() {
     setFocusedIndex(-1);
   }, [paperIds.join(',')]);
 
-  // Measure the list container: column auto-hide reacts to the LIST width,
-  // not the viewport — side panels resize independently of the window.
-  useEffect(() => {
-    const el = listRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver((entries) => {
-      setListWidth(entries[0].contentRect.width);
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [viewMode, papers?.length]);
-
-  // Track the sticky header's height so virtualized scroll-into-view leaves
+  // Measure the sticky header's height so virtualized scroll-into-view leaves
   // clearance for it (scrollPaddingStart).
   useEffect(() => {
     const el = headerRef.current;
@@ -847,14 +813,15 @@ export function PaperList() {
     return () => ro.disconnect();
   }, [viewMode, papers?.length]);
 
-  /** Columns actually rendered: manually hidden columns and columns
-   * auto-hidden because the list got too narrow are both excluded. */
+  /** Columns actually rendered: only manually hidden columns are excluded.
+   *  (The old width-based auto-hide was removed — with all columns fixed
+   *  width the container scrolls horizontally instead, like Zotero, and the
+   *  header menu's checkmarks always match what's on screen.) */
   const visibleColumns = useMemo<Set<ColumnKey>>(() => {
-    const auto = autoHiddenColumns(listWidth);
     return new Set(
-      COLUMN_DEFS.map((c) => c.key).filter((k) => !auto.has(k) && !hiddenColumns.includes(k))
+      COLUMN_DEFS.map((c) => c.key).filter((k) => !hiddenColumns.includes(k))
     );
-  }, [listWidth, hiddenColumns]);
+  }, [hiddenColumns]);
 
   const columnMenuItems: ContextMenuItem[] = COLUMN_DEFS.map((col) => ({
     label: col.label,
@@ -1237,7 +1204,7 @@ export function PaperList() {
           {/* Column headers (right-click to show/hide columns) */}
           <div
             ref={headerRef}
-            className="sticky top-0 z-10 flex items-center gap-2 px-3 py-2 border-b border-surface-hover bg-surface/80 backdrop-blur text-xs text-text-secondary/70"
+            className="sticky top-0 z-10 flex items-center gap-2 px-3 py-2 border-b border-surface-hover bg-surface/80 backdrop-blur text-xs text-text-secondary/70 w-max min-w-full"
             onClick={(e) => e.stopPropagation()}
             onContextMenu={(e) => {
               e.preventDefault();
@@ -1335,7 +1302,12 @@ export function PaperList() {
                     position: 'absolute',
                     top: 0,
                     left: 0,
-                    width: '100%',
+                    // Fit the row's own column width so the selection/hover
+                    // background spans the full scrollable width, but never
+                    // shrink below the container (then the trailing spacer
+                    // fills the slack instead).
+                    width: 'max-content',
+                    minWidth: '100%',
                     transform: `translateY(${vi.start}px)`,
                   }}
                 >

@@ -6,6 +6,7 @@ pub mod citation_export;
 pub mod collection_service;
 pub mod cron_scheduler;
 pub mod db;
+pub mod document_text;
 pub mod error;
 pub mod file_item_service;
 pub mod file_service;

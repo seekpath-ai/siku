@@ -1124,6 +1124,14 @@ export async function readTextFile(path: string): Promise<string> {
   return invoke<string>('read_text_file', { path });
 }
 
+/** Read any document (PDF/office/text, any extension/encoding) as text for
+ *  chat context. Oversized extractions are cached under cacheDir (session
+ *  working dir when set) and the returned text carries a continuation
+ *  pointer the agent can follow with file_read. */
+export async function readDocumentFile(path: string, cacheDir?: string): Promise<string> {
+  return invoke<string>('read_document_file', { path, cacheDir });
+}
+
 /** Write text content to a file at an absolute path (export flows). */
 export async function saveTextFile(path: string, content: string): Promise<void> {
   return invoke<void>('save_text_file', { path, content });

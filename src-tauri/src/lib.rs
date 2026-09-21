@@ -843,6 +843,7 @@ pub fn run() {
             commands::file_browser::file_browser_open_in_system,
             commands::file_browser::file_browser_reveal_in_system,
             commands::file_browser::read_text_file,
+            commands::file_browser::read_document_file,
             commands::file_browser::save_text_file,
             // Image cache
             commands::image_cache::cache_remote_image,

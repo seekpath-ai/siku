@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { Send, Paperclip, ImagePlus, BookOpen, Brain, Square, X, FileText, Scissors } from 'lucide-react';
 import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
-import { agentSendMessage, agentCancel, readTextFile, readImageFile, agentMemoryGet, agentGetSession, agentSetApprovalConfig } from '@/lib/tauri';
+import { agentSendMessage, agentCancel, readDocumentFile, readImageFile, agentMemoryGet, agentGetSession, agentSetApprovalConfig } from '@/lib/tauri';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
 import { useDialog } from '@/hooks/useDialog';
 import { useImageAttachments } from '@/hooks/useImageAttachments';
@@ -24,7 +24,9 @@ interface TextAttachment {
   content: string;
 }
 
-const TEXT_FILTERS = [
+const DOCUMENT_FILTERS = [
+  { name: '所有文件', extensions: ['*'] },
+  { name: '文档', extensions: ['pdf', 'docx', 'xlsx', 'pptx'] },
   { name: '文本文件', extensions: ['txt', 'md', 'json', 'ts', 'tsx', 'js', 'rs', 'py', 'css', 'html', 'yml', 'yaml', 'toml', 'csv', 'xml'] },
 ];
 
@@ -94,19 +96,31 @@ export function MessageInput({ disabled }: Props) {
     try {
       const { open } = await import('@tauri-apps/plugin-dialog');
       const selected = await open({
-        multiple: false,
+        multiple: true,
         directory: false,
         defaultPath: activeProject?.path,
-        filters: TEXT_FILTERS,
+        filters: DOCUMENT_FILTERS,
       });
-      if (selected && typeof selected === 'string') {
-        const content = await readTextFile(selected);
-        const name = selected.split(/[\\/]/).pop() || selected;
-        setTextAttachments((prev) =>
-          prev.some((a) => a.path === selected)
-            ? prev
-            : [...prev, { kind: 'text', id: `txt_${Date.now()}`, path: selected, name, content }]
-        );
+      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+      const failures: string[] = [];
+      for (const path of paths) {
+        if (typeof path !== 'string') continue;
+        const name = path.split(/[\\/]/).pop() || path;
+        try {
+          // cacheDir = session working dir when set, so the agent's sandboxed
+          // file_read can page oversized extractions.
+          const content = await readDocumentFile(path, activeProject?.path);
+          setTextAttachments((prev) =>
+            prev.some((a) => a.path === path)
+              ? prev
+              : [...prev, { kind: 'text', id: `txt_${Date.now()}_${path.length}`, path, name, content }]
+          );
+        } catch (err) {
+          failures.push(`${name}: ${err}`);
+        }
+      }
+      if (failures.length > 0) {
+        await alert(failures.join('\n'), '附件读取失败');
       }
     } catch (err) {
       console.error('Attach failed:', err);

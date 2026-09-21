@@ -45,6 +45,25 @@ pub async fn read_text_file(path: String) -> Result<String, String> {
     }
 }
 
+/// Read any document (PDF/office/text of any extension or encoding) as text
+/// for chat attachment. Oversized extractions are cached under `cache_dir`
+/// (the session working dir when set) so the agent can page them with
+/// file_read. PDF/office run on a blocking thread — extraction is CPU-heavy.
+#[tauri::command]
+#[instrument(skip_all)]
+pub async fn read_document_file(path: String, cache_dir: Option<String>) -> Result<String, String> {
+    let path2 = std::path::PathBuf::from(&path);
+    let cache = cache_dir
+        .filter(|d| !d.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("siku-extracted"));
+    tokio::task::spawn_blocking(move || {
+        crate::core::document_text::read_document_text(&path2, &cache)
+    })
+    .await
+    .map_err(|e| format!("task join: {e}"))?
+}
+
 /// Write text content to a file at an absolute path (e.g. note export).
 #[tauri::command]
 #[instrument]

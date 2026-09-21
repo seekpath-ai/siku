@@ -80,6 +80,14 @@ function markOnboardingCompletedLocal() {
 
 function App() {
   const [showOnboarding, setShowOnboarding] = useState(false);
+  // Route-mounted queries (papers/collections/tags) fire the moment the
+  // router renders. Backend init (DB migrations, crsqlite load, token
+  // refresh, auto-sync proxy) takes seconds, and react-query's retry: 2
+  // (~3s of backoff) often expires before AppState is managed — those
+  // queries settle in error and the collection tree shows "暂无集合" until
+  // a later sync:remote_applied invalidation rescues it. Gate the router on
+  // backend readiness so first queries succeed on the first try.
+  const [backendReady, setBackendReady] = useState(false);
 
   React.useEffect(() => {
     trackPhase('react_mounted');
@@ -105,12 +113,13 @@ function App() {
       import('@tauri-apps/api/window').then(({ getCurrentWindow }) => {
         getCurrentWindow().show().catch(() => {});
       }).catch(() => {});
+      setBackendReady(true); // show the UI even if every probe failed
     }, 10_000);
 
     let cancelled = false;
     (async () => {
       let onboardingCompletedInDb = false;
-      let backendOk = true;
+      let backendOk = false;
 
       // Load persisted settings. The onboarding completion flag lives in the
       // database — a fresh DB (first install, or after deleting the data
@@ -118,13 +127,21 @@ function App() {
       // do NOT gate on "settings table is empty": the backend writes
       // infrastructure settings (e.g. notes.current_vault_id, fts.rebuilt)
       // during startup, so an empty-table check is unreliable.
-      try {
-        const entries = await settingsGetAll();
-        onboardingCompletedInDb = entries.some((e) => e.key === ONBOARDING_KEY && e.value === '1');
-      } catch {
-        backendOk = false;
+      //
+      // Poll until the backend answers: a failed probe means AppState is not
+      // managed yet (init still running), not that the backend is dead.
+      for (let attempt = 0; attempt < 40 && !cancelled; attempt++) {
+        try {
+          const entries = await settingsGetAll();
+          onboardingCompletedInDb = entries.some((e) => e.key === ONBOARDING_KEY && e.value === '1');
+          backendOk = true;
+          break;
+        } catch {
+          await new Promise((r) => setTimeout(r, 250));
+        }
       }
       if (cancelled) return;
+      setBackendReady(true);
 
       trackPhase('settings_loaded');
 
@@ -171,7 +188,8 @@ function App() {
 
   return (
     <QueryClientProvider client={queryClient}>
-      <RouterProvider router={router} />
+      {/* Router mounts only after the backend answers — see backendReady. */}
+      {backendReady && <RouterProvider router={router} />}
       {showOnboarding && (
         <OnboardingWizard onDone={handleOnboardingDone} />
       )}

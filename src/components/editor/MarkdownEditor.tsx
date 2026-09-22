@@ -3,10 +3,10 @@ import CodeMirror from '@uiw/react-codemirror';
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown';
 import { languages } from '@codemirror/language-data';
 import { oneDark } from '@codemirror/theme-one-dark';
-import { EditorView, Decoration, DecorationSet, WidgetType, ViewPlugin, type ViewUpdate } from '@codemirror/view';
-import { RangeSetBuilder, StateField, Facet, type EditorState, type Extension } from '@codemirror/state';
-import { syntaxTree } from '@codemirror/language';
-import { autocompletion, type CompletionContext } from '@codemirror/autocomplete';
+import { EditorView, Decoration, DecorationSet, WidgetType, ViewPlugin, keymap, type ViewUpdate } from '@codemirror/view';
+import { RangeSetBuilder, StateField, Facet, Prec, type EditorState, type Extension } from '@codemirror/state';
+import { syntaxTree, ensureSyntaxTree } from '@codemirror/language';
+import { autocompletion, completionStatus, type CompletionContext } from '@codemirror/autocomplete';
 import { open as shellOpen } from '@tauri-apps/plugin-shell';
 import katex from 'katex';
 import { saveAttachmentBytes } from '@/lib/tauri';
@@ -99,8 +99,6 @@ class MathWidget extends WidgetType {
   }
 }
 
-/** Renders a GFM table block as an HTML <table>. Clicking the rendered table
- *  places the caret at its first source line so the raw cells become editable. */
 // Lucide "copy" / "check" glyphs, inlined because widget DOM is built outside React.
 const COPY_ICON = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
 const CHECK_ICON = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
@@ -118,8 +116,14 @@ function copyWithFeedback(text: string, btn: HTMLElement) {
   }).catch(() => { /* ignore */ });
 }
 
+/** Renders a GFM table block as an HTML <table> plus structural edit controls
+ *  (add/remove row/column). Clicking the table body places the caret at its
+ *  first source line so the raw cells become editable; the controls dispatch
+ *  source rewrites directly and never move the caret, so the widget survives
+ *  their edits (the resulting doc change rebuilds it in place). `table` holds
+ *  the source ranges every control edits through. */
 class TableWidget extends WidgetType {
-  constructor(readonly html: string, readonly markdown: string) {
+  constructor(readonly html: string, readonly markdown: string, readonly table: TableInfo) {
     super();
   }
 
@@ -135,12 +139,77 @@ class TableWidget extends WidgetType {
     tableBtn.innerHTML = COPY_ICON;
     wrap.appendChild(tableBtn);
 
+    // Structural controls. All of them rewrite the markdown source via
+    // view.dispatch (so they join the undo history) and return before the
+    // caret-moving dispatch below, keeping the widget alive.
+    const addRowBtn = document.createElement('button');
+    addRowBtn.className = 'cm-live-table-addrow';
+    addRowBtn.title = '添加行';
+    addRowBtn.textContent = '+';
+    wrap.appendChild(addRowBtn);
+
+    const addColBtn = document.createElement('button');
+    addColBtn.className = 'cm-live-table-addcol';
+    addColBtn.title = '添加列';
+    addColBtn.textContent = '+';
+    wrap.appendChild(addColBtn);
+
+    // Floating delete handles, positioned over the hovered row/column.
+    const delRowBtn = document.createElement('button');
+    delRowBtn.className = 'cm-live-table-delrow';
+    delRowBtn.title = '删除行';
+    delRowBtn.textContent = '×';
+    const delColBtn = document.createElement('button');
+    delColBtn.className = 'cm-live-table-delcol';
+    delColBtn.title = '删除列';
+    delColBtn.textContent = '×';
+    wrap.appendChild(delRowBtn);
+    wrap.appendChild(delColBtn);
+
+    // Hovered cell translated back to source coordinates: source rows are
+    // header + delimiter + body rows, so a tbody row index shifts by 2.
+    let hoverSrcRow = -1;
+    let hoverCol = -1;
+    wrap.addEventListener('mouseover', (e) => {
+      const target = e.target as HTMLElement;
+      const cell = target.closest('td, th') as HTMLTableCellElement | null;
+      if (!cell || !wrap.contains(cell)) return; // over a control: keep as-is
+      const tr = cell.parentElement as HTMLTableRowElement | null;
+      if (!tr) return;
+      hoverSrcRow = tr.parentElement?.tagName === 'THEAD' ? 0 : tr.sectionRowIndex + 2;
+      hoverCol = cell.cellIndex;
+      const wrapRect = wrap.getBoundingClientRect();
+      const rowInfo = this.table.rows[hoverSrcRow];
+      if (rowInfo && rowInfo.kind === 'body') {
+        const r = tr.getBoundingClientRect();
+        delRowBtn.style.top = `${r.top - wrapRect.top + r.height / 2}px`;
+        delRowBtn.classList.add('visible');
+      } else {
+        delRowBtn.classList.remove('visible');
+      }
+      const colCount = this.table.rows[0]?.cells.length ?? 0;
+      const tableEl = wrap.querySelector('table');
+      if (tableEl && hoverCol >= 0 && hoverCol < colCount && colCount > 1) {
+        const c = cell.getBoundingClientRect();
+        const t = tableEl.getBoundingClientRect();
+        delColBtn.style.left = `${c.left - wrapRect.left + c.width / 2}px`;
+        delColBtn.style.top = `${t.top - wrapRect.top}px`;
+        delColBtn.classList.add('visible');
+      } else {
+        delColBtn.classList.remove('visible');
+      }
+    });
+    wrap.addEventListener('mouseleave', () => {
+      delRowBtn.classList.remove('visible');
+      delColBtn.classList.remove('visible');
+    });
+
     wrap.addEventListener('mousedown', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      // Copy buttons must be handled HERE, on mousedown: the default path
-      // below moves the caret into the table, which tears the widget down
-      // and restores the raw source before a click event would ever fire.
+      // Buttons must be handled HERE, on mousedown: the default path below
+      // moves the caret into the table, which tears the widget down and
+      // restores the raw source before a click event would ever fire.
       const target = e.target as HTMLElement;
       if (target.closest('.cm-live-table-copy')) {
         copyWithFeedback(this.markdown, tableBtn);
@@ -152,6 +221,22 @@ class TableWidget extends WidgetType {
         // exactly the cell content.
         const cell = cellBtn.closest('td, th') as HTMLElement | null;
         copyWithFeedback(cell?.innerText.trim() ?? '', cellBtn as HTMLElement);
+        return;
+      }
+      if (target.closest('.cm-live-table-addrow')) {
+        addTableRow(view, this.table);
+        return;
+      }
+      if (target.closest('.cm-live-table-addcol')) {
+        addTableColumn(view, this.table);
+        return;
+      }
+      if (target.closest('.cm-live-table-delrow')) {
+        deleteTableRow(view, this.table, hoverSrcRow);
+        return;
+      }
+      if (target.closest('.cm-live-table-delcol')) {
+        deleteTableColumn(view, this.table, hoverCol);
         return;
       }
       view.dispatch({ selection: { anchor: view.posAtDOM(wrap) }, scrollIntoView: true });
@@ -312,48 +397,101 @@ function inlineCellHtml(text: string): string {
 }
 
 /**
- * Split one table row into cells.
+ * Split one table row into cells, keeping source offsets.
  *
  * A naive `split('|')` cuts a cell like `` `a|b` `` in half, and pipes inside
  * inline code are common (shell pipelines, `a || b`, type unions). The reading
  * view (remark-gfm) keeps them, so the live preview has to as well: pipes
  * inside a backtick span are ignored, and GFM's `\|` escape yields a literal
  * `|`. Backtick runs are matched by length, so `` ``a|b`` `` works too.
+ *
+ * The returned spans carry document offsets (when `lineFrom` is given) so the
+ * structural table commands (add/remove row/column, Tab navigation) can target
+ * cells precisely; `rawFrom`/`rawTo` cover the untrimmed text between the
+ * surrounding delimiter pipes.
  */
-function splitTableRow(line: string): string[] {
-  let row = line.trim();
-  if (row.startsWith('|')) row = row.slice(1);
-  if (row.endsWith('|') && !row.endsWith('\\|')) row = row.slice(0, -1);
+interface TableCellSpan {
+  /** Cell text with `\|` unescaped and surrounding whitespace trimmed. */
+  text: string;
+  /** Trimmed content range; collapsed to a point for empty cells. */
+  from: number;
+  to: number;
+  /** Untrimmed range between the surrounding delimiter pipes. */
+  rawFrom: number;
+  rawTo: number;
+}
 
-  const out: string[] = [];
+function splitTableRowSpans(line: string, lineFrom = 0): TableCellSpan[] {
+  let start = 0;
+  while (start < line.length && (line[start] === ' ' || line[start] === '\t')) start++;
+  if (line[start] === '|') start++;
+  let end = line.length;
+  while (end > start && (line[end - 1] === ' ' || line[end - 1] === '\t')) end--;
+  if (end > start && line[end - 1] === '|' && line[end - 2] !== '\\') end--;
+
+  const out: TableCellSpan[] = [];
+  let rawFrom = start;
   let cur = '';
+  let contentFrom = -1;
+  let contentTo = -1;
   let fence: string | null = null;
-  for (let i = 0; i < row.length; i++) {
-    const ch = row[i];
-    if (ch === '\\' && row[i + 1] === '|') {
+
+  const flush = (rawTo: number) => {
+    let from: number;
+    let to: number;
+    if (contentFrom === -1) {
+      // Empty cell: collapse to just after the opening pipe's space, so Tab
+      // lands at a natural typing position.
+      const p = rawFrom < rawTo && line[rawFrom] === ' ' ? rawFrom + 1 : rawFrom;
+      from = to = lineFrom + p;
+    } else {
+      from = lineFrom + contentFrom;
+      to = lineFrom + contentTo;
+    }
+    out.push({ text: cur.trim(), from, to, rawFrom: lineFrom + rawFrom, rawTo: lineFrom + rawTo });
+    cur = '';
+    contentFrom = -1;
+    contentTo = -1;
+  };
+
+  for (let i = start; i < end; i++) {
+    const ch = line[i];
+    if (ch === '\\' && line[i + 1] === '|') {
+      if (contentFrom === -1) contentFrom = i;
+      contentTo = i + 2;
       cur += '|';
       i += 1;
       continue;
     }
     if (ch === '`') {
       let n = 1;
-      while (row[i + n] === '`') n += 1;
+      while (line[i + n] === '`') n += 1;
       const run = '`'.repeat(n);
       if (fence === null) fence = run;
       else if (run === fence) fence = null;
+      if (contentFrom === -1) contentFrom = i;
+      contentTo = i + n;
       cur += run;
       i += n - 1;
       continue;
     }
     if (ch === '|' && fence === null) {
-      out.push(cur.trim());
-      cur = '';
+      flush(i);
+      rawFrom = i + 1;
       continue;
     }
     cur += ch;
+    if (ch !== ' ' && ch !== '\t') {
+      if (contentFrom === -1) contentFrom = i;
+      contentTo = i + 1;
+    }
   }
-  out.push(cur.trim());
+  flush(end);
   return out;
+}
+
+function splitTableRow(line: string): string[] {
+  return splitTableRowSpans(line).map((c) => c.text);
 }
 
 /** Render a GFM table block (lines of `|`-separated cells) as HTML.
@@ -381,6 +519,305 @@ function parseMarkdownTable(text: string): string {
   html += '</table>';
   return html;
 }
+
+// ── Structured table model (shared by rendering, controls and keymap) ──
+
+interface TableRowInfo {
+  kind: 'header' | 'delimiter' | 'body';
+  /** Document range of the whole source line. */
+  from: number;
+  to: number;
+  cells: TableCellSpan[];
+}
+
+interface TableInfo {
+  /** Document range covering every source line of the table. */
+  from: number;
+  to: number;
+  /** Header row, delimiter row, then body rows — in source order. */
+  rows: TableRowInfo[];
+}
+
+function tableRowInfo(state: EditorState, kind: TableRowInfo['kind'], from: number): TableRowInfo {
+  const line = state.doc.lineAt(from);
+  return { kind, from: line.from, to: line.to, cells: splitTableRowSpans(line.text, line.from) };
+}
+
+/** Regex fallback for findTables when the syntax tree cannot be produced in
+ *  time (huge document on a slow tick). Mirrors the pre-tree detection: runs
+ *  of `|`-led lines, fenced code still excluded via the partial tree. */
+function findTablesFallback(state: EditorState): TableInfo[] {
+  const codeRanges: { from: number; to: number }[] = [];
+  syntaxTree(state).iterate({
+    enter(node) {
+      if (node.name === 'FencedCode') codeRanges.push({ from: node.from, to: node.to });
+    },
+  });
+  const inCode = (from: number, to: number) =>
+    codeRanges.some((r) => from < r.to && to > r.from);
+
+  const tableLineRe = /^\s*\|/;
+  const out: TableInfo[] = [];
+  let row = 1;
+  while (row <= state.doc.lines) {
+    if (!tableLineRe.test(state.doc.line(row).text)) {
+      row += 1;
+      continue;
+    }
+    let end = row;
+    while (end < state.doc.lines && tableLineRe.test(state.doc.line(end + 1).text)) end += 1;
+    const from = state.doc.line(row).from;
+    const to = state.doc.line(end).to;
+    if (end > row && !inCode(from, to)) {
+      const rows: TableRowInfo[] = [];
+      for (let ln = row; ln <= end; ln++) {
+        const line = state.doc.line(ln);
+        let kind: TableRowInfo['kind'] = ln === row ? 'header' : 'body';
+        if (ln === row + 1 && /^[\s:|-]+$/.test(line.text.trim()) && line.text.includes('-')) {
+          kind = 'delimiter';
+        }
+        rows.push(tableRowInfo(state, kind, line.from));
+      }
+      out.push({ from, to, rows });
+    }
+    row = end + 1;
+  }
+  return out;
+}
+
+/** Find every GFM table in the document with per-row, per-cell source ranges.
+ *
+ *  Detection walks the lezer syntax tree (`Table` → `TableHeader` /
+ *  `TableDelimiter` / `TableRow` nodes; GFM is enabled in markdownLanguage),
+ *  so pipe-looking lines inside fenced code blocks are excluded for free and
+ *  detection matches what the reading view (remark-gfm) renders — a run of
+ *  `|` lines without a `---` delimiter row is plain text, not a table. Cell
+ *  spans come from splitTableRowSpans (not the tree's TableCell nodes), so
+ *  empty cells get ranges too and `\|`/backtick pipes never split a cell.
+ *
+ *  Tables nested in a blockquote/list carry `> ` etc. before the row content;
+ *  the renderer and the edit commands assume plain pipe lines, so those are
+ *  skipped (same as the old `^\s*\|` detection).
+ */
+function findTables(state: EditorState): TableInfo[] {
+  const tree = ensureSyntaxTree(state, state.doc.length, 100);
+  if (!tree) return findTablesFallback(state);
+  const tables: TableInfo[] = [];
+  tree.iterate({
+    enter(node) {
+      if (node.name !== 'Table') return;
+      const rows: TableRowInfo[] = [];
+      let plain = true;
+      for (let ch = node.node.firstChild; ch; ch = ch.nextSibling) {
+        const kind =
+          ch.name === 'TableHeader' ? 'header'
+          : ch.name === 'TableDelimiter' ? 'delimiter'
+          : ch.name === 'TableRow' ? 'body'
+          : null;
+        if (!kind) continue;
+        const line = state.doc.lineAt(ch.from);
+        if (state.doc.sliceString(line.from, ch.from).trim() !== '') {
+          plain = false;
+          break;
+        }
+        rows.push(tableRowInfo(state, kind, ch.from));
+      }
+      if (plain && rows.length > 0) {
+        tables.push({ from: rows[0].from, to: rows[rows.length - 1].to, rows });
+      }
+      return false; // table cells don't nest tables
+    },
+  });
+  return tables;
+}
+
+/** Locate the table row containing `pos`, if any. */
+function tableAtPos(
+  state: EditorState,
+  pos: number
+): { table: TableInfo; rowIndex: number; row: TableRowInfo } | null {
+  for (const table of findTables(state)) {
+    if (pos < table.from || pos > table.to) continue;
+    for (let i = 0; i < table.rows.length; i++) {
+      const row = table.rows[i];
+      if (pos >= row.from && pos <= row.to) return { table, rowIndex: i, row };
+    }
+  }
+  return null;
+}
+
+// ── Structural table edits (all dispatch source rewrites → undo history) ──
+
+function emptyTableRowSource(cols: number): string {
+  return '|' + '  |'.repeat(Math.max(1, cols));
+}
+
+/** Append an empty row at the end of the table. The caret is left alone so
+ *  the rendered widget survives and the button stays clickable. */
+function addTableRow(view: EditorView, table: TableInfo) {
+  const cols = table.rows[0]?.cells.length ?? 1;
+  view.dispatch({ changes: { from: table.to, insert: '\n' + emptyTableRowSource(cols) } });
+}
+
+/** Append an empty column at the right edge of every row (the delimiter row
+ *  gets a `---` cell). */
+function addTableColumn(view: EditorView, table: TableInfo) {
+  const changes = table.rows.map((row) => {
+    const text = view.state.doc.sliceString(row.from, row.to);
+    const trimmedEnd = row.from + text.replace(/\s+$/, '').length;
+    const cell = row.kind === 'delimiter' ? ' --- ' : '  ';
+    return { from: trimmedEnd, insert: text.trimEnd().endsWith('|') ? `${cell}|` : ` |${cell}|` };
+  });
+  view.dispatch({ changes });
+}
+
+/** Delete a body row (header/delimiter rows are refused: removing either
+ *  would break the GFM table). */
+function deleteTableRow(view: EditorView, table: TableInfo, rowIndex: number) {
+  const row = table.rows[rowIndex];
+  if (!row || row.kind !== 'body') return;
+  let { from, to } = row;
+  if (to < view.state.doc.length) to += 1; // swallow the trailing newline
+  else if (from > table.from) from -= 1; // last line of the doc: swallow the preceding one
+  view.dispatch({ changes: { from, to } });
+}
+
+/** Delete the column at `colIndex` from every row. Data rows lose the cell
+ *  plus one adjacent pipe (keeping at least one pipe so the line stays a
+ *  table row); the delimiter row is rebuilt from its remaining cells so it
+ *  stays a valid GFM delimiter line. Ragged rows missing that cell are left
+ *  untouched. */
+function deleteTableColumn(view: EditorView, table: TableInfo, colIndex: number) {
+  const colCount = table.rows[0]?.cells.length ?? 0;
+  if (colCount <= 1 || colIndex < 0 || colIndex >= colCount) return;
+  const doc = view.state.doc;
+  const changes: { from: number; to: number; insert?: string }[] = [];
+  for (const row of table.rows) {
+    const cell = row.cells[colIndex];
+    if (!cell) continue;
+    if (row.kind === 'delimiter') {
+      const cells = row.cells.filter((_, j) => j !== colIndex).map((c) => c.text || '---');
+      let insert: string;
+      if (cells.length <= 1) {
+        insert = `| ${cells[0] ?? '---'} |`;
+      } else {
+        const line = doc.sliceString(row.from, row.to);
+        insert = `${/^\s*\|/.test(line) ? '| ' : ''}${cells.join(' | ')}${/\|\s*$/.test(line) ? ' |' : ''}`;
+      }
+      changes.push({ from: row.from, to: row.to, insert });
+      continue;
+    }
+    let { rawFrom: from, rawTo: to } = cell;
+    if (doc.sliceString(to, to + 1) === '|') {
+      to += 1; // cell + the pipe after it
+    } else if (
+      from > row.from &&
+      doc.sliceString(from - 1, from) === '|' &&
+      doc.sliceString(row.from, from - 1).includes('|')
+    ) {
+      from -= 1; // cell + the pipe before it, but never the row's last pipe
+    }
+    changes.push({ from, to });
+  }
+  view.dispatch({ changes });
+}
+
+// ── In-table key bindings (Tab / Shift-Tab / Enter) ──
+
+/** Move the caret one cell forward (dir=1) or backward (dir=-1). Tab past the
+ *  last cell wraps to the next row's first cell, appending a fresh empty row
+ *  at the bottom of the table when there is none. Returns false outside
+ *  tables so the default bindings (indent etc.) keep working. */
+function moveTableCell(view: EditorView, dir: 1 | -1): boolean {
+  const { state } = view;
+  const sel = state.selection.main;
+  if (!sel.empty) return false;
+  const hit = tableAtPos(state, sel.head);
+  if (!hit) return false;
+  const { table, rowIndex, row } = hit;
+
+  let idx: number;
+  if (row.kind === 'delimiter') {
+    idx = dir === 1 ? row.cells.length : -1; // step straight to the adjacent row
+  } else {
+    idx = row.cells.findIndex((c) => sel.head >= c.rawFrom && sel.head <= c.rawTo);
+    if (idx === -1) {
+      // Caret sits on a delimiter pipe or outside the cells: take the nearest
+      // cell in the travel direction.
+      const next = row.cells.findIndex((c) => c.rawFrom > sel.head);
+      const bound = next === -1 ? row.cells.length : next;
+      idx = dir === 1 ? bound : bound - 1;
+    } else {
+      idx += dir;
+    }
+  }
+
+  const stepRow = (ri: number) => {
+    let n = ri + dir;
+    while (n >= 0 && n < table.rows.length && table.rows[n].kind === 'delimiter') n += dir;
+    return n;
+  };
+
+  let r = rowIndex;
+  let c = idx;
+  if (c >= row.cells.length) {
+    const nr = stepRow(rowIndex);
+    if (nr >= table.rows.length) {
+      const cols = table.rows[0]?.cells.length ?? 1;
+      const newRow = emptyTableRowSource(cols);
+      view.dispatch({
+        changes: { from: table.to, insert: '\n' + newRow },
+        selection: { anchor: table.to + 1 + 2 }, // after the new row's "| "
+        scrollIntoView: true,
+      });
+      return true;
+    }
+    r = nr;
+    c = 0;
+  } else if (c < 0) {
+    const pr = stepRow(rowIndex);
+    if (pr < 0) return true; // already on the first cell: swallow Shift-Tab
+    r = pr;
+    c = table.rows[pr].cells.length - 1;
+  }
+  const target = table.rows[r]?.cells[c];
+  if (!target) return true; // ragged row: stay put, but keep Tab from indenting
+  view.dispatch({ selection: { anchor: target.from }, scrollIntoView: true });
+  return true;
+}
+
+/** Enter at the end of a table row inserts a fresh empty row below it (below
+ *  the delimiter line when pressed on the header) and moves the caret into
+ *  its first cell. Mid-line Enter falls through to the default newline. */
+function insertTableRowBelow(view: EditorView): boolean {
+  const { state } = view;
+  const sel = state.selection.main;
+  if (!sel.empty) return false;
+  if (completionStatus(state) === 'active') return false; // let Enter accept completions
+  const hit = tableAtPos(state, sel.head);
+  if (!hit) return false;
+  if (sel.head !== hit.row.to) return false;
+  const anchorRow =
+    hit.row.kind === 'header' && hit.table.rows[1]?.kind === 'delimiter'
+      ? hit.table.rows[1]
+      : hit.row;
+  const cols = hit.table.rows[0]?.cells.length ?? 1;
+  const newRow = emptyTableRowSource(cols);
+  view.dispatch({
+    changes: { from: anchorRow.to, insert: '\n' + newRow },
+    selection: { anchor: anchorRow.to + 1 + 2 }, // after the new row's "| "
+    scrollIntoView: true,
+  });
+  return true;
+}
+
+const tableKeymap = Prec.high(
+  keymap.of([
+    { key: 'Tab', run: (view) => moveTableCell(view, 1) },
+    { key: 'Shift-Tab', run: (view) => moveTableCell(view, -1) },
+    { key: 'Enter', run: insertTableRowBelow },
+  ])
+);
 
 /** Renders markdown semantics inline; syntax markers are hidden unless the
  *  caret is within/adjacent to their content (Obsidian-style live preview).
@@ -514,8 +951,9 @@ function buildLivePreview(view: EditorView): DecorationSet {
   // Block-level constructs (tables, $$ math, horizontal rules) are rendered
   // by livePreviewBlockField — CodeMirror forbids block decorations from
   // view plugins. Their ranges are still collected here so overlapping
-  // inline decorations get dropped.
-  const tableRanges: { from: number; to: number }[] = [];
+  // inline decorations get dropped. Table detection shares the syntax-tree
+  // based findTables with the block field (fenced code excluded for free).
+  const tableRanges: { from: number; to: number }[] = findTables(state);
   const blockMathRanges: { from: number; to: number }[] = [];
 
   // Only visible ranges are decorated. A block starting just above the
@@ -748,29 +1186,6 @@ function buildLivePreview(view: EditorView): DecorationSet {
       if (near(from - 5, to + 5)) continue; // caret inside/adjacent → keep source
       adds.push(replaceItem(from, to, { widget: new MathWidget(m[1].trim(), false) }));
     }
-
-    // Tables are rendered by livePreviewBlockField; here we only collect the
-    // ranges so inline decorations inside them get dropped below. Lines inside
-    // a code block are never table rows (a fenced block demonstrating markdown
-    // table syntax must stay raw code).
-    const tableLineRe = /^\s*\|/;
-    const firstLine = state.doc.lineAt(vr.from).number;
-    const lastLine = state.doc.lineAt(Math.min(vr.to, state.doc.length)).number;
-    let row = firstLine;
-    while (row <= lastLine) {
-      if (!tableLineRe.test(state.doc.line(row).text)) {
-        row += 1;
-        continue;
-      }
-      let end = row;
-      while (end < lastLine && tableLineRe.test(state.doc.line(end + 1).text)) end += 1;
-      const from = state.doc.line(row).from;
-      const to = state.doc.line(end).to;
-      if (end > row && !inCode(from, to)) {
-        tableRanges.push({ from, to });
-      }
-      row = end + 1;
-    }
   }
 
   // Drop decorations that overlap a rendered table or block-math range
@@ -921,30 +1336,20 @@ function buildBlockDecorations(state: EditorState): DecorationSet {
     });
   }
 
-  // Tables: contiguous `|`-led lines, rendered unless the caret is inside.
-  // Lines inside a code block are never table rows.
-  const tableLineRe = /^\s*\|/;
-  let row = 1;
-  while (row <= state.doc.lines) {
-    if (!tableLineRe.test(state.doc.line(row).text)) {
-      row += 1;
-      continue;
-    }
-    let end = row;
-    while (end < state.doc.lines && tableLineRe.test(state.doc.line(end + 1).text)) end += 1;
-    const from = state.doc.line(row).from;
-    const to = state.doc.line(end).to;
-    if (end > row && !inFencedCode(from, to) && !overlapsSelection(from, to)) {
-      adds.push({
-        from,
-        to,
-        deco: Decoration.replace({
-          widget: new TableWidget(parseMarkdownTable(state.doc.sliceString(from, to)), state.doc.sliceString(from, to)),
-          block: true,
-        }),
-      });
-    }
-    row = end + 1;
+  // Tables: syntax-tree GFM tables (see findTables), rendered unless the
+  // caret is inside. Pipe lines inside fenced code never reach here — the
+  // tree does not parse them as tables.
+  for (const table of findTables(state)) {
+    if (overlapsSelection(table.from, table.to)) continue;
+    const source = state.doc.sliceString(table.from, table.to);
+    adds.push({
+      from: table.from,
+      to: table.to,
+      deco: Decoration.replace({
+        widget: new TableWidget(parseMarkdownTable(source), source, table),
+        block: true,
+      }),
+    });
   }
 
   adds.sort((a, b) => a.from - b.from || a.to - b.to);
@@ -1207,6 +1612,10 @@ export function MarkdownEditor({
       // Live-preview decorations are opt-out: source mode (NoteEditor's
       // 源码模式) shows raw markdown without any rendering.
       ...(livePreview ? [livePreviewPlugin, livePreviewBlockField] as Extension[] : []),
+      // Structural table keys (Tab/Shift-Tab/Enter between cells). Active only
+      // on table source lines — the handlers return false elsewhere — so this
+      // is useful in source mode too.
+      tableKeymap,
       oneDark,
       editorTheme,
       EditorView.lineWrapping,

@@ -282,10 +282,11 @@ body.in-tauri {
 .cm-live-math-block { display: block; padding: 0.4em 0; }
 .cm-live-math-block .katex-display { margin: 0; }
 .cm-live-table {
-  /* padding, not margin: same height-map reason as above */
-  padding: 6px 0;
+  /* padding, not margin: same height-map reason as above. The extra bottom
+     padding is the permanent home of the add-row bar (CM measures padding,
+     so the widget height stays in sync). */
+  padding: 6px 0.75rem 20px 0;
   overflow-x: auto;
-  padding-right: 0.75rem;
   cursor: text;
   position: relative;
 }
@@ -318,6 +319,69 @@ body.in-tauri {
 .cm-live-table-cellcopy.copied { color: #27AE60; opacity: 1; }
 .cm-live-table th,
 .cm-live-table td { position: relative; }
+
+/* Table structure controls: add-row bar below the table, add-column button
+   on the right edge, and floating delete handles positioned by JS over the
+   hovered row/column. Same hover-only, dark-theme styling as the copy
+   buttons above; every action rewrites the markdown source (undoable). */
+.cm-live-table-addrow,
+.cm-live-table-addcol,
+.cm-live-table-delrow,
+.cm-live-table-delcol {
+  position: absolute;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  background: #24242B;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 2;
+  user-select: none;
+}
+.cm-live-table-addrow {
+  left: 0;
+  right: 0.75rem;
+  bottom: 2px;
+  height: 16px;
+}
+.cm-live-table-addcol {
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 14px;
+  height: 28px;
+}
+.cm-live-table-delrow {
+  left: 0;
+  width: 16px;
+  height: 16px;
+  transform: translateY(-50%);
+}
+.cm-live-table-delcol {
+  width: 16px;
+  height: 16px;
+  transform: translate(-50%, -50%);
+}
+.cm-live-table:hover .cm-live-table-addrow,
+.cm-live-table:hover .cm-live-table-addcol,
+.cm-live-table-delrow.visible,
+.cm-live-table-delcol.visible { opacity: 1; }
+.cm-live-table-addrow:hover,
+.cm-live-table-addcol:hover {
+  color: var(--text-primary);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+.cm-live-table-delrow:hover,
+.cm-live-table-delcol:hover {
+  color: #E5484D;
+  border-color: rgba(229, 72, 77, 0.5);
+}
 
 /* ── Live Preview: code blocks, lists, tasks, rules, images ── */
 .cm-live-codeblock {

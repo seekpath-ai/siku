@@ -29,14 +29,37 @@ fn percent_decode(s: &str) -> String {
 }
 
 fn decode_entities(s: &str) -> String {
-    s.replace("&amp;", "&")
+    let s = s
+        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&nbsp;", " ")
-        .trim()
-        .to_string()
+        .replace("&ensp;", " ")
+        .replace("&emsp;", " ");
+    // Numeric entities like &#0183; (Bing uses zero-padded forms).
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s.as_str();
+    while let Some(pos) = rest.find("&#") {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos + 2..];
+        match tail.find(';') {
+            Some(e) if e <= 8 && tail[..e].chars().all(|c| c.is_ascii_digit()) => {
+                match tail[..e].parse::<u32>().ok().and_then(char::from_u32) {
+                    Some(c) => out.push(c),
+                    None => out.push_str(&rest[..pos + 2 + e + 1]),
+                }
+                rest = &tail[e + 1..];
+            }
+            _ => {
+                out.push_str("&#");
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
 }
 
 /// DuckDuckGo result pages redirect through `uddg=`; extract the real URL.
@@ -126,17 +149,18 @@ fn parse_bing_results(html: &str) -> Vec<Hit> {
         let block = &after[..end];
         rest = &after[end..];
 
-        let Some(h2) = block.find("<h2>") else { continue };
-        let Some(a) = block[h2..].find("<a href=\"") else { continue };
-        let a_chunk = &block[h2 + a + 9..];
-        let Some(q) = a_chunk.find('"') else { continue };
-        let url = a_chunk[..q].to_string();
-        let title = match a_chunk[q..].find("</a>") {
-            Some(e) => {
-                let t = &a_chunk[q..q + e];
-                let t = t.rsplit('>').next().unwrap_or(t);
-                decode_entities(t)
-            }
+        let Some(h2) = block.find("<h2") else { continue };
+        let after_h2 = &block[h2..];
+        let Some(a) = after_h2.find("<a ") else { continue };
+        let a_tag = &after_h2[a..];
+        // `href=` may be preceded by other attributes (e.g. target="_blank").
+        let Some(tag_end) = a_tag.find('>') else { continue };
+        let Some(href_at) = a_tag[..tag_end].find("href=\"") else { continue };
+        let href_rest = &a_tag[href_at + 6..];
+        let Some(q) = href_rest.find('"') else { continue };
+        let url = href_rest[..q].to_string();
+        let title = match a_tag[tag_end + 1..].find("</a>") {
+            Some(e) => decode_entities(&strip_tags(&a_tag[tag_end + 1..tag_end + 1 + e])),
             None => continue,
         };
         if url.is_empty() || title.is_empty() {
@@ -190,8 +214,11 @@ async fn run_engine(
     match engine.id.as_str() {
         "bing" => {
             let url = format!("https://www.bing.com/search?q={}&mkt=zh-CN", percent_encode_query(query));
-            let body = client.get(&url).send().await.map_err(|e| e.to_string())?
-                .text().await.map_err(|e| e.to_string())?;
+            let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("HTTP {}", resp.status()));
+            }
+            let body = resp.text().await.map_err(|e| e.to_string())?;
             Ok(parse_bing_results(&body))
         }
         "duckduckgo" => {
@@ -201,6 +228,11 @@ async fn run_engine(
                 return Err(format!("HTTP {}", resp.status()));
             }
             let body = resp.text().await.map_err(|e| e.to_string())?;
+            // DDG answers datacenter/bot traffic with an anomaly challenge page
+            // (HTTP 202), which parses as "no results" — surface it instead.
+            if body.contains("anomaly-modal") {
+                return Err("触发 DuckDuckGo 反爬验证".to_string());
+            }
             Ok(parse_ddg_results(&body))
         }
         "tavily" => {
@@ -324,7 +356,7 @@ impl Tool for WebSearchTool {
         let client = builder.build().map_err(|e| format!("client error: {e}"))?;
 
         let mut errors: Vec<String> = Vec::new();
-        let mut saw_empty = false;
+        let mut empty: Vec<&str> = Vec::new();
         for engine in &engines {
             match run_engine(&client, engine, query).await {
                 Ok(results) if !results.is_empty() => {
@@ -346,14 +378,23 @@ impl Tool for WebSearchTool {
                         engine_label(&engine.id)
                     ));
                 }
-                Ok(_) => saw_empty = true,
+                Ok(_) => empty.push(engine_label(&engine.id)),
                 Err(e) => errors.push(format!("{}: {e}", engine_label(&engine.id))),
             }
         }
-        if saw_empty {
+        // Every engine reachable but empty: a genuine "no results". Otherwise
+        // surface per-engine failures so breakage isn't masked as empty.
+        if errors.is_empty() {
             return Ok(format!("No results found for '{query}'."));
         }
-        Err(format!("所有可用搜索引擎均失败 —— {}", errors.join("；")))
+        let mut msg = format!("搜索失败 —— {}", errors.join("；"));
+        if !empty.is_empty() {
+            msg.push_str(&format!(
+                "（{} 返回 0 条，可能触发反爬或页面结构变化）",
+                empty.join("、")
+            ));
+        }
+        Err(msg)
     }
 }
 
@@ -378,15 +419,18 @@ mod tests {
 
     #[test]
     fn bing_parser_extracts_hits() {
+        // Mirrors Bing's current markup: <h2 class="">, attributes before href,
+        // nested <strong> inside the title.
         let html = r#"<ol id="b_results">
-          <li class="b_algo"><h2><a href="https://a.com/x">标题一</a></h2><div class="b_caption"><p>摘要<strong>加粗</strong>一</p></div></li>
+          <li class="b_algo" data-id iid=SERP.5329><h2 class=""><a target="_blank" target="_blank" href="https://a.com/x" h="ID=SERP,1.2">标题<strong>一</strong>全文</a></h2><div class="b_caption"><p class="b_lineclamp2">摘要<strong>加粗</strong>一</p></div></li>
           <li class="b_algo"><h2><a href="https://b.com/y">标题二</a></h2></li>
         </ol>"#;
         let hits = parse_bing_results(html);
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].0, "标题一");
+        assert_eq!(hits[0].0, "标题一全文");
         assert_eq!(hits[0].1, "https://a.com/x");
         assert_eq!(hits[0].2, "摘要加粗一");
+        assert_eq!(hits[1].0, "标题二");
         assert_eq!(hits[1].2, "");
     }
 

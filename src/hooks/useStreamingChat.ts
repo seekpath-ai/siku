@@ -39,9 +39,13 @@ export function useStreamingChat() {
   // matches the DB (same post-run alignment the pet panel already does).
   // Incremental against the paginated view: fetch only rows NEWER than the
   // newest persisted message and append, dropping the optimistic temp
-  // bubbles (their ids are `user_*`/`error_*` locals, never persisted).
+  // bubbles (their ids are `user_*`/`assistant_*`/`error_*` locals, never
+  // persisted — note the done-handler's `assistant_<ts>` bubble MUST be
+  // excluded, otherwise its just-now timestamp becomes the after-cursor and
+  // hides the very rows we're fetching).
   const reloadSessionHistory = useCallback((sessionId: string) => {
-    const isTemp = (id: string) => id.startsWith('user_') || id.startsWith('error_');
+    const isTemp = (id: string) =>
+      id.startsWith('user_') || id.startsWith('error_') || id.startsWith('assistant_');
     const reload = async () => {
       const state = useChatStore.getState();
       const newestPersisted = state.activeSessionId === sessionId

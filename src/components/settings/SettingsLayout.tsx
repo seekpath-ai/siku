@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ArrowLeft, HardDrive, Bot, Cpu, SlidersHorizontal, Cat, RefreshCw } from 'lucide-react';
+import { ArrowLeft, HardDrive, Bot, Cpu, SlidersHorizontal, Cat, RefreshCw, Search } from 'lucide-react';
 import { Link } from '@tanstack/react-router';
 
 interface Section {
@@ -67,5 +67,6 @@ export function GeneralIcon() { return <HardDrive size={16} />; }
 export function LlmIcon() { return <Cpu size={16} />; }
 export function AgentIcon() { return <Bot size={16} />; }
 export function PetIcon() { return <Cat size={16} />; }
+export function SearchIcon() { return <Search size={16} />; }
 export function AdvancedIcon() { return <SlidersHorizontal size={16} />; }
 export function SyncIcon() { return <RefreshCw size={16} />; }

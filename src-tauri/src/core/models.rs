@@ -502,6 +502,38 @@ pub struct AgentStreamEvent {
 // Agent Configuration
 // ============================================================
 
+/// One search engine entry in the ordered web_search fallback chain.
+/// `id`: bing | duckduckgo | tavily | brave | searxng. `api_key` is used by
+/// tavily/brave; `base_url` by searxng.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchEngineConfig {
+    pub id: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+}
+
+impl SearchEngineConfig {
+    pub fn new(id: &str, enabled: bool) -> Self {
+        Self { id: id.to_string(), enabled, api_key: None, base_url: None }
+    }
+}
+
+/// Default chain: Bing first (reachable from CN networks), DuckDuckGo as
+/// fallback; key/URL-based engines available but off until configured.
+fn default_search_engines() -> Vec<SearchEngineConfig> {
+    vec![
+        SearchEngineConfig::new("bing", true),
+        SearchEngineConfig::new("duckduckgo", true),
+        SearchEngineConfig::new("tavily", false),
+        SearchEngineConfig::new("brave", false),
+        SearchEngineConfig::new("searxng", false),
+    ]
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     /// Legacy inline LLM config. Kept for backward compatibility; prefer `default_llm_provider_id`.
@@ -528,6 +560,12 @@ pub struct AppSettings {
     pub sidebar_order: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub homepage: Option<String>,
+
+    // ── Web search ──
+    /// Ordered search engines for the web_search tool; the tool tries them
+    /// in order within one call until one returns results.
+    #[serde(default = "default_search_engines")]
+    pub search_engines: Vec<SearchEngineConfig>,
 
     // ── Advanced truncation / limits ──
     #[serde(default = "default_log_max_size_mb")]
@@ -787,6 +825,7 @@ impl Default for AppSettings {
             default_max_memory_rounds: 10,
             show_pet: default_show_pet(),
             global_screenshot_hotkey: default_global_hotkey(),
+            search_engines: default_search_engines(),
             sidebar_order: None,
             homepage: None,
             log_max_size_mb: default_log_max_size_mb(),

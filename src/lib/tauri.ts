@@ -476,6 +476,17 @@ export async function getAgentSteps(sessionId: string): Promise<AgentStep[]> {
   return invoke<AgentStep[]>('get_agent_steps', { sessionId });
 }
 
+/** One search engine entry in the ordered web_search fallback chain. */
+export interface SearchEngineConfig {
+  /** bing | duckduckgo | tavily | brave | searxng */
+  id: string;
+  enabled: boolean;
+  /** tavily / brave */
+  apiKey?: string | null;
+  /** searxng */
+  baseUrl?: string | null;
+}
+
 export interface AppSettings {
   default_llm?: LlmConfigBlock;
   default_llm_provider_id?: string | null;
@@ -491,6 +502,8 @@ export interface AppSettings {
   show_pet?: boolean;
   /** System-wide Ctrl+Shift+S screenshot hotkey (default on). */
   global_screenshot_hotkey?: boolean;
+  /** Ordered web_search fallback chain. */
+  search_engines?: SearchEngineConfig[];
   sidebar_order?: string[] | null;
   homepage?: string | null;
 

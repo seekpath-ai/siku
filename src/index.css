@@ -502,6 +502,9 @@ body.in-tauri {
 .cm-live-table td {
   border: 1px solid #333333;
   padding: 4px 12px;
+  /* height acts as a MINIMUM on table cells: keeps newly added empty rows
+     the same height as rows with a line of text (line-height 1.65). */
+  height: 1.65em;
   text-align: left;
   vertical-align: top;
 }

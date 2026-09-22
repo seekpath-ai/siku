@@ -85,10 +85,8 @@ class MathWidget extends WidgetType {
     return this.displayMode ? 60 : -1;
   }
 
-  // eq() already guarantees identical content, so the existing DOM is reusable.
-  updateDOM() {
-    return true;
-  }
+  // No updateDOM override: eq() equality already reuses the DOM, and the
+  // default (false) keeps a changed formula from showing stale output.
 
   ignoreEvent(event: Event) {
     return event.type === 'mousedown';
@@ -548,14 +546,14 @@ class TableWidget extends WidgetType {
     return wrap;
   }
 
-  updateDOM() {
-    return true;
-  }
-
   // Rough height for not-yet-measured offscreen tables: rows + padding.
   get estimatedHeight() {
     return (this.html.split('<tr').length - 1) * 34 + 12;
   }
+
+  // NOTE: no updateDOM override. CM calls it as a LAST-RESORT DOM reuse check
+  // when eq() was false (WidgetBuffer.findWidget pass 1) — returning true
+  // there would keep the old table's DOM showing stale content after edits.
 
   ignoreEvent(event: Event) {
     if (event.type === 'mousedown') return true;
@@ -612,9 +610,6 @@ class TaskCheckWidget extends WidgetType {
     });
     return span;
   }
-  updateDOM() {
-    return true;
-  }
   ignoreEvent(event: Event) {
     return event.type === 'mousedown';
   }
@@ -665,10 +660,8 @@ class ImageWidget extends WidgetType {
     };
     return img;
   }
-  // Same src/alt/title → same image; reuse the DOM instead of re-fetching.
-  updateDOM() {
-    return true;
-  }
+  // No updateDOM override: eq() equality already reuses the DOM (so a stable
+  // image is not re-fetched); the default (false) redraws a changed one.
   eq(other: ImageWidget) {
     return other.src === this.src && other.alt === this.alt && other.title === this.title;
   }

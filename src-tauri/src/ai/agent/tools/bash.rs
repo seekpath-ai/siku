@@ -131,7 +131,7 @@ impl BashTool {
 }
 
 fn build_description() -> String {
-    const BASE: &str = "Execute a shell command. Windows defaults to PowerShell; Unix-like systems default to bash (falling back to sh). Use shell=bash|powershell|cmd|sh to override. Requires approval. Commands run in the working directory by default when one is set (otherwise the process cwd). run_in_background=true returns a task id immediately; otherwise waits for completion. Foreground timeout: default 60s, max 5min. Background tasks accept timeout_ms=0 to disable the timeout entirely (long builds, watchers, servers).";
+    const BASE: &str = "Execute a shell command. Windows defaults to PowerShell; Unix-like systems default to bash (falling back to sh). Use shell=bash|powershell|cmd|sh to override. Requires approval. Commands run in the working directory by default when one is set (otherwise the process cwd). run_in_background=true returns a task id immediately; otherwise waits for completion. Foreground timeout: default 60s, max 5min. Background tasks accept timeout_ms=0 to disable the timeout entirely (long builds, watchers, servers). The command is ALREADY parsed by the selected shell: never wrap it in another `powershell -Command`/`bash -c` layer — inside double quotes the outer shell interpolates `$_`/`$VAR` before the inner command sees them. To pass `$` literally, use single quotes.";
     // LLMs write far more reliable bash than PowerShell; when Git Bash is
     // installed, say so and steer Unix-style work to it instead of keeping
     // bash as a fallback the model never thinks to use.

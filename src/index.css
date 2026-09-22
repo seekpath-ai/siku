@@ -383,6 +383,28 @@ body.in-tauri {
   border-color: rgba(229, 72, 77, 0.5);
 }
 
+/* Cell editing: the clicked cell swaps its rendered content for a single-line
+   input holding the raw source text. Padding stays unchanged so the table
+   doesn't jiggle; the outline + tinted background mark the editing cell. */
+.cm-live-table td.cm-live-table-cell-editing,
+.cm-live-table th.cm-live-table-cell-editing {
+  outline: 1px solid var(--primary);
+  outline-offset: -1px;
+  background: rgba(230, 126, 34, 0.08);
+}
+.cm-live-table-input {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+.cm-live-table-cell-editing .cm-live-table-cellcopy { display: none; }
+
 /* ── Live Preview: code blocks, lists, tasks, rules, images ── */
 .cm-live-codeblock {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;

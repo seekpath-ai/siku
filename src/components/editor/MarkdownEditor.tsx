@@ -116,12 +116,68 @@ function copyWithFeedback(text: string, btn: HTMLElement) {
   }).catch(() => { /* ignore */ });
 }
 
-/** Renders a GFM table block as an HTML <table> plus structural edit controls
- *  (add/remove row/column). Clicking the table body places the caret at its
- *  first source line so the raw cells become editable; the controls dispatch
- *  source rewrites directly and never move the caret, so the widget survives
- *  their edits (the resulting doc change rebuilds it in place). `table` holds
- *  the source ranges every control edits through. */
+// ── Rendered table cell editing ──
+
+/** Editing state of the single cell being edited inside a TableWidget's DOM.
+ *  Kept DOM-side (a toDOM closure), not on the widget: `eq()`-based DOM reuse
+ *  is exactly what lets an open editor survive unrelated decoration rebuilds. */
+interface CellEditingState {
+  row: number;
+  col: number;
+  /** Source text of the cell when editing began; re-validated before write-back. */
+  original: string;
+  savedHtml: string;
+  input: HTMLInputElement;
+  cellEl: HTMLTableCellElement;
+}
+
+/** Cell focus to restore after a dispatch rebuilds the table widget. Consumed
+ *  by the next TableWidget.toDOM whose table shape matches; expires quickly so
+ *  a stale record can never hijack an unrelated widget mounted later (e.g. by
+ *  scrolling — offscreen block widgets are created lazily). */
+interface PendingTableCellFocus {
+  row: number;
+  col: number;
+  /** Expected table shape after the edit — mismatch drops the restore. */
+  rows: number;
+  cols: number;
+}
+let pendingTableCellFocus: PendingTableCellFocus | null = null;
+
+function scheduleTableCellFocus(focus: { row: number; col: number }, rows: number, cols: number) {
+  const pf: PendingTableCellFocus = { ...focus, rows, cols };
+  pendingTableCellFocus = pf;
+  setTimeout(() => {
+    if (pendingTableCellFocus === pf) pendingTableCellFocus = null;
+  }, 1000);
+}
+
+/** Sanitize typed cell text for a GFM source cell: single line (GFM cells
+ *  cannot span lines), pipes escaped — existing `\|` escapes left alone. */
+function sanitizeCellSource(text: string): string {
+  // GFM cells are single-line; collapse pasted newlines to spaces.
+  const singleLine = text.replace(/\s*\n\s*/g, ' ');
+  // Escape pipes, leaving existing `\|` escapes untouched.
+  return singleLine
+    .split('\\|')
+    .map((part) => part.replace(/\|/g, '\\|'))
+    .join('\\|');
+}
+
+type TableChange = { from: number; to?: number; insert?: string };
+const byChangeFrom = (a: TableChange, b: TableChange) => a.from - b.from;
+
+/** Renders a GFM table block as an HTML <table> with Obsidian-style cell
+ *  editing: clicking a cell focuses a single-cell editor (the raw source text
+ *  of that cell), committing writes back into the cell's source range.
+ *  Structural controls (add/remove row/column) rewrite the source too. Every
+ *  mutation goes through view.dispatch (undo history); a pending-focus record
+ *  re-opens the right cell editor after the rebuild a dispatch causes.
+ *
+ *  Editing interactions never move the CodeMirror selection, so the
+ *  overlapsSelection guard in buildBlockDecorations does not tear the widget
+ *  down mid-edit; moving the caret into the table source with the keyboard
+ *  (or clicking the widget padding) still reveals the raw markdown. */
 class TableWidget extends WidgetType {
   constructor(readonly html: string, readonly markdown: string, readonly table: TableInfo) {
     super();
@@ -139,9 +195,8 @@ class TableWidget extends WidgetType {
     tableBtn.innerHTML = COPY_ICON;
     wrap.appendChild(tableBtn);
 
-    // Structural controls. All of them rewrite the markdown source via
-    // view.dispatch (so they join the undo history) and return before the
-    // caret-moving dispatch below, keeping the widget alive.
+    // Structural controls stay usable while a cell editor is open: their
+    // dispatch rebuilds the widget and the pending-focus record restores it.
     const addRowBtn = document.createElement('button');
     addRowBtn.className = 'cm-live-table-addrow';
     addRowBtn.title = '添加行';
@@ -166,20 +221,187 @@ class TableWidget extends WidgetType {
     wrap.appendChild(delRowBtn);
     wrap.appendChild(delColBtn);
 
-    // Hovered cell translated back to source coordinates: source rows are
-    // header + delimiter + body rows, so a tbody row index shifts by 2.
+    let editing: CellEditingState | null = null;
+
+    // this.table's offsets were captured when the decorations were built and
+    // can go stale when the DOM is reused across an unrelated edit (eq() is
+    // content-based). Everything that reads or writes the source therefore
+    // re-resolves the table from the widget's live DOM position instead.
+    const resolveTable = (): TableInfo | null => {
+      if (!wrap.isConnected) return null;
+      const pos = view.posAtDOM(wrap);
+      return findTables(view.state).find((t) => pos >= t.from && pos <= t.to) ?? null;
+    };
+
+    // DOM cell ↔ source coordinates: source rows are header + delimiter +
+    // body rows, and the delimiter row is not rendered, so tbody row indices
+    // shift by 2.
+    const srcRowColOfCell = (cell: HTMLTableCellElement): { row: number; col: number } | null => {
+      const tr = cell.parentElement as HTMLTableRowElement | null;
+      if (!tr) return null;
+      const row = tr.parentElement?.tagName === 'THEAD' ? 0 : tr.sectionRowIndex + 2;
+      return { row, col: cell.cellIndex };
+    };
+    const cellDomAt = (row: number, col: number): HTMLTableCellElement | null => {
+      const tr =
+        row === 0
+          ? wrap.querySelector('thead tr')
+          : wrap.querySelectorAll('tbody tr')[row - 2];
+      const cell = tr?.children[col];
+      return cell instanceof HTMLTableCellElement ? cell : null;
+    };
+
+    /** The pending edit as a source change, or null when clean/invalid.
+     *  Re-validates the cell's current source against what the editor
+     *  started from, so a table that changed externally never gets a write
+     *  to the wrong range — the edit is dropped instead. */
+    const buildEditChange = (table: TableInfo): TableChange | null => {
+      if (!editing) return null;
+      const rowInfo = table.rows[editing.row];
+      const cell = rowInfo?.cells[editing.col];
+      if (!rowInfo || rowInfo.kind === 'delimiter' || !cell) return null;
+      if (view.state.doc.sliceString(cell.from, cell.to) !== editing.original) return null;
+      const insert = sanitizeCellSource(editing.input.value);
+      return insert === editing.original ? null : { from: cell.from, to: cell.to, insert };
+    };
+
+    const clearEditing = () => {
+      if (!editing) return;
+      const { cellEl, savedHtml } = editing;
+      editing = null;
+      cellEl.classList.remove('cm-live-table-cell-editing');
+      cellEl.innerHTML = savedHtml;
+    };
+
+    const enterEdit = (row: number, col: number) => {
+      if (editing && editing.row === row && editing.col === col) return;
+      const table = resolveTable() ?? this.table;
+      const rowInfo = table.rows[row];
+      const cell = rowInfo?.cells[col];
+      const cellEl = cellDomAt(row, col);
+      if (!rowInfo || rowInfo.kind === 'delimiter' || !cell || !cellEl) return;
+      const input = document.createElement('input');
+      input.className = 'cm-live-table-input';
+      const original = view.state.doc.sliceString(cell.from, cell.to);
+      input.value = original;
+      input.addEventListener('keydown', (e) => {
+        e.stopPropagation(); // belt-and-braces: ignoreEvent already shields CM
+        if (e.isComposing) return; // IME candidate keys must not commit/navigate
+        if (e.key === 'Tab') {
+          e.preventDefault();
+          moveCellFocus(e.shiftKey ? -1 : 1);
+        } else if (e.key === 'Enter' || e.key === 'Escape') {
+          e.preventDefault();
+          commitAndExit(true);
+        }
+      });
+      input.addEventListener('blur', () => {
+        // Defer: a blur caused by our own dispatch rebuilding the widget must
+        // not dispatch again inside CodeMirror's update cycle.
+        setTimeout(() => {
+          if (editing && editing.input === input) commitAndExit();
+        }, 0);
+      });
+      editing = { row, col, original, savedHtml: cellEl.innerHTML, input, cellEl };
+      cellEl.classList.add('cm-live-table-cell-editing');
+      cellEl.textContent = '';
+      cellEl.appendChild(input);
+      input.focus({ preventScroll: true });
+      input.setSelectionRange(original.length, original.length);
+    };
+
+    const commitAndExit = (focusEditor = false) => {
+      const table = resolveTable();
+      const change = table ? buildEditChange(table) : null;
+      clearEditing();
+      if (change) view.dispatch({ changes: change });
+      if (focusEditor) view.focus();
+    };
+
+    /** Commit the open editor (if dirty) and move the cell editor to
+     *  (row, col) — either in place, or through a rebuild + pending focus. */
+    const commitAndSwitch = (row: number, col: number) => {
+      const table = resolveTable() ?? this.table;
+      const change = buildEditChange(table);
+      clearEditing();
+      if (change) {
+        scheduleTableCellFocus({ row, col }, table.rows.length, table.rows[0]?.cells.length ?? 0);
+        view.dispatch({ changes: change });
+      } else {
+        enterEdit(row, col);
+      }
+    };
+
+    const moveCellFocus = (dir: 1 | -1) => {
+      if (!editing) return;
+      const table = resolveTable() ?? this.table;
+      const rowInfo = table.rows[editing.row];
+      if (!rowInfo) return;
+      const stepRow = (ri: number) => {
+        let n = ri + dir;
+        while (n >= 0 && n < table.rows.length && table.rows[n].kind === 'delimiter') n += dir;
+        return n;
+      };
+      let nr = editing.row;
+      let nc = editing.col + dir;
+      if (nc >= rowInfo.cells.length) {
+        nr = stepRow(editing.row);
+        nc = 0;
+      } else if (nc < 0) {
+        nr = stepRow(editing.row);
+        nc = nr >= 0 ? table.rows[nr].cells.length - 1 : 0;
+      }
+      if (nr >= table.rows.length) {
+        // Tab past the last cell: append an empty row and land in its first
+        // cell — same shape as the source-mode tableKeymap behaviour.
+        const cols = table.rows[0]?.cells.length ?? 1;
+        const changes = addTableRowChanges(table);
+        const change = buildEditChange(table);
+        if (change) changes.push(change);
+        clearEditing();
+        scheduleTableCellFocus({ row: table.rows.length, col: 0 }, table.rows.length + 1, cols);
+        view.dispatch({ changes: changes.sort(byChangeFrom) });
+        return;
+      }
+      if (nr < 0 || !table.rows[nr].cells[nc]) return; // first cell / ragged row: stay
+      commitAndSwitch(nr, nc);
+    };
+
+    /** Structural control handler: combine the pending cell edit and the
+     *  structural change into ONE dispatch (single undo step), then restore
+     *  the cell editor at `focus` after the rebuild. */
+    const runStructural = (
+      changes: TableChange[],
+      focus: { row: number; col: number } | null,
+      rowsAfter: number,
+      colsAfter: number,
+      dropEdit: boolean
+    ) => {
+      if (changes.length === 0) return;
+      if (!dropEdit) {
+        const table = resolveTable();
+        const change = table ? buildEditChange(table) : null;
+        if (change) changes.push(change);
+      }
+      clearEditing();
+      if (focus) scheduleTableCellFocus(focus, rowsAfter, colsAfter);
+      view.dispatch({ changes: changes.sort(byChangeFrom) });
+    };
+
+    // Hovered cell translated back to source coordinates.
     let hoverSrcRow = -1;
     let hoverCol = -1;
     wrap.addEventListener('mouseover', (e) => {
       const target = e.target as HTMLElement;
       const cell = target.closest('td, th') as HTMLTableCellElement | null;
       if (!cell || !wrap.contains(cell)) return; // over a control: keep as-is
-      const tr = cell.parentElement as HTMLTableRowElement | null;
-      if (!tr) return;
-      hoverSrcRow = tr.parentElement?.tagName === 'THEAD' ? 0 : tr.sectionRowIndex + 2;
-      hoverCol = cell.cellIndex;
+      const rc = srcRowColOfCell(cell);
+      if (!rc) return;
+      hoverSrcRow = rc.row;
+      hoverCol = rc.col;
       const wrapRect = wrap.getBoundingClientRect();
       const rowInfo = this.table.rows[hoverSrcRow];
+      const tr = cell.parentElement as HTMLTableRowElement;
       if (rowInfo && rowInfo.kind === 'body') {
         const r = tr.getBoundingClientRect();
         delRowBtn.style.top = `${r.top - wrapRect.top + r.height / 2}px`;
@@ -205,12 +427,14 @@ class TableWidget extends WidgetType {
     });
 
     wrap.addEventListener('mousedown', (e) => {
+      const target = e.target as HTMLElement;
+      // Clicks inside the active cell editor keep native behaviour (caret
+      // placement, drag-selecting the text).
+      if (target.closest('.cm-live-table-input')) return;
       e.preventDefault();
       e.stopPropagation();
-      // Buttons must be handled HERE, on mousedown: the default path below
-      // moves the caret into the table, which tears the widget down and
-      // restores the raw source before a click event would ever fire.
-      const target = e.target as HTMLElement;
+      // Buttons must be handled HERE, on mousedown: preventDefault keeps the
+      // focus where it is, so no blur races the handlers below.
       if (target.closest('.cm-live-table-copy')) {
         copyWithFeedback(this.markdown, tableBtn);
         return;
@@ -224,23 +448,103 @@ class TableWidget extends WidgetType {
         return;
       }
       if (target.closest('.cm-live-table-addrow')) {
-        addTableRow(view, this.table);
+        const table = resolveTable();
+        if (table) {
+          const cols = table.rows[0]?.cells.length ?? 1;
+          // Land in the new row's first cell, ready to type.
+          runStructural(addTableRowChanges(table), { row: table.rows.length, col: 0 }, table.rows.length + 1, cols, false);
+        }
         return;
       }
       if (target.closest('.cm-live-table-addcol')) {
-        addTableColumn(view, this.table);
+        const table = resolveTable();
+        if (table) {
+          const cols = table.rows[0]?.cells.length ?? 1;
+          runStructural(
+            addTableColumnChanges(view.state, table),
+            editing ? { row: editing.row, col: editing.col } : null,
+            table.rows.length,
+            cols + 1,
+            false
+          );
+        }
         return;
       }
       if (target.closest('.cm-live-table-delrow')) {
-        deleteTableRow(view, this.table, hoverSrcRow);
+        const table = resolveTable();
+        if (table && hoverSrcRow >= 0) {
+          const dropEdit = editing?.row === hoverSrcRow;
+          runStructural(
+            deleteTableRowChanges(view.state, table, hoverSrcRow),
+            editing && !dropEdit
+              ? { row: editing.row > hoverSrcRow ? editing.row - 1 : editing.row, col: editing.col }
+              : null,
+            table.rows.length - 1,
+            table.rows[0]?.cells.length ?? 0,
+            dropEdit
+          );
+        }
         return;
       }
       if (target.closest('.cm-live-table-delcol')) {
-        deleteTableColumn(view, this.table, hoverCol);
+        const table = resolveTable();
+        if (table && hoverCol >= 0) {
+          const dropEdit = editing?.col === hoverCol;
+          runStructural(
+            deleteTableColumnChanges(view.state, table, hoverCol),
+            editing && !dropEdit
+              ? { row: editing.row, col: editing.col > hoverCol ? editing.col - 1 : editing.col }
+              : null,
+            table.rows.length,
+            (table.rows[0]?.cells.length ?? 1) - 1,
+            dropEdit
+          );
+        }
         return;
       }
-      view.dispatch({ selection: { anchor: view.posAtDOM(wrap) }, scrollIntoView: true });
+      const cellEl = target.closest('td, th') as HTMLTableCellElement | null;
+      if (cellEl && wrap.contains(cellEl)) {
+        const rc = srcRowColOfCell(cellEl);
+        if (rc && !(editing && editing.row === rc.row && editing.col === rc.col)) {
+          commitAndSwitch(rc.row, rc.col);
+        }
+        return;
+      }
+      // Escape hatch kept from the source-click behaviour: clicking the
+      // widget's padding moves the caret to the table source, which tears the
+      // widget down into raw markdown. Commit the open editor first so the
+      // rebuild triggered here cannot swallow it.
+      const table = resolveTable();
+      const change = table ? buildEditChange(table) : null;
+      clearEditing();
+      view.dispatch({
+        changes: change ?? [],
+        selection: { anchor: view.posAtDOM(wrap) },
+        scrollIntoView: true,
+      });
     });
+
+    // A dispatch we issued rebuilt this widget: re-open the cell editor that
+    // was targeted, when the rebuilt table still has the expected shape.
+    if (pendingTableCellFocus) {
+      const pf = pendingTableCellFocus;
+      pendingTableCellFocus = null;
+      const rows = this.table.rows;
+      const ok =
+        rows.length === pf.rows &&
+        (rows[0]?.cells.length ?? 0) === pf.cols &&
+        pf.row >= 0 &&
+        pf.row < rows.length &&
+        rows[pf.row].kind !== 'delimiter' &&
+        pf.col >= 0 &&
+        pf.col < rows[pf.row].cells.length;
+      if (ok) {
+        // toDOM runs before the widget is attached; focus needs it mounted.
+        requestAnimationFrame(() => {
+          if (wrap.isConnected) enterEdit(pf.row, pf.col);
+        });
+      }
+    }
     return wrap;
   }
 
@@ -254,9 +558,16 @@ class TableWidget extends WidgetType {
   }
 
   ignoreEvent(event: Event) {
-    return event.type === 'mousedown';
+    if (event.type === 'mousedown') return true;
+    // Everything targeted at the open cell editor (keys, paste, selection)
+    // belongs to the input — CodeMirror must not run its keymaps on it.
+    const target = event.target;
+    return target instanceof HTMLElement && !!target.closest('.cm-live-table-cell-editing');
   }
 
+  // Edit state deliberately NOT compared here: it lives in the DOM, and
+  // content-equal rebuilds reusing the DOM (eq true) are exactly what keeps
+  // an open cell editor alive across unrelated decoration rebuilds.
   eq(other: TableWidget) {
     return other.html === this.html && other.markdown === this.markdown;
   }
@@ -646,40 +957,40 @@ function tableAtPos(
   return null;
 }
 
-// ── Structural table edits (all dispatch source rewrites → undo history) ──
+// ── Structural table edits (all dispatched as source rewrites → undo history).
+// These return change lists instead of dispatching, so the table widget can
+// merge a pending cell edit and a structural change into one transaction. ──
 
 function emptyTableRowSource(cols: number): string {
   return '|' + '  |'.repeat(Math.max(1, cols));
 }
 
-/** Append an empty row at the end of the table. The caret is left alone so
- *  the rendered widget survives and the button stays clickable. */
-function addTableRow(view: EditorView, table: TableInfo) {
+/** Append an empty row at the end of the table. */
+function addTableRowChanges(table: TableInfo): TableChange[] {
   const cols = table.rows[0]?.cells.length ?? 1;
-  view.dispatch({ changes: { from: table.to, insert: '\n' + emptyTableRowSource(cols) } });
+  return [{ from: table.to, insert: '\n' + emptyTableRowSource(cols) }];
 }
 
 /** Append an empty column at the right edge of every row (the delimiter row
  *  gets a `---` cell). */
-function addTableColumn(view: EditorView, table: TableInfo) {
-  const changes = table.rows.map((row) => {
-    const text = view.state.doc.sliceString(row.from, row.to);
+function addTableColumnChanges(state: EditorState, table: TableInfo): TableChange[] {
+  return table.rows.map((row) => {
+    const text = state.doc.sliceString(row.from, row.to);
     const trimmedEnd = row.from + text.replace(/\s+$/, '').length;
     const cell = row.kind === 'delimiter' ? ' --- ' : '  ';
     return { from: trimmedEnd, insert: text.trimEnd().endsWith('|') ? `${cell}|` : ` |${cell}|` };
   });
-  view.dispatch({ changes });
 }
 
 /** Delete a body row (header/delimiter rows are refused: removing either
  *  would break the GFM table). */
-function deleteTableRow(view: EditorView, table: TableInfo, rowIndex: number) {
+function deleteTableRowChanges(state: EditorState, table: TableInfo, rowIndex: number): TableChange[] {
   const row = table.rows[rowIndex];
-  if (!row || row.kind !== 'body') return;
+  if (!row || row.kind !== 'body') return [];
   let { from, to } = row;
-  if (to < view.state.doc.length) to += 1; // swallow the trailing newline
+  if (to < state.doc.length) to += 1; // swallow the trailing newline
   else if (from > table.from) from -= 1; // last line of the doc: swallow the preceding one
-  view.dispatch({ changes: { from, to } });
+  return [{ from, to }];
 }
 
 /** Delete the column at `colIndex` from every row. Data rows lose the cell
@@ -687,11 +998,11 @@ function deleteTableRow(view: EditorView, table: TableInfo, rowIndex: number) {
  *  table row); the delimiter row is rebuilt from its remaining cells so it
  *  stays a valid GFM delimiter line. Ragged rows missing that cell are left
  *  untouched. */
-function deleteTableColumn(view: EditorView, table: TableInfo, colIndex: number) {
+function deleteTableColumnChanges(state: EditorState, table: TableInfo, colIndex: number): TableChange[] {
   const colCount = table.rows[0]?.cells.length ?? 0;
-  if (colCount <= 1 || colIndex < 0 || colIndex >= colCount) return;
-  const doc = view.state.doc;
-  const changes: { from: number; to: number; insert?: string }[] = [];
+  if (colCount <= 1 || colIndex < 0 || colIndex >= colCount) return [];
+  const doc = state.doc;
+  const changes: TableChange[] = [];
   for (const row of table.rows) {
     const cell = row.cells[colIndex];
     if (!cell) continue;
@@ -719,7 +1030,7 @@ function deleteTableColumn(view: EditorView, table: TableInfo, colIndex: number)
     }
     changes.push({ from, to });
   }
-  view.dispatch({ changes });
+  return changes;
 }
 
 // ── In-table key bindings (Tab / Shift-Tab / Enter) ──

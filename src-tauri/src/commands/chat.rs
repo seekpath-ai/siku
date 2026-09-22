@@ -171,23 +171,93 @@ pub async fn agent_memory_set_active(
         .map_err(|e| format!("db error: {e}"))
 }
 
-/// Get messages for a session
+/// A page of chat history. `has_more` = older messages exist beyond the
+/// page's first row (only meaningful for cursor/latest-page queries).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMessagePage {
+    pub messages: Vec<ChatMessage>,
+    pub has_more: bool,
+}
+
+/// Paginated message history. Three modes:
+/// - `before_*` cursor: the page OLDER than the cursor (scroll-up loading).
+/// - `after_*` cursor: everything newer than the cursor (post-turn reload).
+/// - neither: the latest `limit` rows, or the full history when `limit` is
+///   None (pet panel and other small sessions).
+/// Cursors are (created_at, id) pairs — ids break timestamp ties.
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn get_chat_messages(
     state: State<'_, AppState>,
     session_id: String,
-) -> Result<Vec<ChatMessage>, String> {
-    let messages = sqlx::query_as::<_, ChatMessage>(
-        "SELECT id, session_id, role, content, reasoning_content, tool_calls, tool_call_id, tool_name, citations, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, attachments, user_tag, created_at
-         FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC"
-    )
-    .bind(&session_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| format!("db error: {e}"))?;
+    before_created_at: Option<String>,
+    before_id: Option<String>,
+    after_created_at: Option<String>,
+    after_id: Option<String>,
+    limit: Option<i64>,
+) -> Result<ChatMessagePage, String> {
+    const COLS: &str = "id, session_id, role, content, reasoning_content, tool_calls, tool_call_id, tool_name, citations, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, attachments, user_tag, created_at";
 
-    Ok(messages)
+    if let (Some(ts), Some(id)) = (after_created_at, after_id) {
+        let messages = sqlx::query_as::<_, ChatMessage>(&format!(
+            "SELECT {COLS} FROM chat_messages \
+             WHERE session_id = ? AND (created_at > ? OR (created_at = ? AND id > ?)) \
+             ORDER BY created_at ASC, id ASC"
+        ))
+        .bind(&session_id)
+        .bind(&ts)
+        .bind(&ts)
+        .bind(&id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
+        return Ok(ChatMessagePage { messages, has_more: false });
+    }
+
+    // Latest page or older page: fetch DESC (newest first) with a +1 row as
+    // the has_more probe, then flip back to ascending for display.
+    let fetch_desc = match (before_created_at, before_id, limit) {
+        (Some(ts), Some(id), Some(n)) => sqlx::query_as::<_, ChatMessage>(&format!(
+            "SELECT {COLS} FROM chat_messages \
+             WHERE session_id = ? AND (created_at < ? OR (created_at = ? AND id < ?)) \
+             ORDER BY created_at DESC, id DESC LIMIT ?"
+        ))
+        .bind(&session_id)
+        .bind(&ts)
+        .bind(&ts)
+        .bind(&id)
+        .bind(n + 1)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?,
+        (None, None, Some(n)) => sqlx::query_as::<_, ChatMessage>(&format!(
+            "SELECT {COLS} FROM chat_messages \
+             WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT ?"
+        ))
+        .bind(&session_id)
+        .bind(n + 1)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?,
+        // No cursor, no limit: legacy full-history read (pet panel etc.).
+        _ => {
+            let messages = sqlx::query_as::<_, ChatMessage>(&format!(
+                "SELECT {COLS} FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC"
+            ))
+            .bind(&session_id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| format!("db error: {e}"))?;
+            return Ok(ChatMessagePage { messages, has_more: false });
+        }
+    };
+
+    let n = limit.expect("cursor/latest queries always carry a limit") as usize;
+    let has_more = fetch_desc.len() > n;
+    let mut messages: Vec<ChatMessage> = fetch_desc.into_iter().take(n).collect();
+    messages.reverse();
+    Ok(ChatMessagePage { messages, has_more })
 }
 
 /// Tag a message from the bubble action bar ("打标即搬运"):

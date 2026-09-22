@@ -601,8 +601,31 @@ export async function deleteChatSession(sessionId: string): Promise<void> {
   return invoke<void>('delete_chat_session', { sessionId });
 }
 
-export async function getChatMessages(sessionId: string): Promise<ChatMessage[]> {
-  return invoke<ChatMessage[]>('get_chat_messages', { sessionId });
+export interface ChatMessagePage {
+  messages: ChatMessage[];
+  /** Older messages exist beyond the page's first row. */
+  hasMore: boolean;
+}
+
+/** Paginated message history. No opts = full history (pet panel etc.);
+ *  `{ limit }` = latest page; `{ before, limit }` = older page (scroll-up);
+ *  `{ after }` = incremental rows newer than the cursor (post-turn reload). */
+export async function getChatMessages(
+  sessionId: string,
+  opts?: {
+    before?: { createdAt: string; id: string };
+    after?: { createdAt: string; id: string };
+    limit?: number;
+  }
+): Promise<ChatMessagePage> {
+  return invoke<ChatMessagePage>('get_chat_messages', {
+    sessionId,
+    beforeCreatedAt: opts?.before?.createdAt ?? null,
+    beforeId: opts?.before?.id ?? null,
+    afterCreatedAt: opts?.after?.createdAt ?? null,
+    afterId: opts?.after?.id ?? null,
+    limit: opts?.limit ?? null,
+  });
 }
 
 /** Tag a message from the bubble action bar. 'experience' copies the content

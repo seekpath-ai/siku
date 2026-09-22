@@ -86,8 +86,17 @@ function StreamingBubble() {
   );
 }
 
-export function MessageList() {
+export function MessageList({
+  onLoadOlder,
+  loadingOlder,
+}: {
+  /** Scroll-up pagination: fired when the user scrolls near the top and
+   * older history exists. */
+  onLoadOlder?: () => void;
+  loadingOlder?: boolean;
+}) {
   const messages = useChatStore((s) => s.messages);
+  const hasMoreMessages = useChatStore((s) => s.hasMoreMessages);
   const agentSteps = useChatStore((s) => s.agentSteps);
   const streamContent = useChatStore((s) => s.streamContent);
   const streamingSteps = useChatStore((s) => s.streamingSteps);
@@ -99,6 +108,10 @@ export function MessageList() {
   const lastMessageIdRef = useRef<string | null>(null);
   const justSwitchedRef = useRef(false);
   const isNearBottomRef = useRef(true);
+  /** scrollHeight captured when an older-page fetch starts; the prepend
+   * shifts content down, and restoring scrollTop = newHeight - oldHeight
+   * keeps the viewport pinned to the same message. */
+  const prependAnchorRef = useRef<number | null>(null);
 
   const stepsByMessageId = useMemo(() => {
     const map = new Map<string, typeof agentSteps>();
@@ -124,6 +137,28 @@ export function MessageList() {
     const distance = container.scrollHeight - container.scrollTop - container.clientHeight;
     isNearBottomRef.current = distance < NEAR_BOTTOM_THRESHOLD;
   };
+
+  // Scroll-top trigger for older history (capture the anchor BEFORE the
+  // store prepend happens — the fetch is async, so the anchor is restored
+  // in the layout effect below once the page lands).
+  const handleScroll = () => {
+    updateNearBottom();
+    const container = containerRef.current;
+    if (!container || !onLoadOlder || !hasMoreMessages || loadingOlder) return;
+    if (container.scrollTop < 80) {
+      prependAnchorRef.current = container.scrollHeight;
+      onLoadOlder();
+    }
+  };
+
+  // Restore the scroll anchor after an older page is prepended.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (container && prependAnchorRef.current != null) {
+      container.scrollTop = container.scrollHeight - prependAnchorRef.current;
+      prependAnchorRef.current = null;
+    }
+  }, [messages]);
 
   useEffect(() => {
     const sessionChanged = prevSessionIdRef.current !== activeSessionId;
@@ -163,10 +198,17 @@ export function MessageList() {
   return (
     <div
       ref={containerRef}
-      onScroll={updateNearBottom}
+      onScroll={handleScroll}
       className="h-full overflow-y-auto px-6 py-8"
     >
       <div className="max-w-[800px] mx-auto space-y-7">
+        {hasMoreMessages && (
+          <div className="flex justify-center">
+            <span className="text-[11px] text-codex-muted">
+              {loadingOlder ? '加载更早的消息…' : '向上滚动加载更早的消息'}
+            </span>
+          </div>
+        )}
         <HistoryMessages messages={messages} stepsByMessageId={stepsByMessageId} />
         <StreamingBubble />
         <div ref={bottomRef} />

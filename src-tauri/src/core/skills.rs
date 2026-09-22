@@ -4,11 +4,14 @@ use serde::Serialize;
 
 /// A loaded inline skill (Kimi Code style): a `<skills_dir>/<name>/SKILL.md`
 /// with YAML-ish frontmatter (`name`, `description`) and a markdown body.
+/// `dir` is the skill's own directory — auxiliary files (scripts, templates)
+/// live there and the SKILL.md body references them by relative path.
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
     pub description: String,
     pub content: String,
+    pub dir: std::path::PathBuf,
 }
 
 /// Parse `SKILL.md`: optional `---` frontmatter block with `name:` and
@@ -78,11 +81,46 @@ pub fn scan(dir: &Path) -> Vec<Skill> {    let mut skills = Vec::new();
                 name,
                 description,
                 content,
+                dir: path.clone(),
             });
         }
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
+}
+
+/// One-level-ish file listing of a skill directory (relative paths, dirs
+/// suffixed with `/`, SKILL.md itself omitted — the model already has its
+/// content). Lets the model discover scripts/templates without a probing
+/// file_list call. Capped so a bloated skill can't flood the context.
+pub fn list_skill_files(dir: &Path) -> Vec<String> {
+    const MAX_ENTRIES: usize = 50;
+    fn walk(base: &Path, rel: &Path, out: &mut Vec<String>, depth: usize) {
+        if out.len() >= MAX_ENTRIES || depth > 2 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(base.join(rel)) else { return };
+        let mut names: Vec<_> = entries.flatten().collect();
+        names.sort_by_key(|e| e.file_name());
+        for entry in names {
+            if out.len() >= MAX_ENTRIES {
+                return;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || (rel.as_os_str().is_empty() && name == "SKILL.md") {
+                continue;
+            }
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let child = rel.join(&name);
+            out.push(format!("{}{}", child.to_string_lossy(), if is_dir { "/" } else { "" }));
+            if is_dir {
+                walk(base, &child, out, depth + 1);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, Path::new(""), &mut out, 1);
+    out
 }
 
 // ── Plugins dialog: listing, detail, import, delete ─────────────────────
@@ -107,7 +145,7 @@ pub fn list_all(user_dir: &Path) -> Vec<SkillInfo> {
     scan(user_dir)
         .into_iter()
         .map(|s| SkillInfo {
-            path: user_dir.join(&s.name).to_string_lossy().to_string(),
+            path: s.dir.to_string_lossy().to_string(),
             name: s.name,
             description: s.description,
         })
@@ -120,7 +158,7 @@ pub fn get(user_dir: &Path, name: &str) -> Option<(Skill, String)> {
         .into_iter()
         .find(|s| s.name == name)
         .map(|s| {
-            let path = user_dir.join(&s.name).to_string_lossy().to_string();
+            let path = s.dir.to_string_lossy().to_string();
             (s, path)
         })
 }
@@ -332,5 +370,19 @@ mod tests {
         let lib = tmp.path().join("lib");
         assert!(import_zip(&lib, &zip_path).is_err());
         assert!(!tmp.path().join("evil.txt").exists());
+    }
+
+    #[test]
+    fn list_skill_files_shows_relative_paths_and_skips_hidden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("SKILL.md"), SKILL_MD).unwrap();
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(dir.join("scripts/run.sh"), "echo hi").unwrap();
+        std::fs::write(dir.join(".hidden"), "x").unwrap();
+        let files = list_skill_files(dir);
+        assert!(files.contains(&"scripts/".to_string()));
+        assert!(files.contains(&std::path::Path::new("scripts").join("run.sh").to_string_lossy().to_string()));
+        assert!(!files.iter().any(|f| f.contains("SKILL.md") || f.contains("hidden")));
     }
 }

@@ -4,7 +4,7 @@ import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';
 import { ChatHeader } from './ChatHeader';
 import { AskUserDialog } from './AskUserDialog';
-import { useChatStore } from '@/stores/chatStore';
+import { useChatStore, MESSAGE_PAGE_SIZE } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
 import { usePetContextStore } from '@/stores/petContextStore';
 import { useStreamingChat } from '@/hooks/useStreamingChat';
@@ -129,6 +129,7 @@ export function ChatPanel() {
     useChatStore();
   const { projects } = useProjectStore();
   const [loadingMessages, setLoadingMessages] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
 
   const activeSession = sessions.find((s) => s.id === activeSessionId) ?? null;
 
@@ -170,12 +171,13 @@ export function ChatPanel() {
       .catch(() => {});
 
     Promise.all([
-      getChatMessages(activeSessionId),
+      getChatMessages(activeSessionId, { limit: MESSAGE_PAGE_SIZE }),
       getAgentSteps(activeSessionId),
     ])
-      .then(([messages, steps]) => {
+      .then(([page, steps]) => {
         if (!cancelled) {
-          setMessages(messages);
+          setMessages(page.messages);
+          useChatStore.getState().setHasMoreMessages(page.hasMore);
           setAgentSteps(steps);
         }
       })
@@ -183,6 +185,7 @@ export function ChatPanel() {
         console.error('Failed to load chat data:', err);
         if (!cancelled) {
           setMessages([]);
+          useChatStore.getState().setHasMoreMessages(false);
           setAgentSteps([]);
         }
       })
@@ -211,6 +214,28 @@ export function ChatPanel() {
       );
     } catch (err) {
       console.error('Failed to rename session:', err);
+    }
+  };
+
+  // Scroll-up pagination: fetch the page older than the oldest loaded row.
+  // MessageList anchors the scroll position across the prepend.
+  const loadOlderMessages = async () => {
+    const { activeSessionId: sid, messages, hasMoreMessages } = useChatStore.getState();
+    if (!sid || !hasMoreMessages || messages.length === 0) return;
+    setLoadingOlder(true);
+    try {
+      const oldest = messages[0];
+      const page = await getChatMessages(sid, {
+        before: { createdAt: oldest.created_at, id: oldest.id },
+        limit: MESSAGE_PAGE_SIZE,
+      });
+      const st = useChatStore.getState();
+      st.prependMessages(page.messages);
+      st.setHasMoreMessages(page.hasMore);
+    } catch (err) {
+      console.error('Failed to load older messages:', err);
+    } finally {
+      setLoadingOlder(false);
     }
   };
 
@@ -258,7 +283,7 @@ export function ChatPanel() {
         onModelChange={handleModelChange}
       />
       <div className="flex-1 overflow-hidden relative">
-        <MessageList />
+        <MessageList onLoadOlder={loadOlderMessages} loadingOlder={loadingOlder} />
         {loadingMessages && (
           <div className="absolute inset-0 flex items-center justify-center bg-background/60 backdrop-blur-[1px]">
             <Loader2 size={20} className="animate-spin text-text-secondary" />

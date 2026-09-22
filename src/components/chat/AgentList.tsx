@@ -8,6 +8,7 @@ import {
   FolderPlus,
   FolderOpen,
   Pin,
+  Plus,
   Trash2,
   Settings,
   Loader2,
@@ -114,7 +115,6 @@ export function AgentList() {
     projects,
     activeProjectId,
     loading: projectsLoading,
-    groupBy,
     sortBy,
     load,
     addProject,
@@ -122,7 +122,6 @@ export function AgentList() {
     renameProject,
     archiveProject,
     switchProject,
-    setGroupBy,
     setSortBy,
   } = useProjectStore();
   const { alert, confirm, prompt } = useDialog();
@@ -150,6 +149,8 @@ export function AgentList() {
   /** Collapsed-state toggles for the archived sections. */
   const [showArchivedChats, setShowArchivedChats] = useState(false);
   const [showArchivedProjects, setShowArchivedProjects] = useState(false);
+  /** Projects expanded to show their sessions inline (Codex workspace style). */
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
   const menuRef = useRef<HTMLDivElement>(null);
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const organizeRef = useRef<HTMLDivElement>(null);
@@ -230,57 +231,67 @@ export function AgentList() {
   const visibleProjects = useMemo(() => projects.filter((p) => !p.archived), [projects]);
   const archivedProjects = useMemo(() => projects.filter((p) => p.archived), [projects]);
   const activeSessions = useMemo(() => sessions.filter((s) => !s.archived), [sessions]);
-  const archivedSessions = useMemo(
-    () =>
-      sessions.filter(
-        (s) => s.archived && (!activeProjectId || s.project_id === activeProjectId)
-      ),
-    [sessions, activeProjectId]
+  const archivedSessions = useMemo(() => sessions.filter((s) => s.archived), [sessions]);
+
+  const sortSessions = useCallback(
+    (list: AgentSession[]) => {
+      const sorted = [...list];
+      switch (sortBy) {
+        case 'updated':
+          sorted.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+          break;
+        case 'manual':
+          sorted.sort(
+            (a, b) =>
+              (a.sort_order ?? 0) - (b.sort_order ?? 0) ||
+              b.updated_at.localeCompare(a.updated_at)
+          );
+          break;
+        default: // priority
+          sorted.sort(
+            (a, b) =>
+              (b.is_pinned ? 1 : 0) - (a.is_pinned ? 1 : 0) ||
+              b.updated_at.localeCompare(a.updated_at)
+          );
+      }
+      return sorted;
+    },
+    [sortBy]
   );
 
-  // Chats visible in the list: non-archived, filtered by the selected
-  // project, then sorted.
-  const visibleSessions = useMemo(() => {
-    const list = activeProjectId
-      ? activeSessions.filter((s) => s.project_id === activeProjectId)
-      : activeSessions;
-    const sorted = [...list];
-    switch (sortBy) {
-      case 'updated':
-        sorted.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
-        break;
-      case 'manual':
-        sorted.sort(
-          (a, b) =>
-            (a.sort_order ?? 0) - (b.sort_order ?? 0) ||
-            b.updated_at.localeCompare(a.updated_at)
-        );
-        break;
-      default: // priority
-        sorted.sort(
-          (a, b) =>
-            (b.is_pinned ? 1 : 0) - (a.is_pinned ? 1 : 0) ||
-            b.updated_at.localeCompare(a.updated_at)
-        );
-    }
-    return sorted;
-  }, [activeSessions, activeProjectId, sortBy]);
-
-  // Group chats by project (only when no project filter and grouping is enabled).
-  const grouped = useMemo(() => {
-    if (activeProjectId || groupBy !== 'project') return null;
+  // Non-archived sessions bucketed by project ('' = unbound), each bucket
+  // sorted. Project buckets render nested under their project row; the ''
+  // bucket is the 对话 section.
+  const sessionsByProject = useMemo(() => {
     const map = new Map<string, AgentSession[]>();
-    for (const s of visibleSessions) {
+    for (const s of activeSessions) {
       const key = s.project_id ?? '';
       const arr = map.get(key) ?? [];
       arr.push(s);
       map.set(key, arr);
     }
+    for (const [key, list] of map) map.set(key, sortSessions(list));
     return map;
-  }, [visibleSessions, activeProjectId, groupBy]);
+  }, [activeSessions, sortSessions]);
 
-  const projectChatCount = (pid: string | null) =>
-    activeSessions.filter((s) => s.project_id === pid).length;
+  const toggleProjectExpanded = (id: string) => {
+    setExpandedProjects((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // On first load, expand the project containing the active session so its
+  // row isn't hidden inside a collapsed project.
+  const autoExpandedRef = useRef(false);
+  useEffect(() => {
+    if (autoExpandedRef.current || sessions.length === 0) return;
+    autoExpandedRef.current = true;
+    const active = sessions.find((s) => s.id === useChatStore.getState().activeSessionId);
+    if (active?.project_id) setExpandedProjects(new Set([active.project_id]));
+  }, [sessions]);
 
   const handleContextMenu = (e: React.MouseEvent, agentId: string) => {
     e.preventDefault();
@@ -400,11 +411,14 @@ export function AgentList() {
 
   const handleCreateProject = async (path: string, name?: string, gitInit?: boolean) => {
     const created = await addProject(path, name, gitInit);
-    if (created) await handleSelectProject(created.id);
+    if (created) {
+      switchProject(created.id);
+      setExpandedProjects((prev) => new Set(prev).add(created.id));
+    }
     return created?.id ?? null;
   };
 
-  // Create a default-agent conversation for a project (Codex-style "默认对话").
+  // Create a default-agent conversation inside a project (the row's + button).
   const createDefaultSession = async (projectId: string) => {
     try {
       const session = await agentCreateSession({
@@ -413,6 +427,7 @@ export function AgentList() {
         toolsEnabled: DEFAULT_TOOLS,
         projectId,
       });
+      setExpandedProjects((prev) => new Set(prev).add(projectId));
       await loadSessions();
       setActiveSession(session.id);
     } catch (err) {
@@ -420,25 +435,11 @@ export function AgentList() {
     }
   };
 
-  // Selecting a project switches the working context: open its most recent
-  // conversation, or auto-create a default-agent conversation if it has none.
-  const handleSelectProject = async (id: string | null) => {
-    if (id === null) {
-      switchProject(null);
-      return;
-    }
-    switchProject(id);
-    const projectSessions = useChatStore
-      .getState()
-      .sessions.filter((s) => s.project_id === id && !s.archived);
-    if (projectSessions.length > 0) {
-      const recent = [...projectSessions].sort((a, b) =>
-        b.updated_at.localeCompare(a.updated_at)
-      )[0];
-      setActiveSession(recent.id);
-    } else {
-      await createDefaultSession(id);
-    }
+  // Clicking a project row selects it as the working context (used by the
+  // hero input's binding and the 拉取请求 menu); the chevron expands its
+  // session list inline.
+  const handleSelectProject = (id: string) => {
+    switchProject(activeProjectId === id ? null : id);
   };
 
   // 拉取请求: opens the create-PR dialog for the selected project (the dialog
@@ -549,28 +550,6 @@ export function AgentList() {
               <div className="px-3 pb-1 text-[11px] font-medium text-codex-muted">
                 组织侧边栏
               </div>
-              <div className="px-3 pb-0.5 text-[10px] text-codex-muted">分组</div>
-              <label className="flex items-center gap-2 px-3 py-1 text-[13px] text-codex-primary hover:bg-codex-hover cursor-pointer">
-                <input
-                  type="radio"
-                  name="sidebarGroup"
-                  checked={groupBy === 'project'}
-                  onChange={() => setGroupBy('project')}
-                  className="accent-codex-accent"
-                />
-                按项目
-              </label>
-              <label className="flex items-center gap-2 px-3 py-1 text-[13px] text-codex-primary hover:bg-codex-hover cursor-pointer">
-                <input
-                  type="radio"
-                  name="sidebarGroup"
-                  checked={groupBy === 'list'}
-                  onChange={() => setGroupBy('list')}
-                  className="accent-codex-accent"
-                />
-                在一个列表中
-              </label>
-              <div className="my-1 border-t border-codex-border" />
               <div className="px-3 pb-0.5 text-[10px] text-codex-muted">排序聊天依据</div>
               {(
                 [
@@ -609,36 +588,72 @@ export function AgentList() {
             <>
               {visibleProjects.map((p) => {
                 const active = p.id === activeProjectId;
+                const expanded = expandedProjects.has(p.id);
+                const projectSessions = sessionsByProject.get(p.id) ?? [];
                 return (
-                  <div
-                    key={p.id}
-                    onClick={() => handleSelectProject(active ? null : p.id)}
-                    onContextMenu={(e) => handleProjectContextMenu(e, p.id)}
-                    className={`group flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer text-[13px] transition-colors ${
-                      active
-                        ? 'bg-codex-hover text-codex-primary'
-                        : 'text-codex-secondary hover:bg-codex-hover hover:text-codex-primary'
-                    }`}
-                    title={p.path}
-                  >
-                    <FolderOpen size={14} className="shrink-0 text-codex-muted" />
-                    <span className="flex-1 truncate">{p.name}</span>
-                    <span className="text-[11px] text-codex-muted shrink-0">
-                      {projectChatCount(p.id)}
-                    </span>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        fileBrowserRevealInSystem(p.path).catch((err) =>
-                          console.error('reveal project dir:', err)
-                        );
-                      }}
-                      title="打开目录位置"
-                      aria-label="打开目录位置"
-                      className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-codex-muted hover:text-codex-primary hover:bg-codex-bg transition-opacity"
+                  <div key={p.id}>
+                    <div
+                      onClick={() => handleSelectProject(p.id)}
+                      onContextMenu={(e) => handleProjectContextMenu(e, p.id)}
+                      className={`group flex items-center gap-1.5 px-2 py-1.5 rounded-md cursor-pointer text-[13px] transition-colors ${
+                        active
+                          ? 'bg-codex-hover text-codex-primary'
+                          : 'text-codex-secondary hover:bg-codex-hover hover:text-codex-primary'
+                      }`}
+                      title={p.path}
                     >
-                      <FolderOpen size={12} />
-                    </button>
+                      {/* Chevron: appears on hover, stays visible while expanded. */}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleProjectExpanded(p.id);
+                        }}
+                        aria-label={expanded ? '收起' : '展开'}
+                        className={`shrink-0 -ml-1 p-0.5 rounded text-codex-muted hover:text-codex-primary transition-opacity ${
+                          expanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                        }`}
+                      >
+                        {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                      </button>
+                      <FolderOpen size={14} className="shrink-0 text-codex-muted" />
+                      <span className="flex-1 truncate">{p.name}</span>
+                      <span className="text-[11px] text-codex-muted shrink-0 group-hover:hidden">
+                        {projectSessions.length}
+                      </span>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void createDefaultSession(p.id);
+                        }}
+                        title="在该项目下新建对话"
+                        aria-label="在该项目下新建对话"
+                        className="hidden group-hover:block shrink-0 p-0.5 rounded text-codex-muted hover:text-codex-primary hover:bg-codex-bg"
+                      >
+                        <Plus size={13} />
+                      </button>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          fileBrowserRevealInSystem(p.path).catch((err) =>
+                            console.error('reveal project dir:', err)
+                          );
+                        }}
+                        title="打开目录位置"
+                        aria-label="打开目录位置"
+                        className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-codex-muted hover:text-codex-primary hover:bg-codex-bg transition-opacity"
+                      >
+                        <FolderOpen size={12} />
+                      </button>
+                    </div>
+                    {expanded && (
+                      <div className="ml-5 space-y-0.5">
+                        {projectSessions.length === 0 ? (
+                          <div className="px-2 py-1 text-[12px] text-codex-muted">暂无对话</div>
+                        ) : (
+                          projectSessions.map((s) => renderChatRow(s))
+                        )}
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -670,25 +685,16 @@ export function AgentList() {
         </div>
       </section>
 
-      {/* Recents */}
+      {/* Unbound conversations */}
       <section className="flex-1 min-h-0 flex flex-col mt-4">
         <div className="px-3 mb-1 text-[11px] font-semibold text-codex-muted uppercase tracking-wide">
-          最近
+          对话
         </div>
         <div className="flex-1 overflow-y-auto px-2 pb-3 space-y-0.5">
-          {visibleSessions.length === 0 ? (
+          {(sessionsByProject.get('') ?? []).length === 0 ? (
             <div className="px-2 py-1 text-[12px] text-codex-muted">暂无对话</div>
-          ) : grouped ? (
-            [...grouped.entries()].map(([pid, list]) => (
-              <div key={pid}>
-                <div className="px-2 pt-2 pb-0.5 text-[11px] text-codex-muted truncate">
-                  {projects.find((p) => p.id === pid)?.name || '未分组'}
-                </div>
-                {list.map((s) => renderChatRow(s))}
-              </div>
-            ))
           ) : (
-            visibleSessions.map((s) => renderChatRow(s))
+            (sessionsByProject.get('') ?? []).map((s) => renderChatRow(s))
           )}
           {archivedSessions.length > 0 && (
             <div className="pt-1">

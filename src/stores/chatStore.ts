@@ -1,10 +1,15 @@
 import { create } from 'zustand';
 import type { AgentSession, AgentStep, ChatMessage, StreamingStep, ToolCallInfo, AskQuestion } from '@/lib/types';
 
+/** Messages per history page (initial load and each scroll-up fetch). */
+export const MESSAGE_PAGE_SIZE = 50;
+
 interface ChatState {
   sessions: AgentSession[];
   activeSessionId: string | null;
   messages: ChatMessage[];
+  /** Older history exists beyond messages[0] (scroll-up pagination). */
+  hasMoreMessages: boolean;
   agentSteps: AgentStep[];
   isLoading: boolean;
   isStreaming: boolean;
@@ -29,6 +34,9 @@ interface ChatState {
   setSessions: (sessions: AgentSession[]) => void;
   setActiveSession: (id: string | null) => void;
   setMessages: (messages: ChatMessage[]) => void;
+  /** Prepend an older page (scroll-up pagination). */
+  prependMessages: (messages: ChatMessage[]) => void;
+  setHasMoreMessages: (v: boolean) => void;
   addMessage: (msg: ChatMessage) => void;
   /** Replace one message in place (e.g. after tagging it). */
   patchMessage: (msg: ChatMessage) => void;
@@ -58,6 +66,7 @@ export const useChatStore = create<ChatState>((set) => ({
   sessions: [],
   activeSessionId: null,
   messages: [],
+  hasMoreMessages: false,
   agentSteps: [],
   isLoading: false,
   isStreaming: false,
@@ -78,6 +87,7 @@ export const useChatStore = create<ChatState>((set) => ({
       return {
         activeSessionId: id,
         messages: [],
+        hasMoreMessages: false,
         agentSteps: [],
         streamContent: '',
         streamingSteps: [],
@@ -91,6 +101,8 @@ export const useChatStore = create<ChatState>((set) => ({
       };
     }),
   setMessages: (messages) => set({ messages }),
+  prependMessages: (older) => set((s) => ({ messages: [...older, ...s.messages] })),
+  setHasMoreMessages: (v) => set({ hasMoreMessages: v }),
   addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
   patchMessage: (msg) =>
     set((s) => ({ messages: s.messages.map((m) => (m.id === msg.id ? msg : m)) })),

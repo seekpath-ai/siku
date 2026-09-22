@@ -533,7 +533,8 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
         if (st.session) {
           const sid = st.session.id;
           const reload = () => Promise.all([getChatMessages(sid), getAgentSteps(sid)]);
-          const applyReloaded = ([msgs, steps]: [ChatMessage[], AgentStep[]]) => {
+          const applyReloaded = ([page, steps]: [{ messages: ChatMessage[] }, AgentStep[]]) => {
+            const msgs = page.messages;
             // Attribute steps the backend left unlinked to the latest
             // assistant reply so their card still renders in history.
             const lastAssistant = [...msgs].reverse().find((m) => m.role === 'assistant');

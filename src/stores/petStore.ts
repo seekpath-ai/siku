@@ -146,10 +146,11 @@ export const usePetStore = create<PetState>((set, get) => ({
           title: ctx.title,
         });
       }
-      const [messages, agentSteps] = await Promise.all([
+      const [msgPage, agentSteps] = await Promise.all([
         getChatMessages(session.id),
         getAgentSteps(session.id),
       ]);
+      const messages = msgPage.messages;
       set({ session, messages, agentSteps, loading: false });
     } catch (err) {
       console.error('pet start:', err);
@@ -165,10 +166,11 @@ export const usePetStore = create<PetState>((set, get) => ({
     });
     try {
       const session = await agentGetSession(sessionId);
-      const [messages, agentSteps] = await Promise.all([
+      const [msgPage, agentSteps] = await Promise.all([
         getChatMessages(sessionId),
         getAgentSteps(sessionId),
       ]);
+      const messages = msgPage.messages;
       set({ session, messages, agentSteps, loading: false });
     } catch (err) {
       console.error('pet attach:', err);

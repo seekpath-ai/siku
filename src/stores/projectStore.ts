@@ -3,7 +3,6 @@ import { persist } from 'zustand/middleware';
 import { projectsList, projectCreate, projectDelete, projectUpdate, projectSetArchived } from '@/lib/tauri';
 import type { Project } from '@/lib/types';
 
-export type SidebarGroupBy = 'project' | 'list';
 export type SidebarSortBy = 'priority' | 'updated' | 'manual';
 
 interface ProjectState {
@@ -11,8 +10,6 @@ interface ProjectState {
   /** Selected project filter for the chat list; null = all projects. */
   activeProjectId: string | null;
   loading: boolean;
-  /** Chat list grouping: by project or one flat list. */
-  groupBy: SidebarGroupBy;
   /** Chat list ordering. */
   sortBy: SidebarSortBy;
   /** Load the project list and restore the persisted active project. */
@@ -23,7 +20,6 @@ interface ProjectState {
   renameProject: (id: string, name: string) => Promise<void>;
   archiveProject: (id: string, archived: boolean) => Promise<void>;
   switchProject: (id: string | null) => void;
-  setGroupBy: (g: SidebarGroupBy) => void;
   setSortBy: (s: SidebarSortBy) => void;
 }
 
@@ -33,7 +29,6 @@ export const useProjectStore = create<ProjectState>()(
       projects: [],
       activeProjectId: null,
       loading: false,
-      groupBy: 'project',
       sortBy: 'priority',
 
       load: async () => {
@@ -91,14 +86,12 @@ export const useProjectStore = create<ProjectState>()(
       },
 
       switchProject: (id) => set({ activeProjectId: id }),
-      setGroupBy: (groupBy) => set({ groupBy }),
       setSortBy: (sortBy) => set({ sortBy }),
     }),
     {
       name: 'siku.chatSidebar',
       partialize: (s) => ({
         activeProjectId: s.activeProjectId,
-        groupBy: s.groupBy,
         sortBy: s.sortBy,
       }),
     }

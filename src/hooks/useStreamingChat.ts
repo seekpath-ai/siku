@@ -1,8 +1,8 @@
 import { useCallback } from 'react';
-import { useChatStore } from '@/stores/chatStore';
-import { getChatMessages, getAgentSteps } from '@/lib/tauri';
+import { useChatStore, MESSAGE_PAGE_SIZE } from '@/stores/chatStore';
+import { getChatMessages, getAgentSteps, type ChatMessagePage } from '@/lib/tauri';
 import { useAgentEventStream } from '@/hooks/useAgentEventStream';
-import type { AgentStep, AgentStreamEvent, ChatMessage, ToolCallInfo } from '@/lib/types';
+import type { AgentStep, AgentStreamEvent, ToolCallInfo } from '@/lib/types';
 
 /** Event types that mark their session as actively generating. */
 const STREAMING_START_TYPES = new Set<AgentStreamEvent['type']>([
@@ -37,18 +37,39 @@ export function useStreamingChat() {
 
   // Re-read the persisted history after a turn completes so the local view
   // matches the DB (same post-run alignment the pet panel already does).
+  // Incremental against the paginated view: fetch only rows NEWER than the
+  // newest persisted message and append, dropping the optimistic temp
+  // bubbles (their ids are `user_*`/`error_*` locals, never persisted).
   const reloadSessionHistory = useCallback((sessionId: string) => {
-    const reload = () => Promise.all([getChatMessages(sessionId), getAgentSteps(sessionId)]);
-    const apply = ([msgs, steps]: [ChatMessage[], AgentStep[]]) => {
+    const isTemp = (id: string) => id.startsWith('user_') || id.startsWith('error_');
+    const reload = async () => {
+      const state = useChatStore.getState();
+      const newestPersisted = state.activeSessionId === sessionId
+        ? [...state.messages].reverse().find((m) => !isTemp(m.id))
+        : null;
+      const [page, steps] = await Promise.all([
+        newestPersisted
+          ? getChatMessages(sessionId, {
+              after: { createdAt: newestPersisted.created_at, id: newestPersisted.id },
+            })
+          : getChatMessages(sessionId, { limit: MESSAGE_PAGE_SIZE }),
+        getAgentSteps(sessionId),
+      ]);
+      return { page, steps };
+    };
+    const apply = ({ page, steps }: { page: ChatMessagePage; steps: AgentStep[] }) => {
       const state = useChatStore.getState();
       // The user switched away meanwhile; that session's history is loaded
       // by ChatPanel when it becomes active again.
       if (state.activeSessionId !== sessionId) return;
-      const lastAssistant = [...msgs].reverse().find((m) => m.role === 'assistant');
+      const persisted = state.messages.filter((m) => !isTemp(m.id));
+      const known = new Set(persisted.map((m) => m.id));
+      const merged = [...persisted, ...page.messages.filter((m) => !known.has(m.id))];
+      const lastAssistant = [...merged].reverse().find((m) => m.role === 'assistant');
       const linked = lastAssistant
         ? steps.map((s) => (s.message_id === null ? { ...s, message_id: lastAssistant.id } : s))
         : steps;
-      state.setMessages(msgs);
+      state.setMessages(merged);
       state.setAgentSteps(linked);
     };
     (async () => {

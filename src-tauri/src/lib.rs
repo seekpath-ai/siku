@@ -627,11 +627,12 @@ pub fn run() {
         // Global (OS-level) screenshot hotkey: fires the snipping flow even
         // when the main window is minimized/hidden — WeChat-style. The combo
         // itself is (un)registered by screenshot_hotkey_sync per settings.
-        // This handler only emits the event; window hide/show is owned by the
-        // frontend screenshot flow (useImageAttachments), which hides the main
-        // window before launching the OS snipping tool and restores it after.
-        // Unminimize/show/focus here would put the window in front of the area
-        // the user wants to capture.
+        // This handler only emits the event; it deliberately does NOT touch
+        // window state. Whether the main window is visible or minimized is
+        // the user's deliberate choice — visible means "may appear in the
+        // shot", minimized means they already cleared it away. Unminimize/
+        // show/focus here would override that choice (and earlier versions
+        // did, covering the exact area the user wanted to capture).
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {

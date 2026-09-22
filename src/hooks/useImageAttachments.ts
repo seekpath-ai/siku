@@ -1,6 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { readImage } from '@tauri-apps/plugin-clipboard-manager';
-import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { screenshotStart } from '@/lib/tauri';
 
 /** Local image attachment staged in an input box (sent as ChatAttachment). */
@@ -126,18 +125,6 @@ export function useImageAttachments({
 
   const clearImages = useCallback(() => setImages([]), []);
 
-  // Bring the main window back after a screenshot (or on cancel-timeout):
-  // even if we did not hide it ourselves, surface it so the user sees the
-  // shot land in the input. Best-effort — failures must never break the flow.
-  // The hook also runs in pet windows, so target 'main' by label.
-  const restoreMainWindow = useCallback(async () => {
-    const win = await WebviewWindow.getByLabel('main');
-    if (!win) return;
-    await win.unminimize().catch(() => {});
-    await win.show().catch(() => {});
-    await win.setFocus().catch(() => {});
-  }, []);
-
   // Screenshot flow: the scissors button launches the OS snipping tool; a
   // fresh clipboard image within SCREENSHOT_TIMEOUT_MS is attached
   // automatically. Checked on window focus AND by polling, because some
@@ -145,17 +132,20 @@ export function useImageAttachments({
   const checkClipboardShot = useCallback(async () => {
     const pending = shotPending.current;
     if (!pending) return;
+    // Claim the pending slot SYNCHRONOUSLY, before any await: reading the
+    // clipboard (RGBA decode + canvas encode) can take hundreds of ms for a
+    // large screenshot, and a focus event plus a polling tick entering
+    // together would otherwise both pass the null check and attach twice.
+    shotPending.current = null;
     if (Date.now() - pending.since > SCREENSHOT_TIMEOUT_MS) {
-      shotPending.current = null;
       setShotArmed(false);
-      // Esc-cancelled snips never touch the clipboard, so the timeout is
-      // also where the hidden main window gets restored.
-      void restoreMainWindow();
       return;
     }
     const shot = await readClipboardShot();
-    if (!shot || shot.sig === pending.prevSig) return;
-    shotPending.current = null;
+    if (!shot || shot.sig === pending.prevSig) {
+      shotPending.current = pending; // no fresh shot — hand the claim back
+      return;
+    }
     setShotArmed(false);
     const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
     addImageData({
@@ -164,9 +154,8 @@ export function useImageAttachments({
       base64: shot.base64,
       previewUrl: shot.dataUrl,
     });
-    void restoreMainWindow();
     onAttached?.();
-  }, [addImageData, onAttached, restoreMainWindow]);
+  }, [addImageData, onAttached]);
 
   useEffect(() => {
     if (!shotArmed) return;
@@ -180,32 +169,18 @@ export function useImageAttachments({
 
   const startScreenshot = useCallback(async () => {
     // Remember the current clipboard content so only a NEW image attaches.
+    // Window state is the user's deliberate choice: a visible window means
+    // "may appear in the shot", a minimized one means they already cleared
+    // it out of the way — never minimize/restore on their behalf.
     const prev = await readClipboardShot();
-    // Hide the main window before invoking the OS snipping tool so it does
-    // not cover the area being captured (WeChat-style). Restored by
-    // checkClipboardShot once the shot lands (or on timeout). A hide failure
-    // (e.g. platform unsupported) must not block the flow.
-    let hidWindow = false;
-    try {
-      const win = await WebviewWindow.getByLabel('main');
-      if (win && (await win.isVisible()) && !(await win.isMinimized())) {
-        await win.hide();
-        hidWindow = true;
-        // Let the hide animation finish so the fading window is not captured.
-        await new Promise((resolve) => setTimeout(resolve, 300));
-      }
-    } catch {
-      hidWindow = false;
-    }
     try {
       await screenshotStart();
       shotPending.current = { since: Date.now(), prevSig: prev?.sig ?? null };
       setShotArmed(true);
     } catch (err) {
-      if (hidWindow) void restoreMainWindow();
       onError?.(String(err), '截图');
     }
-  }, [onError, restoreMainWindow]);
+  }, [onError]);
 
   // Optional in-app shortcut: Ctrl+Shift+S triggers the screenshot flow.
   // Also responds to the OS-global hotkey (registered by the backend, fired

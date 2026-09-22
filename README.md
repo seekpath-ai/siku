@@ -33,7 +33,7 @@ Siku 把这些揉成一件事：**让 AI 在你本地的知识库里干活。**
 - ✅ **信得过** — RAG 回答逐条带 chunk 引用，点击跳回 PDF 原文位置高亮，每句话都可验证
 - 🔗 **长在一起** — 类 Zotero 的文献管理 + 类 Obsidian 的笔记（实时预览/阅读/源码三模式）长在同一个数据库里：笔记引用链回 PDF 页码，双向链接织成知识图谱
 - ✨ **收藏 → 吸收** — 丢个博客链接，AI 抓正文、去噪、整理成结构化笔记，自动挂双链进知识库；整理过的知识才能被检索和复用
-- 🤖 **不止科研** — ReAct 引擎 + 23+ 工具是底座，五大知识域（学术/学习/生活/阅读/个人）各自独立的 prompt 与知识库；定时任务、文件操作、跑脚本，生活工作任务一样能跑
+- 🤖 **不止科研** — ReAct 引擎 + 25+ 工具是底座，五大知识域（学术/学习/生活/阅读/个人）各自独立的 prompt 与知识库；定时任务、文件操作、跑脚本，生活工作任务一样能跑。技能插件按会话挂载（文件夹/zip 导入），并可用「AI 审查」对插件做安全扫描与依赖检查后再启用
 - 🔒 **数据主权** — 全部数据在本地 SQLite，可配 Ollama 完全离线；多设备同步走 WebRTC P2P + 中继邮箱离线中转，端到端加密
 - 🐾 **全局待命** — 桌面宠物悬浮球，不切窗口、随时唤起 AI
 
@@ -66,7 +66,7 @@ Siku 把这些揉成一件事：**让 AI 在你本地的知识库里干活。**
 | PDF | pdfium-render（含 /Rotate 与分栏几何重建）+ pdf_oxide 兜底；lopdf 取元数据 |
 | 语义检索 | 可选：配置 OpenAI 兼容的 /embeddings 端点即启用，与关键词检索按 RRF 融合 |
 | LLM | OpenAI / Anthropic / DeepSeek / SiliconFlow / Ollama / Qwen / Zhipu / Kimi / Gemini |
-| Agent | ReAct 循环 + Tool Registry（23+ 工具 / Skill）+ SSE 流式 + 后台任务 + 定时任务 |
+| Agent | ReAct 循环 + Tool Registry（25+ 工具 / 会话级挂载的 Skill）+ SSE 流式 + 后台任务 + 定时任务 |
 
 ## 项目结构
 
@@ -182,7 +182,7 @@ User → UI (React) → Tauri IPC → Commands → Services → SQLite / File St
                         ↑                          ↑
                   Agent Engine (ReAct)       Tool Registry
                         ↓                          ↓
-                  LLM Client (Multi-Provider)   23+ Tools / Skills
+                  LLM Client (Multi-Provider)   25+ Tools / Skills
 ```
 
 **Agent 信任模型**：只读工具自动放行；写/执行类工具按会话审批模式请求确认。文件工具限定在工作目录（项目沙箱，可配置全盘访问）。单次工具执行超时 320s（`bash` 自带最长 300s）。
@@ -208,6 +208,10 @@ User → UI (React) → Tauri IPC → Commands → Services → SQLite / File St
 - Gemini
 
 代理为可选配置，留空直连。
+
+### 网络搜索引擎
+
+智能体的 `web_search` 工具按「设置 → 网络搜索」中的引擎链**按序回退**：一次调用内依次尝试已启用引擎，首个出结果的生效。默认 Bing（国内直连）→ DuckDuckGo；Tavily / Brave Search 填 API Key、SearXNG 填实例地址后即可加入回退链。
 
 ### 语义检索（可选）
 

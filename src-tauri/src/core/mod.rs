@@ -26,6 +26,7 @@ pub mod redact;
 pub mod research_service;
 pub mod search_service;
 pub mod settings_service;
+pub mod skill_review;
 pub mod skills;
 pub mod tag_service;
 pub mod tasks;

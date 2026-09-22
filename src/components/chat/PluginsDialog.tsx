@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   Puzzle, X, RefreshCw, Search, FolderOpen, FolderInput, FileArchive, Trash2, Loader2,
+  ShieldCheck,
 } from 'lucide-react';
 import {
   skillsList, skillsGet, skillsImportFolder, skillsImportZip, skillsDelete,
-  skillsOpenDirectory, agentSetSessionSkills,
+  skillsOpenDirectory, agentSetSessionSkills, skillsReviewStart, skillsReviewCollect,
   type SkillInfo, type SkillDetail,
 } from '@/lib/tauri';
+import type { AgentStreamEvent } from '@/lib/types';
 import { useChatStore } from '@/stores/chatStore';
 import { useDialog } from '@/hooks/useDialog';
 
@@ -24,6 +26,8 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   const [detail, setDetail] = useState<SkillDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [busy, setBusy] = useState(false);
+  /** skill name → reviewer session id for in-flight AI reviews. */
+  const [reviewing, setReviewing] = useState<Map<string, string>>(new Map());
   const { sessions, activeSessionId, setSessions } = useChatStore();
   const { confirm, alert } = useDialog();
 
@@ -45,6 +49,68 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     load();
   }, [load]);
+
+  /** Start an AI review: deterministic static scan + a no-tool 安全审查
+   * domain session. The review runs in a detached pet-chat window so the
+   * user can watch the process. */
+  const startReview = async (name: string) => {
+    setError(null);
+    try {
+      const { sessionId } = await skillsReviewStart(name);
+      setReviewing((m) => new Map(m).set(name, sessionId));
+      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+      new WebviewWindow(`pet-chat-${Date.now()}`, {
+        url: `index.html?petSession=${sessionId}`,
+        title: '技能安全审查 - 思库',
+        width: 440,
+        height: 680,
+        minWidth: 360,
+        minHeight: 480,
+        center: true,
+        decorations: false,
+        transparent: true,
+        shadow: false,
+      });
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  // When a review turn finishes, collect + persist the verdict and refresh
+  // the badges.
+  useEffect(() => {
+    if (reviewing.size === 0) return;
+    let un: (() => void) | undefined;
+    import('@tauri-apps/api/event')
+      .then(({ listen }) =>
+        listen<AgentStreamEvent>('agent:event', (e) => {
+          const ev = e.payload;
+          if (!['done', 'cancelled', 'error'].includes(ev.type)) return;
+          const entry = [...reviewing.entries()].find(([, sid]) => sid === ev.session_id);
+          if (!entry) return;
+          const [name] = entry;
+          (async () => {
+            if (ev.type === 'done') {
+              try {
+                await skillsReviewCollect(ev.session_id);
+              } catch (err) {
+                setError(String(err));
+              }
+            }
+            setReviewing((m) => {
+              const n = new Map(m);
+              n.delete(name);
+              return n;
+            });
+            await load();
+          })();
+        })
+      )
+      .then((u) => {
+        un = u;
+      });
+    return () => un?.();
+  }, [reviewing, load]);
 
   const openDetail = async (name: string) => {
     setDetailLoading(true);
@@ -141,6 +207,33 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
       s.description.toLowerCase().includes(query.trim().toLowerCase())
   );
 
+  /** Review state badge: 绿=通过 / 黄=注意 / 红=风险；stale（审查后内容变更）按待复审显示。 */
+  const reviewBadge = (s: SkillInfo) => {
+    const r = s.review;
+    if (!r) return null;
+    if (r.stale) {
+      return (
+        <span
+          title="技能内容在审查后发生变更，建议重新审查"
+          className="shrink-0 text-[10px] px-1.5 py-px rounded-full border border-surface-hover text-text-secondary/60"
+        >
+          待复审
+        </span>
+      );
+    }
+    const styles: Record<string, [string, string]> = {
+      pass: ['审查通过', 'border-emerald-400/30 text-emerald-400 bg-emerald-400/10'],
+      warn: ['审查注意', 'border-amber-400/30 text-amber-400 bg-amber-400/10'],
+      risk: ['存在风险', 'border-red-400/30 text-red-400 bg-red-400/10'],
+    };
+    const [label, cls] = styles[r.verdict] ?? styles.warn;
+    return (
+      <span className={`shrink-0 text-[10px] px-1.5 py-px rounded-full border ${cls}`}>
+        {label}
+      </span>
+    );
+  };
+
   return (
     <div className="fixed inset-0 z-[200] flex items-center justify-center">
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
@@ -223,12 +316,31 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
           ) : (
             <div className="grid grid-cols-2 gap-2.5">
               {filtered.map((s) => (
-                <button
+                <div
                   key={s.name}
+                  role="button"
+                  tabIndex={0}
                   onClick={() => openDetail(s.name)}
-                  className="text-left rounded-xl border border-surface-hover bg-background/40 p-3 hover:border-primary/40 transition-colors"
+                  onKeyDown={(e) => e.key === 'Enter' && openDetail(s.name)}
+                  className="group relative text-left rounded-xl border border-surface-hover bg-background/40 p-3 hover:border-primary/40 transition-colors cursor-pointer"
                 >
-                  <div className="flex items-center gap-2 mb-1">
+                  {/* AI 审查 (hover, top-right) */}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void startReview(s.name);
+                    }}
+                    disabled={reviewing.has(s.name)}
+                    title="AI 审查（提示词/脚本安全 + 依赖检查）"
+                    className="absolute top-2 right-2 opacity-0 hover:opacity-100 group-hover:opacity-100 p-1 rounded-md text-text-secondary hover:text-primary hover:bg-surface-hover transition-opacity disabled:opacity-50"
+                  >
+                    {reviewing.has(s.name) ? (
+                      <Loader2 size={13} className="animate-spin" />
+                    ) : (
+                      <ShieldCheck size={13} />
+                    )}
+                  </button>
+                  <div className="flex items-center gap-2 mb-1 pr-6">
                     <span className="text-[13px] font-medium text-text-primary font-mono truncate">
                       {s.name}
                     </span>
@@ -237,12 +349,13 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
                         已挂载
                       </span>
                     )}
+                    {reviewBadge(s)}
                     {detailLoading && <Loader2 size={11} className="animate-spin text-text-secondary/40" />}
                   </div>
                   <p className="text-[11px] text-text-secondary leading-relaxed line-clamp-2">
                     {s.description || '（无描述）'}
                   </p>
-                </button>
+                </div>
               ))}
             </div>
           )}
@@ -279,8 +392,82 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
               <pre className="text-[11px] leading-relaxed text-text-secondary bg-background border border-surface-hover rounded-lg p-3 whitespace-pre-wrap break-words max-h-[300px] overflow-y-auto">
                 {detail.content || '（SKILL.md 无正文）'}
               </pre>
+              {detail.review && (
+                <div className="rounded-lg border border-surface-hover bg-background p-3 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[12px] font-medium text-text-primary">AI 审查报告</span>
+                    <span
+                      className={`text-[10px] px-1.5 py-px rounded-full border ${
+                        detail.review.verdict === 'pass'
+                          ? 'border-emerald-400/30 text-emerald-400 bg-emerald-400/10'
+                          : detail.review.verdict === 'warn'
+                            ? 'border-amber-400/30 text-amber-400 bg-amber-400/10'
+                            : 'border-red-400/30 text-red-400 bg-red-400/10'
+                      }`}
+                    >
+                      {detail.review.verdict === 'pass'
+                        ? '通过'
+                        : detail.review.verdict === 'warn'
+                          ? '注意'
+                          : '风险'}
+                    </span>
+                    <span className="text-[10px] text-text-secondary/50">
+                      {detail.review.reviewedAt.slice(0, 19).replace('T', ' ')}
+                    </span>
+                  </div>
+                  {detail.review.summary && (
+                    <p className="text-[11px] text-text-secondary">{detail.review.summary}</p>
+                  )}
+                  {detail.review.dependencies.length > 0 && (
+                    <div className="text-[11px] text-text-secondary">
+                      依赖：
+                      {detail.review.dependencies.map((d) => (
+                        <span
+                          key={`${d.kind}-${d.name}`}
+                          className={`inline-block mr-1.5 px-1 rounded ${
+                            d.available ? 'text-emerald-400/80' : 'text-red-400'
+                          }`}
+                          title={d.kind === 'binary' ? '系统程序' : 'Python 包'}
+                        >
+                          {d.name}
+                          {d.available ? '✓' : '✗'}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {detail.review.findings.length > 0 && (
+                    <div className="max-h-[140px] overflow-y-auto space-y-1">
+                      {detail.review.findings.slice(0, 20).map((f, i) => (
+                        <div key={i} className="text-[10px] text-text-secondary/80 font-mono">
+                          <span className={f.severity === 'risk' ? 'text-red-400' : 'text-amber-400'}>
+                            [{f.category}]
+                          </span>{' '}
+                          {f.file}:{f.line} {f.excerpt}
+                        </div>
+                      ))}
+                      {detail.review.findings.length > 20 && (
+                        <div className="text-[10px] text-text-secondary/50">
+                          … 共 {detail.review.findings.length} 条
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
             <div className="flex items-center gap-2 px-4 py-3 border-t border-surface-hover">
+              <button
+                onClick={() => void startReview(detail.name)}
+                disabled={reviewing.has(detail.name)}
+                className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-[12px] border border-surface-hover text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors disabled:opacity-50"
+              >
+                {reviewing.has(detail.name) ? (
+                  <Loader2 size={12} className="animate-spin" />
+                ) : (
+                  <ShieldCheck size={12} />
+                )}
+                {detail.review ? '重新审查' : 'AI 审查'}
+              </button>
               <button
                 onClick={() => toggleMount(detail.name)}
                 className={`px-3 py-1.5 rounded-lg text-[12px] transition-colors ${

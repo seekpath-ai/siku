@@ -640,16 +640,55 @@ export async function chatMessageTag(
 
 // ---- Plugins (skills) ----
 
+export interface SkillReviewBadge {
+  verdict: 'pass' | 'warn' | 'risk';
+  /** Skill content changed since the review → treat as unreviewed. */
+  stale: boolean;
+}
+
+export interface SkillReviewFinding {
+  severity: string;
+  category: string;
+  file: string;
+  line: number;
+  excerpt: string;
+  rule: string;
+}
+
+export interface SkillReviewDependency {
+  name: string;
+  kind: string;
+  available: boolean;
+}
+
+export interface SkillReviewRecord {
+  verdict: 'pass' | 'warn' | 'risk';
+  staticVerdict: string;
+  llmVerdict: string | null;
+  summary: string;
+  findings: SkillReviewFinding[];
+  dependencies: SkillReviewDependency[];
+  contentHash: string;
+  reviewedAt: string;
+}
+
 export interface SkillInfo {
   name: string;
   description: string;
   /** Directory holding SKILL.md. */
   path: string;
+  /** Latest review badge; absent = never reviewed. */
+  review?: SkillReviewBadge | null;
 }
 
-export interface SkillDetail extends SkillInfo {
+export interface SkillDetail {
+  name: string;
+  description: string;
+  path: string;
   /** SKILL.md body (the instructions injected when the skill tool runs). */
   content: string;
+  /** Latest review record; absent = never reviewed. */
+  review?: SkillReviewRecord | null;
 }
 
 export async function skillsList(): Promise<SkillInfo[]> {
@@ -659,6 +698,27 @@ export async function skillsList(): Promise<SkillInfo[]> {
 /** Full skill detail for the plugins dialog's second-level view. */
 export async function skillsGet(name: string): Promise<SkillDetail> {
   return invoke<SkillDetail>('skills_get', { name });
+}
+
+/** Static scan report (deterministic, pre-LLM). */
+export interface SkillStaticReport {
+  findings: SkillReviewFinding[];
+  dependencies: SkillReviewDependency[];
+  verdict: string;
+  contentHash: string;
+  scannedFiles: string[];
+}
+
+/** Start an AI review (static scan + no-tool reviewer session). */
+export async function skillsReviewStart(
+  name: string
+): Promise<{ sessionId: string; report: SkillStaticReport }> {
+  return invoke('skills_review_start', { name });
+}
+
+/** Collect + persist the verdict after the review turn completes. */
+export async function skillsReviewCollect(sessionId: string): Promise<SkillReviewRecord> {
+  return invoke<SkillReviewRecord>('skills_review_collect', { sessionId });
 }
 
 /** Import a skill from a folder containing SKILL.md. */

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde::Serialize;
+use sqlx::SqlitePool;
 
 /// A loaded inline skill (Kimi Code style): a `<skills_dir>/<name>/SKILL.md`
 /// with YAML-ish frontmatter (`name`, `description`) and a markdown body.
@@ -138,18 +139,25 @@ pub struct SkillInfo {
     pub description: String,
     /// Directory holding SKILL.md.
     pub path: String,
+    /// Latest review badge; `stale` = the skill changed since the review.
+    pub review: Option<crate::core::skill_review::ReviewBadge>,
 }
 
-/// All external skills in the user skills directory, sorted by name.
-pub fn list_all(user_dir: &Path) -> Vec<SkillInfo> {
-    scan(user_dir)
-        .into_iter()
-        .map(|s| SkillInfo {
+/// All external skills in the user skills directory, sorted by name, each
+/// with its review badge (recomputed hash → stale detection).
+pub async fn list_all(db: &SqlitePool, user_dir: &Path) -> Vec<SkillInfo> {
+    let mut out = Vec::new();
+    for s in scan(user_dir) {
+        let hash = crate::core::skill_review::content_hash(&s.dir);
+        let review = crate::core::skill_review::review_badge(db, &s.name, &hash).await;
+        out.push(SkillInfo {
             path: s.dir.to_string_lossy().to_string(),
             name: s.name,
             description: s.description,
-        })
-        .collect()
+            review,
+        });
+    }
+    out
 }
 
 /// Full skill (incl. SKILL.md body) for the detail dialog.
@@ -196,6 +204,7 @@ pub fn import_folder(user_dir: &Path, src: &Path) -> Result<SkillInfo, String> {
         path: dest.to_string_lossy().to_string(),
         description: parse_skill_md(&text).map(|(_, d, _)| d).unwrap_or_default(),
         name,
+        review: None,
     })
 }
 
@@ -283,6 +292,7 @@ pub fn import_zip(user_dir: &Path, zip_path: &Path) -> Result<SkillInfo, String>
         path: dest.to_string_lossy().to_string(),
         description,
         name,
+        review: None,
     })
 }
 

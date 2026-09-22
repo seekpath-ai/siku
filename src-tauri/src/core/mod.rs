@@ -9,6 +9,7 @@ pub mod cron_scheduler;
 pub mod db;
 pub mod document_text;
 pub mod error;
+pub mod git_host;
 pub mod file_item_service;
 pub mod file_service;
 pub mod graph_service;

@@ -134,8 +134,7 @@ pub async fn set_active(db: &SqlitePool, session_id: &str, active: bool) -> Resu
     Ok(())
 }
 
-/// Append a paragraph to the memory (reserved for a future agent tool).
-#[allow(dead_code)]
+/// Append a paragraph to the memory (used by the memory_write agent tool).
 pub async fn append(db: &SqlitePool, session_id: &str, text: &str) -> Result<()> {
     let current = get(db, session_id).await?;
     let content = match current {

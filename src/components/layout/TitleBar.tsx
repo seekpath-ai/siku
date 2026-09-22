@@ -444,6 +444,8 @@ export function TitleBar() {
                       ['图书馆', 'Ctrl+1'], ['对话', 'Ctrl+2'], ['笔记', 'Ctrl+3'],
                       ['知识库', 'Ctrl+4'], ['文件', 'Ctrl+5'], ['科研追踪', 'Ctrl+R'],
                       ['收藏当前页', 'Ctrl+D'], ['切换宠物', 'Ctrl+Shift+P'],
+                      ['新建智能体', 'Ctrl+Shift+N'], ['新建笔记', 'Ctrl+N'],
+                      ['导入 PDF', 'Ctrl+I'], ['全局搜索', 'Ctrl+K'],
                       ['放大 / 缩小', 'Ctrl+= / Ctrl+-'], ['重置缩放', 'Ctrl+0'],
                       ['翻译面板', 'Ctrl+T'], ['退出', 'Alt+F4'],
                     ].map(([label, shortcut]) => (

@@ -11,6 +11,11 @@ import {
   Trash2,
   Settings,
   Loader2,
+  Archive,
+  ArchiveRestore,
+  Pencil,
+  ChevronDown,
+  ChevronRight,
 } from 'lucide-react';
 import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
@@ -20,13 +25,18 @@ import {
   agentUpdateSession,
   agentDeleteSession,
   agentPinSession,
+  agentArchiveSession,
+  fileBrowserRevealInSystem,
 } from '@/lib/tauri';
 import { useDialog } from '@/hooks/useDialog';
 import { ConfirmButton } from '@/components/ui/ConfirmButton';
 import { AgentAvatar } from './AgentAvatar';
 import { AgentCreateDialog } from './AgentCreateDialog';
 import { AgentConfigPanel } from './AgentConfigPanel';
+import { NewProjectDialog } from './NewProjectDialog';
+import { CreatePrDialog } from './CreatePrDialog';
 import { TaskCenterDialog } from './TaskCenterDialog';
+import { PluginsDialog } from './PluginsDialog';
 import { DEFAULT_TOOLS } from '@/lib/agent-tools';
 import type { AgentSession, LlmConfigBlock, ApprovalConfig } from '@/lib/types';
 
@@ -34,7 +44,8 @@ interface AgentCreateInput {
   title: string;
   systemPrompt?: string;
   tools: string[];
-  projectId?: string;
+  /** Project binding; undefined = project-less (create), null = unbind (update). */
+  projectId?: string | null;
   workingDir: string | null;
   visionProviderId: string | null;
   webProxy: string | null;
@@ -49,6 +60,8 @@ interface AgentCreateInput {
   maxMemoryRounds: number;
   memoryDir?: string;
   skillsDir?: string;
+  /** Skills mounted on this session; undefined = leave untouched. */
+  selectedSkills?: string[];
 }
 
 interface ContextMenuState {
@@ -58,16 +71,25 @@ interface ContextMenuState {
   agentId: string;
 }
 
+interface ProjectMenuState {
+  visible: boolean;
+  x: number;
+  y: number;
+  projectId: string;
+}
+
 function MenuRow({
   icon,
   label,
   onClick,
   primary,
+  shortcut,
 }: {
   icon: React.ReactNode;
   label: string;
   onClick: () => void;
   primary?: boolean;
+  shortcut?: string;
 }) {
   return (
     <button
@@ -78,6 +100,9 @@ function MenuRow({
     >
       <span className="text-codex-muted shrink-0">{icon}</span>
       {label}
+      {shortcut && (
+        <span className="ml-auto text-[10px] text-codex-muted/70">{shortcut}</span>
+      )}
     </button>
   );
 }
@@ -94,14 +119,20 @@ export function AgentList() {
     load,
     addProject,
     removeProject,
+    renameProject,
+    archiveProject,
     switchProject,
     setGroupBy,
     setSortBy,
   } = useProjectStore();
-  const { alert } = useDialog();
+  const { alert, confirm, prompt } = useDialog();
 
   const [showCreate, setShowCreate] = useState(false);
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
+  /** Project the create-PR dialog is open for. */
+  const [prProject, setPrProject] = useState<{ id: string; name: string } | null>(null);
   const [showTaskCenter, setShowTaskCenter] = useState(false);
+  const [showPlugins, setShowPlugins] = useState(false);
   const [configAgent, setConfigAgent] = useState<AgentSession | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>({
     visible: false,
@@ -109,11 +140,19 @@ export function AgentList() {
     y: 0,
     agentId: '',
   });
+  const [projectMenu, setProjectMenu] = useState<ProjectMenuState>({
+    visible: false,
+    x: 0,
+    y: 0,
+    projectId: '',
+  });
   const [organizeOpen, setOrganizeOpen] = useState(false);
+  /** Collapsed-state toggles for the archived sections. */
+  const [showArchivedChats, setShowArchivedChats] = useState(false);
+  const [showArchivedProjects, setShowArchivedProjects] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const projectMenuRef = useRef<HTMLDivElement>(null);
   const organizeRef = useRef<HTMLDivElement>(null);
-
-  const activeProject = projects.find((p) => p.id === activeProjectId) ?? null;
 
   // Load projects once on mount.
   useEffect(() => {
@@ -140,6 +179,13 @@ export function AgentList() {
     loadSessions();
   }, [loadSessions]);
 
+  // Ctrl+Shift+N (AppShell) opens the new-agent dialog.
+  useEffect(() => {
+    const open = () => setShowCreate(true);
+    window.addEventListener('siku:new-agent', open);
+    return () => window.removeEventListener('siku:new-agent', open);
+  }, []);
+
   // Close the organize menu on outside click.
   useEffect(() => {
     if (!organizeOpen) return;
@@ -165,11 +211,39 @@ export function AgentList() {
     };
   }, [contextMenu.visible]);
 
-  // Chats visible in the list: filtered by the selected project, then sorted.
+  // Close the project context menu on outside click.
+  useEffect(() => {
+    if (!projectMenu.visible) return;
+    const close = (e: MouseEvent) => {
+      if (projectMenuRef.current?.contains(e.target as Node)) return;
+      setProjectMenu({ visible: false, x: 0, y: 0, projectId: '' });
+    };
+    const timer = setTimeout(() => document.addEventListener('mousedown', close, true), 0);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener('mousedown', close, true);
+    };
+  }, [projectMenu.visible]);
+
+  // Archived projects/sessions hide from the default lists; they live in the
+  // collapsed "已归档" sections at the bottom.
+  const visibleProjects = useMemo(() => projects.filter((p) => !p.archived), [projects]);
+  const archivedProjects = useMemo(() => projects.filter((p) => p.archived), [projects]);
+  const activeSessions = useMemo(() => sessions.filter((s) => !s.archived), [sessions]);
+  const archivedSessions = useMemo(
+    () =>
+      sessions.filter(
+        (s) => s.archived && (!activeProjectId || s.project_id === activeProjectId)
+      ),
+    [sessions, activeProjectId]
+  );
+
+  // Chats visible in the list: non-archived, filtered by the selected
+  // project, then sorted.
   const visibleSessions = useMemo(() => {
     const list = activeProjectId
-      ? sessions.filter((s) => s.project_id === activeProjectId)
-      : sessions;
+      ? activeSessions.filter((s) => s.project_id === activeProjectId)
+      : activeSessions;
     const sorted = [...list];
     switch (sortBy) {
       case 'updated':
@@ -190,7 +264,7 @@ export function AgentList() {
         );
     }
     return sorted;
-  }, [sessions, activeProjectId, sortBy]);
+  }, [activeSessions, activeProjectId, sortBy]);
 
   // Group chats by project (only when no project filter and grouping is enabled).
   const grouped = useMemo(() => {
@@ -206,12 +280,51 @@ export function AgentList() {
   }, [visibleSessions, activeProjectId, groupBy]);
 
   const projectChatCount = (pid: string | null) =>
-    sessions.filter((s) => s.project_id === pid).length;
+    activeSessions.filter((s) => s.project_id === pid).length;
 
   const handleContextMenu = (e: React.MouseEvent, agentId: string) => {
     e.preventDefault();
     e.stopPropagation();
     setContextMenu({ visible: true, x: e.clientX, y: e.clientY, agentId });
+  };
+
+  const handleProjectContextMenu = (e: React.MouseEvent, projectId: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setProjectMenu({ visible: true, x: e.clientX, y: e.clientY, projectId });
+  };
+
+  const handleArchiveSession = async (id: string, archived: boolean) => {
+    try {
+      await agentArchiveSession(id, archived);
+      setSessions(sessions.map((s) => (s.id === id ? { ...s, archived } : s)));
+    } catch (err) {
+      console.error('Failed to archive session:', err);
+    }
+  };
+
+  const handleRenameProject = async (id: string) => {
+    const project = projects.find((p) => p.id === id);
+    if (!project) return;
+    const name = await prompt('输入新的项目名称', {
+      title: '重命名项目',
+      defaultValue: project.name,
+    });
+    if (!name || !name.trim() || name.trim() === project.name) return;
+    try {
+      await renameProject(id, name.trim());
+    } catch (err) {
+      await alert(`重命名失败：${err}`, '重命名项目');
+    }
+  };
+
+  const handleDeleteProject = async (id: string) => {
+    const project = projects.find((p) => p.id === id);
+    const ok = await confirm(
+      `删除项目「${project?.name ?? ''}」？项目下的对话会保留（变为无项目）。`,
+      '删除项目'
+    );
+    if (ok) await removeProject(id);
   };
 
   const handleNewAgent = async (input: AgentCreateInput) => {
@@ -220,7 +333,10 @@ export function AgentList() {
       agentMode: 'chat',
       toolsEnabled: input.tools,
       systemPrompt: input.systemPrompt,
-      projectId: input.projectId ?? activeProjectId ?? undefined,
+      // New agents start project-less on purpose (a project can be bound
+      // later from the session settings); no forced fallback to the sidebar's
+      // active project.
+      projectId: input.projectId,
       workingDir: input.workingDir,
       visionProviderId: input.visionProviderId,
       webProxy: input.webProxy,
@@ -244,6 +360,7 @@ export function AgentList() {
       agentMode: 'chat',
       toolsEnabled: input.tools,
       systemPrompt: input.systemPrompt,
+      projectId: input.projectId ?? null,
       workingDir: input.workingDir,
       visionProviderId: input.visionProviderId,
       webProxy: input.webProxy,
@@ -256,6 +373,7 @@ export function AgentList() {
       maxMemoryRounds: input.maxMemoryRounds,
       memoryDir: input.memoryDir,
       skillsDir: input.skillsDir,
+      selectedSkills: input.selectedSkills,
     });
     await loadSessions();
   };
@@ -278,21 +396,12 @@ export function AgentList() {
     }
   };
 
-  const handleAddProject = async () => {
-    try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const selected = await open({ directory: true, multiple: false });
-      if (selected && typeof selected === 'string') {
-        const created = await addProject(selected);
-        if (created) await handleSelectProject(created.id);
-      }
-    } catch (err) {
-      console.error('Failed to add project:', err);
-    }
-  };
+  const handleAddProject = () => setNewProjectOpen(true);
 
-  const handleRemoveProject = async (id: string) => {
-    await removeProject(id);
+  const handleCreateProject = async (path: string, name?: string, gitInit?: boolean) => {
+    const created = await addProject(path, name, gitInit);
+    if (created) await handleSelectProject(created.id);
+    return created?.id ?? null;
   };
 
   // Create a default-agent conversation for a project (Codex-style "默认对话").
@@ -321,7 +430,7 @@ export function AgentList() {
     switchProject(id);
     const projectSessions = useChatStore
       .getState()
-      .sessions.filter((s) => s.project_id === id);
+      .sessions.filter((s) => s.project_id === id && !s.archived);
     if (projectSessions.length > 0) {
       const recent = [...projectSessions].sort((a, b) =>
         b.updated_at.localeCompare(a.updated_at)
@@ -332,8 +441,15 @@ export function AgentList() {
     }
   };
 
-  const handlePlaceholder = async (name: string) => {
-    await alert(`${name}功能尚未开放`, '敬请期待');
+  // 拉取请求: opens the create-PR dialog for the selected project (the dialog
+  // itself reports non-git / no-origin / unsupported-host states).
+  const handlePullRequest = async () => {
+    if (!activeProjectId) {
+      await alert('请先在下方项目列表选择一个项目', '拉取请求');
+      return;
+    }
+    const name = projects.find((p) => p.id === activeProjectId)?.name ?? '项目';
+    setPrProject({ id: activeProjectId, name });
   };
 
   const renderChatRow = (session: AgentSession) => (
@@ -372,13 +488,14 @@ export function AgentList() {
         <MenuRow
           icon={<MessageSquarePlus size={16} />}
           label="新建智能体"
+          shortcut="Ctrl+Shift+N"
           onClick={() => setShowCreate(true)}
           primary
         />
         <MenuRow
           icon={<GitPullRequest size={16} />}
           label="拉取请求"
-          onClick={() => handlePlaceholder('拉取请求')}
+          onClick={() => void handlePullRequest()}
         />
         <MenuRow
           icon={<CalendarClock size={16} />}
@@ -396,7 +513,7 @@ export function AgentList() {
         <MenuRow
           icon={<Puzzle size={16} />}
           label="插件"
-          onClick={() => handlePlaceholder('插件')}
+          onClick={() => setShowPlugins(true)}
         />
       </nav>
 
@@ -486,39 +603,69 @@ export function AgentList() {
               <Loader2 size={12} className="animate-spin" />
               加载中…
             </div>
-          ) : projects.length === 0 ? (
+          ) : visibleProjects.length === 0 && archivedProjects.length === 0 ? (
             <div className="px-2 py-1 text-[12px] text-codex-muted">无项目</div>
           ) : (
-            projects.map((p) => {
-              const active = p.id === activeProjectId;
-              return (
-                <div
-                  key={p.id}
-                  onClick={() => handleSelectProject(active ? null : p.id)}
-                  className={`group flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer text-[13px] transition-colors ${
-                    active
-                      ? 'bg-codex-hover text-codex-primary'
-                      : 'text-codex-secondary hover:bg-codex-hover hover:text-codex-primary'
-                  }`}
-                  title={p.path}
-                >
-                  <FolderOpen size={14} className="shrink-0 text-codex-muted" />
-                  <span className="flex-1 truncate">{p.name}</span>
-                  <span className="text-[11px] text-codex-muted shrink-0">
-                    {projectChatCount(p.id)}
-                  </span>
-                  <ConfirmButton
-                    icon
-                    onConfirm={() => handleRemoveProject(p.id)}
-                    confirmText="确认删除项目？（对话保留）"
-                    aria-label="删除项目"
-                    className="opacity-0 group-hover:opacity-100"
+            <>
+              {visibleProjects.map((p) => {
+                const active = p.id === activeProjectId;
+                return (
+                  <div
+                    key={p.id}
+                    onClick={() => handleSelectProject(active ? null : p.id)}
+                    onContextMenu={(e) => handleProjectContextMenu(e, p.id)}
+                    className={`group flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer text-[13px] transition-colors ${
+                      active
+                        ? 'bg-codex-hover text-codex-primary'
+                        : 'text-codex-secondary hover:bg-codex-hover hover:text-codex-primary'
+                    }`}
+                    title={p.path}
                   >
-                    <Trash2 size={12} />
-                  </ConfirmButton>
+                    <FolderOpen size={14} className="shrink-0 text-codex-muted" />
+                    <span className="flex-1 truncate">{p.name}</span>
+                    <span className="text-[11px] text-codex-muted shrink-0">
+                      {projectChatCount(p.id)}
+                    </span>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        fileBrowserRevealInSystem(p.path).catch((err) =>
+                          console.error('reveal project dir:', err)
+                        );
+                      }}
+                      title="打开目录位置"
+                      aria-label="打开目录位置"
+                      className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-codex-muted hover:text-codex-primary hover:bg-codex-bg transition-opacity"
+                    >
+                      <FolderOpen size={12} />
+                    </button>
+                  </div>
+                );
+              })}
+              {archivedProjects.length > 0 && (
+                <div>
+                  <button
+                    onClick={() => setShowArchivedProjects((v) => !v)}
+                    className="w-full flex items-center gap-1.5 px-2 py-1 text-[12px] text-codex-muted hover:text-codex-primary"
+                  >
+                    {showArchivedProjects ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                    已归档（{archivedProjects.length}）
+                  </button>
+                  {showArchivedProjects &&
+                    archivedProjects.map((p) => (
+                      <div
+                        key={p.id}
+                        onContextMenu={(e) => handleProjectContextMenu(e, p.id)}
+                        className="flex items-center gap-2 px-2 py-1.5 rounded-md text-[13px] text-codex-muted hover:bg-codex-hover cursor-default"
+                        title={p.path}
+                      >
+                        <Archive size={14} className="shrink-0" />
+                        <span className="flex-1 truncate">{p.name}</span>
+                      </div>
+                    ))}
                 </div>
-              );
-            })
+              )}
+            </>
           )}
         </div>
       </section>
@@ -542,6 +689,18 @@ export function AgentList() {
             ))
           ) : (
             visibleSessions.map((s) => renderChatRow(s))
+          )}
+          {archivedSessions.length > 0 && (
+            <div className="pt-1">
+              <button
+                onClick={() => setShowArchivedChats((v) => !v)}
+                className="w-full flex items-center gap-1.5 px-2 py-1 text-[12px] text-codex-muted hover:text-codex-primary"
+              >
+                {showArchivedChats ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                已归档（{archivedSessions.length}）
+              </button>
+              {showArchivedChats && archivedSessions.map((s) => renderChatRow(s))}
+            </div>
           )}
         </div>
       </section>
@@ -580,8 +739,95 @@ export function AgentList() {
                 </button>
                 <button
                   onClick={() => {
+                    handleArchiveSession(agent.id, !agent.archived);
+                    setContextMenu({ visible: false, x: 0, y: 0, agentId: '' });
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
+                >
+                  {agent.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
+                  {agent.archived ? '取消归档' : '归档'}
+                </button>
+                <button
+                  onClick={() => {
                     handleDelete(agent.id);
                     setContextMenu({ visible: false, x: 0, y: 0, agentId: '' });
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-danger hover:bg-codex-hover"
+                >
+                  <Trash2 size={14} />
+                  删除
+                </button>
+              </>
+            );
+          })()}
+        </div>
+      )}
+
+      {/* Project context menu */}
+      {projectMenu.visible && (
+        <div
+          ref={projectMenuRef}
+          className="fixed z-[3000] min-w-[170px] rounded-lg border border-codex-border bg-codex-surface shadow-xl py-1"
+          style={{ left: projectMenu.x, top: projectMenu.y }}
+        >
+          {(() => {
+            const project = projects.find((p) => p.id === projectMenu.projectId);
+            if (!project) return null;
+            const closeMenu = () => setProjectMenu({ visible: false, x: 0, y: 0, projectId: '' });
+            return (
+              <>
+                <button
+                  onClick={() => {
+                    fileBrowserRevealInSystem(project.path).catch((err) =>
+                      console.error('reveal project dir:', err)
+                    );
+                    closeMenu();
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
+                >
+                  <FolderOpen size={14} />
+                  打开目录位置
+                </button>
+                {!project.archived && (
+                  <>
+                    <button
+                      onClick={() => {
+                        void handleRenameProject(project.id);
+                        closeMenu();
+                      }}
+                      className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
+                    >
+                      <Pencil size={14} />
+                      重命名
+                    </button>
+                    <button
+                      onClick={() => {
+                        setPrProject({ id: project.id, name: project.name });
+                        closeMenu();
+                      }}
+                      className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
+                    >
+                      <GitPullRequest size={14} />
+                      创建拉取请求
+                    </button>
+                  </>
+                )}
+                <button
+                  onClick={() => {
+                    archiveProject(project.id, !project.archived).catch((err) =>
+                      console.error('archive project:', err)
+                    );
+                    closeMenu();
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
+                >
+                  {project.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
+                  {project.archived ? '取消归档' : '归档'}
+                </button>
+                <button
+                  onClick={() => {
+                    void handleDeleteProject(project.id);
+                    closeMenu();
                   }}
                   className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-danger hover:bg-codex-hover"
                 >
@@ -598,7 +844,8 @@ export function AgentList() {
         <AgentCreateDialog
           onClose={() => setShowCreate(false)}
           onCreate={handleNewAgent}
-          projectPath={activeProject?.path}
+          // No projectPath: new agents are project-less; the sandbox's
+          // "项目目录" option stays disabled until a project is bound.
         />
       )}
 
@@ -608,6 +855,22 @@ export function AgentList() {
 
       {showTaskCenter && activeSessionId && (
         <TaskCenterDialog sessionId={activeSessionId} onClose={() => setShowTaskCenter(false)} />
+      )}
+
+      {showPlugins && <PluginsDialog onClose={() => setShowPlugins(false)} />}
+
+      <NewProjectDialog
+        open={newProjectOpen}
+        onClose={() => setNewProjectOpen(false)}
+        onCreate={handleCreateProject}
+      />
+
+      {prProject && (
+        <CreatePrDialog
+          projectId={prProject.id}
+          projectName={prProject.name}
+          onClose={() => setPrProject(null)}
+        />
       )}
     </aside>
   );

@@ -9,6 +9,7 @@ pub mod web_search;
 pub mod translation;
 pub mod knowledge;
 pub mod knowledge_write;
+pub mod memory;
 pub mod file_ops;
 pub mod file_write;
 pub mod file_edit;

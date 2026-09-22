@@ -178,6 +178,7 @@ export function useStreamingChat() {
             tokens_in_hit: e.tokens_in_hit ?? null,
             tokens_out: e.tokens_out ?? null,
             attachments: null,
+            user_tag: null,
             created_at: new Date().toISOString(),
           });
           state.linkAgentSteps(messageId, e.session_id);
@@ -230,6 +231,7 @@ export function useStreamingChat() {
             tokens_in_hit: e.tokens_in_hit ?? null,
             tokens_out: e.tokens_out ?? null,
             attachments: null,
+            user_tag: null,
             created_at: new Date().toISOString(),
           });
           state.linkAgentSteps(messageId, e.session_id);
@@ -267,6 +269,7 @@ export function useStreamingChat() {
           tokens_in_hit: null,
           tokens_out: null,
           attachments: null,
+          user_tag: null,
           created_at: new Date().toISOString(),
         });
         state.linkAgentSteps(messageId, e.session_id);

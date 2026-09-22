@@ -227,6 +227,7 @@ export function MessageInput({ disabled }: Props) {
       tokens_in_hit: null,
       tokens_out: null,
       attachments: chatAttachments ? JSON.stringify(chatAttachments) : null,
+      user_tag: null,
       created_at: new Date().toISOString(),
     });
 
@@ -248,6 +249,7 @@ export function MessageInput({ disabled }: Props) {
         tokens_in_hit: null,
         tokens_out: null,
         attachments: null,
+        user_tag: null,
         created_at: new Date().toISOString(),
       });
     }

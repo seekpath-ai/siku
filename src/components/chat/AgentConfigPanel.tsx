@@ -4,8 +4,9 @@ import type { AgentSession, ApprovalConfig, LlmConfigBlock, LlmProvider } from '
 import { LlmConfigFields } from './LlmConfigFields';
 import { ToolPicker } from './ToolPicker';
 import { defaultLlmBlock } from '@/lib/llm-presets';
-import { llmProviderList } from '@/lib/tauri';
+import { llmProviderList, skillsList, type SkillInfo } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
+import { useProjectStore } from '@/stores/projectStore';
 
 interface Props {
   agent: AgentSession;
@@ -14,6 +15,8 @@ interface Props {
     title: string;
     systemPrompt?: string;
     tools: string[];
+    /** Project binding; null = unbind. */
+    projectId: string | null;
     workingDir: string | null;
     visionProviderId: string | null;
     webProxy: string | null;
@@ -28,6 +31,8 @@ interface Props {
     maxMemoryRounds: number;
     memoryDir?: string;
     skillsDir?: string;
+    /** Skills mounted on this session; undefined = leave untouched. */
+    selectedSkills?: string[];
   }) => Promise<void>;
 }
 
@@ -50,6 +55,13 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
   const [workingDirMode, setWorkingDirMode] = useState<'project' | 'full'>(
     agent.working_dir ? 'project' : 'full'
   );
+  /** '' = 不绑定项目。 */
+  const [projectId, setProjectId] = useState<string>(agent.project_id ?? '');
+  const projects = useProjectStore((s) => s.projects);
+  /** Path of the currently selected project binding (for the sandbox option). */
+  const boundProjectPath = projectId
+    ? projects.find((p) => p.id === projectId)?.path ?? null
+    : null;
   const [visionProviderId, setVisionProviderId] = useState(agent.vision_provider_id ?? '');
   const [webProxy, setWebProxy] = useState(agent.web_proxy ?? '');
   const [approvalMode, setApprovalMode] = useState<ApprovalConfig['mode']>(agent.approval_config?.mode || 'auto');
@@ -62,6 +74,9 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
   const [maxMemoryRounds, setMaxMemoryRounds] = useState(agent.max_memory_rounds ?? 10);
   const [memoryDir, setMemoryDir] = useState(agent.memory_dir ?? '');
   const [skillsDir, setSkillsDir] = useState(agent.skills_dir ?? '');
+  /** Skills mounted on this session (per-session plugins). */
+  const [selectedSkills, setSelectedSkills] = useState<string[]>(agent.selected_skills ?? []);
+  const [availableSkills, setAvailableSkills] = useState<SkillInfo[]>([]);
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
 
@@ -95,6 +110,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
     setName(agent.title);
     setPersona(agent.system_prompt || '');
     setTools(agent.tools_enabled || []);
+    setProjectId(agent.project_id ?? '');
     setApprovalMode(agent.approval_config?.mode || 'auto');
     setExpireSec(agent.approval_config?.expire_sec ?? 60);
     setWhitelist((agent.approval_config?.whitelist || []).join(', '));
@@ -104,7 +120,15 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
     setMaxMemoryRounds(agent.max_memory_rounds ?? 10);
     setMemoryDir(agent.memory_dir ?? '');
     setSkillsDir(agent.skills_dir ?? '');
+    setSelectedSkills(agent.selected_skills ?? []);
   }, [agent]);
+
+  // Skill library for the mount checkboxes (per-session plugins).
+  useEffect(() => {
+    skillsList()
+      .then(setAvailableSkills)
+      .catch(() => {});
+  }, []);
 
   const approvalConfig: ApprovalConfig = {
     mode: approvalMode,
@@ -123,7 +147,10 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
         title: name.trim(),
         systemPrompt: persona.trim() || undefined,
         tools,
-        workingDir: workingDirMode === 'project' ? (agent.working_dir ?? null) : null,
+        projectId: projectId || null,
+        // Sandbox scope: the bound project's folder wins over whatever the
+        // session had before; explicit full-disk stays null.
+        workingDir: workingDirMode === 'project' ? (boundProjectPath ?? agent.working_dir ?? null) : null,
         visionProviderId: visionProviderId || null,
         webProxy: webProxy.trim() || null,
         llmProviderIds: useCustomLlm ? [] : [selectedProviderId],
@@ -135,6 +162,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
         maxMemoryRounds,
         memoryDir: memoryDir.trim() || undefined,
         skillsDir: skillsDir.trim() || undefined,
+        selectedSkills,
       });
       onClose();
     } catch (err) {
@@ -234,14 +262,36 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
           </div>
 
           <div className="space-y-1.5">
+            <label className="text-xs text-codex-muted">所属项目</label>
+            <select
+              value={projectId}
+              onChange={(e) => {
+                const pid = e.target.value;
+                setProjectId(pid);
+                // Binding a project re-scopes the sandbox to its folder;
+                // unbinding leaves the current working-dir mode untouched.
+                if (pid) setWorkingDirMode('project');
+              }}
+              className="w-full bg-codex-bg border border-codex-border rounded-lg px-3 py-2 text-sm text-codex-primary outline-none focus:border-codex-border-light"
+            >
+              <option value="">不绑定项目</option>
+              {projects.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}（{p.path}）
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="space-y-1.5">
             <label className="text-xs text-codex-muted">工作目录</label>
             <select
               value={workingDirMode}
               onChange={(e) => setWorkingDirMode(e.target.value as 'project' | 'full')}
               className="w-full bg-codex-bg border border-codex-border rounded-lg px-3 py-2 text-sm text-codex-primary outline-none focus:border-codex-border-light"
             >
-              <option value="project">
-                项目目录（沙箱）{agent.working_dir ? `：${agent.working_dir}` : ''}
+              <option value="project" disabled={!boundProjectPath && !agent.working_dir}>
+                项目目录（沙箱）{boundProjectPath ?? (agent.working_dir ? `：${agent.working_dir}` : '：未绑定项目')}
               </option>
               <option value="full">全盘访问（无限制）</option>
             </select>
@@ -353,6 +403,43 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
                 className="w-full bg-codex-bg border border-codex-border rounded-lg px-3 py-2 text-sm text-codex-primary outline-none focus:border-codex-border-light"
               />
             </div>
+          </div>
+
+          <div className="space-y-3 border-t border-codex-border pt-3">
+            <h4 className="text-xs font-semibold text-codex-muted uppercase tracking-wide">技能挂载</h4>
+            {availableSkills.length === 0 ? (
+              <p className="text-[11px] text-codex-muted leading-relaxed">
+                还没有安装技能。在对话页左侧「插件」中通过文件夹或压缩包导入后，即可在此挂载到本会话。
+              </p>
+            ) : (
+              <div className="space-y-1">
+                {availableSkills.map((s) => (
+                  <label
+                    key={s.name}
+                    className="flex items-start gap-2 px-2 py-1.5 rounded-md hover:bg-codex-hover cursor-pointer"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedSkills.includes(s.name)}
+                      onChange={(e) =>
+                        setSelectedSkills(
+                          e.target.checked
+                            ? [...selectedSkills, s.name]
+                            : selectedSkills.filter((n) => n !== s.name)
+                        )
+                      }
+                      className="mt-0.5 accent-codex-accent"
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-[13px] text-codex-primary font-mono">{s.name}</span>
+                      {s.description && (
+                        <span className="block text-[11px] text-codex-muted truncate">{s.description}</span>
+                      )}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            )}
           </div>
 
           <div className="space-y-3 border-t border-codex-border pt-3">

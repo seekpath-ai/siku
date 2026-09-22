@@ -193,6 +193,7 @@ export const usePetStore = create<PetState>((set, get) => ({
       tokens_in_hit: null,
       tokens_out: null,
       attachments: attachments?.length ? JSON.stringify(attachments) : null,
+      user_tag: null,
       created_at: new Date().toISOString(),
     };
     set((s) => ({

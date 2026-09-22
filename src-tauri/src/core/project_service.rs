@@ -4,16 +4,29 @@ use tracing::instrument;
 use crate::core::models::{Project, ProjectInput};
 use crate::core::time::now_iso;
 
-const PROJECT_COLS: &str = "id, name, path, created_at, updated_at";
+const PROJECT_COLS: &str = "id, name, path, archived, created_at, updated_at";
 
 #[instrument(skip(db))]
 pub async fn list(db: &SqlitePool) -> Result<Vec<Project>, String> {
     sqlx::query_as::<_, Project>(&format!(
-        "SELECT {PROJECT_COLS} FROM projects ORDER BY created_at"
+        "SELECT {PROJECT_COLS} FROM projects ORDER BY archived ASC, created_at"
     ))
     .fetch_all(db)
     .await
     .map_err(|e| format!("db error: {e}"))
+}
+
+/// Archive or restore a project (sidebar visibility only).
+#[instrument(skip(db))]
+pub async fn set_archived(db: &SqlitePool, id: &str, archived: bool) -> Result<(), String> {
+    sqlx::query("UPDATE projects SET archived = ?, updated_at = ? WHERE id = ?")
+        .bind(if archived { 1 } else { 0 })
+        .bind(now_iso())
+        .bind(id)
+        .execute(db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
+    Ok(())
 }
 
 #[instrument(skip(db))]
@@ -40,6 +53,43 @@ fn folder_name(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+/// Whether a usable system git is on PATH.
+pub fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Generic .gitignore written by git bootstrap (skipped when one exists).
+const GITIGNORE_TEMPLATE: &str = "# Build outputs\ntarget/\nnode_modules/\ndist/\n\n# Logs & OS noise\n*.log\n.DS_Store\nThumbs.db\n\n# Local env\n.env\n.env.local\n";
+
+/// git init + .gitignore template. No initial commit, no remote — that is
+/// deliberate (see the plugins/PR roadmap); the repo starts clean.
+fn git_bootstrap(dir: &std::path::Path) -> Result<(), String> {
+    if !git_available() {
+        return Err("未检测到 git，请先安装 git 后再初始化仓库".to_string());
+    }
+    let status = std::process::Command::new("git")
+        .arg("init")
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .map_err(|e| format!("git init 执行失败：{e}"))?;
+    if !status.success() {
+        return Err(format!("git init 退出码非零：{status}"));
+    }
+    let ignore = dir.join(".gitignore");
+    if !ignore.exists() {
+        std::fs::write(&ignore, GITIGNORE_TEMPLATE).map_err(|e| format!("写入 .gitignore 失败：{e}"))?;
+    }
+    Ok(())
+}
+
 #[instrument(skip(db))]
 pub async fn create(db: &SqlitePool, input: ProjectInput) -> Result<Project, String> {
     let path = input.path.unwrap_or_default();
@@ -47,8 +97,18 @@ pub async fn create(db: &SqlitePool, input: ProjectInput) -> Result<Project, Str
     if path.is_empty() {
         return Err("project path required".to_string());
     }
+    // Create the directory when it does not exist ("新建项目目录" flow) —
+    // there is no default/app-data project anymore, so every project dir is
+    // an explicit user choice.
     if !std::path::Path::new(&path).is_dir() {
-        return Err(format!("not a directory: {path}"));
+        std::fs::create_dir_all(&path).map_err(|e| format!("无法创建目录 {path}：{e}"))?;
+    }
+
+    // Optional git bootstrap: git init + a generic .gitignore. Best-effort in
+    // the sense that a missing git binary produces a clear error instead of a
+    // half-created project — the directory and project row are kept either way.
+    if input.git_init.unwrap_or(false) {
+        git_bootstrap(std::path::Path::new(&path))?;
     }
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -116,111 +176,6 @@ pub async fn delete(db: &SqlitePool, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Ensure at least one project exists (the app data dir as the default) and
-/// backfill legacy sessions without a project into it. Called on startup.
-#[instrument(skip(db))]
-pub async fn ensure_default_project(
-    db: &SqlitePool,
-    app_data_dir: &std::path::Path,
-) -> Result<Project, String> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects")
-        .fetch_one(db)
-        .await
-        .map_err(|e| format!("db error: {e}"))?;
-
-    if count == 0 {
-        let path = app_data_dir.to_string_lossy().to_string();
-        let name = folder_name(&path);
-        let id = uuid::Uuid::new_v4().to_string();
-        let now = now_iso();
-        if let Err(e) = sqlx::query(
-            "INSERT INTO projects (id, name, path, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(&name)
-        .bind(&path)
-        .bind(&now)
-        .bind(&now)
-        .execute(db)
-        .await
-        {
-            // The projects table only has 5 columns; a mismatch like
-            // "expected 57 values, got 53" means a trigger (or stale CRR
-            // trigger) is firing on INSERT and doing an unqualified
-            // `INSERT INTO other_table VALUES (...)` with the wrong count.
-            let schema: Option<(String,)> = sqlx::query_as(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projects'",
-            )
-            .fetch_optional(db)
-            .await
-            .unwrap_or_default();
-            let triggers: Vec<(String, String)> = sqlx::query_as(
-                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'projects'",
-            )
-            .fetch_all(db)
-            .await
-            .unwrap_or_default();
-
-            let mut msg = format!("db error: {e}");
-            if let Some((sql,)) = schema {
-                msg.push_str(&format!("\nprojects schema: {sql}"));
-            }
-            for (name, sql) in triggers {
-                msg.push_str(&format!("\nprojects trigger `{name}`: {sql}"));
-            }
-            return Err(msg);
-        }
-    } else {
-        // Self-heal: the default project points at the app data dir. If the
-        // stored path no longer exists but still looks like an app-data
-        // default (same folder name as the live one — e.g. the dir was
-        // cleaned, or the DB was moved to another machine), repoint it.
-        // User-chosen paths are never touched: a temporarily unplugged disk
-        // must not clobber a real project.
-        let first: Option<(String, String)> =
-            sqlx::query_as("SELECT id, path FROM projects ORDER BY created_at LIMIT 1")
-                .fetch_optional(db)
-                .await
-                .map_err(|e| format!("db error: {e}"))?;
-        if let Some((pid, path)) = first {
-            let looks_like_app_data = match (
-                std::path::Path::new(&path).file_name(),
-                app_data_dir.file_name(),
-            ) {
-                (Some(a), Some(b)) => a == b,
-                _ => false,
-            };
-            if looks_like_app_data && !std::path::Path::new(&path).is_dir() {
-                let new_path = app_data_dir.to_string_lossy().to_string();
-                sqlx::query("UPDATE projects SET path = ?, updated_at = ? WHERE id = ?")
-                    .bind(&new_path)
-                    .bind(now_iso())
-                    .bind(&pid)
-                    .execute(db)
-                    .await
-                    .map_err(|e| format!("db error: {e}"))?;
-            }
-        }
-    }
-
-    // Backfill legacy sessions into the first project.
-    sqlx::query(
-        "UPDATE chat_sessions SET project_id = (SELECT id FROM projects ORDER BY created_at LIMIT 1) \
-         WHERE project_id IS NULL",
-    )
-    .execute(db)
-    .await
-    .map_err(|e| format!("db error: {e}"))?;
-
-    sqlx::query_as::<_, Project>(&format!(
-        "SELECT {PROJECT_COLS} FROM projects ORDER BY created_at LIMIT 1"
-    ))
-    .fetch_one(db)
-    .await
-    .map_err(|e| format!("db error: {e}"))
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,66 +187,77 @@ mod tests {
         db
     }
 
-    /// The default project points at the app data dir; when that stored path
-    /// goes stale (dir cleaned, DB moved to another machine) it is repointed
-    /// at the live app data dir on startup.
+    /// Creating a project for a path that does not exist creates the
+    /// directory ("新建项目目录" flow).
     #[tokio::test]
-    async fn heals_stale_default_project_path() {
+    async fn creates_missing_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let live_app_dir = dir.path().join("live").join("com.siku.reader");
-        std::fs::create_dir_all(&live_app_dir).unwrap();
-        let stale = dir.path().join("old").join("com.siku.reader"); // never created
-
         let db = fresh_db(dir.path()).await;
-        sqlx::query(
-            "INSERT INTO projects (id, name, path, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        let target = dir.path().join("new-project").join("nested");
+        let p = create(
+            &db,
+            ProjectInput { name: None, path: Some(target.to_string_lossy().to_string()), git_init: None },
         )
-        .bind("p1")
-        .bind("com.siku.reader")
-        .bind(stale.to_str().unwrap())
-        .bind("2026-01-01T00:00:00Z")
-        .bind("2026-01-01T00:00:00Z")
-        .execute(&db)
         .await
         .unwrap();
-
-        ensure_default_project(&db, &live_app_dir).await.unwrap();
-        let (path,): (String,) = sqlx::query_as("SELECT path FROM projects WHERE id = 'p1'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        assert_eq!(path, live_app_dir.to_string_lossy());
+        assert!(target.is_dir());
+        assert_eq!(p.name, "nested");
         db.close().await;
     }
 
-    /// A user-chosen project path that is missing (e.g. an unplugged disk)
-    /// must NOT be rewritten — only app-data-shaped defaults are healed.
+    /// git_init bootstraps a repository and writes the .gitignore template
+    /// (skipped silently on machines without git — the dialog greys the
+    /// option out there anyway).
     #[tokio::test]
-    async fn keeps_user_project_even_if_missing() {
+    async fn git_init_creates_repo_and_gitignore() {
+        if !git_available() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
-        let live_app_dir = dir.path().join("live").join("com.siku.reader");
-        std::fs::create_dir_all(&live_app_dir).unwrap();
-        let user_path = dir.path().join("unplugged-disk").join("my-vault"); // never created
-
         let db = fresh_db(dir.path()).await;
-        sqlx::query(
-            "INSERT INTO projects (id, name, path, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        let target = dir.path().join("repo");
+        create(
+            &db,
+            ProjectInput { name: None, path: Some(target.to_string_lossy().to_string()), git_init: Some(true) },
         )
-        .bind("p1")
-        .bind("my-vault")
-        .bind(user_path.to_str().unwrap())
-        .bind("2026-01-01T00:00:00Z")
-        .bind("2026-01-01T00:00:00Z")
-        .execute(&db)
         .await
         .unwrap();
+        assert!(target.join(".git").is_dir());
+        assert!(target.join(".gitignore").is_file());
+        db.close().await;
+    }
 
-        ensure_default_project(&db, &live_app_dir).await.unwrap();
-        let (path,): (String,) = sqlx::query_as("SELECT path FROM projects WHERE id = 'p1'")
-            .fetch_one(&db)
-            .await
-            .unwrap();
-        assert_eq!(path, user_path.to_str().unwrap());
+    /// Regression: the frontend sends `gitInit` (camelCase); without
+    /// serde rename_all the flag used to deserialize as None and git
+    /// bootstrap silently never ran.
+    #[test]
+    fn project_input_accepts_camel_case_git_init() {
+        let input: ProjectInput =
+            serde_json::from_str(r#"{"path": "/tmp/x", "gitInit": true}"#).unwrap();
+        assert_eq!(input.git_init, Some(true));
+        let input: ProjectInput = serde_json::from_str(r#"{"path": "/tmp/x"}"#).unwrap();
+        assert_eq!(input.git_init, None);
+    }
+
+    /// Archiving hides a project from the sidebar but keeps it listed
+    /// (the frontend filters); restoring brings it back.
+    #[tokio::test]
+    async fn archive_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path()).await;
+        let p = create(
+            &db,
+            ProjectInput { name: None, path: Some(dir.path().join("p").to_string_lossy().to_string()), git_init: None },
+        )
+        .await
+        .unwrap();
+        assert!(!p.archived);
+        set_archived(&db, &p.id, true).await.unwrap();
+        let p = get_by_id(&db, &p.id).await.unwrap().unwrap();
+        assert!(p.archived);
+        set_archived(&db, &p.id, false).await.unwrap();
+        let p = get_by_id(&db, &p.id).await.unwrap().unwrap();
+        assert!(!p.archived);
         db.close().await;
     }
 }

@@ -52,7 +52,9 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
   const [selectedProviderId, setSelectedProviderId] = useState<string>('');
   const [useCustomLlm, setUseCustomLlm] = useState(false);
   const [customLlm, setCustomLlm] = useState(defaultLlmBlock());
-  const [workingDirMode, setWorkingDirMode] = useState<'project' | 'full'>('project');
+  // New agents are project-less by default, so the working directory defaults
+  // to full-disk access (the user can bind a project later and re-scope).
+  const [workingDirMode, setWorkingDirMode] = useState<'project' | 'full'>('full');
   const [visionProviderId, setVisionProviderId] = useState('');
   const [webProxy, setWebProxy] = useState('');
   const [approvalMode, setApprovalMode] = useState<ApprovalConfig['mode']>('auto');
@@ -223,7 +225,9 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
               onChange={(e) => setWorkingDirMode(e.target.value as 'project' | 'full')}
               className="w-full bg-codex-bg border border-codex-border rounded-lg px-3 py-2 text-sm text-codex-primary outline-none focus:border-codex-border-light"
             >
-              <option value="project">项目目录（沙箱，推荐）{projectPath ? `：${projectPath}` : ''}</option>
+              <option value="project" disabled={!projectPath}>
+                {projectPath ? `项目目录（沙箱）：${projectPath}` : '项目目录（未绑定项目，不可用）'}
+              </option>
               <option value="full">全盘访问（无限制）</option>
             </select>
             <p className="text-[11px] text-codex-muted">

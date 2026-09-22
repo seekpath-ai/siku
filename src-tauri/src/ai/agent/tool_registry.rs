@@ -131,11 +131,18 @@ impl ToolRegistry {
         self.tools.retain(|name, _| allowed_set.contains(name.as_str()));
     }
 
-    /// Register inline skills from a skills directory as `skill_<name>` tools.
-    /// Call AFTER `retain` so skills are always available to the agent.
-    pub fn register_skills(&mut self, dir: &std::path::Path) {
+    /// Register the session's mounted skills as `skill_<name>` tools. Only
+    /// names in `selected` register — unmounted skills stay invisible to the
+    /// model, so their descriptions cost no context. Call AFTER `retain` so
+    /// mounted skills are always available to the agent.
+    pub fn register_skills(&mut self, dir: &std::path::Path, selected: &std::collections::HashSet<String>) {
+        if selected.is_empty() {
+            return;
+        }
         for skill in crate::core::skills::scan(dir) {
-            self.register(crate::ai::agent::tools::skill::SkillTool::new(skill));
+            if selected.contains(&skill.name) {
+                self.register(crate::ai::agent::tools::skill::SkillTool::new(skill));
+            }
         }
     }
 
@@ -186,6 +193,13 @@ impl ToolRegistry {
         // Knowledge
         registry.register(crate::ai::agent::tools::knowledge::KnowledgeQueryTool::new(db.clone()));
         registry.register(crate::ai::agent::tools::knowledge_write::KnowledgeWriteTool::new(db.clone()));
+
+        // Long-term memory (per-session; needs the session id, so only for
+        // real chat sessions — not for session-less helper registries).
+        if let Some(sid) = session_id.clone() {
+            registry.register(crate::ai::agent::tools::memory::MemoryReadTool::new(db.clone(), sid.clone()));
+            registry.register(crate::ai::agent::tools::memory::MemoryWriteTool::new(db.clone(), sid));
+        }
 
         // File tools
         registry.register(crate::ai::agent::tools::file_ops::FileReadTool::new());

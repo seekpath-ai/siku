@@ -239,7 +239,8 @@ export interface AgentSessionInput {
   agentMode?: string;
   toolsEnabled?: string[];
   systemPrompt?: string;
-  projectId?: string;
+  /** The project this session belongs to; null on update = unbind. */
+  projectId?: string | null;
   /** Sandbox root for file tools; null = full disk access. */
   workingDir?: string | null;
   /** Optional vision (multimodal) provider for the agent. */
@@ -257,6 +258,8 @@ export interface AgentSessionInput {
   maxMemoryRounds?: number;
   memoryDir?: string;
   skillsDir?: string;
+  /** Skills mounted on this session; undefined on update = leave untouched. */
+  selectedSkills?: string[];
 }
 
 export async function agentCreateSession(input: AgentSessionInput): Promise<AgentSession> {
@@ -459,6 +462,11 @@ export async function agentPinSession(sessionId: string, pinned: boolean): Promi
   return invoke<void>('agent_pin_session', { sessionId, pinned });
 }
 
+/** Archive/restore a session (archived sessions hide from the sidebar list). */
+export async function agentArchiveSession(sessionId: string, archived: boolean): Promise<void> {
+  return invoke<void>('agent_archive_session', { sessionId, archived });
+}
+
 export async function getAgentSteps(sessionId: string): Promise<AgentStep[]> {
   return invoke<AgentStep[]>('get_agent_steps', { sessionId });
 }
@@ -597,6 +605,64 @@ export async function getChatMessages(sessionId: string): Promise<ChatMessage[]>
   return invoke<ChatMessage[]>('get_chat_messages', { sessionId });
 }
 
+/** Tag a message from the bubble action bar. 'experience' copies the content
+ *  into the session's long-term memory, 'knowledge' into the knowledge base,
+ *  'chitchat' only marks; null clears the tag. Returns the updated message. */
+export async function chatMessageTag(
+  messageId: string,
+  tag: 'experience' | 'knowledge' | 'chitchat' | null,
+): Promise<ChatMessage> {
+  return invoke<ChatMessage>('chat_message_tag', { messageId, tag });
+}
+
+// ---- Plugins (skills) ----
+
+export interface SkillInfo {
+  name: string;
+  description: string;
+  /** Directory holding SKILL.md. */
+  path: string;
+}
+
+export interface SkillDetail extends SkillInfo {
+  /** SKILL.md body (the instructions injected when the skill tool runs). */
+  content: string;
+}
+
+export async function skillsList(): Promise<SkillInfo[]> {
+  return invoke<SkillInfo[]>('skills_list');
+}
+
+/** Full skill detail for the plugins dialog's second-level view. */
+export async function skillsGet(name: string): Promise<SkillDetail> {
+  return invoke<SkillDetail>('skills_get', { name });
+}
+
+/** Import a skill from a folder containing SKILL.md. */
+export async function skillsImportFolder(path: string): Promise<SkillInfo> {
+  return invoke<SkillInfo>('skills_import_folder', { path });
+}
+
+/** Import a skill from a zip archive. */
+export async function skillsImportZip(path: string): Promise<SkillInfo> {
+  return invoke<SkillInfo>('skills_import_zip', { path });
+}
+
+/** Delete an installed skill (removes its directory). */
+export async function skillsDelete(name: string): Promise<void> {
+  return invoke<void>('skills_delete', { name });
+}
+
+/** Replace the session's mounted skill list (per-session plugins). */
+export async function agentSetSessionSkills(sessionId: string, skills: string[]): Promise<void> {
+  return invoke<void>('agent_set_session_skills', { sessionId, skills });
+}
+
+/** Open the user skills (plugins) directory in the OS file manager. */
+export async function skillsOpenDirectory(): Promise<void> {
+  return invoke<void>('skills_open_directory');
+}
+
 // Agent long-term memory (per chat session, brain button in the input area)
 export interface AgentMemory {
   id: string;
@@ -629,12 +695,61 @@ export async function projectsList(): Promise<Project[]> {
   return invoke<Project[]>('projects_list');
 }
 
-export async function projectCreate(input: { name?: string; path: string }): Promise<Project> {
+export async function projectCreate(input: { name?: string; path: string; gitInit?: boolean }): Promise<Project> {
   return invoke<Project>('project_create', { input });
+}
+
+/** Whether the system git binary is available (new-project dialog checkbox). */
+export async function gitAvailable(): Promise<boolean> {
+  return invoke<boolean>('git_available');
+}
+
+// ---- Git hosting (PR) ----
+
+export interface GitRemoteInfo {
+  platform: 'github' | 'gitee';
+  owner: string;
+  repo: string;
+  branch: string;
+  remoteUrl: string;
+}
+
+/** Inspect a project's origin remote + current branch (errors when the
+ *  project is not a git repo / has no origin / unsupported host). */
+export async function gitRemoteInfo(projectId: string): Promise<GitRemoteInfo> {
+  return invoke<GitRemoteInfo>('git_remote_info', { projectId });
+}
+
+/** Push the current branch to origin using the user's own git credentials. */
+export async function gitPushBranch(projectId: string): Promise<string> {
+  return invoke<string>('git_push_branch', { projectId });
+}
+
+export async function gitHostTokenStatus(): Promise<{ github: boolean; gitee: boolean }> {
+  return invoke('git_host_token_status');
+}
+
+/** Store a platform PAT (device-local, used only for the platform API). */
+export async function gitHostSetToken(platform: 'github' | 'gitee', token: string): Promise<void> {
+  return invoke<void>('git_host_set_token', { platform, token });
+}
+
+export async function prCreate(
+  projectId: string,
+  title: string,
+  body?: string,
+  base?: string,
+): Promise<{ htmlUrl: string; number: number }> {
+  return invoke('pr_create', { projectId, title, body: body ?? null, base: base ?? null });
 }
 
 export async function projectUpdate(id: string, input: { name?: string }): Promise<Project> {
   return invoke<Project>('project_update', { id, input });
+}
+
+/** Archive/restore a project (archived projects hide from the sidebar list). */
+export async function projectSetArchived(id: string, archived: boolean): Promise<void> {
+  return invoke<void>('project_set_archived', { id, archived });
 }
 
 export async function projectDelete(id: string): Promise<void> {

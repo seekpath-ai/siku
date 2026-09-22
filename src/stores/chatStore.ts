@@ -21,11 +21,17 @@ interface ChatState {
   /** Session the pending questions belong to; the dialog only renders while
    * that session is active and re-appears when switching back to it. */
   pendingQuestionsSessionId: string | null;
+  /** First message queued by the empty-state hero input: the session was just
+   * created and the message fires once its (empty) history has loaded —
+   * sending earlier would race the load and wipe the optimistic bubble. */
+  pendingFirst: { sessionId: string; text: string } | null;
 
   setSessions: (sessions: AgentSession[]) => void;
   setActiveSession: (id: string | null) => void;
   setMessages: (messages: ChatMessage[]) => void;
   addMessage: (msg: ChatMessage) => void;
+  /** Replace one message in place (e.g. after tagging it). */
+  patchMessage: (msg: ChatMessage) => void;
   setAgentSteps: (steps: AgentStep[]) => void;
   addAgentStep: (step: AgentStep) => void;
   updateAgentStep: (stepIndex: number, updates: Partial<AgentStep>) => void;
@@ -45,6 +51,7 @@ interface ChatState {
   clearStreamingSteps: () => void;
   removeSession: (id: string) => void;
   setPendingQuestions: (q: AskQuestion[] | null, sessionId?: string | null) => void;
+  setPendingFirst: (p: { sessionId: string; text: string } | null) => void;
 }
 
 export const useChatStore = create<ChatState>((set) => ({
@@ -61,6 +68,7 @@ export const useChatStore = create<ChatState>((set) => ({
   currentStreamingStep: null,
   pendingQuestions: null,
   pendingQuestionsSessionId: null,
+  pendingFirst: null,
 
   setSessions: (sessions) => set({ sessions }),
   setActiveSession: (id) =>
@@ -84,6 +92,8 @@ export const useChatStore = create<ChatState>((set) => ({
     }),
   setMessages: (messages) => set({ messages }),
   addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
+  patchMessage: (msg) =>
+    set((s) => ({ messages: s.messages.map((m) => (m.id === msg.id ? msg : m)) })),
   setAgentSteps: (agentSteps) => set({ agentSteps }),
   addAgentStep: (step) => set((s) => ({ agentSteps: [...s.agentSteps, step] })),
   updateAgentStep: (stepIndex, updates) =>
@@ -220,4 +230,6 @@ export const useChatStore = create<ChatState>((set) => ({
         ? { pendingQuestions: q, pendingQuestionsSessionId: sessionId ?? s.activeSessionId }
         : { pendingQuestions: null, pendingQuestionsSessionId: null }
     ),
+
+  setPendingFirst: (p) => set({ pendingFirst: p }),
 }));

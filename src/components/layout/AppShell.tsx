@@ -249,7 +249,13 @@ export function AppShell({ children }: AppShellProps) {
           return;
         case 'n':
           e.preventDefault();
-          createNote();
+          if (e.shiftKey) {
+            // Ctrl+Shift+N: new agent conversation (chat page).
+            openRouteTab('/chat', '对话', 'chat');
+            window.dispatchEvent(new CustomEvent('siku:new-agent'));
+          } else {
+            createNote();
+          }
           return;
         case ',':
           e.preventDefault();

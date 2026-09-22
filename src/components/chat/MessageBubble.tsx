@@ -2,12 +2,14 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
-import { User, Copy, Check, Paperclip, ChevronDown, ChevronUp } from 'lucide-react';
+import { User, Copy, Check, Paperclip, ChevronDown, ChevronUp, Tag } from 'lucide-react';
 import { memo, useEffect, useMemo, useState } from 'react';
 import type { AgentStep, ChatMessage } from '@/lib/types';
 import { parseToolCalls, stepsToPhases } from '@/lib/agentPhases';
 import { parseAttachments } from '@/lib/attachments';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
+import { chatMessageTag } from '@/lib/tauri';
+import { useChatStore } from '@/stores/chatStore';
 import { MarkdownCode, MarkdownPre } from './CodeBlock';
 import { ToolCallCard } from './ToolCallCard';
 import { ReasoningProcessCard } from './ReasoningProcessCard';
@@ -121,6 +123,44 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
   // 本轮上下文 viewer: right-click the user avatar (see TurnContextDialog).
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const [ctxOpen, setCtxOpen] = useState(false);
+  // Bubble tagging (打标即搬运): experience → long-term memory, knowledge →
+  // knowledge base, chitchat → mark only.
+  const [tagMenuOpen, setTagMenuOpen] = useState(false);
+  const [tagBusy, setTagBusy] = useState(false);
+
+  const TAG_LABELS: Record<string, string> = {
+    experience: '经验',
+    knowledge: '私域知识',
+    chitchat: '闲聊',
+  };
+
+  const handleTag = async (tag: 'experience' | 'knowledge' | 'chitchat' | null) => {
+    setTagMenuOpen(false);
+    if (tagBusy) return;
+    setTagBusy(true);
+    try {
+      const updated = await chatMessageTag(message.id, tag);
+      useChatStore.getState().patchMessage(updated);
+    } catch (err) {
+      console.error('tag message failed:', err);
+    } finally {
+      setTagBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!tagMenuOpen) return;
+    const close = () => setTagMenuOpen(false);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') close();
+    };
+    window.addEventListener('mousedown', close);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('mousedown', close);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [tagMenuOpen]);
 
   useEffect(() => {
     if (!ctxMenu) return;
@@ -195,6 +235,11 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
             </span>
           )}
           <span className="text-[11px] text-codex-muted">{formatTime(message.created_at)}</span>
+          {message.user_tag && (
+            <span className="text-[10px] px-1.5 py-px rounded-full bg-codex-accent/15 text-codex-accent border border-codex-accent/30">
+              {TAG_LABELS[message.user_tag] ?? message.user_tag}
+            </span>
+          )}
           <button
             onClick={handleCopy}
             className="opacity-0 group-hover/bubble:opacity-100 transition-opacity p-0.5 rounded hover:bg-codex-hover text-codex-muted hover:text-codex-primary"
@@ -265,7 +310,7 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
         )}
       </div>
 
-      {/* Copy button under the assistant's bubble */}
+      {/* Copy + tag buttons under the assistant's bubble */}
       {!isUser && (
         <div className="flex items-center gap-1 mt-1 opacity-0 group-hover/bubble:opacity-100 transition-opacity">
           <button
@@ -275,6 +320,50 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
           >
             {copied ? <Check size={11} className="text-codex-accent" /> : <Copy size={11} />}
           </button>
+          <div className="relative" onMouseDown={(e) => e.stopPropagation()}>
+            <button
+              onClick={() => setTagMenuOpen((v) => !v)}
+              disabled={tagBusy}
+              className="p-0.5 rounded hover:bg-codex-hover text-codex-muted hover:text-codex-primary disabled:opacity-40"
+              title="打标（经验/私域知识会搬运到对应存储）"
+            >
+              <Tag size={11} />
+            </button>
+            {tagMenuOpen && (
+              <div className="absolute left-0 bottom-full mb-1 z-50 min-w-[150px] py-1 rounded-lg border border-codex-border bg-codex-surface shadow-xl">
+                {(
+                  [
+                    ['experience', '标记为经验', '追加到本会话长期记忆'],
+                    ['knowledge', '标记为私域知识', '写入知识库'],
+                    ['chitchat', '标记为闲聊', '仅打标，不搬运'],
+                  ] as const
+                ).map(([key, label, hint]) => (
+                  <button
+                    key={key}
+                    onClick={() => handleTag(key)}
+                    className="w-full px-3 py-1.5 text-left hover:bg-codex-hover"
+                  >
+                    <div className="text-[12px] text-codex-primary flex items-center gap-1.5">
+                      {message.user_tag === key && <Check size={11} className="text-codex-accent" />}
+                      {label}
+                    </div>
+                    <div className="text-[10px] text-codex-muted">{hint}</div>
+                  </button>
+                ))}
+                {message.user_tag && (
+                  <>
+                    <div className="my-1 border-t border-codex-border" />
+                    <button
+                      onClick={() => handleTag(null)}
+                      className="w-full px-3 py-1.5 text-left text-[12px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
+                    >
+                      取消标记
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       )}
 

@@ -37,6 +37,13 @@ export const TOOL_CATEGORIES: AgentToolCategory[] = [
     ],
   },
   {
+    name: '长期记忆',
+    tools: [
+      { key: 'memory_read', label: 'memory_read — 读取长期记忆' },
+      { key: 'memory_write', label: 'memory_write — 写入长期记忆（追加/重写）' },
+    ],
+  },
+  {
     name: '网络',
     tools: [
       { key: 'web_fetch', label: 'web_fetch — 抓取网页' },

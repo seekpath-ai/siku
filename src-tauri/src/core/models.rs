@@ -189,8 +189,12 @@ pub struct ChatSession {
     pub memory_file_path: Option<String>,
     pub memory_dir: Option<String>,
     pub skills_dir: Option<String>,
+    /// Skills mounted on this session (JSON array of names); None/[] = none.
+    pub selected_skills: Option<String>,
     pub is_pinned: Option<i32>,
     pub sort_order: Option<i32>,
+    /// Archived sessions hide from the sidebar list (restorable).
+    pub archived: Option<i32>,
     pub icon: Option<String>,
     pub color: Option<String>,
     pub domain: Option<String>,
@@ -216,6 +220,10 @@ pub struct ChatMessage {
     pub tokens_in_hit: Option<i32>,
     pub tokens_out: Option<i32>,
     pub attachments: Option<String>,
+    /// User-set tag from the bubble action bar: experience | knowledge |
+    /// chitchat; None = untagged. Tagging also copies the content to the
+    /// corresponding store (memory / knowledge base) — see chat_message_tag.
+    pub user_tag: Option<String>,
     pub created_at: String,
 }
 
@@ -225,15 +233,26 @@ pub struct Project {
     pub id: String,
     pub name: String,
     pub path: String,
+    /// Archived projects hide from the sidebar (restorable). Device-local.
+    #[serde(default)]
+    pub archived: bool,
     pub created_at: String,
     pub updated_at: String,
 }
 
 /// Input for creating/updating a project.
 #[derive(Debug, Clone, serde::Deserialize)]
+// camelCase: the frontend sends `gitInit`; without this the field silently
+// deserialized to None and git bootstrap never ran.
+#[serde(rename_all = "camelCase")]
 pub struct ProjectInput {
     pub name: Option<String>,
     pub path: Option<String>,
+    /// Create a git repository in the project dir (git init + .gitignore).
+    /// Requires the system git binary; the new-project dialog greys the
+    /// option out when git is missing (see projects::git_available).
+    #[serde(default)]
+    pub git_init: Option<bool>,
 }
 
 /// A scheduled agent prompt (cron job).
@@ -434,6 +453,10 @@ pub struct AgentSessionInput {
     pub max_memory_rounds: Option<i32>,
     pub memory_dir: Option<String>,
     pub skills_dir: Option<String>,
+    /// Skills mounted on this session. None = leave the column untouched
+    /// (e.g. callers that don't know about skills); Some([]) = unmount all.
+    #[serde(default)]
+    pub selected_skills: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for AgentSessionInput {

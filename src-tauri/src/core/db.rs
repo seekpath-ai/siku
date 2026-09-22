@@ -658,6 +658,11 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     add_column_if_missing(&db, "chat_messages", "attachments", "TEXT")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_messages.attachments: {}", e))?;
+    // Message tagging (2026-09): 经验/私域知识/闲聊 markers set from the
+    // bubble action bar; None = untagged.
+    add_column_if_missing(&db, "chat_messages", "user_tag", "TEXT")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chat_messages.user_tag: {}", e))?;
 
     // Migration: sync chat_sessions columns added for agent features
     add_column_if_missing(&db, "chat_sessions", "llm_models", "TEXT")
@@ -706,6 +711,11 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     add_column_if_missing(&db, "chat_sessions", "sort_order", "INTEGER DEFAULT 0")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.sort_order: {}", e))?;
+    // Archived sessions hide from the sidebar list (restorable). Synced like
+    // the other session metadata, so archiving on one device archives everywhere.
+    add_column_if_missing(&db, "chat_sessions", "archived", "INTEGER NOT NULL DEFAULT 0")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.archived: {}", e))?;
     add_column_if_missing(&db, "chat_sessions", "icon", "TEXT")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.icon: {}", e))?;
@@ -759,6 +769,11 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     add_column_if_missing(&db, "chat_sessions", "skills_dir", "TEXT")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.skills_dir: {}", e))?;
+    // Per-session mounted skills (JSON array of names). Only mounted skills
+    // register as tools — unmounted skill descriptions never reach the LLM.
+    add_column_if_missing(&db, "chat_sessions", "selected_skills", "TEXT")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.selected_skills: {}", e))?;
 
     // Migration: agent_steps for ReAct iterations (added 2026-08-07)
     sqlx::query(
@@ -788,9 +803,12 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     add_column_if_missing(&db, "chat_sessions", "project_id", "TEXT")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.project_id: {}", e))?;
-    crate::core::project_service::ensure_default_project(&db, &app_data_dir)
+    // No default project is seeded: projects are explicit user choices,
+    // sessions may be project-less, and projects are device-local (never in
+    // the sync table lists — absolute paths are meaningless on other devices).
+    add_column_if_missing(&db, "projects", "archived", "INTEGER NOT NULL DEFAULT 0")
         .await
-        .map_err(|e| anyhow::anyhow!("failed to seed default project: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("migration failed for projects.archived: {}", e))?;
 
     // Migration: per-session working directory (sandbox scope) + cron jobs (added 2026-08-09)
     add_column_if_missing(&db, "chat_sessions", "working_dir", "TEXT")

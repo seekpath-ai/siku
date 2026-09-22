@@ -166,8 +166,12 @@ export interface AgentSession {
   memory_file_path: string | null;
   memory_dir: string | null;
   skills_dir: string | null;
+  /** Skills mounted on this session (per-session plugins). */
+  selected_skills: string[];
   is_pinned: boolean;
   sort_order: number;
+  /** Archived sessions hide from the sidebar list (restorable). */
+  archived: boolean;
   icon: string | null;
   color: string | null;
   paper_ids: string;
@@ -193,6 +197,8 @@ export interface Project {
   id: string;
   name: string;
   path: string;
+  /** Archived projects hide from the sidebar list (restorable). */
+  archived: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -297,6 +303,8 @@ export interface ChatMessage {
   tokens_in_hit: number | null;
   tokens_out: number | null;
   attachments: string | null; // JSON ChatAttachment[]
+  /** Bubble tag: experience | knowledge | chitchat; null = untagged. */
+  user_tag: string | null;
   created_at: string;
 }
 

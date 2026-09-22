@@ -329,6 +329,8 @@ pub async fn agent_create_session(
         "skills_dir": config.skills_dir,
         "is_pinned": false,
         "sort_order": 0,
+        "archived": false,
+        "selected_skills": Vec::<String>::new(),
         "icon": null,
         "color": null,
         "paper_ids": "[]",
@@ -368,21 +370,32 @@ pub async fn agent_update_session(
     let provider_ids_json = serde_json::to_string(&input.llm_provider_ids).map_err(|e| format!("json: {e}"))?;
     let approval_json = serde_json::to_string(&config.approval).map_err(|e| format!("json: {e}"))?;
     let tools_json = serde_json::to_string(&config.tools).map_err(|e| format!("json: {e}"))?;
+    // None = caller didn't send the field → keep the stored mount list.
+    let selected_skills_json = input
+        .selected_skills
+        .as_ref()
+        .map(|v| serde_json::to_string(v).map_err(|e| format!("json: {e}")))
+        .transpose()?;
 
     sqlx::query(
         "UPDATE chat_sessions SET
             title = ?, agent_mode = ?, tools_enabled = ?, system_prompt = ?,
+            project_id = ?,
             working_dir = COALESCE(?, working_dir),
             vision_provider_id = COALESCE(?, vision_provider_id),
             web_proxy = COALESCE(?, web_proxy),
             llm_models = ?, llm_provider_ids = ?, approval_config = ?, max_loops = ?, max_tokens = ?,
-            context_budget = ?, max_memory_rounds = ?, memory_file_path = ?, memory_dir = ?, skills_dir = ?, updated_at = ?
+            context_budget = ?, max_memory_rounds = ?, memory_file_path = ?, memory_dir = ?, skills_dir = ?,
+            selected_skills = COALESCE(?, selected_skills), updated_at = ?
          WHERE id = ?"
     )
     .bind(&config.display_name)
     .bind(&input.agent_mode)
     .bind(&tools_json)
     .bind(&config.system_prompt)
+    // project_id is always (re)assigned — the config panel sends the field
+    // explicitly (id or null-to-unbind); the sole caller is the panel.
+    .bind(&input.project_id)
     .bind(&input.working_dir)
     .bind(&input.vision_provider_id)
     .bind(&input.web_proxy)
@@ -396,6 +409,7 @@ pub async fn agent_update_session(
     .bind(&config.memory_file_path)
     .bind(&config.memory_dir)
     .bind(&config.skills_dir)
+    .bind(&selected_skills_json)
     .bind(&now)
     .bind(&session_id)
     .execute(&state.db)
@@ -405,7 +419,7 @@ pub async fn agent_update_session(
     let session = sqlx::query_as::<_, ChatSession>(
         "SELECT id, title, mode, project_id, working_dir, vision_provider_id, web_proxy, agent_mode, tools_enabled, system_prompt,
                 llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, context_budget, max_memory_rounds,
-                memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, icon, color, domain, context, paper_ids, created_at, updated_at
+                memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, archived, icon, color, domain, context, selected_skills, paper_ids, created_at, updated_at
          FROM chat_sessions WHERE id = ?"
     )
     .bind(&session_id)
@@ -421,6 +435,8 @@ pub async fn agent_update_session(
         session.agent_mode,
         session.is_pinned.unwrap_or(0) != 0,
         session.sort_order.unwrap_or(0),
+        session.archived.unwrap_or(0) != 0,
+        session.selected_skills,
         session.paper_ids,
         session.llm_provider_ids,
         session.project_id,
@@ -473,7 +489,7 @@ pub async fn agent_get_session(
     let session = sqlx::query_as::<_, ChatSession>(
         "SELECT id, title, mode, project_id, working_dir, vision_provider_id, web_proxy, agent_mode, tools_enabled, system_prompt,
                 llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, context_budget, max_memory_rounds,
-                memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, icon, color, domain, context, paper_ids, created_at, updated_at
+                memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, archived, icon, color, domain, context, selected_skills, paper_ids, created_at, updated_at
          FROM chat_sessions WHERE id = ?"
     )
     .bind(&session_id)
@@ -490,6 +506,8 @@ pub async fn agent_get_session(
         session.agent_mode,
         session.is_pinned.unwrap_or(0) != 0,
         session.sort_order.unwrap_or(0),
+        session.archived.unwrap_or(0) != 0,
+        session.selected_skills,
         session.paper_ids,
         session.llm_provider_ids,
         session.project_id,
@@ -515,6 +533,46 @@ pub async fn agent_pin_session(
     sqlx::query("UPDATE chat_sessions SET is_pinned = ?, updated_at = ? WHERE id = ?")
         .bind(if pinned { 1 } else { 0 })
         .bind(&now)
+        .bind(&session_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
+    Ok(())
+}
+
+/// Archive or restore an agent session. Archived sessions hide from the
+/// sidebar list; the conversation itself is untouched.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn agent_archive_session(
+    state: State<'_, AppState>,
+    session_id: String,
+    archived: bool,
+) -> Result<(), String> {
+    let now = now_iso();
+    sqlx::query("UPDATE chat_sessions SET archived = ?, updated_at = ? WHERE id = ?")
+        .bind(if archived { 1 } else { 0 })
+        .bind(&now)
+        .bind(&session_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
+    Ok(())
+}
+
+/// Replace the session's mounted skill list. Only mounted skills register as
+/// tools for that session (Kimi-style per-session plugins).
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn agent_set_session_skills(
+    state: State<'_, AppState>,
+    session_id: String,
+    skills: Vec<String>,
+) -> Result<(), String> {
+    let json = serde_json::to_string(&skills).map_err(|e| format!("json: {e}"))?;
+    sqlx::query("UPDATE chat_sessions SET selected_skills = ?, updated_at = ? WHERE id = ?")
+        .bind(&json)
+        .bind(now_iso())
         .bind(&session_id)
         .execute(&state.db)
         .await
@@ -572,6 +630,8 @@ fn session_to_json(
     agent_mode: String,
     is_pinned: bool,
     sort_order: i32,
+    archived: bool,
+    selected_skills: Option<String>,
     paper_ids: String,
     llm_provider_ids: Option<String>,
     project_id: Option<String>,
@@ -588,6 +648,11 @@ fn session_to_json(
     let llm_provider_ids: Option<Vec<String>> = llm_provider_ids
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok());
+    // Mounted skill names as a real array (raw column is a JSON string).
+    let selected_skills: Vec<String> = selected_skills
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
     serde_json::json!({
         "id": id,
         "title": config.display_name,
@@ -611,6 +676,8 @@ fn session_to_json(
         "skills_dir": config.skills_dir,
         "is_pinned": is_pinned,
         "sort_order": sort_order,
+        "archived": archived,
+        "selected_skills": selected_skills,
         "icon": config.display_name.chars().next().map(|c| c.to_string()),
         "color": None::<String>,
         "domain": domain,
@@ -639,7 +706,7 @@ pub(crate) async fn run_agent_turn(
     let session = sqlx::query_as::<_, ChatSession>(
         "SELECT id, title, mode, project_id, working_dir, vision_provider_id, web_proxy, agent_mode, tools_enabled, system_prompt,
                 llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, context_budget, max_memory_rounds,
-                memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, icon, color, domain, context, paper_ids, created_at, updated_at
+                memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, archived, icon, color, domain, context, selected_skills, paper_ids, created_at, updated_at
          FROM chat_sessions WHERE id = ?"
     )
     .bind(&session_id)
@@ -781,15 +848,24 @@ pub(crate) async fn run_agent_turn(
 
     let data_dir_path = device_settings.data_dir.as_deref().map(std::path::PathBuf::from);
 
-    // Register inline skills from the effective skills directory (global or
-    // per-agent). Always available to the agent.
+    // Register the skills MOUNTED ON THIS SESSION (per-session plugins): a
+    // skill the session didn't mount never reaches the tool list, so its
+    // description costs no context. Skills dir = per-agent → global setting
+    // → default, same resolution as before.
     let skills_dir = agent_skills_dir(
         &state.app_data_dir,
         data_dir_path.as_deref(),
         config.skills_dir.as_deref(),
         device_settings.skills_dir.as_deref(),
     );
-    registry.register_skills(&skills_dir);
+    let selected_skills: std::collections::HashSet<String> = session
+        .selected_skills
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    registry.register_skills(&skills_dir, &selected_skills);
 
     let memory_path = agent_memory_path(
         &state.app_data_dir,
@@ -1271,7 +1347,7 @@ pub async fn agent_list_sessions(
 ) -> Result<Vec<serde_json::Value>, String> {
     const SESSION_COLS: &str = "id, title, mode, project_id, working_dir, vision_provider_id, web_proxy, agent_mode, tools_enabled, system_prompt, \
          llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, context_budget, max_memory_rounds, \
-         memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, icon, color, domain, context, paper_ids, created_at, updated_at";
+         memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, archived, icon, color, domain, context, selected_skills, paper_ids, created_at, updated_at";
 
     let rows = if let Some(pid) = project_id {
         sqlx::query_as::<_, ChatSession>(&format!(
@@ -1355,6 +1431,12 @@ fn session_to_list_json(session: ChatSession) -> serde_json::Value {
         "skills_dir": session.skills_dir,
         "is_pinned": session.is_pinned.unwrap_or(0) != 0,
         "sort_order": session.sort_order.unwrap_or(0),
+        "archived": session.archived.unwrap_or(0) != 0,
+        "selected_skills": session
+            .selected_skills
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .unwrap_or_default(),
         "icon": session.icon.or_else(|| title.chars().next().map(|c| c.to_string())),
         "color": session.color,
         "domain": session.domain,

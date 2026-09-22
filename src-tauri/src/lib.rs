@@ -624,6 +624,24 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        // Global (OS-level) screenshot hotkey: fires the snipping flow even
+        // when the main window is minimized/hidden — WeChat-style. The combo
+        // itself is (un)registered by screenshot_hotkey_sync per settings.
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() != tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        return;
+                    }
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.unminimize();
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                        let _ = w.emit("siku:global-screenshot", ());
+                    }
+                })
+                .build(),
+        )
         // Updater: checks GitHub Releases for a newer signed build.
         // Process: relaunch after the updater installs a new version.
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -881,6 +899,7 @@ pub fn run() {
             commands::system::system_info,
             commands::system::log_startup_metrics,
             commands::system::screenshot_start,
+            commands::system::screenshot_hotkey_sync,
             // Annotations
             commands::annotation::annotation_list,
             commands::annotation::annotation_create,

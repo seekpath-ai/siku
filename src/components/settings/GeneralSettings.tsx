@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Folder, HardDrive, Loader2, FolderOpen, Cat, Check, Home } from 'lucide-react';
+import { Folder, HardDrive, Loader2, FolderOpen, Cat, Check, Home, Camera } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
-import { settingsGetDataDir, settingsAppGet, settingsAppSave } from '@/lib/tauri';
+import { settingsGetDataDir, settingsAppGet, settingsAppSave, screenshotHotkeySync } from '@/lib/tauri';
 import { useTabStore } from '@/stores/tabStore';
 import { pickDirectory } from '@/lib/pickDirectory';
 
@@ -24,6 +24,8 @@ export function GeneralSettings() {
   const [dataDirSaving, setDataDirSaving] = useState(false);
   const [dataDirSaved, setDataDirSaved] = useState(false);
   const [showPet, setShowPet] = useState<boolean>(true);
+  const [globalShot, setGlobalShot] = useState<boolean>(true);
+  const [globalShotSaving, setGlobalShotSaving] = useState(false);
   const [homepage, setHomepage] = useState<string>('/library');
   const [homepageSaving, setHomepageSaving] = useState(false);
   const [homepageSaved, setHomepageSaved] = useState(false);
@@ -37,6 +39,7 @@ export function GeneralSettings() {
         setCurrentDir(actual);
         setDataDir(settings.data_dir || '');
         setShowPet(settings.show_pet ?? true);
+        setGlobalShot(settings.global_screenshot_hotkey ?? true);
         setHomepage(settings.homepage || '/library');
       })
       .catch((err) => console.error('Failed to load general settings:', err))
@@ -86,8 +89,21 @@ export function GeneralSettings() {
     await saveDataDir(selected);
   };
 
-  const savePetVisibility = async (next: boolean) => {
-    setPetSaving(true);
+  const saveGlobalShot = async (next: boolean) => {
+    setGlobalShotSaving(true);
+    try {
+      const current = await settingsAppGet();
+      await settingsAppSave({ ...current, global_screenshot_hotkey: next });
+      // Apply (register/unregister) immediately.
+      await screenshotHotkeySync();
+    } catch (err) {
+      console.error('Failed to save global hotkey setting:', err);
+    } finally {
+      setGlobalShotSaving(false);
+    }
+  };
+
+  const savePetVisibility = async (next: boolean) => {    setPetSaving(true);
     try {
       const current = await settingsAppGet();
       await settingsAppSave({ ...current, show_pet: next });
@@ -249,6 +265,50 @@ export function GeneralSettings() {
               <span
                 className={`block w-4 h-4 rounded-full bg-white shadow transition-transform ${
                   showPet ? 'translate-x-[18px]' : 'translate-x-0.5'
+                }`}
+              />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Global screenshot hotkey */}
+      <div className="space-y-3">
+        <div className="flex items-center gap-2 text-sm text-text-primary">
+          <Camera size={16} className="text-primary" />
+          <span>全局截图快捷键</span>
+        </div>
+        <div
+          className={`flex items-center gap-4 px-4 py-3.5 bg-surface border rounded-xl transition-colors ${
+            globalShot ? 'border-primary/30' : 'border-surface-hover'
+          }`}
+        >
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-medium text-text-primary">
+              Ctrl+Shift+S 系统级截图
+            </div>
+            <p className="text-xs text-text-secondary mt-0.5">
+              开启后即使应用最小化也能唤起截图，截完自动附加到当前对话输入框。若与其他软件冲突可关闭。
+            </p>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            {globalShotSaving && <Loader2 size={14} className="animate-spin text-text-secondary" />}
+            <button
+              role="switch"
+              aria-checked={globalShot}
+              disabled={globalShotSaving}
+              onClick={() => {
+                const next = !globalShot;
+                setGlobalShot(next);
+                saveGlobalShot(next);
+              }}
+              className={`w-9 h-5 rounded-full transition-colors shrink-0 disabled:opacity-50 ${
+                globalShot ? 'bg-primary' : 'bg-surface-hover'
+              }`}
+            >
+              <span
+                className={`block w-4 h-4 rounded-full bg-white shadow transition-transform ${
+                  globalShot ? 'translate-x-[18px]' : 'translate-x-0.5'
                 }`}
               />
             </button>

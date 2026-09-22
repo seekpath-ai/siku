@@ -446,6 +446,7 @@ export function TitleBar() {
                       ['收藏当前页', 'Ctrl+D'], ['切换宠物', 'Ctrl+Shift+P'],
                       ['新建智能体', 'Ctrl+Shift+N'], ['新建笔记', 'Ctrl+N'],
                       ['导入 PDF', 'Ctrl+I'], ['全局搜索', 'Ctrl+K'],
+                      ['全局截图（最小化也可用）', 'Ctrl+Shift+S'],
                       ['放大 / 缩小', 'Ctrl+= / Ctrl+-'], ['重置缩放', 'Ctrl+0'],
                       ['翻译面板', 'Ctrl+T'], ['退出', 'Alt+F4'],
                     ].map(([label, shortcut]) => (

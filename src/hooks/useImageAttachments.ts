@@ -174,6 +174,8 @@ export function useImageAttachments({
   }, [onError]);
 
   // Optional in-app shortcut: Ctrl+Shift+S triggers the screenshot flow.
+  // Also responds to the OS-global hotkey (registered by the backend, fired
+  // even while minimized), forwarded by AppShell as 'siku:screenshot-hotkey'.
   useEffect(() => {
     if (!enableShortcut) return;
     const onKey = (e: KeyboardEvent) => {
@@ -182,8 +184,15 @@ export function useImageAttachments({
         if (!disabled) startScreenshot();
       }
     };
+    const onGlobalHotkey = () => {
+      if (!disabled) startScreenshot();
+    };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('siku:screenshot-hotkey', onGlobalHotkey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('siku:screenshot-hotkey', onGlobalHotkey);
+    };
   }, [enableShortcut, disabled, startScreenshot]);
 
   // Attach pasted images; text paste falls through to the default handler.

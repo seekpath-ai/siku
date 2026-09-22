@@ -14,7 +14,7 @@ import { runFileBatch, useBatchImportStore } from '@/stores/batchImportStore';
 import { useImportPaper } from '@/hooks/useLibrary';
 import { useShellStore } from '@/stores/shellStore';
 import { useTabStore } from '@/stores/tabStore';
-import { notesCreate, bookmarksCreate, settingsAppGet, settingsAppSave } from '@/lib/tauri';
+import { notesCreate, bookmarksCreate, settingsAppGet, settingsAppSave, screenshotHotkeySync } from '@/lib/tauri';
 import { openNoteTab } from '@/lib/openNote';
 import { listen } from '@tauri-apps/api/event';
 
@@ -111,6 +111,20 @@ export function AppShell({ children }: AppShellProps) {
       window.removeEventListener('siku:toggle-translation', handleToggleTranslation);
     };
   }, [isReader]);
+
+  // Global screenshot hotkey: apply the setting at startup, and forward the
+  // backend's trigger event into the in-app screenshot flow (the chat
+  // input's useImageAttachments listens for this DOM event).
+  useEffect(() => {
+    screenshotHotkeySync().catch((err) => console.warn('global screenshot hotkey:', err));
+    let unlisten: (() => void) | undefined;
+    listen('siku:global-screenshot', () => {
+      window.dispatchEvent(new CustomEvent('siku:screenshot-hotkey'));
+    }).then((u) => {
+      unlisten = u;
+    });
+    return () => unlisten?.();
+  }, []);
 
   // Sync the pinned home tab with the user-configured homepage.
   useEffect(() => {

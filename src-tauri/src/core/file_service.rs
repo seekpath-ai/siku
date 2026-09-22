@@ -60,7 +60,7 @@ pub fn get_file_info(path: &str) -> Result<FileEntry, String> {
 pub fn open_in_system(path: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
+        crate::core::process::no_window(&mut std::process::Command::new("cmd"))
             .args(["/C", "start", "", path])
             .spawn()
             .map_err(|e| format!("failed to open: {e}"))?;

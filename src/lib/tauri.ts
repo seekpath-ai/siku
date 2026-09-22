@@ -388,6 +388,11 @@ export async function screenshotStart(): Promise<string> {
   return invoke<string>('screenshot_start');
 }
 
+/** (Re)apply the global screenshot hotkey per settings (app start + toggle). */
+export async function screenshotHotkeySync(): Promise<void> {
+  return invoke<void>('screenshot_hotkey_sync');
+}
+
 /** Rename a session (title only). */
 export async function agentRenameSession(sessionId: string, title: string): Promise<void> {
   return invoke<void>('agent_rename_session', { sessionId, title });
@@ -484,6 +489,8 @@ export interface AppSettings {
 
   // UI features
   show_pet?: boolean;
+  /** System-wide Ctrl+Shift+S screenshot hotkey (default on). */
+  global_screenshot_hotkey?: boolean;
   sidebar_order?: string[] | null;
   homepage?: string | null;
 

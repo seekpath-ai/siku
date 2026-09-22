@@ -631,19 +631,6 @@ export function AgentList() {
                       >
                         <Plus size={13} />
                       </button>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          fileBrowserRevealInSystem(p.path).catch((err) =>
-                            console.error('reveal project dir:', err)
-                          );
-                        }}
-                        title="打开目录位置"
-                        aria-label="打开目录位置"
-                        className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-codex-muted hover:text-codex-primary hover:bg-codex-bg transition-opacity"
-                      >
-                        <FolderOpen size={12} />
-                      </button>
                     </div>
                     {expanded && (
                       <div className="ml-5 space-y-0.5">

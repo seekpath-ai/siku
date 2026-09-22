@@ -1,6 +1,8 @@
 use tauri::State;
 use tracing::instrument;
 
+use tauri::AppHandle;
+
 use crate::core::models::SystemInfo;
 use crate::core::time;
 use crate::AppState;
@@ -39,14 +41,39 @@ pub async fn log_startup_metrics(
     Ok(())
 }
 
+/// The system-wide screenshot hotkey (WeChat-style: fires even while the
+/// main window is minimized). Kept as a single constant so registration and
+/// the handler stay in sync.
+pub const SCREENSHOT_HOTKEY: &str = "ctrl+shift+s";
+
+/// Apply the `global_screenshot_hotkey` setting: (un)register the OS-level
+/// hotkey. Called on app start and after the settings toggle flips.
+/// Unregister-when-absent is ignored; register-conflict (another app grabbed
+/// the combo) is surfaced as an error for the UI to show.
+#[tauri::command]
+#[instrument(skip(state, app_handle))]
+pub async fn screenshot_hotkey_sync(
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    let settings = crate::core::settings_service::load_app_settings(&state.db).await?;
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let gs = app_handle.global_shortcut();
+    let _ = gs.unregister(SCREENSHOT_HOTKEY);
+    if settings.global_screenshot_hotkey {
+        gs.register(SCREENSHOT_HOTKEY)
+            .map_err(|e| format!("注册全局截图热键失败（可能被其他应用占用）：{e}"))?;
+    }
+    Ok(())
+}
+
 /// Launch the OS-native region screenshot tool; the captured image lands in
 /// the clipboard and the frontend picks it up on window refocus. Returns the
 /// launched tool's name. Errors when no known tool is available (Linux
 /// without flameshot/spectacle/gnome-screenshot).
 #[tauri::command]
 #[instrument]
-pub fn screenshot_start() -> Result<String, String> {
-    #[cfg(target_os = "windows")]
+pub fn screenshot_start() -> Result<String, String> {    #[cfg(target_os = "windows")]
     {
         std::process::Command::new("explorer")
             .arg("ms-screenclip:")

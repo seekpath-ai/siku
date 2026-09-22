@@ -55,7 +55,7 @@ fn folder_name(path: &str) -> String {
 
 /// Whether a usable system git is on PATH.
 pub fn git_available() -> bool {
-    std::process::Command::new("git")
+    crate::core::process::no_window(&mut std::process::Command::new("git"))
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -73,7 +73,7 @@ fn git_bootstrap(dir: &std::path::Path) -> Result<(), String> {
     if !git_available() {
         return Err("未检测到 git，请先安装 git 后再初始化仓库".to_string());
     }
-    let status = std::process::Command::new("git")
+    let status = crate::core::process::no_window(&mut std::process::Command::new("git"))
         .arg("init")
         .current_dir(dir)
         .stdout(std::process::Stdio::null())

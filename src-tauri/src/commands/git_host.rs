@@ -9,7 +9,7 @@ use crate::AppState;
 /// Run a git command in `dir`, returning trimmed stdout; stderr goes into the
 /// error so the dialog shows git's own message.
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = std::process::Command::new("git")
+    let out = crate::core::process::no_window(&mut std::process::Command::new("git"))
         .args(args)
         .current_dir(dir)
         .output()
@@ -77,7 +77,7 @@ pub async fn git_push_branch(state: State<'_, AppState>, project_id: String) -> 
         return Err("当前处于 detached HEAD，请先切换到一个分支".to_string());
     }
     // push prints progress to stderr even on success; use output() directly.
-    let out = std::process::Command::new("git")
+    let out = crate::core::process::no_window(&mut std::process::Command::new("git"))
         .args(["push", "-u", "origin", &branch])
         .current_dir(dir)
         .output()

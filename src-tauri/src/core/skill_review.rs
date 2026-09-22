@@ -147,7 +147,7 @@ pub fn content_hash(dir: &Path) -> String {
 }
 
 fn binary_available(name: &str) -> bool {
-    std::process::Command::new(name)
+    crate::core::process::no_window(&mut std::process::Command::new(name))
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -177,7 +177,7 @@ fn pip_to_module(pkg: &str) -> String {
 }
 
 fn python_module_available(module: &str) -> bool {
-    std::process::Command::new("python3")
+    crate::core::process::no_window(&mut std::process::Command::new("python3"))
         .args(["-c", &format!("import {module}")])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

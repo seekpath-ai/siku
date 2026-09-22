@@ -521,6 +521,9 @@ pub struct AppSettings {
     // ── UI features ──
     #[serde(default = "default_show_pet")]
     pub show_pet: bool,
+    /// System-wide Ctrl+Shift+S screenshot hotkey (works while minimized).
+    #[serde(default = "default_global_hotkey")]
+    pub global_screenshot_hotkey: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sidebar_order: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -704,6 +707,9 @@ impl std::fmt::Debug for AppSettings {
 fn default_show_pet() -> bool {
     true
 }
+fn default_global_hotkey() -> bool {
+    true
+}
 fn default_embedding_backend() -> String {
     "hash".into()
 }
@@ -780,6 +786,7 @@ impl Default for AppSettings {
             default_context_budget: 28000,
             default_max_memory_rounds: 10,
             show_pet: default_show_pet(),
+            global_screenshot_hotkey: default_global_hotkey(),
             sidebar_order: None,
             homepage: None,
             log_max_size_mb: default_log_max_size_mb(),

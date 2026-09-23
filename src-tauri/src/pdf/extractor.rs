@@ -32,8 +32,8 @@ pub fn line_bbox(line: &crate::pdf::paragraphs::GeoLine) -> [f32; 4] {
 }
 
 /// Anchor one paragraph (its lines) for the dual-pane view. `None` when the
-/// paragraph has no visible text.
-fn anchor_paragraph(
+/// paragraph has no visible text. Also used by `figures` to anchor captions.
+pub(crate) fn anchor_paragraph(
     page: u16,
     para: &[crate::pdf::paragraphs::GeoLine],
 ) -> Option<AnchoredParagraph> {

@@ -1240,8 +1240,8 @@ pub async fn pet_create_session(
     // Per-domain tool sets: only the tools each agent actually needs.
     let tools = match domain.as_str() {
         "note_organizer" => r#"["note_read","note_write"]"#,
-        "literature_analyzer" => r#"["paper_search","paper_read","translate","note_read","note_write"]"#,
-        "research_tracker" => r#"["paper_search","paper_read","note_read","note_write"]"#,
+        "literature_analyzer" => r#"["paper_search","paper_read","paper_snapshot","translate","note_read","note_write"]"#,
+        "research_tracker" => r#"["paper_search","paper_read","paper_snapshot","note_read","note_write"]"#,
         "knowledge_curator" => r#"["knowledge_query","knowledge_create","note_read","note_write"]"#,
         "chat_summarizer" => "[]",
         _ => "[]",

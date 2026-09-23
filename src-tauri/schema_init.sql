@@ -420,6 +420,26 @@ CREATE TABLE IF NOT EXISTS imports (
     completed_at TEXT
 );
 
+-- paper_figures: per-paper figure/table metadata (page, caption label, image
+-- bbox) for the agent's paper_snapshot tool. Device-local derived data,
+-- rebuilt from the PDF when the paper is indexed — intentionally no FK, no
+-- sync. bbox/caption_bbox are JSON [x0,y0,x1,y1] in display-frame PDF points
+-- (y-up); bbox is NULL for captions without a matched image object (vector
+-- figures, drawn tables); image_path is filled lazily by paper_snapshot.
+CREATE TABLE IF NOT EXISTS paper_figures (
+    id TEXT PRIMARY KEY NOT NULL,
+    paper_id TEXT NOT NULL,
+    page INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'figure',
+    label TEXT NOT NULL DEFAULT '',
+    caption TEXT NOT NULL DEFAULT '',
+    bbox TEXT,
+    caption_bbox TEXT,
+    image_path TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_paper_figures_paper ON paper_figures(paper_id);
+
 -- tool_executions
 CREATE TABLE IF NOT EXISTS tool_executions (
     id TEXT PRIMARY KEY,

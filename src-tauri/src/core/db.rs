@@ -1120,6 +1120,50 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // Existing installs: the version column guards cache staleness across
     // extractor upgrades (geometry fixes change the paragraph output).
     add_column_if_missing(&db, "paper_paragraphs", "version", "INTEGER NOT NULL DEFAULT 1").await?;
+
+    // Per-paper figure/table metadata (page, label, caption, image bbox) for
+    // the agent's paper_snapshot tool. Device-local derived data like
+    // paper_paragraphs: rebuilt from the PDF when the paper is indexed, so no
+    // sync weight. `bbox`/`caption_bbox` are JSON [x0,y0,x1,y1] arrays in
+    // display-frame PDF points (y-up); bbox is NULL for captions with no
+    // matched image object (vector figures, drawn tables), and `image_path`
+    // is filled lazily by paper_snapshot when it renders the crop.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS paper_figures (
+            id TEXT PRIMARY KEY NOT NULL,
+            paper_id TEXT NOT NULL,
+            page INTEGER NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'figure',
+            label TEXT NOT NULL DEFAULT '',
+            caption TEXT NOT NULL DEFAULT '',
+            bbox TEXT,
+            caption_bbox TEXT,
+            image_path TEXT,
+            created_at TEXT NOT NULL
+        )"
+    )
+    .execute(&db)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_paper_figures_paper ON paper_figures(paper_id)"
+    )
+    .execute(&db)
+    .await?;
+
+    // Migration: grant the new paper_snapshot tool to existing literature/
+    // research pet sessions — their tool allowlist (tools_enabled) was
+    // persisted at session creation, before the tool existed (added 2026-09-23).
+    // Idempotent string splice on the JSON array; NULL/'[]' keep their
+    // meaning (no tools / unchanged) and are untouched.
+    sqlx::query(
+        "UPDATE chat_sessions
+         SET tools_enabled = replace(tools_enabled, '\"paper_read\"', '\"paper_read\",\"paper_snapshot\"')
+         WHERE domain IN ('literature_analyzer', 'research_tracker')
+           AND tools_enabled LIKE '%\"paper_read\"%'
+           AND tools_enabled NOT LIKE '%paper_snapshot%'"
+    )
+    .execute(&db)
+    .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_turn_contexts_message ON turn_contexts(message_id)"
     )

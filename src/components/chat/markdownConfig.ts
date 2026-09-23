@@ -15,9 +15,13 @@ export const assistantRemarkPlugins: PluggableList = [remarkGfm, remarkFilePaths
 export const assistantRehypePlugins: PluggableList = [[rehypeKatex, { throwOnError: false }]];
 
 /** The default transform strips unknown schemes from href/src; keep our
- *  `siku-path:` chip links intact. */
+ *  `siku-path:` chip links intact. Also pass local absolute paths through:
+ *  tools like paper_snapshot return them as img src, and the default would
+ *  strip a Windows path like `C:\…` as an unknown "c:" protocol (POSIX paths
+ *  survive by looking relative). MarkdownImage convertFileSrc's them later. */
 export function markdownUrlTransform(url: string): string {
   if (url.startsWith(SIKU_PATH_SCHEME)) return url;
+  if (/^([A-Za-z]:[\\/]|\\\\|\/(?!\/))/.test(url)) return url;
   return defaultUrlTransform(url);
 }
 

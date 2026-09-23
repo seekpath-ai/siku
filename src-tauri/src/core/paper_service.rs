@@ -149,6 +149,12 @@ pub async fn finalize_paper_import(
                         Ok(n) => info!(paper_id = %paper_id, chunk_count = n, "text chunking completed"),
                         Err(e) => warn!(paper_id = %paper_id, error = %e, "chunking failed"),
                     }
+
+                    // Figure/table metadata for paper_snapshot (best-effort).
+                    match replace_paper_figures(db, &paper_id, &pdf_path).await {
+                        Ok(n) => info!(paper_id = %paper_id, figure_count = n, "figure metadata extracted"),
+                        Err(e) => warn!(paper_id = %paper_id, error = %e, "figure extraction failed"),
+                    }
                 }
             }
             Err(e) => {
@@ -316,6 +322,55 @@ async fn insert_chunks_tx(
     Ok(())
 }
 
+/// Insert figure/table metadata rows inside an existing transaction.
+/// Callers must have already deleted the paper's previous rows.
+async fn insert_figures_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    paper_id: &str,
+    figures: &[pdf::figures::FigureRecord],
+    now: &str,
+) -> Result<()> {
+    for fig in figures {
+        let bbox = fig
+            .bbox
+            .map(|b| serde_json::to_string(&b).unwrap_or_default());
+        let caption_bbox = fig
+            .caption_bbox
+            .map(|b| serde_json::to_string(&b).unwrap_or_default());
+        sqlx::query(
+            "INSERT INTO paper_figures (id, paper_id, page, kind, label, caption, bbox, caption_bbox, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(paper_id)
+        .bind(fig.page as i32)
+        .bind(fig.kind.as_str())
+        .bind(&fig.label)
+        .bind(&fig.caption)
+        .bind(bbox)
+        .bind(caption_bbox)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Re-extract figure/table metadata for a paper and swap the rows in
+/// atomically. Best-effort at the call sites: a failure only means the
+/// paper_snapshot label lookup degrades for this paper.
+async fn replace_paper_figures(db: &SqlitePool, paper_id: &str, pdf_path: &Path) -> Result<usize> {
+    let figures = pdf::figures::extract_figures(pdf_path)?;
+    let now = now_iso();
+    let mut tx = db.begin().await?;
+    sqlx::query("DELETE FROM paper_figures WHERE paper_id = ?")
+        .bind(paper_id)
+        .execute(&mut *tx)
+        .await?;
+    insert_figures_tx(&mut tx, paper_id, &figures, &now).await?;
+    tx.commit().await?;
+    Ok(figures.len())
+}
+
 /// Kick off embedding generation in the background. The embedder picks up
 /// whatever chunks of the paper still lack vectors, so it is safe to call
 /// this after any chunk rewrite.
@@ -387,6 +442,12 @@ pub async fn reprocess_paper_index(
     let pages = pdf::extractor::extract_text(&path)?;
     let config = ChunkConfig::default();
     let chunks = pdf::chunker::chunk_pages(&pages, &config);
+    // Figure/table metadata comes from the same PDF pass — a failure here
+    // must not block the text index rebuild (label lookup simply degrades).
+    let figures = pdf::figures::extract_figures(&path).unwrap_or_else(|e| {
+        warn!(paper_id = %paper.id, error = %e, "figure extraction failed");
+        Vec::new()
+    });
 
     // Atomic swap: old chunks out (embeddings cascade via FK, chunks_fts via
     // triggers), new chunks in, page count refreshed.
@@ -403,6 +464,11 @@ pub async fn reprocess_paper_index(
         .bind(&paper.id)
         .execute(&mut *tx)
         .await?;
+    sqlx::query("DELETE FROM paper_figures WHERE paper_id = ?")
+        .bind(&paper.id)
+        .execute(&mut *tx)
+        .await?;
+    insert_figures_tx(&mut tx, &paper.id, &figures, &now).await?;
     sqlx::query("UPDATE papers SET page_count = ?, updated_at = ? WHERE id = ?")
         .bind(pages.len() as i32)
         .bind(&now)
@@ -933,6 +999,13 @@ pub async fn purge_paper(db: &SqlitePool, app_data_dir: &Path, id: &str) -> Resu
         .execute(db)
         .await?;
     sqlx::query("DELETE FROM attachments WHERE paper_id = ?")
+        .bind(id)
+        .execute(db)
+        .await?;
+    // Device-local derived rows (no FK, no sync): paper_paragraphs is a lazy
+    // cache that may be left to be replaced on re-index, but figure rows are
+    // written eagerly at index time — purge them with the paper.
+    sqlx::query("DELETE FROM paper_figures WHERE paper_id = ?")
         .bind(id)
         .execute(db)
         .await?;

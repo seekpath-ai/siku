@@ -19,7 +19,9 @@ export const TOOL_CATEGORIES: AgentToolCategory[] = [
     tools: [
       { key: 'paper_search', label: 'paper_search — 搜索论文' },
       { key: 'paper_read', label: 'paper_read — 读取论文' },
+      { key: 'paper_snapshot', label: 'paper_snapshot — 截取论文图/表' },
       { key: 'paper_import', label: 'paper_import — 导入论文' },
+      { key: 'search_library', label: 'search_library — 全文检索图书馆' },
     ],
   },
   {

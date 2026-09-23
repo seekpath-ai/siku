@@ -175,6 +175,13 @@ impl ToolRegistry {
         // Paper tools
         registry.register(crate::ai::agent::tools::paper_search::PaperSearchTool::new(db.clone()));
         registry.register(crate::ai::agent::tools::paper_read::PaperReadTool::new(db.clone()));
+        // PDF region screenshots for figures/tables; `vision_llm` powers the
+        // optional one-shot analysis (same config as read_media_file).
+        registry.register(crate::ai::agent::tools::paper_snapshot::PaperSnapshotTool::new(
+            db.clone(),
+            app_data_dir.to_path_buf(),
+            vision_llm.clone(),
+        ));
         // Retrieval half of the RAG pipeline (keyword + optional semantic).
         registry.register(crate::ai::agent::tools::library_search::LibrarySearchTool::new(db.clone()));
         registry.register(crate::ai::agent::tools::paper_import::PaperImportTool::new(db.clone(), app_data_dir.to_path_buf()));

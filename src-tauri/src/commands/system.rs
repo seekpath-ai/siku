@@ -120,6 +120,66 @@ fn is_executable_path(p: &std::path::Path) -> bool {
     EXECUTABLE_EXTS.contains(&ext.as_str())
 }
 
+/// Resolve a chat-prose path candidate to a path that exists on disk. The
+/// remark plugin's greedy candidates may legitimately contain spaces and may
+/// have prose glued to the end, so truncation walks right-to-left until
+/// something exists. `Ok(None)` = dead candidate; the chip renders as plain
+/// text and never calls open/reveal.
+#[tauri::command]
+#[instrument]
+pub fn resolve_existing_path(candidate: String) -> Result<Option<String>, String> {
+    Ok(resolve_existing(&candidate))
+}
+
+fn resolve_existing(candidate: &str) -> Option<String> {
+    let trimmed = candidate.trim().trim_matches(|c| c == '"' || c == '\'');
+    if trimmed.len() < 4 {
+        return None;
+    }
+    if std::path::Path::new(trimmed).exists() {
+        return Some(trimmed.to_string());
+    }
+    // Right-to-left word truncation: `…/my docs/a.png 备注` → `…/my docs/a.png`.
+    let mut s = trimmed;
+    while let Some(idx) = s.rfind(' ') {
+        s = s[..idx].trim_end();
+        if s.len() < 4 {
+            break;
+        }
+        if std::path::Path::new(s).exists() {
+            return Some(s.to_string());
+        }
+    }
+    // Extension-boundary truncation: `…/y.zip注意` → `…/y.zip`.
+    for end in extension_ends(trimmed).into_iter().rev() {
+        let s = &trimmed[..end];
+        if std::path::Path::new(s).exists() {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+/// End offsets (exclusive) of every `.<2-5 ASCII alnum>` extension run.
+fn extension_ends(s: &str) -> Vec<usize> {
+    let bytes = s.as_bytes();
+    let mut ends = Vec::new();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'.' {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j].is_ascii_alphanumeric() {
+            j += 1;
+        }
+        let len = j - (i + 1);
+        if (2..=5).contains(&len) {
+            ends.push(j);
+        }
+    }
+    ends
+}
+
 /// Open a local file with the OS default application (chat file-path chips).
 /// Directories fall through to the file manager; nonexistent paths and
 /// executables are refused with a user-facing message.
@@ -251,5 +311,52 @@ mod tests {
         assert!(!is_executable_path(std::path::Path::new("/tmp/笔记.png")));
         assert!(!is_executable_path(std::path::Path::new("/tmp/report.docx")));
         assert!(!is_executable_path(std::path::Path::new("/tmp/Makefile")));
+    }
+
+    #[test]
+    fn resolve_existing_as_is_and_quoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, b"x").unwrap();
+        let s = f.to_str().unwrap().to_string();
+        assert_eq!(resolve_existing(&s), Some(s.clone()));
+        assert_eq!(resolve_existing(&format!("\"{s}\"")), Some(s.clone()));
+        assert_eq!(resolve_existing(&format!("  '{s}' ")), Some(s.clone()));
+    }
+
+    #[test]
+    fn resolve_existing_truncates_space_glued_prose() {
+        let dir = tempfile::tempdir().unwrap();
+        // Space inside the file name AND prose glued behind it.
+        let sub = dir.path().join("my docs");
+        std::fs::create_dir(&sub).unwrap();
+        let f = sub.join("a file.png");
+        std::fs::write(&f, b"x").unwrap();
+        let s = f.to_str().unwrap().to_string();
+        assert_eq!(
+            resolve_existing(&format!("{s} 备注文字")),
+            Some(s.clone())
+        );
+        assert_eq!(resolve_existing(&format!("{s} then more words")), Some(s.clone()));
+    }
+
+    #[test]
+    fn resolve_existing_truncates_at_extension_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("y.zip");
+        std::fs::write(&f, b"x").unwrap();
+        let s = f.to_str().unwrap().to_string();
+        // CJK glued directly to the extension, no space.
+        assert_eq!(resolve_existing(&format!("{s}注意查收")), Some(s.clone()));
+    }
+
+    #[test]
+    fn resolve_existing_returns_none_for_dead_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope").join("missing.txt");
+        let s = missing.to_str().unwrap().to_string();
+        assert_eq!(resolve_existing(&s), None);
+        assert_eq!(resolve_existing(&format!("{s} 备注")), None);
+        assert_eq!(resolve_existing("/flag"), None);
     }
 }

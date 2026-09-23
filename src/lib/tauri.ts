@@ -404,6 +404,12 @@ export async function revealInFileManager(path: string): Promise<void> {
   return invoke<void>('reveal_in_file_manager', { path });
 }
 
+/** Resolve a prose path candidate (may include glued text) to a path that
+ * exists on disk; null means dead candidate — render it as plain text. */
+export async function resolveExistingPath(candidate: string): Promise<string | null> {
+  return invoke<string | null>('resolve_existing_path', { candidate });
+}
+
 /** Rename a session (title only). */
 export async function agentRenameSession(sessionId: string, title: string): Promise<void> {
   return invoke<void>('agent_rename_session', { sessionId, title });

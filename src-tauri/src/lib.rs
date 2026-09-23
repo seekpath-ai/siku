@@ -905,6 +905,7 @@ pub fn run() {
             commands::system::screenshot_hotkey_sync,
             commands::system::open_local_path,
             commands::system::reveal_in_file_manager,
+            commands::system::resolve_existing_path,
             // Annotations
             commands::annotation::annotation_list,
             commands::annotation::annotation_create,

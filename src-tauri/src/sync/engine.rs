@@ -1,9 +1,10 @@
 use crate::sync::attachments::{
-    blob_answer_on_cooldown, blob_dedup_key, blob_request_on_cooldown, chunk_count,
-    collect_missing_blob_hashes, mark_blob_pushed, mark_push_retry, missing_chunk_indices,
-    note_blob_answered, note_blob_request_sent, pending_blob_pushes, read_blob_base64,
-    read_blob_chunk_base64, try_assemble_blob, write_blob_from_base64, write_incoming_chunk,
-    MAX_CHUNKED_BLOB_BYTES, MAX_MAILBOX_BLOB_BYTES, RELAY_MAX_FRAME_BYTES,
+    blob_answer_on_cooldown, blob_dedup_key, blob_push_chunk_cursor, blob_request_on_cooldown,
+    chunk_count, collect_missing_blob_hashes, mark_blob_pushed, mark_push_retry,
+    missing_chunk_indices, note_blob_answered, note_blob_chunks_pushed, note_blob_request_sent,
+    pending_blob_pushes, read_blob_base64, read_blob_chunk_base64, try_assemble_blob,
+    write_blob_from_base64, write_incoming_chunk, MAX_CHUNKED_BLOB_BYTES,
+    MAX_MAILBOX_BLOB_BYTES, PROACTIVE_PUSH_CHUNK_MAX_BYTES, RELAY_MAX_FRAME_BYTES,
 };
 use crate::sync::crdt::{apply_changes, export_changes_since, export_own_changes_since, ChangesetMessage, CrsqlChange};
 use crate::sync::mailbox_client::MailboxClient;
@@ -2124,9 +2125,13 @@ fn blob_request_messages(
 
 /// Push locally written blobs (marked via `mark_blob_pending_push`) into the
 /// account-level mailbox archive, so peers receive them without a request
-/// round-trip. Deposits are acked (`deposit_await_ack` scales the wait with
-/// payload size); on success the mark is cleared, on failure the mark is
-/// re-armed with a 5-minute backoff. Missing local files just clear the mark.
+/// round-trip. Blobs up to `MAX_MAILBOX_BLOB_BYTES` go as one
+/// `AttachmentPayload`; larger ones (up to `PROACTIVE_PUSH_CHUNK_MAX_BYTES`)
+/// go as `AttachmentChunk` slices, resumable via a persisted per-hash chunk
+/// cursor and capped per tick so changeset delivery is not starved. Deposits
+/// are acked (`deposit_await_ack` scales the wait with payload size); on
+/// success the mark is cleared, on failure the mark is re-armed with a
+/// 5-minute backoff. Missing local files just clear the mark.
 /// Per-blob failures never abort the batch.
 pub async fn flush_pending_blob_pushes(
     db: &SqlitePool,
@@ -2136,22 +2141,92 @@ pub async fn flush_pending_blob_pushes(
 ) -> Result<()> {
     use base64::Engine as _;
     const PUSH_RETRY_DELAY_SECS: u64 = 300;
+    /// Chunks pushed per tick per blob: keeps the tick short enough that
+    /// changeset delivery is not starved by a large push; the remainder
+    /// resumes (from the persisted cursor) on the next tick.
+    const CHUNK_PUSH_PER_TICK: u32 = 8;
     for (hash, ext) in pending_blob_pushes(db).await {
         if !crate::file_store::has_blob(app_data_dir, &hash) {
             // The blob was deleted locally; nothing to push, clear the mark.
             mark_blob_pushed(db, &hash).await;
             continue;
         }
-        // Marks written under an older, larger push limit would produce a
-        // frame over the relay's 16 MiB cap (double base64: ~1.78x raw) and
-        // get the connection killed on every attempt. Clear the mark instead:
-        // the peer pulls such blobs as chunks on demand.
         let raw_size = std::fs::metadata(crate::file_store::blob_path(app_data_dir, &hash, &ext))
             .map(|m| m.len())
             .unwrap_or(0);
-        if raw_size > MAX_MAILBOX_BLOB_BYTES {
-            warn!(hash = %hash, size = raw_size, "blob push mark exceeds single-frame cap; clearing (peer will pull chunked)");
+        if raw_size > PROACTIVE_PUSH_CHUNK_MAX_BYTES {
+            // Beyond even the chunked-push limit (e.g. a mark written under an
+            // older, larger limit): stays request-served — an archive copy
+            // this size is not worth the account quota.
+            warn!(hash = %hash, size = raw_size, "blob exceeds chunked-push limit; clearing mark (peer will pull on demand)");
             mark_blob_pushed(db, &hash).await;
+            continue;
+        }
+        if raw_size > MAX_MAILBOX_BLOB_BYTES {
+            // ── Chunked push: one AttachmentChunk per deposit, acked one by
+            // one, resumable via the persisted chunk cursor. The peer's
+            // existing staging/assembly path handles the rest — it never
+            // needs to send a request. ──
+            let total = chunk_count(raw_size);
+            let mut index = blob_push_chunk_cursor(db, &hash).await;
+            let mut sent_this_tick = 0u32;
+            let mut failed = false;
+            while index < total && sent_this_tick < CHUNK_PUSH_PER_TICK {
+                let data = match read_blob_chunk_base64(app_data_dir, &hash, &ext, index) {
+                    Ok(Some(d)) => d,
+                    Ok(None) => {
+                        // Blob vanished mid-push; clear the mark.
+                        mark_blob_pushed(db, &hash).await;
+                        failed = true; // skip the completion check below
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, hash = %hash, index, "blob chunk push: read failed");
+                        mark_push_retry(db, &hash, &ext, PUSH_RETRY_DELAY_SECS).await;
+                        failed = true;
+                        break;
+                    }
+                };
+                let json = serde_json::to_string(&SyncMessage::AttachmentChunk {
+                    hash: hash.clone(),
+                    ext: ext.clone(),
+                    index,
+                    total,
+                    data,
+                })
+                .context("serialize blob push chunk")?;
+                let (ciphertext, nonce) = crate::sync::crypto::encrypt_bytes(key, json.as_bytes())
+                    .map_err(anyhow::Error::msg)?;
+                let payload = crate::sync::types::MailboxDepositPayload {
+                    to_device_id: String::new(), // account-level archive
+                    ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+                    nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
+                    ttl_seconds: Some(7 * 24 * 3600),
+                    message_id: None,
+                    dedup_key: Some(blob_dedup_key(key, &format!("{hash}:{index}"))),
+                };
+                match relay.deposit_await_ack(payload, MAILBOX_ACK_TIMEOUT).await {
+                    Ok(()) => {
+                        index += 1;
+                        sent_this_tick += 1;
+                        note_blob_chunks_pushed(db, &hash, index).await;
+                        set_quota_exceeded(false);
+                    }
+                    Err(e) => {
+                        if e.is_quota_exceeded() {
+                            set_quota_exceeded(true);
+                        }
+                        warn!(error = %e, hash = %hash, index, total, "blob chunk push failed; backing off");
+                        mark_push_retry(db, &hash, &ext, PUSH_RETRY_DELAY_SECS).await;
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            if !failed && index >= total {
+                mark_blob_pushed(db, &hash).await;
+                info!(hash = %hash, ext = %ext, total, "chunked blob pushed to account archive");
+            }
             continue;
         }
         let data = match read_blob_base64(app_data_dir, &hash, &ext) {
@@ -4252,6 +4327,129 @@ mod tests {
             crate::sync::attachments::mark_blob_pending_push(&db, &dir, &hash, &ext).await;
             assert!(crate::sync::attachments::pending_blob_pushes(&db).await.is_empty());
         }
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// A blob above the single-frame cap is pushed as AttachmentChunk slices:
+    /// one acked deposit per chunk, `hash:index` dedup keys, mark and
+    /// progress cursor cleared once all chunks land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_pending_blob_pushes_sends_large_blob_as_chunks() -> anyhow::Result<()> {
+        let (db, dir) = create_test_db().await?;
+        // 8 MiB + 1 byte → just over MAX_MAILBOX_BLOB_BYTES → 3 chunks.
+        let blob_bytes = vec![7u8; (MAX_MAILBOX_BLOB_BYTES + 1) as usize];
+        let rel = crate::file_store::write_blob(&dir, &blob_bytes, "pdf")?;
+        let (hash, ext) = crate::file_store::parse_blob_path(&rel).unwrap();
+        crate::sync::attachments::mark_blob_pending_push(&db, &dir, &hash, &ext).await;
+        assert_eq!(
+            pending_blob_pushes(&db).await.len(),
+            1,
+            "an over-single-frame blob must still be marked (chunked push)"
+        );
+        let key = crate::sync::crypto::generate_sync_key();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+        let relay_ack = relay.clone();
+        let ack_task = tokio::spawn(async move {
+            let mut payloads = Vec::new();
+            for _ in 0..3 {
+                let msg = rx.recv().await.expect("3 chunk deposits expected");
+                let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = msg else {
+                    panic!("expected mailbox deposit");
+                };
+                relay_ack.route_ack(crate::sync::types::MailboxDepositAckPayload {
+                    id: payload.message_id.clone().unwrap(),
+                    ok: true,
+                    error: None,
+                });
+                payloads.push(payload);
+            }
+            payloads
+        });
+        flush_pending_blob_pushes(&db, &dir, &key, &relay).await?;
+        let payloads = ack_task.await?;
+
+        use base64::Engine as _;
+        for (i, payload) in payloads.iter().enumerate() {
+            assert_eq!(payload.to_device_id, "", "chunk pushes target the account archive");
+            assert_eq!(
+                payload.dedup_key.as_deref(),
+                Some(crate::sync::attachments::blob_dedup_key(&key, &format!("{hash}:{i}")).as_str()),
+                "chunk {i} must carry its hash:index dedup key"
+            );
+            let envelope = decrypt_deposit(&key, payload).await?;
+            let SyncMessage::AttachmentChunk { index, total, data, .. } = envelope else {
+                anyhow::bail!("expected attachment chunk, got {envelope:?}");
+            };
+            assert_eq!((index, total), (i as u32, 3));
+            let decoded = base64::engine::general_purpose::STANDARD.decode(data)?;
+            let start = i * crate::sync::attachments::CHUNK_RAW_BYTES;
+            let end = ((i + 1) * crate::sync::attachments::CHUNK_RAW_BYTES).min(blob_bytes.len());
+            assert_eq!(decoded, blob_bytes[start..end], "chunk {i} must match the source slice");
+        }
+        assert!(
+            pending_blob_pushes(&db).await.is_empty(),
+            "a completed chunked push must clear the mark"
+        );
+        assert_eq!(
+            crate::sync::attachments::blob_push_chunk_cursor(&db, &hash).await,
+            0,
+            "the chunk progress key must be cleared with the mark"
+        );
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// An interrupted chunked push resumes at the persisted chunk cursor
+    /// instead of re-transmitting already-acked chunks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_pending_blob_pushes_chunk_resume_skips_acked() -> anyhow::Result<()> {
+        let (db, dir) = create_test_db().await?;
+        let blob_bytes = vec![9u8; (MAX_MAILBOX_BLOB_BYTES + 1) as usize];
+        let rel = crate::file_store::write_blob(&dir, &blob_bytes, "pdf")?;
+        let (hash, ext) = crate::file_store::parse_blob_path(&rel).unwrap();
+        crate::sync::attachments::mark_blob_pending_push(&db, &dir, &hash, &ext).await;
+        // Simulate an interruption after chunk 0 was acked.
+        crate::sync::attachments::note_blob_chunks_pushed(&db, &hash, 1).await;
+        let key = crate::sync::crypto::generate_sync_key();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+        let relay_ack = relay.clone();
+        let ack_task = tokio::spawn(async move {
+            let mut payloads = Vec::new();
+            for _ in 0..2 {
+                let msg = rx.recv().await.expect("only the 2 remaining chunks may be sent");
+                let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = msg else {
+                    panic!("expected mailbox deposit");
+                };
+                relay_ack.route_ack(crate::sync::types::MailboxDepositAckPayload {
+                    id: payload.message_id.clone().unwrap(),
+                    ok: true,
+                    error: None,
+                });
+                payloads.push(payload);
+            }
+            payloads
+        });
+        flush_pending_blob_pushes(&db, &dir, &key, &relay).await?;
+        let payloads = ack_task.await?;
+
+        assert_eq!(payloads.len(), 2, "chunk 0 must not be re-transmitted");
+        for (expect_index, payload) in payloads.iter().enumerate().map(|(k, p)| (k as u32 + 1, p)) {
+            let envelope = decrypt_deposit(&key, payload).await?;
+            let SyncMessage::AttachmentChunk { index, .. } = envelope else {
+                anyhow::bail!("expected attachment chunk, got {envelope:?}");
+            };
+            assert_eq!(index, expect_index);
+        }
+        assert!(pending_blob_pushes(&db).await.is_empty());
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;

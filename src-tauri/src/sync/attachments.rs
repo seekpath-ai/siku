@@ -150,8 +150,17 @@ pub const MAX_CHUNKED_BLOB_BYTES: u64 = 200 * 1024 * 1024;
 /// Blobs up to this size are proactively pushed to the account archive on
 /// local write (paper import, note attachment, vault file), so peers receive
 /// them without a request round-trip. Kept at `MAX_MAILBOX_BLOB_BYTES`: a
-/// pushed blob travels as a single frame, so it must fit the relay cap.
+/// whole-payload push travels as a single frame, so it must fit the relay
+/// cap. Larger blobs (up to `PROACTIVE_PUSH_CHUNK_MAX_BYTES`) are pushed as
+/// `AttachmentChunk` slices instead.
 pub const PROACTIVE_PUSH_MAX_BYTES: u64 = MAX_MAILBOX_BLOB_BYTES;
+
+/// Largest blob proactively pushed at all (as `AttachmentChunk` slices).
+/// Beyond this, blobs stay request-served: a bigger archive copy would
+/// balloon relay storage against the account quota (a push persists 7 days)
+/// for a file the peer may never open. 50MB covers essentially all
+/// literature PDFs; a 50MB blob is 17 chunks ≈ 67MB of archive.
+pub const PROACTIVE_PUSH_CHUNK_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Number of chunks a blob of `size` bytes splits into.
 pub fn chunk_count(size: u64) -> u32 {
@@ -314,12 +323,12 @@ const PUSH_PENDING_PREFIX: &str = "sync.blob_push.pending.";
 const PUSH_DONE_PREFIX: &str = "sync.blob_push.done.";
 
 /// Mark a locally written blob for proactive push on the next auto-sync tick.
-/// No-op for blobs above the proactive size limit (they stay request-served).
+/// No-op for blobs above the chunked-push limit (they stay request-served).
 pub async fn mark_blob_pending_push(db: &SqlitePool, app_data_dir: &std::path::Path, hash: &str, ext: &str) {
     let size = std::fs::metadata(file_store::blob_path(app_data_dir, hash, ext))
         .map(|m| m.len())
         .unwrap_or(u64::MAX);
-    if size > PROACTIVE_PUSH_MAX_BYTES {
+    if size > PROACTIVE_PUSH_CHUNK_MAX_BYTES {
         return;
     }
     let done = crate::core::settings_service::get_device_setting(
@@ -394,10 +403,41 @@ pub async fn mark_blob_pushed(db: &SqlitePool, hash: &str) {
         "1",
     )
     .await;
-    let _ = sqlx::query("DELETE FROM device_settings WHERE key = ?")
+    let _ = sqlx::query("DELETE FROM device_settings WHERE key = ? OR key = ?")
         .bind(format!("{PUSH_PENDING_PREFIX}{hash}"))
+        .bind(format!("{PUSH_CHUNKS_PREFIX}{hash}"))
         .execute(db)
         .await;
+}
+
+// ── Chunked-push progress ──────────────────────────────────────────────────
+//
+// A chunked push (blob > MAX_MAILBOX_BLOB_BYTES) spans many acked deposits
+// and possibly many ticks / app restarts. The next unsent chunk index is
+// persisted per hash so an interrupted push resumes instead of
+// re-transmitting every chunk (relay dedup_key would absorb the storage,
+// but not the uplink).
+
+const PUSH_CHUNKS_PREFIX: &str = "sync.blob_push.chunks.";
+
+/// Next chunk index to push for `hash` (0 when no progress is recorded).
+pub async fn blob_push_chunk_cursor(db: &SqlitePool, hash: &str) -> u32 {
+    crate::core::settings_service::get_device_setting(db, &format!("{PUSH_CHUNKS_PREFIX}{hash}"))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Record that chunks `< next_index` have been acked by the relay.
+pub async fn note_blob_chunks_pushed(db: &SqlitePool, hash: &str, next_index: u32) {
+    let _ = crate::core::settings_service::set_device_setting(
+        db,
+        &format!("{PUSH_CHUNKS_PREFIX}{hash}"),
+        &next_index.to_string(),
+    )
+    .await;
 }
 
 // ── Request/answer throttling ───────────────────────────────────────────────

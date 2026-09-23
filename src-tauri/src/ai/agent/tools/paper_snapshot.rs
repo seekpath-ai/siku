@@ -59,6 +59,15 @@ fn slug(s: &str) -> String {
     }
 }
 
+/// Path string handed to the LLM for markdown embedding: forward slashes on
+/// Windows (`C:/…` works with every Windows API), so backslashes never hit
+/// markdown's escape and URI-encoding layers (`C:\…` arrives at the renderer
+/// percent-encoded as `C:%5C…`).
+fn display_path(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().into_owned();
+    if cfg!(windows) { s.replace('\\', "/") } else { s }
+}
+
 #[async_trait]
 impl Tool for PaperSnapshotTool {
     fn name(&self) -> &str {
@@ -255,8 +264,9 @@ impl Tool for PaperSnapshotTool {
                 .await;
         }
 
+        let shown_path = display_path(&out_path);
         let mut info = serde_json::json!({
-            "path": out_path.to_string_lossy(),
+            "path": shown_path,
             "paper": title,
             "page": page,
             "width": width,
@@ -281,7 +291,7 @@ impl Tool for PaperSnapshotTool {
             "{info}\n\n\
              截图已保存。**在回复正文中用 ![]({}) 嵌入此图**，用户即可在气泡中查看论文原图。\
              表格内容优先整理为 markdown 文本表格（可复制），版式复杂时再附图。",
-            out_path.to_string_lossy()
+            shown_path
         );
 
         if analyze {

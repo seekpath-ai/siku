@@ -1,8 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import remarkMath from 'remark-math';
-import rehypeKatex from 'rehype-katex';
 import { emit } from '@tauri-apps/api/event';
 import { useNavigate } from '@tanstack/react-router';
 import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus, CheckCircle2, AlertCircle, Square } from 'lucide-react';
@@ -12,13 +9,13 @@ import { useEvidenceStore } from '@/stores/evidenceStore';
 import { agentCancel, agentIsRunning, getChatMessages, getAgentSteps, notesCreate, noteCreateUnderPaper, readImageFile, settingsAppGet, settingsGet, settingsSet } from '@/lib/tauri';
 import { parseEvidence, buildNoteMarkdown } from '@/lib/evidence';
 import type { EvidenceEntry } from '@/lib/evidence';
-import { MarkdownCode, MarkdownPre } from '@/components/chat/CodeBlock';
+import { MarkdownLink } from '@/components/chat/FilePathLink';
+import { assistantMarkdownComponents, assistantRehypePlugins, assistantRemarkPlugins, markdownUrlTransform } from '@/components/chat/markdownConfig';
 import { ApprovalCard } from '@/components/chat/ApprovalCard';
 import { PetAskUserDialog } from '@/components/chat/AskUserDialog';
 import { ApprovalPolicySwitch } from '@/components/chat/ApprovalPolicySwitch';
 import { parseAttachments } from '@/lib/attachments';
 import { ReasoningProcessCard } from '@/components/chat/ReasoningProcessCard';
-import { ExternalLink } from '@/components/ui/ExternalLink';
 import { AttachmentImage } from '@/components/ui/AttachmentImage';
 import { useImageAttachments } from '@/hooks/useImageAttachments';
 import { useAgentEventStream } from '@/hooks/useAgentEventStream';
@@ -71,13 +68,14 @@ export function PetMarkdown({ content, onCitation }: { content: string; onCitati
   const { clean, evidence } = useMemo(() => parseEvidence(content), [content]);
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath, remarkCitations]}
-      rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
+      remarkPlugins={[...assistantRemarkPlugins, remarkCitations]}
+      rehypePlugins={assistantRehypePlugins}
       // Keep our internal cite: scheme (the default transform blanks
-      // non-whitelisted protocols). Non-http(s)/anchor links are defused in
-      // the `a` renderer below, so this is safe.
-      urlTransform={(url) => url}
+      // non-whitelisted protocols); everything else defers to the shared
+      // transform (siku-path chips, local absolute paths for images).
+      urlTransform={(url) => (url.startsWith('cite:') ? url : markdownUrlTransform(url))}
       components={{
+        ...assistantMarkdownComponents,
         a: ({ href, children }: { href?: string; children?: React.ReactNode }) => {
           const cite = /^cite:(\d+)$/.exec(href ?? '');
           if (cite) {
@@ -105,15 +103,10 @@ export function PetMarkdown({ content, onCitation }: { content: string; onCitati
               </button>
             );
           }
-          // Defuse javascript:/data: etc. — only web links, mailto and
-          // in-page anchors stay anchors.
-          if (href && !/^(https?:|mailto:|#)/.test(href)) {
-            return <span>{children}</span>;
-          }
-          return <ExternalLink href={href}>{children}</ExternalLink>;
+          // MarkdownLink handles siku-path: chips; the shared transform has
+          // already blanked javascript:/data: etc., so web links are safe.
+          return <MarkdownLink href={href}>{children}</MarkdownLink>;
         },
-        code: MarkdownCode,
-        pre: MarkdownPre,
       }}
     >
       {clean}

@@ -3,9 +3,12 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 import { ImageOff } from 'lucide-react';
 
 /** markdown img src → renderable URL: http(s)/data/blob pass through, a
- * local absolute path goes through the asset protocol (scope `**`). */
+ * local absolute path goes through the asset protocol (scope `**`). Windows
+ * paths arrive with backslashes percent-encoded (hast normalizeUri turns
+ * `C:\…` into `C:%5C…`) — decode before convertFileSrc. */
 function resolveImageSrc(src: string): string {
   if (/^(https?|data|blob|asset):/i.test(src)) return src;
+  if (/^[A-Za-z]:%5C/i.test(src)) return convertFileSrc(decodeURIComponent(src));
   if (/^([A-Za-z]:[\\/]|\\\\|\/)/.test(src)) return convertFileSrc(src);
   return src;
 }

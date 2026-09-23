@@ -512,6 +512,11 @@ export function SyncSettings() {
                 </button>
               </div>
             )}
+
+            {/* 大文件同步策略说明：解释「为什么有的文件没同步」 */}
+            <p className="text-xs text-text-secondary/60 leading-relaxed">
+              50MB 以上的文件不主动推送，将在对端需要时经中继分片拉取；200MB 以上的文件仅在两台设备同时在线（P2P 直连）时同步。
+            </p>
           </div>
         </div>
       )}

@@ -1169,6 +1169,11 @@ function ReaderView({ paperId }: { paperId: string }) {
             <div className="flex flex-col items-center justify-center h-full text-text-secondary text-sm gap-2 px-6">
               <p>PDF 加载失败</p>
               <p className="text-xs text-text-secondary/50 break-all text-center max-w-md">{pdfError}</p>
+              {pdfError.includes('不存在') && (
+                <p className="text-xs text-text-secondary/50 text-center max-w-md">
+                  该文件可能尚未同步到本机：50MB 以上的文件需对端在线后经中继分片拉取，200MB 以上需两台设备同时在线（P2P 直连）。
+                </p>
+              )}
               <button
                 onClick={() => setPdfReloadKey((k) => k + 1)}
                 className="mt-1 px-3 py-1.5 bg-surface border border-surface-hover rounded-lg text-xs hover:bg-surface-hover transition-colors"

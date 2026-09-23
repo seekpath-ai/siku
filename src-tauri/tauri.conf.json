@@ -43,7 +43,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' http://asset.localhost blob:; connect-src 'self' ipc: ipc://localhost http://ipc.localhost http://localhost:* http://asset.localhost https://asset.localhost asset: blob:; img-src 'self' asset: http://asset.localhost blob: data:; script-src 'self' 'unsafe-eval' 'unsafe-inline' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self' blob:; media-src 'self' http://asset.localhost https://asset.localhost asset: blob:",
+      "csp": "default-src 'self' http://asset.localhost blob:; connect-src 'self' ipc: ipc://localhost http://ipc.localhost http://localhost:* http://asset.localhost https://asset.localhost asset: blob:; img-src 'self' asset: http://asset.localhost http: https: blob: data:; script-src 'self' 'unsafe-eval' 'unsafe-inline' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; worker-src 'self' blob:; media-src 'self' http://asset.localhost https://asset.localhost asset: blob:",
       "dangerousDisableAssetCspModification": ["style-src"],
       "assetProtocol": {
         "enable": true,

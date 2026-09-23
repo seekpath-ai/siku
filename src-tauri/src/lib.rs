@@ -903,6 +903,8 @@ pub fn run() {
             commands::system::log_startup_metrics,
             commands::system::screenshot_start,
             commands::system::screenshot_hotkey_sync,
+            commands::system::open_local_path,
+            commands::system::reveal_in_file_manager,
             // Annotations
             commands::annotation::annotation_list,
             commands::annotation::annotation_create,

@@ -105,6 +105,101 @@ pub fn screenshot_start() -> Result<String, String> {    #[cfg(target_os = "wind
     }
 }
 
+/// "Open" on these extensions executes code, so `open_local_path` refuses
+/// them and the UI points the user at reveal-in-file-manager instead.
+const EXECUTABLE_EXTS: &[&str] = &[
+    "exe", "bat", "cmd", "ps1", "com", "scr", "msi", "sh", "app", "dll",
+];
+
+fn is_executable_path(p: &std::path::Path) -> bool {
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    EXECUTABLE_EXTS.contains(&ext.as_str())
+}
+
+/// Open a local file with the OS default application (chat file-path chips).
+/// Directories fall through to the file manager; nonexistent paths and
+/// executables are refused with a user-facing message.
+#[tauri::command]
+#[instrument]
+pub fn open_local_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("路径不存在：{path}"));
+    }
+    if p.is_dir() {
+        return reveal_in_file_manager(path);
+    }
+    if is_executable_path(p) {
+        return Err("为安全起见，可执行文件不直接打开，请改用「在文件夹中显示」".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `start` is a cmd builtin; no_window suppresses the console flash.
+        crate::core::process::no_window(&mut std::process::Command::new("cmd"))
+            .args(["/c", "start", "", &path])
+            .spawn()
+            .map_err(|e| format!("打开文件失败：{e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("打开文件失败：{e}"))?;
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("打开文件失败：{e}"))?;
+    }
+    Ok(())
+}
+
+/// Select the file in the OS file manager (Linux has no portable "select",
+/// so it opens the containing folder).
+#[tauri::command]
+#[instrument]
+pub fn reveal_in_file_manager(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("路径不存在：{path}"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // explorer returns non-zero even on success, so spawn and don't wait.
+        let mut cmd = std::process::Command::new("explorer");
+        if p.is_dir() {
+            cmd.arg(&path);
+        } else {
+            cmd.arg(format!("/select,{path}"));
+        }
+        cmd.spawn().map_err(|e| format!("打开文件管理器失败：{e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("打开文件管理器失败：{e}"))?;
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let dir = if p.is_dir() { p } else { p.parent().unwrap_or(p) };
+        std::process::Command::new("xdg-open")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| format!("打开文件管理器失败：{e}"))?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 #[instrument]
 pub async fn system_info() -> Result<SystemInfo, String> {
@@ -138,4 +233,23 @@ pub async fn system_info() -> Result<SystemInfo, String> {
         disk_total_gb: None,
         disk_used_gb: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn executable_exts_are_blocked_case_insensitively() {
+        assert!(is_executable_path(std::path::Path::new("/tmp/a.exe")));
+        assert!(is_executable_path(std::path::Path::new("C:\\Tools\\RUN.SH")));
+        assert!(is_executable_path(std::path::Path::new("/tmp/b.Ps1")));
+    }
+
+    #[test]
+    fn documents_and_extensionless_files_open_normally() {
+        assert!(!is_executable_path(std::path::Path::new("/tmp/笔记.png")));
+        assert!(!is_executable_path(std::path::Path::new("/tmp/report.docx")));
+        assert!(!is_executable_path(std::path::Path::new("/tmp/Makefile")));
+    }
 }

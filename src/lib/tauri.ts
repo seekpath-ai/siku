@@ -393,6 +393,17 @@ export async function screenshotHotkeySync(): Promise<void> {
   return invoke<void>('screenshot_hotkey_sync');
 }
 
+/** Open a local file with the OS default application. Executable extensions
+ * are refused backend-side; directories are revealed instead. */
+export async function openLocalPath(path: string): Promise<void> {
+  return invoke<void>('open_local_path', { path });
+}
+
+/** Select the file in the OS file manager (Linux: opens its folder). */
+export async function revealInFileManager(path: string): Promise<void> {
+  return invoke<void>('reveal_in_file_manager', { path });
+}
+
 /** Rename a session (title only). */
 export async function agentRenameSession(sessionId: string, title: string): Promise<void> {
   return invoke<void>('agent_rename_session', { sessionId, title });

@@ -1,7 +1,4 @@
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import remarkMath from 'remark-math';
-import rehypeKatex from 'rehype-katex';
 import { User, Copy, Check, Paperclip, ChevronDown, ChevronUp, Tag } from 'lucide-react';
 import { memo, useEffect, useMemo, useState } from 'react';
 import type { AgentStep, ChatMessage } from '@/lib/types';
@@ -10,13 +7,17 @@ import { parseAttachments } from '@/lib/attachments';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
 import { chatMessageTag } from '@/lib/tauri';
 import { useChatStore } from '@/stores/chatStore';
-import { MarkdownCode, MarkdownPre } from './CodeBlock';
+import { AttachmentImage } from '@/components/ui/AttachmentImage';
 import { ToolCallCard } from './ToolCallCard';
 import { ReasoningProcessCard } from './ReasoningProcessCard';
 import { ReasoningBlock } from './ReasoningBlock';
 import { TurnContextDialog } from './TurnContextDialog';
-import { AttachmentImage } from '@/components/ui/AttachmentImage';
-import { ExternalLink } from '@/components/ui/ExternalLink';
+import {
+  assistantMarkdownComponents,
+  assistantRehypePlugins,
+  assistantRemarkPlugins,
+  markdownUrlTransform,
+} from './markdownConfig';
 import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
 
 interface Props {
@@ -290,13 +291,10 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
         ) : (
           <div className="prose prose-sm prose-invert max-w-none [&>*:first-child]:mt-0 [overflow-wrap:anywhere]">
             <ReactMarkdown
-              remarkPlugins={[remarkGfm, remarkMath]}
-              rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
-              components={{
-                a: ExternalLink,
-                code: MarkdownCode,
-                pre: MarkdownPre,
-              }}
+              remarkPlugins={assistantRemarkPlugins}
+              rehypePlugins={assistantRehypePlugins}
+              urlTransform={markdownUrlTransform}
+              components={assistantMarkdownComponents}
             >
               {normalizedContent}
             </ReactMarkdown>

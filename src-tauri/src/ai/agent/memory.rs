@@ -152,6 +152,29 @@ impl ConversationMemory {
             result.push((*msg).clone());
         }
 
+        // Drop orphaned tool messages. Budget exhaustion can split a tool
+        // group: the tool responses fit individually but the assistant
+        // carrying their tool_calls (bulky arguments) does not, leaving
+        // `tool` messages with no preceding tool_calls. Strict providers
+        // (DeepSeek) reject the whole request with a 400 — every later round
+        // hits the same split point, so the turn never recovers. An orphaned
+        // response is unsendable by definition; dropping it keeps the
+        // request valid.
+        let mut tool_group_open = false;
+        result.retain(|m| {
+            match m.role.as_str() {
+                "assistant" => {
+                    tool_group_open = m.tool_calls.is_some();
+                    true
+                }
+                "tool" => tool_group_open,
+                _ => {
+                    tool_group_open = false;
+                    true
+                }
+            }
+        });
+
         result
     }
 }
@@ -269,6 +292,68 @@ mod tests {
         let sane = memory.truncate(&messages, 200);
         assert!(sane.len() > truncated.len());
         assert_eq!(sane.last().unwrap().content, "current question");
+    }
+
+    #[test]
+    fn test_truncate_drops_orphaned_tool_messages() {
+        // A tool group split by budget: the tool responses fit individually,
+        // but the assistant carrying their tool_calls does not. The truncated
+        // list must not start with (or contain) a bare tool message — strict
+        // providers (DeepSeek) 400 the whole request, and every later round
+        // re-hits the same split.
+        let memory = ConversationMemory::new(1000, Some("sys".into()));
+        let big = "y".repeat(1200); // ~300 tokens per message
+        let user_msg = |content: &str| crate::ai::llm::ChatMessage {
+            role: "user".to_string(),
+            content: content.to_string(),
+            attachments: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let tool_msg = |content: String| crate::ai::llm::ChatMessage {
+            role: "tool".to_string(),
+            content,
+            attachments: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+            name: Some("file_read".to_string()),
+        };
+        let assistant_tc = crate::ai::llm::ChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            attachments: None,
+            tool_calls: Some(vec![crate::ai::llm::ToolCall {
+                id: "call_1".to_string(),
+                call_type: "function".to_string(),
+                function: crate::ai::llm::FunctionCall {
+                    name: "file_read".to_string(),
+                    arguments: format!("{{\"path\": \"{big}\"}}"),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        };
+        let messages = vec![
+            user_msg("old question"),
+            assistant_tc,
+            tool_msg(big.clone()),
+            tool_msg(big),
+            user_msg("latest"),
+        ];
+
+        let truncated = memory.truncate(&messages, 200);
+        // Validity invariant: every tool message must follow (directly or via
+        // sibling tool messages) an assistant carrying tool_calls.
+        let mut group_open = false;
+        for m in &truncated {
+            match m.role.as_str() {
+                "assistant" => group_open = m.tool_calls.is_some(),
+                "tool" => assert!(group_open, "orphaned tool message survived truncation: {truncated:?}"),
+                _ => group_open = false,
+            }
+        }
+        assert_eq!(truncated.last().unwrap().content, "latest");
     }
 
     #[test]

@@ -20,8 +20,14 @@ function isAssetUrl(src: string): boolean {
 }
 
 function isAbsolutePath(src: string): boolean {
-  // Unix absolute or Windows absolute (e.g. C:\...)
-  return src.startsWith('/') || /^[A-Za-z]:[\\/]/.test(src);
+  // Unix absolute, Windows absolute (C:\ / C:/, also %5C-encoded after hast's
+  // normalizeUri), or UNC (\\server\share).
+  return (
+    src.startsWith('/') ||
+    /^[A-Za-z]:[\\/]/.test(src) ||
+    /^[A-Za-z]:%5C/i.test(src) ||
+    /^(\\\\|%5C%5C)/i.test(src)
+  );
 }
 
 function resolveLocalImageSrc(src: string, options?: ResolveImageOptions): string {
@@ -29,7 +35,16 @@ function resolveLocalImageSrc(src: string, options?: ResolveImageOptions): strin
   if (src.startsWith('data:') || isAssetUrl(src)) return src;
 
   let path = src;
-  if (!isAbsolutePath(src) && options?.attachmentsDir) {
+  // Percent-encoded Windows path (hast normalizeUri): decode back to a real
+  // path before convertFileSrc.
+  if (/^([A-Za-z]:%5C|%5C%5C)/i.test(path)) {
+    try {
+      path = decodeURIComponent(path);
+    } catch {
+      // keep as-is
+    }
+  }
+  if (!isAbsolutePath(path) && options?.attachmentsDir) {
     const base = options.attachmentsDir.replace(/\\/g, '/').replace(/\/$/, '');
     if (src.startsWith('blobs/') && base.endsWith('/blobs')) {
       // The backend stores blobs under {app_data_dir}/blobs/ and returns

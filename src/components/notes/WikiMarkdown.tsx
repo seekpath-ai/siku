@@ -34,6 +34,10 @@ const EMBED_RE = /!\[\[([^\]]+?)\]\]/g;
 // component can handle navigation / evidence highlighting.
 const ALLOWED_URL_PROTOCOLS = /^(https?|mailto|tel|note|note-create|siku-reader)$/i;
 function allowCustomProtocols(url: string): string | undefined {
+  // Local absolute paths (img src from tools/notes): a single-letter
+  // "protocol" followed by a separator is a Windows drive letter, not a
+  // scheme. Backslashes arrive percent-encoded as %5C (hast normalizeUri).
+  if (/^[A-Za-z]:[\\/]/.test(url) || /^[A-Za-z]:%5C/i.test(url) || url.startsWith('\\\\')) return url;
   const colon = url.indexOf(':');
   if (colon === -1) return url;
   return ALLOWED_URL_PROTOCOLS.test(url.slice(0, colon)) ? url : undefined;

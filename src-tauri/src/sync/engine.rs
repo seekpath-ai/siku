@@ -3,9 +3,9 @@ use crate::sync::attachments::{
     collect_missing_blob_hashes, mark_blob_pushed, mark_push_retry, missing_chunk_indices,
     note_blob_answered, note_blob_request_sent, pending_blob_pushes, read_blob_base64,
     read_blob_chunk_base64, try_assemble_blob, write_blob_from_base64, write_incoming_chunk,
-    MAX_CHUNKED_BLOB_BYTES, MAX_MAILBOX_BLOB_BYTES,
+    MAX_CHUNKED_BLOB_BYTES, MAX_MAILBOX_BLOB_BYTES, RELAY_MAX_FRAME_BYTES,
 };
-use crate::sync::crdt::{apply_changes, export_changes_since, export_own_changes_since, ChangesetMessage};
+use crate::sync::crdt::{apply_changes, export_changes_since, export_own_changes_since, ChangesetMessage, CrsqlChange};
 use crate::sync::mailbox_client::MailboxClient;
 use crate::sync::types::MailboxMessage;
 use crate::sync::webrtc_peer::SyncSession;
@@ -192,6 +192,63 @@ const SYNC_PUSH_INTERVAL_SECS: u64 = 15;
 /// floor: `deposit_await_ack` scales the wait with the payload size (large
 /// frames take seconds just to transmit), capped at 60s.
 const MAILBOX_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// JSON budget for one changeset slice deposited to the mailbox. The wire
+/// frame is ~4/3 of this after encryption + base64 (plus a small envelope),
+/// so a slice stays comfortably under the relay's 16 MiB hard frame cap
+/// (`RELAY_MAX_FRAME_BYTES`). Larger exports are delivered as multiple
+/// slices, the cursor advancing per acked slice — an unbounded single-frame
+/// changeset (production: a 22MB chat-history backlog) got the connection
+/// killed on every flush and blocked ALL sync for days.
+const MAILBOX_CHANGESET_BUDGET_BYTES: usize = 6 * 1024 * 1024;
+
+/// Absolute ceiling for one mailbox message's serialized JSON (changeset
+/// slice or full snapshot). ~4/3 of this on the wire ≈ 10.7MB, still under
+/// the relay cap with margin. A slice can only exceed this when a SINGLE row
+/// is bigger than the whole budget — such rows are skipped for the mailbox
+/// (a live P2P session chunks arbitrarily large rows) instead of poisoning
+/// the connection.
+const MAX_MAILBOX_JSON_BYTES: usize = 8 * 1024 * 1024;
+
+/// Split a changeset into slices whose serialized JSON stays under `budget`
+/// bytes, breaking only at row boundaries (a single row larger than the
+/// budget forms its own slice). Rows arrive ordered by (db_version, seq), so
+/// a slice's `to_db_version` is its last row's version; slices chain via
+/// from/to_db_version and each acked slice can advance the delivery cursor
+/// independently. The original export watermark (`cs.to_db_version`, which
+/// covers filtered echo rows beyond the last kept row) is NOT preserved on
+/// the slices — the caller advances to it after the final slice lands.
+fn split_changeset_by_budget(cs: ChangesetMessage, budget: usize) -> Vec<ChangesetMessage> {
+    let mut slices = Vec::new();
+    let mut cur: Vec<CrsqlChange> = Vec::new();
+    let mut cur_bytes = 0usize;
+    let mut from = cs.from_db_version;
+    for change in cs.changes {
+        // +1 for the array comma; exact enough for a budget check.
+        let row_len = serde_json::to_string(&change).map(|s| s.len() + 1).unwrap_or(1024);
+        if !cur.is_empty() && cur_bytes + row_len > budget {
+            let to = cur.last().map(|c| c.db_version).unwrap_or(from);
+            slices.push(ChangesetMessage {
+                changes: std::mem::take(&mut cur),
+                from_db_version: from,
+                to_db_version: to,
+            });
+            from = to;
+            cur_bytes = 0;
+        }
+        cur_bytes += row_len;
+        cur.push(change);
+    }
+    if !cur.is_empty() {
+        let to = cur.last().map(|c| c.db_version).unwrap_or(from);
+        slices.push(ChangesetMessage {
+            changes: cur,
+            from_db_version: from,
+            to_db_version: to,
+        });
+    }
+    slices
+}
 
 /// device_settings keys persisting sync progress per peer. Progress must be
 /// keyed by peer: a global watermark would make a freshly reconnected peer
@@ -1310,6 +1367,25 @@ pub async fn flush_outbox_with(
                 .await?;
             continue;
         }
+        // Undeliverable dead letter: the relay hard-closes the connection on
+        // any frame over its 16 MiB cap, before an ack can exist — so this
+        // row would be retransmitted forever, killing the connection on every
+        // flush (production: a 22MB chat-history changeset looping for days,
+        // blocking ALL sync). Drop it. Changeset rows are re-exported in
+        // slices by `deliver_changes_mailbox` (the cursor never advanced past
+        // them); blob payloads are re-served chunked when the peer re-asks.
+        if ciphertext.len() + nonce.len() + 256 > RELAY_MAX_FRAME_BYTES {
+            warn!(
+                id = %id,
+                bytes = ciphertext.len(),
+                "outbox row exceeds relay frame cap; dropping undeliverable message"
+            );
+            sqlx::query("DELETE FROM sync_outbox WHERE id = ?")
+                .bind(&id)
+                .execute(db)
+                .await?;
+            continue;
+        }
         // Rows written before the message_id column existed get a stable id
         // now, so later flushes retry with the SAME id.
         let message_id = match message_id {
@@ -1423,56 +1499,92 @@ pub async fn deliver_changes_mailbox(
     if changes.changes.is_empty() {
         return Ok(since);
     }
-    let delivered_to = changes.to_db_version;
-    let json = serde_json::to_string(&SyncMessage::Changeset(changes)).context("serialize")?;
-    let (ciphertext, nonce) =
-        crate::sync::crypto::encrypt_bytes(key, json.as_bytes()).map_err(anyhow::Error::msg)?;
-    // The message_id is fixed BEFORE the deposit so an outbox retry reuses it
-    // (relay-side dedupe makes the retry idempotent even when the original
-    // deposit was stored but its ack was lost).
-    let message_id = uuid::Uuid::new_v4().to_string();
-    let payload = crate::sync::types::MailboxDepositPayload {
-        to_device_id: to_device_id.to_string(),
-        ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
-        nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
-        ttl_seconds: Some(7 * 24 * 3600),
-        message_id: Some(message_id.clone()),
-        dedup_key: None,
-    };
-    // Advance the cursor ONLY after the relay acknowledges the deposit is
-    // durably stored. A rejected deposit (e.g. per-device target not in room)
-    // or a missing ack (dead transport) queues the changeset for retry instead
-    // of silently losing it behind an advanced watermark.
-    match relay.deposit_await_ack(payload, MAILBOX_ACK_TIMEOUT).await {
-        Ok(()) => {
+    // The export watermark covers filtered echo rows beyond the last own row;
+    // advance to it once the final slice lands.
+    let final_to = changes.to_db_version;
+    // Slice the export so no single frame can exceed the relay's hard cap.
+    let slices = split_changeset_by_budget(changes, MAILBOX_CHANGESET_BUDGET_BYTES);
+    let n_slices = slices.len();
+    let mut cursor = since;
+    for (i, slice) in slices.into_iter().enumerate() {
+        let slice_to = slice.to_db_version;
+        let slice_rows = slice.changes.len();
+        let cursor_target = if i + 1 == n_slices { final_to } else { slice_to };
+        let json = serde_json::to_string(&SyncMessage::Changeset(slice)).context("serialize")?;
+        if json.len() > MAX_MAILBOX_JSON_BYTES {
+            // Only reachable when a SINGLE row exceeds the whole budget (e.g.
+            // a chat message with megabytes of inline base64). No frame can
+            // ever carry it — the relay kills oversized frames on sight.
+            // Skip it for the mailbox (P2P chunks rows of any size) instead
+            // of poisoning the connection on every tick; the cursor still
+            // advances so later changes are not blocked behind it.
+            warn!(
+                bytes = json.len(),
+                to = %to_device_id,
+                "changeset slice exceeds relay frame cap; skipping (P2P will carry it)"
+            );
             let _ = crate::core::settings_service::set_device_setting(
                 db,
                 &sent_cursor_key(peer_key),
-                &delivered_to.to_string(),
+                &cursor_target.to_string(),
             )
             .await;
-            info!(to = %to_device_id, to_db_version = delivered_to, "changeset deposited to mailbox (offline, acked)");
-            // deposit 被确认存储，说明配额已恢复（扩容或用量回落）。
-            set_quota_exceeded(false);
-            Ok(delivered_to)
+            cursor = cursor_target;
+            continue;
         }
-        Err(e) => {
-            if e.is_quota_exceeded() {
-                // 云端存储已满：标记同步状态（无 engine 实例时也生效）；
-                // changeset 照常入 outbox，扩容后 flush 自动恢复。
-                set_quota_exceeded(true);
+        let (ciphertext, nonce) =
+            crate::sync::crypto::encrypt_bytes(key, json.as_bytes()).map_err(anyhow::Error::msg)?;
+        // The message_id is fixed BEFORE the deposit so an outbox retry reuses it
+        // (relay-side dedupe makes the retry idempotent even when the original
+        // deposit was stored but its ack was lost).
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let payload = crate::sync::types::MailboxDepositPayload {
+            to_device_id: to_device_id.to_string(),
+            ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+            nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
+            ttl_seconds: Some(7 * 24 * 3600),
+            message_id: Some(message_id.clone()),
+            dedup_key: None,
+        };
+        // Advance the cursor ONLY after the relay acknowledges the deposit is
+        // durably stored. A rejected deposit (e.g. per-device target not in room)
+        // or a missing ack (dead transport) queues the slice for retry instead
+        // of silently losing it behind an advanced watermark. Already-acked
+        // slices keep their progress — only the failed slice is queued.
+        match relay.deposit_await_ack(payload, MAILBOX_ACK_TIMEOUT).await {
+            Ok(()) => {
+                let _ = crate::core::settings_service::set_device_setting(
+                    db,
+                    &sent_cursor_key(peer_key),
+                    &cursor_target.to_string(),
+                )
+                .await;
+                info!(to = %to_device_id, to_db_version = cursor_target, slice = i + 1, n_slices, rows = slice_rows, "changeset slice deposited to mailbox (offline, acked)");
+                // deposit 被确认存储，说明配额已恢复（扩容或用量回落）。
+                set_quota_exceeded(false);
+                cursor = cursor_target;
             }
-            warn!(to = %to_device_id, error = %e, "mailbox deposit unacknowledged; queuing to outbox");
-            write_outbox_row(db, to_device_id, &ciphertext, &nonce, &message_id).await?;
-            Ok(since)
+            Err(e) => {
+                if e.is_quota_exceeded() {
+                    // 云端存储已满：标记同步状态（无 engine 实例时也生效）；
+                    // changeset 照常入 outbox，扩容后 flush 自动恢复。
+                    set_quota_exceeded(true);
+                }
+                warn!(to = %to_device_id, error = %e, slice = i + 1, n_slices, "mailbox deposit unacknowledged; queuing to outbox");
+                write_outbox_row(db, to_device_id, &ciphertext, &nonce, &message_id).await?;
+                break;
+            }
         }
     }
+    Ok(cursor)
 }
 
 /// Serialized mailbox snapshot larger than this is skipped (P2P covers those
-/// libraries); the relay has no frame limit, but a multi-MB single frame is
-/// wasteful for what is only a history-fill safety net.
-const MAX_MAILBOX_SNAPSHOT_BYTES: usize = 12 * 1024 * 1024;
+/// libraries). Must fit one relay frame: ~4/3 of this on the wire stays under
+/// the relay's 16 MiB hard cap — the old 12MB value produced ~16.0MB frames,
+/// right at/over the cap, so a large enough snapshot killed the connection
+/// exactly like an oversized changeset.
+const MAX_MAILBOX_SNAPSHOT_BYTES: usize = MAX_MAILBOX_JSON_BYTES;
 
 /// Export the full change history (everything in `crsql_changes` since
 /// db_version 0 — including tombstones, which CR-SQLite backfills for
@@ -2027,6 +2139,18 @@ pub async fn flush_pending_blob_pushes(
     for (hash, ext) in pending_blob_pushes(db).await {
         if !crate::file_store::has_blob(app_data_dir, &hash) {
             // The blob was deleted locally; nothing to push, clear the mark.
+            mark_blob_pushed(db, &hash).await;
+            continue;
+        }
+        // Marks written under an older, larger push limit would produce a
+        // frame over the relay's 16 MiB cap (double base64: ~1.78x raw) and
+        // get the connection killed on every attempt. Clear the mark instead:
+        // the peer pulls such blobs as chunks on demand.
+        let raw_size = std::fs::metadata(crate::file_store::blob_path(app_data_dir, &hash, &ext))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if raw_size > MAX_MAILBOX_BLOB_BYTES {
+            warn!(hash = %hash, size = raw_size, "blob push mark exceeds single-frame cap; clearing (peer will pull chunked)");
             mark_blob_pushed(db, &hash).await;
             continue;
         }
@@ -3629,6 +3753,86 @@ mod tests {
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;
         Ok(())
+    }
+
+    /// A queued row whose wire frame exceeds the relay's hard cap can never be
+    /// acked (the relay kills the connection on sight). The flush must drop
+    /// such dead letters WITHOUT attempting a deposit — retransmission would
+    /// kill the connection on every tick and block all sync (the 22MB
+    /// chat-history incident).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_outbox_drops_oversized_dead_letter() -> anyhow::Result<()> {
+        let _guard = FLUSH_TEST_MUTEX.lock().unwrap();
+        flush_backoff_reset();
+        let (db, _dir) = create_test_db().await?;
+        // 13MB raw → ~17.3M base64 chars stored, over the 16 MiB frame cap.
+        let jumbo = vec![1u8; 13 * 1024 * 1024];
+        write_outbox_row(&db, "", &jumbo, &[7u8; 12], "mid-jumbo").await?;
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay = crate::sync::relay_client::RelayClient::new_for_test(tx);
+        flush_outbox_with(&db, &relay).await?;
+        assert!(
+            rx.try_recv().is_err(),
+            "an oversized row must be dropped without any deposit attempt"
+        );
+        let remaining: (i64,) = sqlx::query_as("SELECT count(*) FROM sync_outbox")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(remaining.0, 0, "oversized dead letter must be dropped");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    fn test_change(db_version: i64, val_len: usize) -> CrsqlChange {
+        CrsqlChange {
+            table: "notes".into(),
+            pk: b"pk".to_vec(),
+            cid: "content".into(),
+            val: Some("x".repeat(val_len)),
+            col_version: 1,
+            db_version,
+            site_id: b"site".to_vec(),
+            cl: 1,
+            seq: 0,
+        }
+    }
+
+    /// Changeset slicing: rows packed under the byte budget, breaks only at
+    /// row boundaries, slices chain via from/to_db_version.
+    #[test]
+    fn split_changeset_packs_rows_under_budget() {
+        let changes: Vec<CrsqlChange> = (1..=10).map(|v| test_change(v, 500)).collect();
+        let cs = ChangesetMessage { changes, from_db_version: 0, to_db_version: 10 };
+        let slices = split_changeset_by_budget(cs, 2_000);
+        assert!(slices.len() >= 3, "10 x ~550B rows under a 2KB budget must produce several slices, got {}", slices.len());
+        assert_eq!(slices.first().unwrap().from_db_version, 0);
+        for w in slices.windows(2) {
+            assert_eq!(w[0].to_db_version, w[1].from_db_version, "slices must chain");
+            assert!(w[0].to_db_version < w[1].to_db_version, "versions must advance");
+        }
+        assert_eq!(slices.last().unwrap().to_db_version, 10);
+        for s in &slices {
+            let len = serde_json::to_string(&SyncMessage::Changeset(s.clone())).unwrap().len();
+            assert!(len <= 2_000 + 600, "slice over budget+one row: {len}");
+            assert!(!s.changes.is_empty());
+        }
+    }
+
+    /// A single row larger than the whole budget forms its own slice (never
+    /// silently merged or dropped at this layer).
+    #[test]
+    fn split_changeset_oversized_row_gets_own_slice() {
+        let changes = vec![test_change(1, 100), test_change(2, 100_000), test_change(3, 100)];
+        let cs = ChangesetMessage { changes, from_db_version: 0, to_db_version: 3 };
+        let slices = split_changeset_by_budget(cs, 2_000);
+        assert_eq!(slices.len(), 3);
+        assert_eq!(slices[1].changes.len(), 1);
+        assert_eq!(slices[1].to_db_version, 2);
+        assert_eq!(slices[1].from_db_version, 1);
+        assert_eq!(slices[2].from_db_version, 2);
     }
 
     /// Backoff growth: 10s initial, doubling on consecutive failures, capped

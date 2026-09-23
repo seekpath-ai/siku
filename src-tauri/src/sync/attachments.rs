@@ -117,12 +117,19 @@ pub async fn collect_missing_blob_hashes(
     Ok(missing)
 }
 
-/// Maximum blob size served through the mailbox. A mailbox message is one
-/// relay frame holding the entire base64 payload (~1.33x wire size, ~2.7x
-/// memory after encryption) and the relay has no per-message size guard, so
-/// oversized blobs are only served over a live P2P DataChannel (which chunks
-/// them via `MAX_WIRE_MSG`) instead.
-pub const MAX_MAILBOX_BLOB_BYTES: u64 = 20 * 1024 * 1024;
+/// Hard cap the relay enforces on a single websocket frame (tungstenite
+/// frame/message limit on the deployed relay): a larger frame gets the
+/// connection killed outright, before any application-level ack can exist.
+/// Every mailbox message must serialize well under this.
+pub const RELAY_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum blob size served through the mailbox as ONE message. The wire math
+/// is doubly inflated: the blob is base64'd into the JSON payload (~1.33x)
+/// and the encrypted envelope is base64'd again for the frame (~1.78x raw),
+/// which must stay under `RELAY_MAX_FRAME_BYTES` — 8MB raw ≈ 14.2MB on the
+/// wire. Larger blobs are served as `AttachmentChunk` slices (or over a live
+/// P2P DataChannel, which chunks them via `MAX_WIRE_MSG`).
+pub const MAX_MAILBOX_BLOB_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Whether the blob is small enough to be served through the mailbox.
 #[allow(dead_code)]
@@ -142,8 +149,9 @@ pub const CHUNK_RAW_BYTES: usize = 3 * 1024 * 1024;
 pub const MAX_CHUNKED_BLOB_BYTES: u64 = 200 * 1024 * 1024;
 /// Blobs up to this size are proactively pushed to the account archive on
 /// local write (paper import, note attachment, vault file), so peers receive
-/// them without a request round-trip.
-pub const PROACTIVE_PUSH_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// them without a request round-trip. Kept at `MAX_MAILBOX_BLOB_BYTES`: a
+/// pushed blob travels as a single frame, so it must fit the relay cap.
+pub const PROACTIVE_PUSH_MAX_BYTES: u64 = MAX_MAILBOX_BLOB_BYTES;
 
 /// Number of chunks a blob of `size` bytes splits into.
 pub fn chunk_count(size: u64) -> u32 {

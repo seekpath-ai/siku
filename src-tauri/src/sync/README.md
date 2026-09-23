@@ -21,12 +21,13 @@
 
 ## Blob（PDF/图片等文件）同步分层
 
-blob 内容寻址存于 `<app_data>/blobs/<sha256>.<ext>`，按大小走不同通道（常量见 `attachments.rs`）：
+blob 内容寻址存于 `<app_data>/blobs/<sha256>.<ext>`，按大小走不同通道（常量见 `attachments.rs`）。**所有 mailbox 消息单帧必须小于 relay 的 16 MiB WebSocket 硬上限**（`RELAY_MAX_FRAME_BYTES`；超限 relay 直接掐连接，不产生任何 ack）——blob 载荷是「base64 进 JSON、加密后再 base64」的双重膨胀（≈1.78x 原始大小），故单帧 blob 上限为 8MB：
 
-- **≤10MB（`PROACTIVE_PUSH_MAX_BYTES`）**：本地写入时（导入论文、粘贴图片、vault 文件）打 `sync.blob_push.pending.*` 标记，auto-sync 的 mailbox tick 由 `flush_pending_blob_pushes` 主动推到账号存档（`to_device_id=""`，ack 确认后才清标记；失败把标记改写成 `ext@retry_after_epoch`，5 分钟退避重试）——对端无需请求即可拉到。
-- **≤20MB（`MAX_MAILBOX_BLOB_BYTES`）**：请求-拉，单条 `AttachmentPayload` 信箱消息。
-- **20MB~200MB（`MAX_CHUNKED_BLOB_BYTES`）**：请求-拉 + 3MB 分片（`CHUNK_RAW_BYTES`）。每片一条 `AttachmentChunk`（自描述 `index`/`total`，可乱序、跨会话到达）；接收侧暂存于 `blobs/.incoming/<hash>/`（`<index>.part` + `total` 文件），齐片后 `try_assemble_blob` 校验 sha256 再落 blob 库（hash 不符则丢弃暂存重新请求）。中断后由 `AttachmentChunkRequest { missing_indices }` 断点续传——请求侧按暂存情况只补缺的片。
+- **≤8MB（`PROACTIVE_PUSH_MAX_BYTES` = `MAX_MAILBOX_BLOB_BYTES`）**：本地写入时（导入论文、粘贴图片、vault 文件）打 `sync.blob_push.pending.*` 标记，auto-sync 的 mailbox tick 由 `flush_pending_blob_pushes` 主动推到账号存档（`to_device_id=""`，ack 确认后才清标记；失败把标记改写成 `ext@retry_after_epoch`，5 分钟退避重试）——对端无需请求即可拉到。请求-拉路径同尺寸上限，单条 `AttachmentPayload` 信箱消息。
+- **8MB~200MB（`MAX_CHUNKED_BLOB_BYTES`）**：请求-拉 + 3MB 分片（`CHUNK_RAW_BYTES`）。每片一条 `AttachmentChunk`（自描述 `index`/`total`，可乱序、跨会话到达）；接收侧暂存于 `blobs/.incoming/<hash>/`（`<index>.part` + `total` 文件），齐片后 `try_assemble_blob` 校验 sha256 再落 blob 库（hash 不符则丢弃暂存重新请求）。中断后由 `AttachmentChunkRequest { missing_indices }` 断点续传——请求侧按暂存情况只补缺的片。
 - **>200MB**：仅 P2P DataChannel（`send_message` 的既有 wire 分片），不进 mailbox。
+
+changeset 投递同样受帧上限约束：`deliver_changes_mailbox` 按 6MB JSON 预算把大导出切成多片（`split_changeset_by_budget`），逐片 ack、逐片推进游标；单行即超 8MB 的病态行跳过信箱走 P2P。outbox flush 会直接丢弃超帧上限的死信行（changeset 由游标重导出、blob 由对端重新请求分片，均不丢数据）。
 
 **relay 去重（`dedup_key`）**：blob 载荷/分片的 mailbox deposit 携带 `dedup_key = HMAC(sync_key, hash)`（分片为 `HMAC(sync_key, "hash:index")`）。同账号重复推送同一 blob 时 relay 只存一份（不重复计配额）；relay 只见 HMAC 输出，无法关联具体文件。changeset/请求类消息不带 dedup_key。
 

@@ -1,6 +1,6 @@
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use pdfium_render::prelude::{Pdfium, PdfiumError};
+use pdfium_render::prelude::Pdfium;
 
 /// Serializes every pdfium call in the process.
 ///
@@ -33,13 +33,17 @@ pub fn pdfium_guard() -> MutexGuard<'static, ()> {
 /// Lookup order — the bare library name alone only searches OS loader paths,
 /// which never find our bundled copy:
 /// 1. `SIKU_PDFIUM_PATH` env override (exact file path);
-/// 2. next to the executable (installed app: pdfium.dll is bundled there as a
-///    Tauri resource);
-/// 3. `<cwd>/bin/<lib>` (cargo dev/test run with src-tauri as CWD, where
+/// 2. next to the executable;
+/// 3. `<exe dir>/bin/<lib>` — the actual installed layout (the bundle
+///    resources map ships pdfium under `bin/`); relying on `<cwd>/bin`
+///    alone made binding depend on HOW the app was launched (shortcut vs
+///    autostart → different cwd → LoadLibrary error 126 even though the
+///    file was right there);
+/// 4. `<cwd>/bin/<lib>` (cargo dev/test run with src-tauri as CWD, where
 ///    bin/pdfium.dll / bin/libpdfium.so live);
-/// 4. the OS default search (system-wide installs).
+/// 5. the OS default search (system-wide installs).
 pub fn pdfium() -> Result<&'static Pdfium, String> {
-    static INSTANCE: OnceLock<Result<Pdfium, PdfiumError>> = OnceLock::new();
+    static INSTANCE: OnceLock<Result<Pdfium, String>> = OnceLock::new();
     INSTANCE
         .get_or_init(|| {
             let lib_name = Pdfium::pdfium_platform_library_name();
@@ -50,6 +54,7 @@ pub fn pdfium() -> Result<&'static Pdfium, String> {
             if let Ok(exe) = std::env::current_exe() {
                 if let Some(dir) = exe.parent() {
                     candidates.push(dir.join(&lib_name));
+                    candidates.push(dir.join("bin").join(&lib_name));
                 }
             }
             if let Ok(cwd) = std::env::current_dir() {
@@ -57,13 +62,28 @@ pub fn pdfium() -> Result<&'static Pdfium, String> {
             }
             for path in &candidates {
                 if path.exists() {
-                    if let Ok(b) = Pdfium::bind_to_library(path) {
-                        return Ok(Pdfium::new(b));
+                    match Pdfium::bind_to_library(path) {
+                        Ok(b) => return Ok(Pdfium::new(b)),
+                        Err(e) => {
+                            tracing::warn!(path = %path.display(), error = %e, "pdfium bind failed; trying next candidate");
+                        }
                     }
                 }
             }
-            let bindings = Pdfium::bind_to_library(lib_name)?;
-            Ok(Pdfium::new(bindings))
+            // Last resort: the OS loader search. Report the tried paths on
+            // failure — the raw LoadLibrary code (126) alone points at the
+            // wrong place ("file not found" while it sits in bin\).
+            match Pdfium::bind_to_library(&lib_name) {
+                Ok(b) => Ok(Pdfium::new(b)),
+                Err(e) => Err(format!(
+                    "{e} (tried: {}; os default search)",
+                    candidates
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            }
         })
         .as_ref()
         .map_err(|e| format!("failed to bind pdfium library: {e}"))

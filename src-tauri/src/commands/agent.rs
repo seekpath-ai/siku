@@ -830,7 +830,9 @@ pub(crate) async fn run_agent_turn(
             .await
             .ok()
             .map(|b| b.to_llm_config()),
-        None => None,
+        // No dedicated vision provider: a vision-capable main model serves
+        // multimodal duties itself (same rule as the attachment routing above).
+        None => llm_config.is_vision.then(|| llm_config.clone()),
     };
 
     // Build filtered tool registry (sandbox root = session working_dir)

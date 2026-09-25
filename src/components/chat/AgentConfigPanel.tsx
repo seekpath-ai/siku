@@ -1,10 +1,17 @@
 import { useState, useEffect } from 'react';
-import { X, Bot, FolderOpen } from 'lucide-react';
+import { X, Bot, FolderOpen, Copy, Trash2 } from 'lucide-react';
+import { open } from '@tauri-apps/plugin-shell';
 import type { AgentSession, ApprovalConfig, LlmConfigBlock, LlmProvider } from '@/lib/types';
 import { LlmConfigFields } from './LlmConfigFields';
 import { ToolPicker } from './ToolPicker';
 import { defaultLlmBlock } from '@/lib/llm-presets';
-import { llmProviderList, skillsList, type SkillInfo } from '@/lib/tauri';
+import {
+  agentSessionWorkspace,
+  agentSessionWorkspaceClear,
+  llmProviderList,
+  skillsList,
+  type SkillInfo,
+} from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
 import { useProjectStore } from '@/stores/projectStore';
 
@@ -58,7 +65,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
   /** '' = 不绑定项目。 */
   const [projectId, setProjectId] = useState<string>(agent.project_id ?? '');
   const projects = useProjectStore((s) => s.projects);
-  /** Path of the currently selected project binding (for the sandbox option). */
+  /** Path of the currently selected project binding (the "项目目录" write dir). */
   const boundProjectPath = projectId
     ? projects.find((p) => p.id === projectId)?.path ?? null
     : null;
@@ -74,6 +81,11 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
   const [maxMemoryRounds, setMaxMemoryRounds] = useState(agent.max_memory_rounds ?? 10);
   const [memoryDir, setMemoryDir] = useState(agent.memory_dir ?? '');
   const [skillsDir, setSkillsDir] = useState(agent.skills_dir ?? '');
+  /** Absolute path of the automatic per-session workspace, resolved on demand
+   *  (only while the "不指定" mode is selected). null = not fetched yet or the
+   *  backend could not provide it. */
+  const [workspacePath, setWorkspacePath] = useState<string | null>(null);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   /** Skills mounted on this session (per-session plugins). */
   const [selectedSkills, setSelectedSkills] = useState<string[]>(agent.selected_skills ?? []);
   const [availableSkills, setAvailableSkills] = useState<SkillInfo[]>([]);
@@ -130,6 +142,64 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
       .catch(() => {});
   }, []);
 
+  // The automatic session workspace is resolved server-side, so only ask while
+  // the user actually has that mode selected. A failure (older backend without
+  // the command, unreadable app data dir) must not break the panel: it degrades
+  // to an explanatory line with the buttons disabled.
+  useEffect(() => {
+    if (workingDirMode !== 'full') {
+      setWorkspacePath(null);
+      setWorkspaceError(null);
+      return;
+    }
+    let cancelled = false;
+    agentSessionWorkspace(agent.id)
+      .then((path) => {
+        if (cancelled) return;
+        setWorkspacePath(path);
+        setWorkspaceError(null);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setWorkspacePath(null);
+        setWorkspaceError('无法获取会话工作区路径（后端命令不可用或目录不可读）');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workingDirMode, agent.id]);
+
+  const handleOpenWorkspace = () => {
+    if (!workspacePath) return;
+    // Failure (e.g. outside Tauri) is not worth interrupting the user for.
+    open(workspacePath).catch(() => {});
+  };
+
+  const handleCopyWorkspace = () => {
+    if (!workspacePath) return;
+    try {
+      navigator.clipboard.writeText(workspacePath).catch(() => {});
+    } catch {
+      /* clipboard unavailable (no permission / insecure context) — silent */
+    }
+  };
+
+  const handleClearWorkspace = async () => {
+    if (!workspacePath) return;
+    if (
+      !window.confirm(
+        `清空该会话工作区？\n\n${workspacePath}\n\n其中的文件会被永久删除，无法恢复。`
+      )
+    ) {
+      return;
+    }
+    try {
+      await agentSessionWorkspaceClear(agent.id);
+    } catch (err) {
+      alert(`清空会话工作区失败: ${err}`);
+    }
+  };
+
   const approvalConfig: ApprovalConfig = {
     mode: approvalMode,
     expire_sec: approvalMode === 'auto_expire_time' || approvalMode === 'manual' ? expireSec : undefined,
@@ -148,8 +218,9 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
         systemPrompt: persona.trim() || undefined,
         tools,
         projectId: projectId || null,
-        // Sandbox scope: the bound project's folder wins over whatever the
-        // session had before; explicit full-disk stays null.
+        // Write directory: the bound project's folder wins over whatever the
+        // session had before; "不指定" stays null (backend then uses the
+        // per-session workspace).
         workingDir: workingDirMode === 'project' ? (boundProjectPath ?? agent.working_dir ?? null) : null,
         visionProviderId: visionProviderId || null,
         webProxy: webProxy.trim() || null,
@@ -268,7 +339,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
               onChange={(e) => {
                 const pid = e.target.value;
                 setProjectId(pid);
-                // Binding a project re-scopes the sandbox to its folder;
+                // Binding a project re-points the write dir at its folder;
                 // unbinding leaves the current working-dir mode untouched.
                 if (pid) setWorkingDirMode('project');
               }}
@@ -284,17 +355,63 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
           </div>
 
           <div className="space-y-1.5">
-            <label className="text-xs text-codex-muted">工作目录</label>
+            <label className="text-xs text-codex-muted">写入目录（相对路径默认落点）</label>
             <select
               value={workingDirMode}
               onChange={(e) => setWorkingDirMode(e.target.value as 'project' | 'full')}
               className="w-full bg-codex-bg border border-codex-border rounded-lg px-3 py-2 text-sm text-codex-primary outline-none focus:border-codex-border-light"
             >
               <option value="project" disabled={!boundProjectPath && !agent.working_dir}>
-                项目目录（沙箱）{boundProjectPath ?? (agent.working_dir ? `：${agent.working_dir}` : '：未绑定项目')}
+                项目目录：{boundProjectPath ?? agent.working_dir ?? '未绑定项目'}
               </option>
-              <option value="full">全盘访问（无限制）</option>
+              <option value="full">不指定（用会话工作区）</option>
             </select>
+            {workingDirMode === 'full' && (
+              <div className="rounded-lg border border-codex-border bg-codex-bg px-3 py-2 space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-codex-muted shrink-0">会话工作区</span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={handleOpenWorkspace}
+                      disabled={!workspacePath}
+                      title="在文件管理器中打开该目录"
+                      className="flex items-center gap-1 px-2 py-1 rounded-md border border-codex-border text-[11px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary transition-colors disabled:opacity-50 disabled:hover:bg-transparent"
+                    >
+                      <FolderOpen size={11} />
+                      打开
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleCopyWorkspace}
+                      disabled={!workspacePath}
+                      title="复制绝对路径"
+                      className="flex items-center gap-1 px-2 py-1 rounded-md border border-codex-border text-[11px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary transition-colors disabled:opacity-50 disabled:hover:bg-transparent"
+                    >
+                      <Copy size={11} />
+                      复制
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleClearWorkspace}
+                      disabled={!workspacePath}
+                      title="删除该会话工作区里的文件"
+                      className="flex items-center gap-1 px-2 py-1 rounded-md border border-codex-border text-[11px] text-codex-danger hover:bg-codex-hover transition-colors disabled:opacity-50 disabled:hover:bg-transparent"
+                    >
+                      <Trash2 size={11} />
+                      清空
+                    </button>
+                  </div>
+                </div>
+                <p className="font-mono text-[11px] text-codex-secondary break-all">
+                  {workspacePath ?? '（正在获取…）'}
+                </p>
+                {workspaceError && <p className="text-[11px] text-codex-danger">{workspaceError}</p>}
+              </div>
+            )}
+            <p className="text-[11px] text-codex-muted">
+              写入目录只是相对路径的默认落点，不是沙箱：绝对路径可以指向任意位置；落在该目录之外的写入会在审批卡上高亮提醒。
+            </p>
           </div>
 
           <div className="space-y-1.5">

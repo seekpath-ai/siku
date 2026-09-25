@@ -19,7 +19,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read lines from a text file within the working directory. Supports line_offset (1-based, negative counts from the end) and n_lines. Read-only, auto-approved."
+        "Read lines from a text file. Absolute paths may point anywhere on disk; relative paths resolve against the session's write directory. Supports line_offset (1-based, negative counts from the end) and n_lines. Read-only, auto-approved."
     }
 
     fn readonly(&self) -> bool {
@@ -31,7 +31,7 @@ impl Tool for FileReadTool {
             ToolParameter {
                 name: "path".into(),
                 param_type: "string".into(),
-                description: "File path (absolute, or relative to the working directory)".into(),
+                description: "File path (absolute anywhere, or relative to the session's write directory)".into(),
                 required: true,
             },
             ToolParameter {
@@ -62,6 +62,9 @@ impl Tool for FileReadTool {
         }
 
         let content = std::fs::read_to_string(&resolved).map_err(|e| format!("read failed: {e}"))?;
+        // The agent has now seen this file's current content, which is what
+        // lets a later whole-file `file_write` (mode=overwrite) proceed.
+        super::known_files::remember(&resolved);
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
 
@@ -119,7 +122,7 @@ impl Tool for FileListTool {
     }
 
     fn description(&self) -> &str {
-        "List files and directories in a directory within the working directory. Read-only, auto-approved."
+        "List files and directories in a directory. Defaults to the session's write directory; absolute paths may point anywhere. Read-only, auto-approved."
     }
 
     fn readonly(&self) -> bool {
@@ -130,7 +133,7 @@ impl Tool for FileListTool {
         vec![ToolParameter {
             name: "path".into(),
             param_type: "string".into(),
-            description: "Directory path (absolute, or relative to the working directory; default working directory)".into(),
+            description: "Directory path (absolute, or relative to the session's write directory; default write directory)".into(),
             required: false,
         }]
     }

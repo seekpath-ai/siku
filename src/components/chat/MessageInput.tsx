@@ -107,8 +107,8 @@ export function MessageInput({ disabled }: Props) {
         if (typeof path !== 'string') continue;
         const name = path.split(/[\\/]/).pop() || path;
         try {
-          // cacheDir = session working dir when set, so the agent's sandboxed
-          // file_read can page oversized extractions.
+          // cacheDir = session write dir when set, so the agent's file_read
+          // can page oversized extractions.
           const content = await readDocumentFile(path, activeProject?.path);
           setTextAttachments((prev) =>
             prev.some((a) => a.path === path)

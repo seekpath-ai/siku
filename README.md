@@ -185,7 +185,7 @@ User → UI (React) → Tauri IPC → Commands → Services → SQLite / File St
                   LLM Client (Multi-Provider)   25+ Tools / Skills
 ```
 
-**Agent 信任模型**：只读工具自动放行；写/执行类工具按会话审批模式请求确认。文件工具限定在工作目录（项目沙箱，可配置全盘访问）。单次工具执行超时 320s（`bash` 自带最长 300s）。
+**Agent 信任模型**：只读工具自动放行；写/执行类工具按会话审批模式请求确认。文件工具不设沙箱（`bash` 本来就不受约束，谎称有边界只会误导）：相对路径落在会话的写入目录（项目目录或自动会话工作区），绝对路径可指向任意位置，越出写入目录的调用会在审批卡上高亮提醒。单次工具执行超时 320s（`bash` 自带最长 300s）。
 
 **智能体内置工具**：见 [docs/agent-tools.md](docs/agent-tools.md)。
 

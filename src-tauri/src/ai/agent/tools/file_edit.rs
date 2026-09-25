@@ -17,7 +17,7 @@ impl Tool for FileEditTool {
     }
 
     fn description(&self) -> &str {
-        "Replace a unique substring in a text file within the working directory. Returns an error if old_string matches multiple times unless replace_all is true. Requires approval."
+        "Replace a unique substring in a text file. Relative paths resolve against the session's write directory; absolute paths may point anywhere. Returns an error if old_string matches multiple times unless replace_all is true. Requires approval."
     }
 
     fn parameters(&self) -> Vec<ToolParameter> {
@@ -25,7 +25,7 @@ impl Tool for FileEditTool {
             ToolParameter {
                 name: "path".into(),
                 param_type: "string".into(),
-                description: "File path (absolute, or relative to the working directory)".into(),
+                description: "File path (absolute anywhere, or relative to the session's write directory)".into(),
                 required: true,
             },
             ToolParameter {
@@ -80,11 +80,92 @@ impl Tool for FileEditTool {
             content.replacen(old_string, new_string, 1)
         };
 
-        std::fs::write(&resolved, &updated).map_err(|e| format!("write failed: {e}"))?;
+        // Same atomic replace as file_write: a truncated-then-rewritten file
+        // is exactly the failure this avoids.
+        super::write_atomically(&resolved, &updated)?;
+        // The file now holds content the agent authored, so a later
+        // whole-file overwrite may proceed without a fresh read.
+        super::known_files::remember(&resolved);
 
         Ok(format!(
             "Replaced {count} occurrence(s) in {}",
             resolved.display()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(dir: &std::path::Path, old: &str, new: &str) -> serde_json::Value {
+        serde_json::json!({
+            "path": "f.txt",
+            "old_string": old,
+            "new_string": new,
+            "_working_dir": dir.to_str().unwrap(),
+        })
+    }
+
+    #[tokio::test]
+    async fn replaces_and_keeps_the_file_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, "a = 1;\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let out = FileEditTool::new()
+            .execute(args(dir.path(), "a = 1;", "a = 2;"))
+            .await
+            .expect("edit must succeed");
+        assert!(out.contains("Replaced 1 occurrence(s)"), "{out}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "a = 2;\n");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        // No temp file may survive the replace.
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("siku-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// An edit makes the file's content known, so a following whole-file
+    /// overwrite no longer needs a read.
+    #[tokio::test]
+    async fn edited_file_counts_as_known_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f.txt");
+        std::fs::write(&target, "a = 1;\n").unwrap();
+
+        FileEditTool::new()
+            .execute(args(dir.path(), "a = 1;", "a = 2;"))
+            .await
+            .unwrap();
+
+        crate::ai::agent::tools::file_write::FileWriteTool::new()
+            .execute(serde_json::json!({
+                "path": "f.txt",
+                "content": "rewritten\n",
+                "mode": "overwrite",
+                "_working_dir": dir.path().to_str().unwrap(),
+            }))
+            .await
+            .expect("the edit made the content known");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "rewritten\n");
     }
 }

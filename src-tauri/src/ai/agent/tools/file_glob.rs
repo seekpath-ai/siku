@@ -71,7 +71,7 @@ impl Tool for FileGlobTool {
     }
 
     fn description(&self) -> &str {
-        "List files within the working directory matching a glob pattern (e.g. **/*.rs, src/**/*.ts). Returns up to 100 entries sorted by modification time, newest first. Read-only, auto-approved."
+        "List files matching a glob pattern (searched from the session's write directory by default; absolute paths may point anywhere) (e.g. **/*.rs, src/**/*.ts). Returns up to 100 entries sorted by modification time, newest first. Read-only, auto-approved."
     }
 
     fn parameters(&self) -> Vec<ToolParameter> {
@@ -79,13 +79,13 @@ impl Tool for FileGlobTool {
             ToolParameter {
                 name: "pattern".into(),
                 param_type: "string".into(),
-                description: "Glob pattern, relative to the working directory".into(),
+                description: "Glob pattern, matched from the search base directory".into(),
                 required: true,
             },
             ToolParameter {
                 name: "path".into(),
                 param_type: "string".into(),
-                description: "Optional base subdirectory to search from (default working directory)".into(),
+                description: "Optional base directory to search from (default the session's write directory)".into(),
                 required: false,
             },
         ]

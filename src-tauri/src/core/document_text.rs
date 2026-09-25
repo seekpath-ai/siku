@@ -27,8 +27,8 @@ pub const INJECT_BUDGET_CHARS: usize = 30_000;
 /// Read a document file as text for chat context injection.
 ///
 /// `cache_dir` is where oversized extractions land; it must be a directory
-/// the agent's file tools can read (the session's working dir when one is
-/// set — the sandbox rejects absolute paths outside it).
+/// the agent's file tools can read (the session's write directory when one is
+/// set). Absolute paths are accepted anywhere, so any readable directory works.
 pub fn read_document_text(path: &Path, cache_dir: &Path) -> Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("read failed: {e}"))?;
     let name = path

@@ -131,7 +131,7 @@ impl BashTool {
 }
 
 fn build_description() -> String {
-    const BASE: &str = "Execute a shell command. Windows defaults to PowerShell; Unix-like systems default to bash (falling back to sh). Use shell=bash|powershell|cmd|sh to override. Requires approval. Commands run in the working directory by default when one is set (otherwise the process cwd). run_in_background=true returns a task id immediately; otherwise waits for completion. Foreground timeout: default 60s, max 5min. Background tasks accept timeout_ms=0 to disable the timeout entirely (long builds, watchers, servers). The command is ALREADY parsed by the selected shell: never wrap it in another `powershell -Command`/`bash -c` layer — inside double quotes the outer shell interpolates `$_`/`$VAR` before the inner command sees them. To pass `$` literally, use single quotes.";
+    const BASE: &str = "Execute a shell command. Windows defaults to PowerShell; Unix-like systems default to bash (falling back to sh). Use shell=bash|powershell|cmd|sh to override. Requires approval. Commands run in the session's write directory by default when one is set (otherwise the process cwd). run_in_background=true returns a task id immediately; otherwise waits for completion. Foreground timeout: default 60s, max 5min. Background tasks accept timeout_ms=0 to disable the timeout entirely (long builds, watchers, servers). The command is ALREADY parsed by the selected shell: never wrap it in another `powershell -Command`/`bash -c` layer — inside double quotes the outer shell interpolates `$_`/`$VAR` before the inner command sees them. To pass `$` literally, use single quotes.";
     // LLMs write far more reliable bash than PowerShell; when Git Bash is
     // installed, say so and steer Unix-style work to it instead of keeping
     // bash as a fallback the model never thinks to use.
@@ -233,7 +233,7 @@ impl Tool for BashTool {
             ToolParameter {
                 name: "cwd".into(),
                 param_type: "string".into(),
-                description: "Working directory for the command (relative to the working directory). Defaults to the working directory itself when one is set; otherwise the process cwd.".into(),
+                description: "Working directory for the command (relative to the write directory). Defaults to the session's write directory; otherwise the process cwd.".into(),
                 required: false,
             },
             ToolParameter {
@@ -274,23 +274,34 @@ impl Tool for BashTool {
         let mut cmd = build_command(&shell, &command);
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        // Explicit cwd: fail loudly — the caller asked for that directory.
-        // Default cwd (= sandbox root): a missing root must NOT kill
-        // sandbox-agnostic commands (e.g. `systeminfo`). The working dir
-        // never constrained bash anyway (a command can `cd` anywhere), so
-        // degrade to the process cwd and say so in the output.
+        // Explicit cwd: fail loudly — the caller asked for that directory, and
+        // "no such directory" is a much clearer answer than the spawn error.
+        // Default cwd (= the session's write directory): a missing one must NOT
+        // kill directory-agnostic commands (e.g. `systeminfo`), so degrade to
+        // the process cwd and say so in the output. (bash was never confined by
+        // that directory anyway — a command can `cd` anywhere.)
         let mut cwd_fallback: Option<String> = None;
         match args["cwd"].as_str().filter(|c| !c.trim().is_empty()) {
             Some(cwd) => {
-                cmd.current_dir(resolve_path(wd.as_deref(), cwd)?);
+                let dir = resolve_path(wd.as_deref(), cwd)?;
+                if !dir.is_dir() {
+                    return Err(format!("cwd does not exist: {}", dir.display()));
+                }
+                cmd.current_dir(dir);
             }
             None if wd.is_some() => match resolve_path(wd.as_deref(), ".") {
-                Ok(dir) => {
+                Ok(dir) if dir.is_dir() => {
                     cmd.current_dir(dir);
+                }
+                Ok(dir) => {
+                    cwd_fallback = Some(format!(
+                        "write directory unavailable ({}); command ran in the process cwd instead",
+                        dir.display()
+                    ));
                 }
                 Err(e) => {
                     cwd_fallback = Some(format!(
-                        "working directory unavailable ({e}); command ran in the process cwd instead"
+                        "write directory unavailable ({e}); command ran in the process cwd instead"
                     ));
                 }
             },
@@ -490,12 +501,12 @@ mod tests {
             .join("no-such-dir")
     }
 
-    /// A missing sandbox root must degrade to the process cwd with a
-    /// warning instead of killing the command — the working dir never
-    /// actually confined bash, so sandbox-agnostic commands (e.g.
-    /// `systeminfo`) must keep working.
+    /// A missing write directory must degrade to the process cwd with a
+    /// warning instead of killing the command — that directory never confined
+    /// bash, so directory-agnostic commands (e.g. `systeminfo`) must keep
+    /// working.
     #[tokio::test]
-    async fn missing_working_dir_degrades_with_warning() {
+    async fn missing_write_dir_degrades_with_warning() {
         let tool = BashTool::new(TaskStore::default(), std::env::temp_dir(), None);
         let missing = missing_dir();
         let out = tool
@@ -512,8 +523,8 @@ mod tests {
         );
     }
 
-    /// An explicitly requested cwd must still fail loudly — the caller
-    /// asked for that directory.
+    /// An explicitly requested cwd must still fail loudly — the caller asked
+    /// for that directory, and "does not exist" beats a spawn error.
     #[tokio::test]
     async fn explicit_cwd_fails_loudly() {
         let tool = BashTool::new(TaskStore::default(), std::env::temp_dir(), None);
@@ -526,8 +537,22 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert!(err.contains("working directory error"), "{err}");
+        assert!(err.contains("cwd does not exist"), "{err}");
         assert!(err.contains("no-such-dir"), "error must name the path: {err}");
+    }
+
+    /// With no write directory, bash runs in the process cwd without pretending
+    /// otherwise (relative paths there are the caller's business; nothing
+    /// confines bash either way).
+    #[tokio::test]
+    async fn absent_write_dir_runs_in_the_process_cwd() {
+        let tool = BashTool::new(TaskStore::default(), std::env::temp_dir(), None);
+        let out = tool
+            .execute(serde_json::json!({ "command": "echo siku-no-wd-ok" }))
+            .await
+            .expect("bash must run without a write directory");
+        assert!(out.contains("siku-no-wd-ok"), "{out}");
+        assert!(!out.contains("warning"), "{out}");
     }
 
     /// A background task past its timeout must end as `timed_out` (not

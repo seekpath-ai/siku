@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Terminal, Loader2, ChevronDown } from 'lucide-react';
+import { Terminal, Loader2, ChevronDown, AlertTriangle } from 'lucide-react';
 import { useChatStore } from '@/stores/chatStore';
 import { agentApproveTool, type ApprovalDecision } from '@/lib/tauri';
 
@@ -20,6 +20,18 @@ interface ApprovalCardProps {
   onSubmitFailed?: (decision: ApprovalDecision) => void;
   /** Compact spacing for narrow containers (pet panel). */
   compact?: boolean;
+  /** Render `command` in full instead of collapsing it past
+   *  `COMMAND_COLLAPSE_CHARS`. Used for the file-tool previews: those are
+   *  already truncated by `formatFileToolApproval` to a readable size, and a
+   *  300-char preview of a file's content would hide the very thing the user
+   *  is approving. The block itself stays scrollable (max-h-40), so existing
+   *  callers are unaffected — the default keeps today's behavior. */
+  disableCommandCollapse?: boolean;
+  /** Backend-computed flag: this call's target path is outside the session's
+   *  write directory. Advisory only — the card is NOT blocked and no extra
+   *  confirmation is demanded, the user just needs to see where the call is
+   *  aimed. Default false keeps every existing caller unchanged. */
+  outsideWriteBase?: boolean;
   /** Called after a successful submit (e.g. clear the caller's pending state). */
   onSubmitted?: () => void;
 }
@@ -31,9 +43,14 @@ type Panel = 'none' | 'modify' | 'guide';
 const COMMAND_COLLAPSE_CHARS = 500;
 const COMMAND_PREVIEW_CHARS = 300;
 
+/** Tools that write a file at an explicit `path`, so "outside the write
+ *  directory" is a statement about that file's location. Everything else
+ *  (notably `bash` with a `cwd`) is judged as "runs outside the directory". */
+const FILE_WRITE_TOOLS = new Set(['file_write', 'file_edit']);
+
 /** Tool approval card: approve (optionally with edited arguments), decline &
  * continue, decline with guidance for the agent, or decline & end the turn. */
-export function ApprovalCard({ toolCallId, toolName, command, args, sessionId, compact, onDecision, onSubmitFailed, onSubmitted }: ApprovalCardProps) {
+export function ApprovalCard({ toolCallId, toolName, command, args, sessionId, compact, disableCommandCollapse, outsideWriteBase = false, onDecision, onSubmitFailed, onSubmitted }: ApprovalCardProps) {
   const { activeSessionId, updateStreamingToolCallById } = useChatStore();
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [declineOpen, setDeclineOpen] = useState(false);
@@ -44,7 +61,7 @@ export function ApprovalCard({ toolCallId, toolName, command, args, sessionId, c
   const [cmdExpanded, setCmdExpanded] = useState(false);
   // Code-point-safe preview (surrogate pairs must not be split).
   const cmdChars = [...command];
-  const cmdLong = cmdChars.length > COMMAND_COLLAPSE_CHARS;
+  const cmdLong = !disableCommandCollapse && cmdChars.length > COMMAND_COLLAPSE_CHARS;
   const cmdPreview = cmdLong ? `${cmdChars.slice(0, COMMAND_PREVIEW_CHARS).join('')}…` : command;
 
   const submit = async (
@@ -109,6 +126,20 @@ export function ApprovalCard({ toolCallId, toolName, command, args, sessionId, c
         <Terminal size={14} className="text-codex-accent" />
         请求执行 · {toolName}
       </div>
+      {outsideWriteBase && (
+        // Advisory, never blocking: the sandbox is gone, so the only defence
+        // left is the user SEEING that the target is outside the write
+        // directory. The target path itself stays visible right below, in the
+        // command block.
+        <div className="mb-2 flex items-start gap-1.5 rounded-md border border-codex-warning/50 bg-codex-warning/10 px-2 py-1.5 text-[12px] leading-snug text-codex-warning">
+          <AlertTriangle size={13} className="mt-[1px] shrink-0" />
+          <span>
+            {FILE_WRITE_TOOLS.has(toolName)
+              ? '⚠ 该路径不在写入目录内，请确认这是你要的位置'
+              : '⚠ 该命令在写入目录之外运行'}
+          </span>
+        </div>
+      )}
       <div className={`rounded-md bg-codex-code border border-codex-border p-2.5 font-mono text-[12px] text-codex-secondary break-all whitespace-pre-wrap max-h-40 overflow-y-auto ${cmdLong ? 'mb-1' : 'mb-3'}`}>
         {cmdExpanded ? command : cmdPreview}
       </div>

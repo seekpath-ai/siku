@@ -1,63 +1,78 @@
+//! Path resolution for the file tools: a *default write directory*, not a
+//! sandbox.
+//!
+//! The containment check that used to live here was removed on purpose. `bash`
+//! is unconfined by design (it only gets a cwd; `cd`, redirects and scripts go
+//! wherever they like), so a file-tool sandbox was never a boundary — it only
+//! produced `outside working directory` errors that cost the model a turn
+//! whenever it legitimately needed a temp dir, another repository, or the
+//! user's Downloads. Approval is the real gate; being honest about that beats
+//! pretending.
+//!
+//! What survives is the useful half: a deterministic base for relative paths,
+//! so `notes/x.md` lands somewhere meaningful instead of in the process cwd
+//! (on Windows, `C:\Windows\System32` for a GUI-launched app).
+//!
+//! - absolute path → used as given, anywhere on disk
+//! - relative path → joined onto the session's write directory
+//! - relative path with no write directory → refused with an actionable error
+//!   (the app always supplies one — a project folder or the session workspace —
+//!   so this only fires for a misconfigured caller, and it must never fall back
+//!   to the process cwd)
+//!
+//! The result is canonicalized as far as the path exists (best effort), so
+//! callers report an absolute path with `..` and symlinks already resolved.
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// Resolve a tool path against the sandbox root (`working_dir`).
-///
-/// - `working_dir = None` → full disk access; the path is used as-is.
-/// - `working_dir = Some(base)` → relative paths resolve under `base`;
-///   absolute paths are canonicalized and must stay inside `base`.
-///
-/// Non-existent targets (e.g. a file to create) are handled by canonicalizing
-/// the deepest existing ancestor and re-appending the missing parts.
 pub fn resolve_path(base: Option<&str>, path: &str) -> Result<PathBuf, String> {
     let raw = Path::new(path);
-    let Some(base) = base else {
-        return Ok(raw.to_path_buf());
+    let joined = match base.filter(|b| !b.trim().is_empty()) {
+        Some(base) if !raw.is_absolute() => Path::new(base).join(raw),
+        Some(_) => raw.to_path_buf(),
+        None if raw.is_absolute() => raw.to_path_buf(),
+        None => return Err(no_working_dir_error(path)),
     };
-    if base.trim().is_empty() {
-        return Ok(raw.to_path_buf());
-    }
+    Ok(canonical_best_effort(&joined))
+}
 
-    let base_path = Path::new(base);
-    let joined = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        base_path.join(raw)
-    };
-
-    let canon_base = base_path
-        .canonicalize()
-        .map_err(|e| format!("working directory error: {base}: {e}"))?;
-
-    // Canonicalize the deepest existing ancestor, then re-append missing parts.
+/// Canonicalize the deepest existing ancestor and re-append the parts that do
+/// not exist yet (the target of a create, typically). Never fails: when even
+/// the root cannot be resolved the joined path is returned unchanged.
+fn canonical_best_effort(path: &Path) -> PathBuf {
     let mut missing: Vec<OsString> = Vec::new();
-    let mut probe = joined.as_path();
-    let canon = loop {
+    let mut probe = path;
+    let mut canonical = None;
+    loop {
         match probe.canonicalize() {
-            Ok(c) => break c,
+            Ok(c) => {
+                canonical = Some(c);
+                break;
+            }
             Err(_) => match probe.file_name() {
-                Some(n) => {
-                    missing.push(n.to_os_string());
-                    probe = probe.parent().unwrap_or(probe);
+                Some(name) => {
+                    missing.push(name.to_os_string());
+                    match probe.parent() {
+                        Some(parent) => probe = parent,
+                        None => break,
+                    }
                 }
-                None => return Err(format!("path error: {path}")),
+                None => break,
             },
         }
-    };
+    }
 
-    let mut result = canon;
+    let Some(mut result) = canonical else {
+        return path.to_path_buf();
+    };
     for part in missing.iter().rev() {
         result.push(part);
     }
-
-    if result.starts_with(&canon_base) {
-        Ok(result)
-    } else {
-        Err(format!("path outside working directory: {path}"))
-    }
+    result
 }
 
-/// Read `working_dir` injected into tool args by the registry.
+/// Read the write directory injected into tool args by the registry.
 pub fn working_dir_from_args(args: &serde_json::Value) -> Option<String> {
     args.get("_working_dir")
         .and_then(|v| v.as_str())
@@ -65,57 +80,115 @@ pub fn working_dir_from_args(args: &serde_json::Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Actionable refusal for a relative path with no write directory. The process
+/// cwd is named because seeing `C:\Windows\System32` in the message is what
+/// makes the rule obvious to the caller (model or human).
+fn no_working_dir_error(path: &str) -> String {
+    let cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    format!(
+        "relative path '{path}' has no base: no write directory is configured for this session, and the \
+         process cwd ({cwd}) is not a usable base for it. Pass an absolute path, or set a write \
+         directory for the session."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::resolve_path;
 
-    /// Sandboxed resolution must reject every `..` escape shape — whether the
-    /// target exists, only the parent exists, or nothing exists.
-    #[test]
-    fn missing_base_error_names_the_path() {
-        let missing = std::env::temp_dir()
-            .join(format!("siku-no-such-dir-{}", std::process::id()))
-            .join("sandbox");
-        let base_s = missing.to_str().unwrap();
-        let msg = resolve_path(Some(base_s), "x").unwrap_err();
-        assert!(msg.contains(base_s), "error must name the failing base: {msg}");
-    }
-
-    #[test]
-    fn rejects_dotdot_escape_shapes() {
+    fn write_dir_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("sandbox");
-        std::fs::create_dir_all(base.join("a")).unwrap();
-        let base_s = base.to_str().unwrap();
-
-        // Missing tail with .. that climbs out of the sandbox.
-        assert!(resolve_path(Some(base_s), "a/../../b").is_err());
-        assert!(resolve_path(Some(base_s), "nonexist/../../outside.txt").is_err());
-        assert!(resolve_path(Some(base_s), "../escape.txt").is_err());
-        // Existing file reached via ...
-        let outside = dir.path().join("secret.txt");
-        std::fs::write(&outside, b"x").unwrap();
-        assert!(resolve_path(Some(base_s), "a/../../secret.txt").is_err());
-        // Absolute path outside the sandbox.
-        assert!(resolve_path(Some(base_s), outside.to_str().unwrap()).is_err());
-    }
-
-    #[test]
-    fn allows_legitimate_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("sandbox");
+        let base = dir.path().join("write-dir");
         std::fs::create_dir_all(base.join("a")).unwrap();
         std::fs::write(base.join("a/f.txt"), b"x").unwrap();
+        (dir, base)
+    }
+
+    #[test]
+    fn relative_paths_resolve_under_the_base() {
+        let (_dir, base) = write_dir_fixture();
         let base_s = base.to_str().unwrap();
 
         // Existing file, plain and via an internal `a/../` detour.
-        assert!(resolve_path(Some(base_s), "a/f.txt").is_ok());
-        assert!(resolve_path(Some(base_s), "a/../a/f.txt").is_ok());
-        // New file to create inside the sandbox.
-        let new_file = resolve_path(Some(base_s), "a/new.txt").unwrap();
+        assert_eq!(
+            resolve_path(Some(base_s), "a/f.txt").unwrap(),
+            base.join("a/f.txt").canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_path(Some(base_s), "a/../a/f.txt").unwrap(),
+            base.join("a/f.txt").canonicalize().unwrap()
+        );
+        // A file to create: absolute, and still under the base.
+        let new_file = resolve_path(Some(base_s), "x/y/z.txt").unwrap();
+        assert!(new_file.is_absolute());
         assert!(new_file.starts_with(base.canonicalize().unwrap()));
-        // Deeply nested new file.
-        assert!(resolve_path(Some(base_s), "x/y/z.txt").is_ok());
+    }
+
+    /// The containment check is gone: `..` and absolute paths may leave the
+    /// write directory, and they resolve to the truth rather than erroring.
+    #[test]
+    fn paths_outside_the_base_resolve_instead_of_failing() {
+        let (dir, base) = write_dir_fixture();
+        let base_s = base.to_str().unwrap();
+        let outside = dir.path().join("secret.txt");
+        std::fs::write(&outside, b"x").unwrap();
+        let outside_canon = outside.canonicalize().unwrap();
+
+        assert_eq!(
+            resolve_path(Some(base_s), "a/../../secret.txt").unwrap(),
+            outside_canon
+        );
+        assert_eq!(
+            resolve_path(Some(base_s), outside.to_str().unwrap()).unwrap(),
+            outside_canon
+        );
+        // Non-existent escape target: parent canonicalized, tail re-appended.
+        assert_eq!(
+            resolve_path(Some(base_s), "../escape.txt").unwrap(),
+            dir.path().canonicalize().unwrap().join("escape.txt")
+        );
+    }
+
+    /// No write directory means "no default", not "no file access".
+    #[test]
+    fn absolute_paths_are_used_as_given_without_a_write_dir() {
+        let abs = std::env::temp_dir();
+        assert_eq!(
+            resolve_path(None, abs.to_str().unwrap()).unwrap(),
+            abs.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_path(Some("   "), abs.to_str().unwrap()).unwrap(),
+            abs.canonicalize().unwrap()
+        );
+    }
+
+    /// The process cwd is not a usable base for a relative path, so it must be
+    /// refused (with the cwd named) instead of silently resolving there.
+    #[test]
+    fn relative_paths_are_refused_without_a_write_dir() {
+        for base in [None, Some(""), Some("  ")] {
+            for path in ["x.txt", "./x.txt", "sub/x.txt", ".", ".."] {
+                let err =
+                    resolve_path(base, path).expect_err("a relative path needs a write directory");
+                assert!(err.contains("no write directory"), "{err}");
+                assert!(err.contains("absolute path"), "must say what to do: {err}");
+                assert!(err.contains(path), "must name the path: {err}");
+            }
+        }
+    }
+
+    /// A write directory that does not exist (moved vault, fresh sync) is not
+    /// an error any more: the path resolves under the deepest existing
+    /// ancestor, and the writer creates the rest.
+    #[test]
+    fn a_missing_base_still_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone").join("sub");
+        let resolved = resolve_path(Some(missing.to_str().unwrap()), "x.txt").unwrap();
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with("gone/sub/x.txt"), "{resolved:?}");
     }
 }
-

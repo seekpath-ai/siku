@@ -261,7 +261,7 @@ pub async fn agent_create_session(
     let project_id = input.project_id.clone();
     let vision_provider_id = input.vision_provider_id.clone();
     let web_proxy = input.web_proxy.clone();
-    // Default the sandbox root to the project directory when not specified.
+    // Default the write directory to the project's folder when not specified.
     let mut working_dir = input.working_dir.clone();
     if working_dir.is_none() {
         if let Some(pid) = &input.project_id {
@@ -688,6 +688,85 @@ fn session_to_json(
     })
 }
 
+/// Where a session's scratch files go when it has no project folder.
+///
+/// App-owned and per session, so one conversation's files never collide with
+/// another's, and so a session without a project never writes into the user's
+/// real directories by accident. Session ids are locally generated UUIDs, but
+/// this path is built from a DB value, so it is sanitized rather than trusted.
+pub(crate) fn session_workspace_dir(
+    app_data_dir: &std::path::Path,
+    session_id: &str,
+) -> PathBuf {
+    let safe: String = session_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    app_data_dir.join("agent_workspaces").join(safe)
+}
+
+/// What the model is told about where its relative paths land. Says out loud
+/// that this is not a sandbox, so the model neither treats the directory as a
+/// fence nor assumes a write elsewhere will be blocked.
+fn write_dir_note(dir: &str, fallback_reason: Option<&str>) -> String {
+    match fallback_reason {
+        Some(reason) => format!(
+            "{reason}，本会话已改用自动工作区：{dir}。文件类工具的相对路径默认落在该目录；\
+             这不是沙箱 —— 绝对路径可指向磁盘任意位置，越出该目录的写入会在审批卡上高亮提醒用户。\
+             bash 未指定 cwd 时也在该目录运行。"
+        ),
+        None => format!(
+            "文件类工具的写入目录（相对路径的默认落点）：{dir}。这不是沙箱 —— 绝对路径可指向磁盘任意位置，\
+             越出该目录的写入会在审批卡上高亮提醒用户。bash 未指定 cwd 时也在该目录运行。"
+        ),
+    }
+}
+
+/// Absolute path of a session's auto workspace, created if missing. Used by the
+/// session settings panel so the fallback location is discoverable rather than
+/// hidden in the app data directory.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn agent_session_workspace(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<String, String> {
+    let dir = session_workspace_dir(&state.app_data_dir, &session_id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建工作区失败: {e}"))?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+/// Empty a session's auto workspace. Its contents are scratch by definition, so
+/// this is the "clean up" affordance; the directory itself stays.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn agent_session_workspace_clear(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    let dir = session_workspace_dir(&state.app_data_dir, &session_id);
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("读取工作区失败: {e}"))?;
+    for entry in entries {
+        let path = entry.map_err(|e| format!("读取工作区失败: {e}"))?.path();
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        result.map_err(|e| format!("删除 {} 失败: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Execute one agent turn for a session, streaming via "agent:event".
 /// Shared by user messages and scheduled (cron) prompts.
 pub(crate) async fn run_agent_turn(
@@ -736,17 +815,30 @@ pub(crate) async fn run_agent_turn(
         None => None,
     };
 
-    // Runtime self-heal for the sandbox root. working_dir is a device-local
-    // absolute path that can go stale: the vault was moved or deleted, or
-    // the session row arrived via sync from another device (the column no
-    // longer syncs, but historical rows predate that). Re-resolve through
-    // the session's project and persist the fix locally. An unhealable root
-    // stays in place — file tools reject with a named-path error, bash
-    // degrades to the process cwd — and the model is told to inform the user.
-    let mut working_dir = session.working_dir.clone();
-    let mut working_dir_warning: Option<String> = None;
-    if let Some(wd) = working_dir.as_deref().filter(|w| !w.trim().is_empty()) {
-        if !std::path::Path::new(wd).is_dir() {
+    // Resolve the session's default write directory. This is NOT a sandbox:
+    // absolute paths go anywhere, and writes outside this directory are merely
+    // flagged in the approval card. It exists so relative paths land somewhere
+    // predictable instead of in the process cwd (`C:\Windows\System32` for a
+    // GUI-launched app), which is where agents used to lose files.
+    //
+    // Order:
+    //   1. the session's configured directory (its project folder) — self-healed
+    //      through the project row when the path went stale, since working_dir
+    //      is device-local and can arrive stale from sync;
+    //   2. the app-owned session workspace, created on demand. Used when nothing
+    //      is configured, or when the configured directory is gone for good.
+    // The session's stored setting is left alone in the fallback case, so a
+    // vault that comes back (external drive) is picked up again next turn.
+    let mut working_dir = session
+        .working_dir
+        .clone()
+        .filter(|w| !w.trim().is_empty());
+    let mut workspace_note: Option<String> = None;
+
+    if let Some(wd) = working_dir.clone() {
+        if std::path::Path::new(&wd).is_dir() {
+            workspace_note = Some(write_dir_note(&wd, None));
+        } else {
             let healed = project_dir
                 .as_deref()
                 .filter(|p| std::path::Path::new(p).is_dir())
@@ -764,16 +856,37 @@ pub(crate) async fn run_agent_turn(
                     {
                         warn!(error=%e, "persist healed working_dir failed");
                     }
+                    workspace_note = Some(write_dir_note(&p, None));
                     working_dir = Some(p);
                 }
                 None => {
                     warn!(session_id=%session_id, working_dir=%wd, "session working_dir does not exist");
-                    working_dir_warning = Some(format!(
-                        "警告：本会话的工作目录 {wd} 在本机不存在（目录可能被移动/删除，或该会话同步自其他设备）。\
-                         文件类工具会报「working directory error」；bash 会降级到进程当前目录运行。\
-                         请直接告知用户此情况，并建议其在会话设置中重新指定工作目录或改为完全访问。"
-                    ));
+                    working_dir = None;
+                    // Fall through to the session workspace, remembering why.
+                    workspace_note = Some(format!("配置的写入目录 {wd} 在本机不存在"));
                 }
+            }
+        }
+    }
+
+    if working_dir.is_none() {
+        let workspace = session_workspace_dir(&state.app_data_dir, &session_id);
+        match std::fs::create_dir_all(&workspace) {
+            Ok(()) => {
+                // Carry over the reason (stale path) when there was one.
+                let reason = workspace_note.take().unwrap_or_else(|| "本会话未指定写入目录".to_string());
+                working_dir = Some(workspace.to_string_lossy().to_string());
+                workspace_note = Some(write_dir_note(
+                    &workspace.to_string_lossy(),
+                    Some(&reason),
+                ));
+            }
+            Err(e) => {
+                warn!(session_id=%session_id, error=%e, "create session workspace failed");
+                workspace_note = Some(format!(
+                    "警告：本会话没有可用的写入目录，且会话工作区创建失败（{e}）。\
+                     文件类工具的相对路径会被拒绝，请改用绝对路径，并告知用户检查磁盘权限。"
+                ));
             }
         }
     }
@@ -835,7 +948,7 @@ pub(crate) async fn run_agent_turn(
         None => llm_config.is_vision.then(|| llm_config.clone()),
     };
 
-    // Build filtered tool registry (sandbox root = session working_dir)
+    // Build filtered tool registry (default write directory = working_dir)
     let mut registry = ToolRegistry::default_registry(
         &state.db,
         &state.app_data_dir,
@@ -935,9 +1048,10 @@ pub(crate) async fn run_agent_turn(
         format!("当前上下文：你在「{name}」场景中，当前对象：{title}（id: {oid}）{extra}。用户的请求针对该对象，请直接处理它。")
     });
 
-    // A stale sandbox root (heal failed) rides the same system-prompt channel
-    // so the model informs the user instead of retrying blindly.
-    let context_prompt = match (context_prompt, working_dir_warning) {
+    // The write directory rides the system prompt every turn: without it the
+    // model guesses where a relative path lands, and a wrong guess is invisible
+    // until a later file_read "cannot find" what the agent believes it wrote.
+    let context_prompt = match (context_prompt, workspace_note) {
         (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
         (Some(a), None) => Some(a),
         (None, b) => b,
@@ -1478,6 +1592,16 @@ pub async fn agent_delete_session(
     );
     let _ = std::fs::remove_file(&memory_path);
     let _ = std::fs::remove_file(memory_path.with_extension("jsonl.meta"));
+
+    // The session's automatic workspace goes with it: its contents are scratch
+    // by definition, and leaving one directory per deleted session behind would
+    // grow the app data dir forever. Never fatal — the row is what matters.
+    let workspace = session_workspace_dir(&state.app_data_dir, &session_id);
+    if workspace.is_dir() {
+        if let Err(e) = std::fs::remove_dir_all(&workspace) {
+            warn!(session_id=%session_id, error=%e, "remove session workspace failed");
+        }
+    }
 
     sqlx::query("DELETE FROM tool_executions WHERE session_id = ?")
         .bind(&session_id)

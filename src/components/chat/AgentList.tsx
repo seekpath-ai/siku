@@ -837,8 +837,8 @@ export function AgentList() {
         <AgentCreateDialog
           onClose={() => setShowCreate(false)}
           onCreate={handleNewAgent}
-          // No projectPath: new agents are project-less; the sandbox's
-          // "项目目录" option stays disabled until a project is bound.
+          // No projectPath: new agents are project-less; the "项目目录"
+          // write-dir option stays disabled until a project is bound.
         />
       )}
 

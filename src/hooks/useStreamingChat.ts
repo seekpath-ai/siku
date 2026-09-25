@@ -138,14 +138,19 @@ export function useStreamingChat() {
         if (e.tool_call_id && e.tool_name && e.step_index !== undefined) {
           state.ensureStreamingStep(e.step_index);
           // Update an existing tool call to pending; if it does not exist yet, add it.
+          // `outside_write_base` travels with the approval event and must land
+          // on BOTH paths: the tool_call that preceded this event (update) and
+          // a card created straight from this event (add).
           state.updateStreamingToolCall(e.step_index, e.tool_call_id, {
             status: 'pending',
+            outside_write_base: e.outside_write_base === true,
           });
           state.addStreamingToolCall(e.step_index, {
             id: e.tool_call_id,
             name: e.tool_name,
             arguments: (e.tool_args as Record<string, unknown>) || {},
             status: 'pending',
+            outside_write_base: e.outside_write_base === true,
           });
         }
         break;

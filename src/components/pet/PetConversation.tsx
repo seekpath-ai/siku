@@ -8,6 +8,7 @@ import type { PetContext } from '@/stores/petContextStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
 import { agentCancel, agentIsRunning, getChatMessages, getAgentSteps, notesCreate, noteCreateUnderPaper, readImageFile, settingsAppGet, settingsGet, settingsSet } from '@/lib/tauri';
 import { parseEvidence, buildNoteMarkdown } from '@/lib/evidence';
+import { formatFileToolApproval } from '@/lib/agent-tools';
 import type { EvidenceEntry } from '@/lib/evidence';
 import { MarkdownLink } from '@/components/chat/FilePathLink';
 import { assistantMarkdownComponents, assistantRehypePlugins, assistantRemarkPlugins, markdownUrlTransform } from '@/components/chat/markdownConfig';
@@ -475,20 +476,29 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
         break;
       case 'tool_approval_required': {
         const stepIndex = e.step_index;
+        // `outside_write_base` is computed by the backend and rides the
+        // approval event; carry it into the pending approval (and the tool
+        // card below) so the card can flag an out-of-directory write.
+        const outsideWriteBase = e.outside_write_base === true;
         st.setPendingApproval({
           toolCallId: e.tool_call_id ?? '',
           toolName: e.tool_name ?? '',
           args: e.tool_args ? JSON.stringify(e.tool_args, null, 1) : '',
           stepIndex,
+          outsideWriteBase,
         });
         if (e.tool_call_id && e.tool_name && stepIndex !== undefined) {
           st.ensureStreamingStep(stepIndex);
-          st.updateStreamingToolCall(stepIndex, e.tool_call_id, { status: 'pending' });
+          st.updateStreamingToolCall(stepIndex, e.tool_call_id, {
+            status: 'pending',
+            outside_write_base: outsideWriteBase,
+          });
           st.addStreamingToolCall(stepIndex, {
             id: e.tool_call_id,
             name: e.tool_name,
             arguments: e.tool_args || {},
             status: 'pending',
+            outside_write_base: outsideWriteBase,
           });
         }
         break;
@@ -687,6 +697,36 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
     return map;
   }, [store.agentSteps]);
 
+  // The pending approval carries its arguments as a JSON string. Parse it once
+  // and derive both the editable args and the display text from that single
+  // parse (two independent `JSON.parse` calls could disagree); when the string
+  // is not a JSON object the raw string stays the display text and the editor
+  // falls back to `{}`, as before.
+  const pendingApproval = store.pendingApproval;
+  const pendingApprovalArgs = useMemo(() => {
+    if (!pendingApproval) return null;
+    try {
+      const parsed: unknown = JSON.parse(pendingApproval.args);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  }, [pendingApproval]);
+  // Backend-injected `_`-prefixed pseudo-arguments are re-injected on
+  // execution, so they are hidden here (and from the "修改参数" editor).
+  const displayApprovalArgs = useMemo(
+    () =>
+      pendingApprovalArgs
+        ? Object.fromEntries(Object.entries(pendingApprovalArgs).filter(([key]) => !key.startsWith('_')))
+        : {},
+    [pendingApprovalArgs]
+  );
+  const approvalPreview = pendingApproval
+    ? formatFileToolApproval(pendingApproval.toolName, displayApprovalArgs)
+    : null;
+
   const handleStop = () => {
     if (petSessionId) agentCancel(petSessionId).catch(() => {});
   };
@@ -815,20 +855,16 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
       {/* Approval — same four-decision card as the main chat. */}
       <PetAskUserDialog />
 
-      {store.pendingApproval && store.session && (
+      {pendingApproval && store.session && (
         <div className="px-3 border-t border-surface-hover shrink-0">
           <ApprovalCard
-            toolCallId={store.pendingApproval.toolCallId}
-            toolName={store.pendingApproval.toolName}
-            command={store.pendingApproval.args}
+            toolCallId={pendingApproval.toolCallId}
+            toolName={pendingApproval.toolName}
+            command={approvalPreview ?? pendingApproval.args}
             compact
-            args={(() => {
-              try {
-                return JSON.parse(store.pendingApproval.args) as Record<string, unknown>;
-              } catch {
-                return {};
-              }
-            })()}
+            args={displayApprovalArgs}
+            disableCommandCollapse={approvalPreview !== null}
+            outsideWriteBase={pendingApproval.outsideWriteBase === true}
             sessionId={store.session.id}
             onDecision={(decision, localResult) => {
               const a = store.pendingApproval;

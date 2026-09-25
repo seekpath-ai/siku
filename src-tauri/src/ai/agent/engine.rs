@@ -55,6 +55,12 @@ pub enum AgentEvent {
         tool_call_id: String,
         tool_name: String,
         tool_args: serde_json::Value,
+        /// The call targets a path outside the session's default write
+        /// directory. Advisory only: nothing is blocked (there is no sandbox),
+        /// the approval card highlights it so the human sees a write leaving
+        /// the usual place.
+        #[serde(default)]
+        outside_write_base: bool,
     },
     StepComplete {
         session_id: String,
@@ -1069,12 +1075,18 @@ impl AgentEngine {
                     if auto_approved {
                         true
                     } else {
+                        // Advisory flag for the approval card; the call still
+                        // runs wherever it asks (there is no sandbox).
+                        let outside_write_base = self
+                            .tool_registry
+                            .writes_outside_write_dir(&tc.function.name, &args);
                         self.emit(&event_tx, |session_id| AgentEvent::ToolApprovalRequired {
                             session_id,
                             step_index,
                             tool_call_id: tool_id.clone(),
                             tool_name: tc.function.name.clone(),
                             tool_args: args.clone(),
+                            outside_write_base,
                         });
 
                         // Drain stale responses left in the channel by earlier

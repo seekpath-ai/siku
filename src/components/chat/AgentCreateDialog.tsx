@@ -11,7 +11,7 @@ import { useDialog } from '@/hooks/useDialog';
 
 interface Props {
   onClose: () => void;
-  /** Project directory for the default sandbox scope. */
+  /** Project directory offered as the "项目目录" write dir. */
   projectPath?: string;
   onCreate: (input: {
     title: string;
@@ -52,8 +52,9 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
   const [selectedProviderId, setSelectedProviderId] = useState<string>('');
   const [useCustomLlm, setUseCustomLlm] = useState(false);
   const [customLlm, setCustomLlm] = useState(defaultLlmBlock());
-  // New agents are project-less by default, so the working directory defaults
-  // to full-disk access (the user can bind a project later and re-scope).
+  // New agents are project-less by default, so no write dir is specified here
+  // (relative writes then land in the session's automatic workspace; the user
+  // can bind a project later and re-point it).
   const [workingDirMode, setWorkingDirMode] = useState<'project' | 'full'>('full');
   const [visionProviderId, setVisionProviderId] = useState('');
   const [webProxy, setWebProxy] = useState('');
@@ -219,19 +220,22 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
           </div>
 
           <div className="space-y-2 border-t border-codex-border pt-3">
-            <h4 className="text-xs font-semibold text-codex-muted uppercase tracking-wide">工作目录</h4>
+            <h4 className="text-xs font-semibold text-codex-muted uppercase tracking-wide">写入目录（相对路径默认落点）</h4>
             <select
               value={workingDirMode}
               onChange={(e) => setWorkingDirMode(e.target.value as 'project' | 'full')}
               className="w-full bg-codex-bg border border-codex-border rounded-lg px-3 py-2 text-sm text-codex-primary outline-none focus:border-codex-border-light"
             >
               <option value="project" disabled={!projectPath}>
-                {projectPath ? `项目目录（沙箱）：${projectPath}` : '项目目录（未绑定项目，不可用）'}
+                {projectPath ? `项目目录：${projectPath}` : '项目目录（未绑定项目，不可用）'}
               </option>
-              <option value="full">全盘访问（无限制）</option>
+              <option value="full">不指定（用会话工作区）</option>
             </select>
             <p className="text-[11px] text-codex-muted">
-              文件工具（file_read / file_write / file_edit / file_grep / file_glob）只能操作所选目录；选择全盘访问则不受限制。
+              写入目录只是相对路径的默认落点，不是沙箱：绝对路径可以指向任意位置；落在该目录之外的写入会在审批卡上高亮提醒。
+            </p>
+            <p className="text-[11px] text-codex-muted">
+              未指定时，文件写入会落在该会话的自动工作区（可在会话配置里查看、打开或清空）。
             </p>
           </div>
 

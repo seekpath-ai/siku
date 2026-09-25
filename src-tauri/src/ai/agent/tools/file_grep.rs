@@ -26,7 +26,7 @@ impl Tool for FileGrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search text files within the working directory for a substring, returning matching lines with file and line numbers. Matching is a case-sensitive substring search (not regex). Read-only, auto-approved."
+        "Search text files (from the session's write directory by default; absolute paths may point anywhere) for a substring, returning matching lines with file and line numbers. Matching is a case-sensitive substring search (not regex). Read-only, auto-approved."
     }
 
     fn parameters(&self) -> Vec<ToolParameter> {
@@ -40,7 +40,7 @@ impl Tool for FileGrepTool {
             ToolParameter {
                 name: "path".into(),
                 param_type: "string".into(),
-                description: "Optional file or directory to scope the search (relative to the working directory)".into(),
+                description: "Optional file or directory to scope the search (relative paths resolve against the write directory)".into(),
                 required: false,
             },
             ToolParameter {

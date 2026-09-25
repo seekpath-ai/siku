@@ -382,6 +382,22 @@ export async function agentSetApprovalConfig(
   return invoke<void>('agent_set_approval_config', { sessionId, approvalConfig });
 }
 
+/** Absolute path of the session's automatic workspace
+ *  (`app_data_dir/agent_workspaces/<session_id>`). This is where relative paths
+ *  land when the session has no write directory. The backend creates the
+ *  directory on demand, so a successful call always names an existing path. */
+export async function agentSessionWorkspace(sessionId: string): Promise<string> {
+  return invoke<string>('agent_session_workspace', { sessionId });
+}
+
+/** Clear the session's automatic workspace (its files are removed).
+ *  Irreversible — confirm with the user before calling. Whether the directory
+ *  itself survives is the backend's decision; the frontend only re-reads the
+ *  path afterwards and never assumes a shape. */
+export async function agentSessionWorkspaceClear(sessionId: string): Promise<void> {
+  return invoke<void>('agent_session_workspace_clear', { sessionId });
+}
+
 /** Launch the OS-native region screenshot tool; the captured image lands in
  * the clipboard and is attached automatically on window refocus. */
 export async function screenshotStart(): Promise<string> {

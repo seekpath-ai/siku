@@ -315,6 +315,11 @@ export interface ToolCallInfo {
   result?: string;
   status: 'pending' | 'running' | 'completed' | 'error' | 'timeout';
   duration_ms?: number;
+  /** The backend computed that this call's target path lies outside the
+   *  session's write directory (relative-path default). Advisory only — the
+   *  call is not blocked; the approval card flags it. Absent = not computed
+   *  (older backend, or a tool with no path to judge). */
+  outside_write_base?: boolean;
 }
 
 /** A ReAct step while it is still streaming. */
@@ -351,6 +356,10 @@ export interface AgentStreamEvent {
   tool_result?: string;
   status?: string;
   duration_ms?: number;
+  /** Only sent with `tool_approval_required`: the backend already decided
+   *  whether the target path is outside the session's write directory. Never
+   *  derived on the frontend. */
+  outside_write_base?: boolean;
   tokens_used?: number | null;
   tokens_in?: number | null;
   tokens_in_hit?: number | null;

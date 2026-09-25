@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Wrench, ChevronDown, ChevronRight, Loader2, CheckCircle2, XCircle, Clock, Timer } from 'lucide-react';
 import type { ToolCallInfo } from '@/lib/types';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
+import { formatFileToolApproval } from '@/lib/agent-tools';
 import { ApprovalCard } from './ApprovalCard';
 import { TerminalOutput } from './TerminalOutput';
 
@@ -46,12 +47,21 @@ export function ToolCallCard({ toolCall }: Props) {
   const status = statusConfig[toolCall.status] ?? statusConfig.pending;
 
   if (toolCall.status === 'pending') {
+    // Drop the backend-injected pseudo-arguments (`_working_dir` and friends):
+    // they are re-injected on every execution, so showing or editing them here
+    // is noise. The `command` / `shell_command` priority is unchanged.
+    const displayArgs = Object.fromEntries(
+      Object.entries(toolCall.arguments).filter(([key]) => !key.startsWith('_'))
+    );
+    // File-writing tools get a content preview instead of a JSON dump.
+    const preview = formatFileToolApproval(toolCall.name, displayArgs);
     const command =
-      typeof toolCall.arguments.command === 'string'
-        ? toolCall.arguments.command
-        : typeof toolCall.arguments.shell_command === 'string'
-          ? toolCall.arguments.shell_command
-          : JSON.stringify(toolCall.arguments);
+      preview ??
+      (typeof displayArgs.command === 'string'
+        ? displayArgs.command
+        : typeof displayArgs.shell_command === 'string'
+          ? displayArgs.shell_command
+          : JSON.stringify(displayArgs));
     return (
       <div className="flex gap-4">
         <div className="w-8 h-8 rounded-full shrink-0 flex items-center justify-center text-[14px] font-semibold bg-gradient-to-br from-codex-accent to-emerald-700 text-black">
@@ -62,7 +72,14 @@ export function ToolCallCard({ toolCall }: Props) {
             <span className="text-[13px] font-semibold text-codex-primary">{agentName}</span>
             <ApprovalCountdown />
           </div>
-          <ApprovalCard toolCallId={toolCall.id} toolName={toolCall.name} command={command} args={toolCall.arguments} />
+          <ApprovalCard
+            toolCallId={toolCall.id}
+            toolName={toolCall.name}
+            command={command}
+            args={displayArgs}
+            disableCommandCollapse={preview !== null}
+            outsideWriteBase={toolCall.outside_write_base === true}
+          />
         </div>
       </div>
     );

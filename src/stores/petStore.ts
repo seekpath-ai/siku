@@ -38,6 +38,9 @@ export interface PetApproval {
   toolName: string;
   args: string;
   stepIndex?: number;
+  /** Backend-computed: the target path is outside the session's write
+   *  directory. Advisory — surfaced as a warning on the approval card. */
+  outsideWriteBase?: boolean;
 }
 
 interface PetState {

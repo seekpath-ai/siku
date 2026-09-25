@@ -22,6 +22,12 @@ pub struct MemoryRecord {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// The chain of thought that produced this assistant message. Replayed to
+    /// the API on later turns when the provider wants it (DeepSeek thinking
+    /// models require it whenever tools are in play, and use it to continue
+    /// the same train of thought).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 pub struct MemoryStore {
@@ -79,6 +85,7 @@ impl MemoryStore {
     }
 
     /// Append a message record to the JSONL file.
+    #[allow(clippy::too_many_arguments)]
     pub fn append(
         &self,
         role: &str,
@@ -87,6 +94,7 @@ impl MemoryStore {
         tool_call_id: Option<&str>,
         tool_name: Option<&str>,
         attachments: Option<&str>,
+        reasoning_content: Option<&str>,
     ) {
         let now = Utc::now();
         let record = MemoryRecord {
@@ -98,6 +106,7 @@ impl MemoryStore {
             tool_calls: tool_calls.map(|s| s.to_string()),
             tool_call_id: tool_call_id.map(|s| s.to_string()),
             tool_name: tool_name.map(|s| s.to_string()),
+            reasoning_content: reasoning_content.map(|s| s.to_string()),
         };
 
         let line = match serde_json::to_string(&record) {

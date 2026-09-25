@@ -431,12 +431,18 @@ export async function agentRenameSession(sessionId: string, title: string): Prom
   return invoke<void>('agent_rename_session', { sessionId, title });
 }
 
-/** Answer a pending AskUserQuestion dialog for a session. */
+/** Answer a pending AskUserQuestion dialog for a session.
+ *
+ *  `answers` is the per-question reply; `note` is the user's free-form message
+ *  (optional). The backend hands both to the model together, with the note
+ *  marked as authoritative — it is how the user says "stop asking, do this"
+ *  without abandoning the questions. */
 export async function agentAnswerUser(
   sessionId: string,
-  answers: { question: string; answer: string }[],
+  answers: { question: string; answer: string; custom?: boolean }[],
+  note?: string,
 ): Promise<void> {
-  return invoke<void>('agent_answer_user', { sessionId, answers });
+  return invoke<void>('agent_answer_user', { sessionId, answers, note: note ?? '' });
 }
 
 // ============================================================

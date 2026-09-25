@@ -52,6 +52,12 @@ impl ConversationMemory {
                     + 5;
             }
         }
+        // Replayed thinking counts toward the input: DeepSeek concatenates it
+        // into the context, so ignoring it here would let the real request
+        // overflow the budget the truncator was respecting.
+        if let Some(reasoning) = &m.reasoning_content {
+            tokens += Self::estimate_tokens(reasoning);
+        }
         tokens
     }
 
@@ -87,7 +93,7 @@ impl ConversationMemory {
         if let Some(sys) = &self.system_prompt {
             let sys_tokens = Self::estimate_tokens(sys);
             used += sys_tokens + 10;
-            result.push(crate::ai::llm::ChatMessage {
+            result.push(crate::ai::llm::ChatMessage { reasoning_content: None,
                 role: "system".to_string(),
                 content: sys.clone(),
                 attachments: None,
@@ -97,85 +103,139 @@ impl ConversationMemory {
             });
         }
 
-        // Keep most recent messages first (reverse iterate)
+        // Keep the most recent messages, walking BACKWARDS in whole blocks.
+        //
+        // A block = an assistant message carrying tool_calls plus every tool
+        // response that follows it. The API rejects a request where even one
+        // response is missing, and a response is meaningless without the message
+        // that asked for it, so a block is indivisible. Keeping blocks (instead
+        // of pulling the assistant in as a "piggyback" on its last response and
+        // then reversing the list) also preserves their order: the old code
+        // emitted `tool(x), assistant(tool_calls=[x,y]), tool(y)`, which strict
+        // providers answer with 400 "the following tool_call_ids did not have
+        // response messages".
         let recent: Vec<&crate::ai::llm::ChatMessage> = messages
             .iter()
             .filter(|m| m.role != "system")
             .collect();
 
-        // Take from the end (most recent), keeping tool+assistant pairs together
-        let mut kept_recent: Vec<&crate::ai::llm::ChatMessage> = Vec::new();
-        let mut i = 0;
-        while i < recent.len() {
-            let msg = &recent[recent.len() - 1 - i];
-            // If this is a tool message, also keep the preceding assistant message
-            let extra = if msg.role == "tool" && i + 1 < recent.len() {
-                let prev = &recent[recent.len() - 2 - i];
-                if prev.role == "assistant" && prev.tool_calls.is_some() {
-                    Some(prev)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            let pair_tokens = Self::estimate_message_tokens(msg)
-                + extra.map(|m| Self::estimate_message_tokens(m)).unwrap_or(0);
-
-            if used + pair_tokens <= budget {
-                if let Some(e) = extra {
-                    used += Self::estimate_message_tokens(e);
-                    kept_recent.push(e);
-                    i += 1;
-                }
-                used += Self::estimate_message_tokens(msg);
-                kept_recent.push(msg);
-                i += 1;
+        let mut kept: Vec<&[&crate::ai::llm::ChatMessage]> = Vec::new();
+        let mut end = recent.len();
+        while end > 0 {
+            let start = Self::block_start(&recent, end);
+            let block_tokens: usize = recent[start..end]
+                .iter()
+                .map(|m| Self::estimate_message_tokens(m))
+                .sum();
+            if used + block_tokens <= budget {
+                used += block_tokens;
+                kept.push(&recent[start..end]);
+                end = start;
             } else {
                 break;
             }
         }
 
-        // Safety net: the most recent message (the current turn) must survive
-        // even when it alone exceeds the budget — dropping it leaves the model
-        // staring at an empty human turn (or pure system prompt) and it will
-        // hallucinate from the system prompt instead of answering.
-        if kept_recent.is_empty() {
-            if let Some(newest) = recent.last() {
-                kept_recent.push(newest);
+        // Safety net: something has to survive even when the budget is already
+        // blown, and it must be a message that can stand on its own. Dropping
+        // everything leaves the model staring at a bare system prompt (it then
+        // hallucinates from that instead of answering); keeping a lone tool
+        // response is worse still, since it is unsendable by definition.
+        if kept.is_empty() {
+            if let Some(idx) = recent.iter().rposition(|m| m.role != "tool") {
+                kept.push(std::slice::from_ref(&recent[idx]));
             }
         }
 
-        // Add back in original order
-        for msg in kept_recent.iter().rev() {
-            result.push((*msg).clone());
+        // Add back in original order.
+        for block in kept.iter().rev() {
+            for msg in block.iter() {
+                result.push((*msg).clone());
+            }
         }
 
-        // Drop orphaned tool messages. Budget exhaustion can split a tool
-        // group: the tool responses fit individually but the assistant
-        // carrying their tool_calls (bulky arguments) does not, leaving
-        // `tool` messages with no preceding tool_calls. Strict providers
-        // (DeepSeek) reject the whole request with a 400 — every later round
-        // hits the same split point, so the turn never recovers. An orphaned
-        // response is unsendable by definition; dropping it keeps the
-        // request valid.
-        let mut tool_group_open = false;
-        result.retain(|m| {
-            match m.role.as_str() {
-                "assistant" => {
-                    tool_group_open = m.tool_calls.is_some();
-                    true
-                }
-                "tool" => tool_group_open,
-                _ => {
-                    tool_group_open = false;
-                    true
-                }
-            }
-        });
+        // Final guarantee: a sendable tail. No orphan responses, no assistant
+        // whose responses were left behind.
+        Self::repair_tool_pairing(&mut result);
 
         result
+    }
+
+    /// Start index of the block that ends at `end` (exclusive).
+    ///
+    /// A block is a run of `tool` messages together with the assistant message
+    /// that carries their `tool_calls`, when that assistant directly precedes
+    /// the run.
+    fn block_start(recent: &[&crate::ai::llm::ChatMessage], end: usize) -> usize {
+        let mut start = end - 1;
+        if recent[start].role == "tool" {
+            while start > 0 && recent[start - 1].role == "tool" {
+                start -= 1;
+            }
+            if start > 0
+                && recent[start - 1].role == "assistant"
+                && recent[start - 1].tool_calls.is_some()
+            {
+                start -= 1;
+            }
+        }
+        start
+    }
+
+    /// Make a message list sendable by dropping tool groups that are not whole:
+    /// `tool` messages nobody asked for, and an assistant whose `tool_calls` are
+    /// not all answered immediately after it. Both shapes are hard 400s on
+    /// strict providers (OpenAI, DeepSeek), and one split group would poison
+    /// every later request of the turn, so this runs before every request as a
+    /// last line of defence.
+    pub fn repair_tool_pairing(messages: &mut Vec<crate::ai::llm::ChatMessage>) {
+        let before = messages.len();
+        let mut out: Vec<crate::ai::llm::ChatMessage> = Vec::with_capacity(before);
+        let mut i = 0;
+        while i < messages.len() {
+            let msg = &messages[i];
+            if msg.role == "assistant" && msg.tool_calls.is_some() {
+                let ids: Vec<&str> = msg
+                    .tool_calls
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|c| c.id.as_str())
+                    .collect();
+                let mut j = i + 1;
+                let mut answered: Vec<&str> = Vec::new();
+                while j < messages.len() && messages[j].role == "tool" {
+                    if let Some(id) = messages[j].tool_call_id.as_deref() {
+                        answered.push(id);
+                    }
+                    j += 1;
+                }
+                if ids.iter().all(|id| answered.contains(id)) {
+                    for m in &messages[i..j] {
+                        out.push(m.clone());
+                    }
+                } else {
+                    // We cannot invent the missing answer, so the group goes.
+                    tracing::warn!(
+                        missing = ids.len() - answered.len(),
+                        "dropping an incomplete tool group before the request"
+                    );
+                }
+                i = j;
+                continue;
+            }
+            if msg.role == "tool" {
+                // Orphan response: its assistant never made the request.
+                i += 1;
+                continue;
+            }
+            out.push(msg.clone());
+            i += 1;
+        }
+        if out.len() != before {
+            tracing::debug!(before, after = out.len(), "repaired tool pairing");
+        }
+        *messages = out;
     }
 }
 
@@ -204,7 +264,7 @@ mod tests {
     fn test_truncate_keeps_recent() {
         let memory = ConversationMemory::new(500, Some("You are helpful.".into()));
         let messages: Vec<crate::ai::llm::ChatMessage> = (0..50)
-            .map(|i| crate::ai::llm::ChatMessage {
+            .map(|i| crate::ai::llm::ChatMessage { reasoning_content: None,
                 role: "user".to_string(),
                 content: format!("message {}", i),
                 attachments: None,
@@ -220,9 +280,175 @@ mod tests {
         assert_eq!(truncated[0].role, "system");
     }
 
+    // ── tool-group integrity ────────────────────────────────────────────────
+    // Regression: a request that carries `tool_calls` without a response for
+    // every id is a hard 400 on strict providers ("An assistant message with
+    // 'tool_calls' must be followed by tool messages responding to each
+    // 'tool_call_id'").
+
+    fn msg(role: &str, content: &str) -> crate::ai::llm::ChatMessage {
+        crate::ai::llm::ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            attachments: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn assistant_with_calls(ids: &[&str], filler: usize) -> crate::ai::llm::ChatMessage {
+        let mut m = msg("assistant", &"t".repeat(filler));
+        m.tool_calls = Some(
+            ids.iter()
+                .map(|id| crate::ai::llm::ToolCall {
+                    id: (*id).to_string(),
+                    call_type: "function".to_string(),
+                    function: crate::ai::llm::FunctionCall {
+                        name: "file_read".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                })
+                .collect(),
+        );
+        m
+    }
+
+    fn tool_result(id: &str, content: &str) -> crate::ai::llm::ChatMessage {
+        let mut m = msg("tool", content);
+        m.tool_call_id = Some(id.to_string());
+        m
+    }
+
+    /// Every assistant tool_call must be answered right after it, in order, and
+    /// every tool response must be preceded by its request.
+    fn assert_sendable(messages: &[crate::ai::llm::ChatMessage]) {
+        let mut i = 0;
+        while i < messages.len() {
+            let m = &messages[i];
+            if m.role == "assistant" && m.tool_calls.is_some() {
+                let ids: Vec<&str> = m
+                    .tool_calls
+                    .as_deref()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c.id.as_str())
+                    .collect();
+                let mut j = i + 1;
+                let mut answered: Vec<&str> = Vec::new();
+                while j < messages.len() && messages[j].role == "tool" {
+                    answered.push(messages[j].tool_call_id.as_deref().unwrap_or(""));
+                    j += 1;
+                }
+                for id in &ids {
+                    assert!(
+                        answered.contains(id),
+                        "tool_call {id} has no response: {:?}",
+                        messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+                    );
+                }
+                i = j;
+                continue;
+            }
+            assert_ne!(
+                m.role, "tool",
+                "orphan tool response: {:?}",
+                messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+            );
+            i += 1;
+        }
+    }
+
+    /// Two responses for one assistant message must stay AFTER it, in their
+    /// original order. The old keep-loop pulled the assistant in as a
+    /// piggyback on the last response and reversed the list, producing
+    /// `tool(x), assistant([x, y]), tool(y)`.
+    #[test]
+    fn test_truncate_keeps_tool_group_order() {
+        let memory = ConversationMemory::new(100_000, Some("sys".into()));
+        let messages = vec![
+            msg("user", "do two reads"),
+            assistant_with_calls(&["call_x", "call_y"], 20),
+            tool_result("call_x", "first result"),
+            tool_result("call_y", "second result"),
+        ];
+
+        let out = memory.truncate(&messages, 0);
+
+        assert_sendable(&out);
+        let roles: Vec<&str> = out.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["system", "user", "assistant", "tool", "tool"]);
+        assert_eq!(out[3].tool_call_id.as_deref(), Some("call_x"));
+        assert_eq!(out[4].tool_call_id.as_deref(), Some("call_y"));
+    }
+
+    /// A group that does not fit must be dropped whole: never a bare assistant
+    /// with unanswered tool_calls, never a response whose request is gone.
+    #[test]
+    fn test_truncate_never_splits_a_tool_group() {
+        // ~25 chars ≈ 10 tokens each; the budget fits the newest user message
+        // plus roughly one block, never all of them.
+        let memory = ConversationMemory::new(120, None);
+        let messages = vec![
+            msg("user", "old question"),
+            assistant_with_calls(&["call_a", "call_b"], 400),
+            tool_result("call_a", &"a".repeat(400)),
+            tool_result("call_b", &"b".repeat(400)),
+            msg("user", "new question"),
+        ];
+
+        let out = memory.truncate(&messages, 0);
+
+        assert_sendable(&out);
+        assert!(
+            out.iter().any(|m| m.role == "user" && m.content == "new question"),
+            "the current turn must survive: {:?}",
+            out.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The repair pass is the last line of defence: whatever produced a broken
+    /// pair, nothing unsendable may leave for the provider.
+    #[test]
+    fn test_repair_drops_incomplete_groups_and_orphans() {
+        let mut messages = vec![
+            msg("user", "hi"),
+            // Assistant whose second call was never answered (a split group).
+            assistant_with_calls(&["call_x", "call_y"], 0),
+            tool_result("call_x", "only one answer"),
+            // Unrelated orphan response.
+            tool_result("call_z", "nobody asked"),
+            msg("user", "next"),
+        ];
+
+        ConversationMemory::repair_tool_pairing(&mut messages);
+
+        assert_sendable(&messages);
+        let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "user"]);
+    }
+
+    /// A complete group is left exactly as it is.
+    #[test]
+    fn test_repair_keeps_complete_groups() {
+        let mut messages = vec![
+            msg("user", "hi"),
+            assistant_with_calls(&["call_x"], 0),
+            tool_result("call_x", "answer"),
+            msg("assistant", "done"),
+        ];
+        let before = messages.len();
+
+        ConversationMemory::repair_tool_pairing(&mut messages);
+
+        assert_eq!(messages.len(), before);
+        assert_sendable(&messages);
+    }
+
     #[test]
     fn test_estimate_counts_tool_calls_and_attachments() {
-        let plain = crate::ai::llm::ChatMessage {
+        let plain = crate::ai::llm::ChatMessage { reasoning_content: None,
             role: "assistant".to_string(),
             content: "hi".to_string(),
             attachments: None,
@@ -230,7 +456,7 @@ mod tests {
             tool_call_id: None,
             name: None,
         };
-        let with_extras = crate::ai::llm::ChatMessage {
+        let with_extras = crate::ai::llm::ChatMessage { reasoning_content: None,
             role: "assistant".to_string(),
             content: "hi".to_string(),
             attachments: Some("x".repeat(400)),
@@ -263,7 +489,7 @@ mod tests {
         // current turn) must survive.
         let memory = ConversationMemory::new(1000, Some("sys".into()));
         let mut messages: Vec<crate::ai::llm::ChatMessage> = (0..100)
-            .map(|i| crate::ai::llm::ChatMessage {
+            .map(|i| crate::ai::llm::ChatMessage { reasoning_content: None,
                 role: "user".to_string(),
                 content: format!("old message {i} {}", "z".repeat(40)),
                 attachments: None,
@@ -272,7 +498,7 @@ mod tests {
                 name: None,
             })
             .collect();
-        messages.push(crate::ai::llm::ChatMessage {
+        messages.push(crate::ai::llm::ChatMessage { reasoning_content: None,
             role: "user".to_string(),
             content: "current question".to_string(),
             attachments: None,
@@ -303,7 +529,7 @@ mod tests {
         // re-hits the same split.
         let memory = ConversationMemory::new(1000, Some("sys".into()));
         let big = "y".repeat(1200); // ~300 tokens per message
-        let user_msg = |content: &str| crate::ai::llm::ChatMessage {
+        let user_msg = |content: &str| crate::ai::llm::ChatMessage { reasoning_content: None,
             role: "user".to_string(),
             content: content.to_string(),
             attachments: None,
@@ -311,7 +537,7 @@ mod tests {
             tool_call_id: None,
             name: None,
         };
-        let tool_msg = |content: String| crate::ai::llm::ChatMessage {
+        let tool_msg = |content: String| crate::ai::llm::ChatMessage { reasoning_content: None,
             role: "tool".to_string(),
             content,
             attachments: None,
@@ -319,7 +545,7 @@ mod tests {
             tool_call_id: Some("call_1".to_string()),
             name: Some("file_read".to_string()),
         };
-        let assistant_tc = crate::ai::llm::ChatMessage {
+        let assistant_tc = crate::ai::llm::ChatMessage { reasoning_content: None,
             role: "assistant".to_string(),
             content: String::new(),
             attachments: None,
@@ -366,7 +592,7 @@ mod tests {
             "base64": "A".repeat(300_000),
         }])
         .to_string();
-        let msg = crate::ai::llm::ChatMessage {
+        let msg = crate::ai::llm::ChatMessage { reasoning_content: None,
             role: "user".to_string(),
             content: "描述图片".to_string(),
             attachments: Some(attachments),
@@ -393,7 +619,7 @@ mod tests {
         }])
         .to_string();
         let messages = vec![
-            crate::ai::llm::ChatMessage {
+            crate::ai::llm::ChatMessage { reasoning_content: None,
                 role: "user".to_string(),
                 content: "old question".to_string(),
                 attachments: None,
@@ -401,7 +627,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
             },
-            crate::ai::llm::ChatMessage {
+            crate::ai::llm::ChatMessage { reasoning_content: None,
                 role: "user".to_string(),
                 content: "描述图片".to_string(),
                 attachments: Some(attachments),

@@ -19,7 +19,7 @@ impl Tool for AskUserTool {
     }
 
     fn description(&self) -> &str {
-        "Ask the user a structured multiple-choice question. questions: array of { question, header?, options: [{ label, description? }], multi_select? }. Use when you need clarification or a choice before continuing."
+        "Ask the user a structured multiple-choice question. questions: array of { question, header?, options: [{ label, description? }], multi_select? }. Use when you need clarification or a choice before continuing. The user is never limited to the options: they can type their own answer for any question, and can add a free-form message (supplementary instructions, a correction, or \"stop asking and do X\"). Treat such input as authoritative — it overrides the options — and follow it instead of re-asking."
     }
 
     fn readonly(&self) -> bool {
@@ -30,7 +30,7 @@ impl Tool for AskUserTool {
         vec![ToolParameter {
             name: "questions".into(),
             param_type: "array".into(),
-            description: "1-4 questions, each with question text and 2-4 options".into(),
+            description: "1-4 questions, each with question text and 2-4 options. Options are a menu, not a fence: the user may answer in their own words instead.".into(),
             required: true,
         }]
     }

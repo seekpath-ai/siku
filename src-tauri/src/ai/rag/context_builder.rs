@@ -115,14 +115,14 @@ pub fn build_rag_messages(
     let context = build_context(results, query);
 
     vec![
-        crate::ai::llm::ChatMessage {
+        crate::ai::llm::ChatMessage { reasoning_content: None,
             role: "system".to_string(),
             content: system_prompt.unwrap_or(
                 "You are a research assistant. Answer questions based on the provided literature excerpts. Always cite sources using [n] notation."
             ).to_string(),
             attachments: None, tool_calls: None, tool_call_id: None, name: None,
         },
-        crate::ai::llm::ChatMessage {
+        crate::ai::llm::ChatMessage { reasoning_content: None,
             role: "user".to_string(),
             content: context,
             attachments: None, tool_calls: None, tool_call_id: None, name: None,

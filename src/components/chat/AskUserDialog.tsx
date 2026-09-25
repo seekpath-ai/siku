@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Bot, Timer } from 'lucide-react';
+import { Bot, Timer, MessageSquarePlus } from 'lucide-react';
 import type { AskAnswer } from '@/lib/types';
 import { useChatStore } from '@/stores/chatStore';
 import { usePetStore } from '@/stores/petStore';
@@ -31,8 +31,9 @@ function TimeoutCountdown() {
 
 interface AskUserQuestionsProps {
   questions: AskQuestion[];
-  /** Hand the answers back to the agent that asked. */
-  onAnswer: (answers: AskAnswer[]) => Promise<void> | void;
+  /** Hand the answers — plus the user's free-form message, if any — back to the
+   *  agent that asked. */
+  onAnswer: (answers: AskAnswer[], note: string) => Promise<void> | void;
   /** Closing without answering must still unblock the backend — otherwise it
    *  waits out the full timeout with the whole turn frozen. */
   onDismiss: () => Promise<void> | void;
@@ -40,18 +41,38 @@ interface AskUserQuestionsProps {
 
 /** Presentation for the agent's AskUserQuestion tool, shared by the chat panel
  *  and the pet panel: the two have separate stores but must behave identically,
- *  including the countdown and the "answer to unblock" rule. */
+ *  including the countdown and the "answer to unblock" rule.
+ *
+ *  The agent's options are a menu, never a fence: every question also accepts a
+ *  typed answer, and the dialog carries one free-form message for the agent.
+ *  That message is the escape hatch — it lets the user redirect the agent
+ *  ("别问了，直接改成周报格式") without first satisfying every question. */
 export function AskUserQuestionsDialog({ questions, onAnswer, onDismiss }: AskUserQuestionsProps) {
   const [answers, setAnswers] = useState<Record<number, string[]>>({});
+  /** Per-question text the user typed instead of picking an option. */
+  const [customs, setCustoms] = useState<Record<number, string>>({});
+  /** Free-form message for the agent, tied to no particular question. */
+  const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
   if (questions.length === 0) return null;
 
+  const customText = (qi: number) => (customs[qi] ?? '').trim();
+  /** The answer that will be sent for one question; '' = unanswered. */
+  const answerText = (qi: number) => customText(qi) || (answers[qi] ?? []).join(', ');
+  const answeredCount = questions.filter((_, i) => answerText(i) !== '').length;
+  const allAnswered = answeredCount === questions.length;
+  // Typing a message is itself a valid reply: the user may override the whole
+  // dialog instead of answering it point by point.
+  const canSubmit = allAnswered || note.trim() !== '';
+
   const toggle = (qi: number, label: string) => {
+    // Picking an option drops any typed answer for that question: the two are
+    // mutually exclusive, so the model never receives a contradictory pair.
+    setCustoms((prev) => ({ ...prev, [qi]: '' }));
     setAnswers((prev) => {
       const cur = prev[qi] ?? [];
-      const multi = questions[qi]?.multi_select;
-      if (multi) {
+      if (questions[qi]?.multi_select) {
         return {
           ...prev,
           [qi]: cur.includes(label) ? cur.filter((x) => x !== label) : [...cur, label],
@@ -61,17 +82,35 @@ export function AskUserQuestionsDialog({ questions, onAnswer, onDismiss }: AskUs
     });
   };
 
+  const typeCustom = (qi: number, text: string) => {
+    setCustoms((prev) => ({ ...prev, [qi]: text }));
+    if (text.trim() !== '') {
+      setAnswers((prev) => ({ ...prev, [qi]: [] }));
+    }
+  };
+
+  const reset = () => {
+    setAnswers({});
+    setCustoms({});
+    setNote('');
+  };
+
   const handleSubmit = async () => {
-    const allAnswered = questions.every((_, i) => (answers[i] ?? []).length > 0);
-    if (!allAnswered) return;
+    if (!canSubmit || submitting) return;
     setSubmitting(true);
     try {
-      const result: AskAnswer[] = questions.map((q, i) => ({
-        question: q.question,
-        answer: (answers[i] ?? []).join(', '),
-      }));
-      await onAnswer(result);
-      setAnswers({});
+      const result: AskAnswer[] = questions.map((q, i) => {
+        const typed = customText(i);
+        return {
+          question: q.question,
+          answer: answerText(i),
+          // Typed answers are labelled for the model so it cannot read them as
+          // one of its own options.
+          custom: typed !== '',
+        };
+      });
+      await onAnswer(result, note.trim());
+      reset();
     } catch (err) {
       console.error('Failed to answer:', err);
     } finally {
@@ -85,7 +124,7 @@ export function AskUserQuestionsDialog({ questions, onAnswer, onDismiss }: AskUs
     } catch (err) {
       console.error('Failed to dismiss ask_user:', err);
     }
-    setAnswers({});
+    reset();
   };
 
   return (
@@ -108,7 +147,8 @@ export function AskUserQuestionsDialog({ questions, onAnswer, onDismiss }: AskUs
               <div className="text-sm text-codex-primary mb-2">{q.question}</div>
               <div className="space-y-1">
                 {q.options.map((opt) => {
-                  const selected = (answers[qi] ?? []).includes(opt.label);
+                  const selected =
+                    (answers[qi] ?? []).includes(opt.label) && customText(qi) === '';
                   return (
                     <button
                       key={opt.label}
@@ -127,10 +167,48 @@ export function AskUserQuestionsDialog({ questions, onAnswer, onDismiss }: AskUs
                   );
                 })}
               </div>
+              <input
+                value={customs[qi] ?? ''}
+                onChange={(e) => typeCustom(qi, e.target.value)}
+                placeholder="其它（也可以自己输入）"
+                spellCheck={false}
+                className={`mt-1.5 w-full rounded-lg px-3 py-2 text-[13px] outline-none transition-colors ${
+                  customText(qi) !== ''
+                    ? 'bg-codex-accent/15 border border-codex-accent/50 text-codex-primary placeholder:text-codex-muted'
+                    : 'bg-codex-bg border border-codex-border text-codex-primary placeholder:text-codex-secondary/50 focus:border-codex-border-light'
+                }`}
+              />
             </div>
           ))}
         </div>
-        <div className="flex justify-end gap-2 mt-5">
+
+        {/* Free-form message: an answer that outranks the questions above. */}
+        <div className="mt-5 pt-4 border-t border-codex-border">
+          <div className="flex items-center gap-1.5 text-[11px] text-codex-muted mb-1.5">
+            <MessageSquarePlus size={12} />
+            想对智能体说的话（可选）
+          </div>
+          <textarea
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            rows={2}
+            spellCheck={false}
+            placeholder="补充说明、纠正方向，或直接说「别问了，按 X 做」——填了它就可以不逐题作答"
+            className="w-full resize-y rounded-lg bg-codex-bg border border-codex-border px-3 py-2 text-[13px] text-codex-primary outline-none focus:border-codex-border-light placeholder:text-codex-secondary/50"
+          />
+        </div>
+
+        <div className="flex items-center justify-end gap-2 mt-4">
+          {!canSubmit && (
+            <span className="mr-auto text-[11px] text-codex-muted">
+              每题选择或自行输入，或直接在下方留言
+            </span>
+          )}
+          {canSubmit && !allAnswered && (
+            <span className="mr-auto text-[11px] text-codex-muted">
+              已答 {answeredCount}/{questions.length} 题，将连同留言一起发送
+            </span>
+          )}
           <button
             onClick={dismiss}
             className="px-3 py-1.5 rounded-lg border border-codex-border text-[13px] text-codex-secondary hover:bg-codex-hover"
@@ -139,7 +217,7 @@ export function AskUserQuestionsDialog({ questions, onAnswer, onDismiss }: AskUs
           </button>
           <button
             onClick={handleSubmit}
-            disabled={submitting || questions.some((_, i) => (answers[i] ?? []).length === 0)}
+            disabled={submitting || !canSubmit}
             className="px-4 py-1.5 rounded-lg bg-codex-accent text-black text-[13px] font-semibold hover:bg-codex-accent-hover disabled:opacity-50"
           >
             提交
@@ -164,9 +242,9 @@ export function AskUserDialog() {
   return (
     <AskUserQuestionsDialog
       questions={questions}
-      onAnswer={async (answers) => {
+      onAnswer={async (answers, note) => {
         if (!activeSessionId) return;
-        await agentAnswerUser(activeSessionId, answers);
+        await agentAnswerUser(activeSessionId, answers, note);
         setPendingQuestions(null);
       }}
       onDismiss={async () => {
@@ -195,8 +273,8 @@ export function PetAskUserDialog() {
   return (
     <AskUserQuestionsDialog
       questions={questions}
-      onAnswer={async (answers) => {
-        await agentAnswerUser(sessionId, answers);
+      onAnswer={async (answers, note) => {
+        await agentAnswerUser(sessionId, answers, note);
         setPendingQuestions(null);
       }}
       onDismiss={async () => {

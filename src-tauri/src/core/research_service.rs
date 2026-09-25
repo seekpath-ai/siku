@@ -273,12 +273,12 @@ async fn expand_query(db: &SqlitePool, topic_name: &str, keywords: &[String]) ->
          请给出 3~5 个用于文献检索的英文关键词/短语，用逗号分隔，不要编号，不要解释。"
     );
     let messages = vec![
-        crate::ai::llm::ChatMessage {
+        crate::ai::llm::ChatMessage { reasoning_content: None,
             role: "system".into(),
             content: "你是文献检索助手，只输出检索关键词。".into(),
             attachments: None, tool_calls: None, tool_call_id: None, name: None,
         },
-        crate::ai::llm::ChatMessage {
+        crate::ai::llm::ChatMessage { reasoning_content: None,
             role: "user".into(),
             content: prompt,
             attachments: None, tool_calls: None, tool_call_id: None, name: None,

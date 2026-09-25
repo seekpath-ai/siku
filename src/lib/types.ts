@@ -190,6 +190,10 @@ export interface LlmConfigBlock {
   max_tokens?: number | null;
   temperature?: number | null;
   extra_body?: Record<string, unknown>;
+  /** Send each assistant message's `reasoning_content` back to the API.
+   *  undefined/null = auto (on for the DeepSeek endpoint, whose thinking models
+   *  return 400 without it whenever tools are in play; off elsewhere). */
+  reasoning_passthrough?: boolean | null;
 }
 
 /** A Codex-style project: a local folder the agent works in. */
@@ -251,10 +255,14 @@ export interface AskQuestion {
   options: { label: string; description?: string }[];
 }
 
-/** User's answer to a question. */
+/** User's answer to a question. `custom` marks an answer the user typed
+ *  themselves instead of picking one of the offered options — the backend
+ *  labels it that way for the model, so a self-written answer is never read as
+ *  one of the agent's own suggestions. */
 export interface AskAnswer {
   question: string;
   answer: string;
+  custom?: boolean;
 }
 
 export interface LlmProvider {

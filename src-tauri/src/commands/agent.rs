@@ -688,6 +688,45 @@ fn session_to_json(
     })
 }
 
+/// The reasoning to persist alongside a turn's assistant message.
+///
+/// A turn can span several ReAct rounds (think → tool → think → answer); the
+/// API expects per-message reasoning, but the memory file stores one assistant
+/// record per turn, so the rounds are concatenated in order. Capped at
+/// `REASONING_MEMORY_CAP` characters — everything here is replayed into the
+/// next turn's input context, and an unbounded thinking transcript would eat
+/// the context budget for no benefit.
+const REASONING_MEMORY_CAP: usize = 8_000;
+
+fn turn_reasoning_from_steps(steps: &[AgentStep]) -> Option<String> {
+    let mut out = String::new();
+    for step in steps {
+        let Some(reasoning) = step.reasoning_content.as_deref().map(str::trim) else {
+            continue;
+        };
+        if reasoning.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(reasoning);
+    }
+    if out.trim().is_empty() {
+        return None;
+    }
+    if out.chars().count() > REASONING_MEMORY_CAP {
+        // Keep the END: the tail is what the model was thinking just before it
+        // answered, which is the part worth continuing from.
+        let tail: String = out
+            .chars()
+            .skip(out.chars().count() - REASONING_MEMORY_CAP)
+            .collect();
+        return Some(format!("…（较早的思考已省略）\n{tail}"));
+    }
+    Some(out)
+}
+
 /// Where a session's scratch files go when it has no project folder.
 ///
 /// App-owned and per session, so one conversation's files never collide with
@@ -1013,6 +1052,9 @@ pub(crate) async fn run_agent_turn(
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            // Replayed so the model can continue its earlier reasoning (and so
+            // DeepSeek's thinking models do not 400 on a tools request).
+            reasoning_content: r.reasoning_content,
         })
         .collect();
     // Attachments are base64 blobs; keeping them on every historical message
@@ -1027,7 +1069,7 @@ pub(crate) async fn run_agent_turn(
         }
     }
 
-    memory.append("user", &content, None, None, None, attachments_json.as_deref());
+    memory.append("user", &content, None, None, None, attachments_json.as_deref(), None);
 
     // Pet domain sessions: build a context hint for the system prompt so the
     // agent knows which object (note/paper/...) the user is talking about.
@@ -1154,6 +1196,12 @@ pub(crate) async fn run_agent_turn(
         let mem = MemoryStore::new(spawn_memory_path);
         match result {
             Ok((final_content, steps, cancelled, total_tokens, turn_error)) => {
+                // The turn's chain of thought, replayed on later turns so the
+                // model continues its earlier reasoning instead of starting
+                // over (and so DeepSeek's thinking models do not 400 on a
+                // request that carries tools). Capped: thinking can be long,
+                // and it all lands in the next turn's input context.
+                let turn_reasoning = turn_reasoning_from_steps(&steps);
                 // Never persist an empty reply — an empty assistant row
                 // renders as a blank bubble after the frontend reloads on
                 // done. Fall back to a visible placeholder. A cancelled turn
@@ -1221,7 +1269,15 @@ pub(crate) async fn run_agent_turn(
                     }
                 }
 
-                mem.append("assistant", &persist_content, None, None, None, None);
+                mem.append(
+                    "assistant",
+                    &persist_content,
+                    None,
+                    None,
+                    None,
+                    None,
+                    turn_reasoning.as_deref(),
+                );
 
                 // Terminal event goes last: the frontend reloads the session
                 // history on done/cancelled, so it must observe committed rows.
@@ -1263,7 +1319,7 @@ pub(crate) async fn run_agent_turn(
                 ).await {
                     error!(error = %db_err, "failed to persist agent error message");
                 }
-                mem.append("assistant", &error_content, None, None, None, None);
+                mem.append("assistant", &error_content, None, None, None, None, None);
                 let _ = app_clone.emit("agent:event", &AgentEvent::Error {
                     session_id: sid.clone(),
                     content: e,
@@ -1305,16 +1361,23 @@ pub async fn agent_send_message(
 }
 
 /// Answer a pending AskUserQuestion dialog for a session.
+///
+/// `answers` is the per-question reply (`[{ question, answer, custom? }]`);
+/// `note` is the user's free-form message, which the engine hands to the model
+/// as authoritative guidance alongside the answers. Both travel as one payload
+/// so a late reply can never be split across two channel messages.
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn agent_answer_user(
     state: State<'_, AppState>,
     session_id: String,
     answers: serde_json::Value,
+    note: Option<String>,
 ) -> Result<(), String> {
     let senders = state.ask_senders.lock().await;
     if let Some(tx) = senders.get(&session_id) {
-        let _ = tx.send(answers);
+        let note = note.unwrap_or_default();
+        let _ = tx.send(serde_json::json!({ "answers": answers, "note": note }));
         Ok(())
     } else {
         Err("no pending question for this session".to_string())
@@ -1837,6 +1900,7 @@ pub async fn settings_validate_llm(
         max_tokens: 100,
         temperature: 0.0,
         is_vision: false,
+        reasoning_passthrough: None,
     };
 
     settings_service::validate_llm_config(&config).await

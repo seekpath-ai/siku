@@ -205,6 +205,8 @@ pub fn provider_to_block(p: &LlmProvider) -> LlmConfigBlock {
         temperature: p.temperature.map(|t| t as f32),
         extra_body: p.extra_body.as_ref().and_then(|s| serde_json::from_str(s).ok()),
         is_vision: p.is_vision,
+        // No per-provider column for this yet: auto (DeepSeek endpoint on).
+        reasoning_passthrough: None,
     }
 }
 

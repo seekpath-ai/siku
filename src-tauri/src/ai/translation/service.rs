@@ -25,7 +25,7 @@ fn build_translation_messages(text: &str, source: &str, target: &str) -> Vec<Cha
     };
 
     vec![
-        ChatMessage {
+        ChatMessage { reasoning_content: None,
             role: "system".to_string(),
             content: TRANSLATION_SYSTEM_PROMPT.to_string(),
             attachments: None,
@@ -33,7 +33,7 @@ fn build_translation_messages(text: &str, source: &str, target: &str) -> Vec<Cha
             tool_call_id: None,
             name: None,
         },
-        ChatMessage {
+        ChatMessage { reasoning_content: None,
             role: "user".to_string(),
             content: user_prompt,
             attachments: None,

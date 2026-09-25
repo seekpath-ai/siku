@@ -481,7 +481,10 @@ mod tests {
         std::fs::write(&target, KEEP).unwrap();
         read(dir.path(), "keep.txt").await;
 
-        std::fs::write(&target, "changed by something else entirely").unwrap();
+        // Deliberately a different length: a same-length rewrite would only
+        // differ by mtime, which can land in the same timestamp tick (see the
+        // precision note in `known_files`).
+        std::fs::write(&target, "changed by something else entirely, and longer").unwrap();
         let err = write(
             dir.path(),
             "keep.txt",
@@ -493,7 +496,7 @@ mod tests {
         assert!(err.contains("changed"), "{err}");
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
-            "changed by something else entirely"
+            "changed by something else entirely, and longer"
         );
 
         read(dir.path(), "keep.txt").await;

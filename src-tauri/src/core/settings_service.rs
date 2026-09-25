@@ -214,7 +214,7 @@ pub async fn load_llm_config(db: &SqlitePool) -> Result<crate::ai::llm::LlmConfi
 pub async fn validate_llm_config(config: &crate::ai::llm::LlmConfig) -> Result<bool, String> {
     let client = crate::ai::llm::client::create_llm_client(config)?;
 
-    let test_messages = vec![crate::ai::llm::ChatMessage {
+    let test_messages = vec![crate::ai::llm::ChatMessage { reasoning_content: None,
         role: "user".to_string(),
         content: "Hello, respond with just 'ok'.".to_string(),
         attachments: None,

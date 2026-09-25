@@ -295,7 +295,7 @@ impl AgentEngine {
             _ = self.cancel_token.cancelled() => None,
             result = tokio::time::timeout(std::time::Duration::from_secs(300), ask_rx.recv()) => Some(result),
         } {
-            Some(Ok(Some(answers))) => answers.to_string(),
+            Some(Ok(Some(answers))) => format_ask_answers(&answers),
             Some(Ok(None)) => "AskUserQuestion failed: channel closed".to_string(),
             Some(Err(_)) => "AskUserQuestion timed out".to_string(),
             None => "AskUserQuestion cancelled by user".to_string(),
@@ -390,10 +390,10 @@ impl AgentEngine {
             if let Some(ltm) = &self.long_term_memory {
                 content.push_str(&format!("\n\n# 长期记忆\n{ltm}"));
             }
-            messages.push(ChatMessage { role: "system".into(), content, attachments: None, tool_calls: None, tool_call_id: None, name: None });
+            messages.push(ChatMessage { reasoning_content: None, role: "system".into(), content, attachments: None, tool_calls: None, tool_call_id: None, name: None });
         }
         messages.extend(history.iter().cloned());
-        messages.push(ChatMessage { role: "user".into(), content: user_message.to_string(), attachments: attachments.map(|s| s.to_string()), tool_calls: None, tool_call_id: None, name: None });
+        messages.push(ChatMessage { reasoning_content: None, role: "user".into(), content: user_message.to_string(), attachments: attachments.map(|s| s.to_string()), tool_calls: None, tool_call_id: None, name: None });
 
         // Snapshot what this turn actually starts with — the assembled system
         // prompt AND the history as loaded from memory (post max_memory_rounds
@@ -460,6 +460,12 @@ impl AgentEngine {
         // rounds of this turn (kept local so the turn stays &self).
         let mut retry_llm: Option<Box<dyn LlmClient>> = None;
         let mut cap_bumps = 0u32;
+        // Continuations of a reply cut off by the output cap (distinct from
+        // `cap_bumps`, which retries a round that produced no text at all).
+        let mut continuations = 0u32;
+        // True while the current round appends to the previous round's text, so
+        // the join is verbatim instead of a new paragraph.
+        let mut continuing = false;
 
         // — ReAct loop with streaming —
         let mut final_content = String::new();
@@ -501,7 +507,7 @@ impl AgentEngine {
                 // prompts through the model's chat template (e.g. Qwen's
                 // Jinja raises "System message must be at the beginning"),
                 // so a mid-conversation system message is a 500 there.
-                messages.push(ChatMessage { role: "user".into(),
+                messages.push(ChatMessage { reasoning_content: None, role: "user".into(),
                     content: "Max tool calls reached. Provide your final answer now based on gathered information.".into(),
                     attachments: None, tool_calls: None, tool_call_id: None, name: None });
                 let resp = match active_llm.chat_completion(&messages, &[]).await {
@@ -531,6 +537,12 @@ impl AgentEngine {
             if ConversationMemory::estimate_messages_tokens(&messages) > context_budget {
                 messages = self.memory.truncate(&messages, output_cap as usize);
             }
+            // Every request must satisfy the provider's tool-pairing rule: an
+            // assistant message with tool_calls needs a response for each id,
+            // immediately after it. Anything else is a hard 400 that repeats on
+            // every later round of the turn. The engine keeps the pairs intact
+            // itself; this is the cheap last check before the wire.
+            ConversationMemory::repair_tool_pairing(&mut messages);
 
             let mut stream_text = String::new();
             let mut round_reasoning = String::new();
@@ -690,11 +702,17 @@ impl AgentEngine {
             self.flush_batcher(&event_tx, step_index, &mut batcher);
 
             // Fold this round's visible text into the full reply (see
-            // full_text above).
+            // full_text above). A continuation picks up mid-sentence, so it is
+            // appended verbatim — no paragraph break, no trailing trim.
             if !stream_text.trim().is_empty() {
-                if !full_text.is_empty() { full_text.push_str("\n\n"); }
-                full_text.push_str(stream_text.trim_end());
+                if continuing {
+                    full_text.push_str(&stream_text);
+                } else {
+                    if !full_text.is_empty() { full_text.push_str("\n\n"); }
+                    full_text.push_str(stream_text.trim_end());
+                }
             }
+            continuing = false;
             // Mid-turn LLM failure: stop the ReAct loop here (never execute
             // tool calls or start another round against a failing backend).
             // Keep the failed round's partial reasoning as a step so the
@@ -722,7 +740,7 @@ impl AgentEngine {
                 // cannot ask this itself: in this failure mode it produced no
                 // tool call at all, so the engine asks on its behalf.
                 if !cancelled && cap_bumps < 3 {
-                    let next = output_cap.saturating_mul(2);
+                    let next = bump_output_cap(output_cap);
                     let questions = serde_json::json!({ "questions": [{
                         "question": format!("模型的思考过程占满了单轮输出额度（当前 max_tokens={output_cap}），没有生成正文。要调大额度重试吗？"),
                         "header": "输出额度不足",
@@ -753,18 +771,32 @@ impl AgentEngine {
                                         created_at: time::now_iso(),
                                     });
                                 }
-                                // The retry is a brand-new completion (the API
-                                // cannot resume a truncated one and reasoning
-                                // must not be fed back), so give the model a
-                                // hint instead: otherwise it tends to re-burn
-                                // the enlarged budget on the same long think.
-                                // Sent as `user` — a mid-conversation `system`
-                                // message breaks chat templates that require
-                                // the system message first (Qwen: 500 Jinja
-                                // "System message must be at the beginning").
-                                messages.push(ChatMessage { role: "user".into(),
-                                    content: format!("Your previous reply exhausted the per-round output budget (max_tokens={output_cap}) during reasoning and produced no visible answer. The budget has been raised to {next}. Keep reasoning brief and produce the answer directly."),
-                                    attachments: None, tool_calls: None, tool_call_id: None, name: None });
+                                // The API cannot resume a truncated completion, so
+                                // the model gets its own interrupted draft back
+                                // and is told to carry on from it — otherwise it
+                                // tends to re-burn the enlarged budget re-deriving
+                                // the same long think from scratch.
+                                //
+                                // The draft rides a `user` message rather than an
+                                // assistant one: the truncated round produced no
+                                // assistant message at all (empty content), and an
+                                // assistant turn with empty content is rejected by
+                                // several providers. `user` also avoids the
+                                // mid-conversation-`system` trap that breaks chat
+                                // templates requiring the system message first
+                                // (Qwen answers with a 500 Jinja error).
+                                let draft = reasoning_draft(&round_reasoning);
+                                messages.push(ChatMessage {
+                                    role: "user".into(),
+                                    content: format!(
+                                        "Your previous reply exhausted the per-round output budget (max_tokens={output_cap}) during reasoning and produced no visible answer. The budget has been raised to {next}. Keep reasoning brief and produce the answer directly.{draft}"
+                                    ),
+                                    attachments: None,
+                                    tool_calls: None,
+                                    tool_call_id: None,
+                                    name: None,
+                                    reasoning_content: None,
+                                });
                                 retry_llm = Some(client);
                                 output_cap = next;
                                 cap_bumps += 1;
@@ -775,6 +807,86 @@ impl AgentEngine {
                                 warn!(error = %e, "failed to rebuild LLM client for cap bump");
                             }
                         }
+                    }
+                }
+            }
+
+            // The answer itself was cut off (finish_reason=length with visible
+            // text). Hand the partial answer back as the assistant turn and ask
+            // the model to carry on from exactly there: a silently truncated
+            // reply is the one failure the user cannot even notice.
+            if round_finish.as_deref() == Some("length")
+                && !stream_text.trim().is_empty()
+                && !cancelled
+                && continuations < MAX_CONTINUATIONS
+            {
+                let next = bump_output_cap(output_cap);
+                let mut cfg = self.llm_config.clone();
+                cfg.max_tokens = next;
+                match llm::client::create_llm_client(&cfg) {
+                    Ok(client) => {
+                        let partial_tool_call = !tool_call_buf.is_empty();
+                        if partial_tool_call {
+                            // The cap ran out while emitting a tool call, so the
+                            // partial text is not a resumable answer — ask for a
+                            // clean tool call instead of prefixing the message.
+                            messages.push(ChatMessage {
+                                role: "user".into(),
+                                content: format!(
+                                    "Your previous reply was cut off by the per-round output budget (max_tokens={output_cap}) while emitting a tool call, so that call never completed. The budget has been raised to {next}. Emit the complete tool call now, and do not repeat the text you already produced."
+                                ),
+                                attachments: None,
+                                tool_calls: None,
+                                tool_call_id: None,
+                                name: None,
+                                reasoning_content: None,
+                            });
+                        } else {
+                            // The prefix is the WHOLE answer so far (`full_text`,
+                            // which may span earlier rounds), not just this
+                            // round's chunk: the model must see everything it
+                            // has already written to continue it coherently.
+                            messages.push(ChatMessage {
+                                role: "assistant".into(),
+                                content: full_text.clone(),
+                                attachments: None,
+                                tool_calls: None,
+                                tool_call_id: None,
+                                name: None,
+                                reasoning_content: if round_reasoning.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(round_reasoning.clone())
+                                },
+                            });
+                            messages.push(ChatMessage {
+                                role: "user".into(),
+                                content: format!(
+                                    "Your previous reply was cut off by the per-round output budget (max_tokens={output_cap}). The budget has been raised to {next}. Continue from EXACTLY where it stopped: do not repeat anything you already wrote, do not restart the answer, and do not add a preamble — output only the remaining text."
+                                ),
+                                attachments: None,
+                                tool_calls: None,
+                                tool_call_id: None,
+                                name: None,
+                                reasoning_content: None,
+                            });
+                        }
+                        info!(
+                            old_cap = output_cap,
+                            new_cap = next,
+                            continuations,
+                            partial_tool_call,
+                            round,
+                            "continuing a length-truncated reply"
+                        );
+                        retry_llm = Some(client);
+                        output_cap = next;
+                        continuations += 1;
+                        continuing = true;
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to rebuild LLM client for continuation");
                     }
                 }
             }
@@ -831,7 +943,25 @@ impl AgentEngine {
                     tc2
                 })
                 .collect();
-            messages.push(ChatMessage { role: "assistant".into(), content: stream_text.clone(), attachments: None, tool_calls: Some(normalized_calls), tool_call_id: None, name: None });
+            // The reasoning that produced these tool calls travels with the
+            // message: DeepSeek's thinking models require it back on every
+            // request carrying `tools` (400 otherwise) and concatenate it into
+            // the context, so this is also what lets the model keep its train
+            // of thought across tool rounds instead of re-deriving it.
+            let round_reasoning_for_context = if round_reasoning.trim().is_empty() {
+                None
+            } else {
+                Some(round_reasoning.clone())
+            };
+            messages.push(ChatMessage {
+                role: "assistant".into(),
+                content: stream_text.clone(),
+                attachments: None,
+                tool_calls: Some(normalized_calls),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: round_reasoning_for_context,
+            });
 
             // Execute each tool call and collect records for this step.
             let mut step_tool_records: Vec<ToolCallRecord> = Vec::new();
@@ -962,7 +1092,7 @@ impl AgentEngine {
                         let _ = sqlx::query(
                             "INSERT INTO tool_executions (id, session_id, tool_name, tool_input, tool_output, status, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                         ).bind(&exec_id).bind(&self.session_id).bind(&tc.function.name).bind(&tc.function.arguments).bind(&tool_result).bind(tool_status).bind(duration_ms).bind(&now).execute(&self.db).await;
-                        messages.push(ChatMessage {
+                        messages.push(ChatMessage { reasoning_content: None,
                             role: "tool".into(), content: tool_result.clone(),
                             attachments: None, tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some(tc.function.name.clone()),
                         });
@@ -1007,7 +1137,7 @@ impl AgentEngine {
                             status: "error".into(),
                             duration_ms: 0,
                         });
-                        messages.push(ChatMessage {
+                        messages.push(ChatMessage { reasoning_content: None,
                             role: "tool".into(), content: tool_result,
                             attachments: None, tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some(tc.function.name.clone()),
                         });
@@ -1047,7 +1177,7 @@ impl AgentEngine {
                         status: status.into(),
                         duration_ms: 0,
                     });
-                    messages.push(ChatMessage {
+                    messages.push(ChatMessage { reasoning_content: None,
                         role: "tool".into(), content: answers,
                         attachments: None, tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some("ask_user".into()),
                     });
@@ -1198,7 +1328,7 @@ impl AgentEngine {
                         status: "error".into(),
                         duration_ms: 0,
                     });
-                    messages.push(ChatMessage {
+                    messages.push(ChatMessage { reasoning_content: None,
                         role: "tool".into(), content: tool_result.clone(),
                         attachments: None, tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some(tc.function.name.clone()),
                     });
@@ -1286,7 +1416,7 @@ impl AgentEngine {
                     "INSERT INTO tool_executions (id, session_id, tool_name, tool_input, tool_output, status, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                 ).bind(&exec_id).bind(&self.session_id).bind(&tc.function.name).bind(&tc.function.arguments).bind(&tool_result).bind(tool_status).bind(duration_ms).bind(&now).execute(&self.db).await;
 
-                messages.push(ChatMessage {
+                messages.push(ChatMessage { reasoning_content: None,
                     role: "tool".into(), content: tool_result.clone(),
                     attachments: None, tool_calls: None, tool_call_id: Some(tc.id.clone()), name: Some(tc.function.name.clone()),
                 });
@@ -1342,5 +1472,190 @@ impl AgentEngine {
         }
 
         Ok((reply, steps, cancelled, usage, turn_error))
+    }
+}
+
+/// How many times a reply cut off by the output cap is continued before the
+/// engine gives up and shows what it has.
+const MAX_CONTINUATIONS: u32 = 2;
+
+/// Smallest cap a bump will ever produce. Doubling a 0 (`max_tokens` unset)
+/// would otherwise offer the user "retry with 0".
+const MIN_OUTPUT_CAP: u32 = 1024;
+
+/// Double the per-round output cap, with a floor so a zero/absurdly small
+/// configured cap can still recover, and a ceiling so one turn cannot ask for
+/// an unbounded completion.
+fn bump_output_cap(current: u32) -> u32 {
+    current.saturating_mul(2).max(MIN_OUTPUT_CAP).min(128 * 1024)
+}
+
+/// How much of an interrupted chain of thought is handed back for the model to
+/// continue from. The tail is the useful part (that is where it stopped), and
+/// the cap keeps a runaway think from filling the next request.
+const REASONING_DRAFT_CAP: usize = 6_000;
+
+/// The interrupted reasoning draft, phrased so the model continues it instead
+/// of starting over. Empty when there is no reasoning to hand back.
+fn reasoning_draft(reasoning: &str) -> String {
+    let trimmed = reasoning.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let chars = trimmed.chars().count();
+    let draft: String = if chars > REASONING_DRAFT_CAP {
+        trimmed.chars().skip(chars - REASONING_DRAFT_CAP).collect()
+    } else {
+        trimmed.to_string()
+    };
+    format!(
+        "\n\nYour interrupted chain of thought (continue FROM it — do not restate it, do not start over):\n{draft}"
+    )
+}
+
+/// Render the user's AskUserQuestion reply into the tool result the model sees.
+///
+/// The frontend sends `{ answers: [{ question, answer, custom? }], note? }`;
+/// a bare array is the older shape and is still accepted. Free-form input is
+/// first-class here: `custom` marks an answer the user typed themselves rather
+/// than picking one of the offered options, and `note` is an extra message tied
+/// to no question (supplementary instructions, a correction, or "stop asking and
+/// do X"). Both are given the last word so a model cannot quietly fall back to
+/// its own preferred option.
+fn format_ask_answers(payload: &serde_json::Value) -> String {
+    let entries = if payload.is_array() {
+        payload
+    } else {
+        &payload["answers"]
+    };
+    let note = payload
+        .get("note")
+        .and_then(|n| n.as_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
+
+    let mut out = String::new();
+    if let Some(list) = entries.as_array() {
+        for (i, entry) in list.iter().enumerate() {
+            let question = entry["question"].as_str().unwrap_or("").trim();
+            let answer = entry["answer"].as_str().unwrap_or("").trim();
+            let custom = entry["custom"].as_bool().unwrap_or(false);
+            out.push_str(&format!(
+                "\n{}. {}",
+                i + 1,
+                if question.is_empty() { "(未提供问题)" } else { question }
+            ));
+            if answer.is_empty() {
+                out.push_str("\n   → 用户未选择（见补充说明）");
+            } else if custom {
+                out.push_str(&format!("\n   → 用户自行回答：{answer}"));
+            } else {
+                out.push_str(&format!("\n   → 选择：{answer}"));
+            }
+        }
+    }
+    if let Some(note) = note {
+        out.push_str(&format!(
+            "\n用户补充说明（用户直接输入的原文，请以此为准）：{note}"
+        ));
+    }
+
+    if out.trim().is_empty() {
+        // Nothing recognisable: hand the raw payload over rather than losing it.
+        return payload.to_string();
+    }
+    format!("用户回答：{out}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bump_output_cap, format_ask_answers, reasoning_draft, REASONING_DRAFT_CAP};
+    use serde_json::json;
+
+    #[test]
+    fn formats_option_answers() {
+        let out = format_ask_answers(&json!({
+            "answers": [
+                { "question": "用哪种格式？", "answer": "Markdown" },
+                { "question": "范围？", "answer": "全部, 仅新增" },
+            ]
+        }));
+        assert!(out.starts_with("用户回答："), "{out}");
+        assert!(out.contains("1. 用哪种格式？"), "{out}");
+        assert!(out.contains("→ 选择：Markdown"), "{out}");
+        assert!(out.contains("2. 范围？"), "{out}");
+        assert!(out.contains("→ 选择：全部, 仅新增"), "{out}");
+    }
+
+    /// A typed answer must be labelled as such, so the model does not read it as
+    /// one of its own options.
+    #[test]
+    fn marks_user_typed_answers() {
+        let out = format_ask_answers(&json!({
+            "answers": [
+                { "question": "用哪种格式？", "answer": "先用纯文本，别加表格", "custom": true },
+            ]
+        }));
+        assert!(out.contains("→ 用户自行回答：先用纯文本，别加表格"), "{out}");
+        assert!(!out.contains("→ 选择："), "{out}");
+    }
+
+    /// The free-form message is the point of the feature: it must survive with
+    /// an explicit "this wins" framing, and unanswered questions must say so
+    /// instead of looking like blank choices.
+    #[test]
+    fn carries_the_free_form_message() {
+        let out = format_ask_answers(&json!({
+            "answers": [{ "question": "要现在处理吗？", "answer": "" }],
+            "note": "别问了，直接改成周报格式",
+        }));
+        assert!(out.contains("→ 用户未选择（见补充说明）"), "{out}");
+        assert!(
+            out.contains("用户补充说明") && out.contains("别问了，直接改成周报格式"),
+            "{out}"
+        );
+    }
+
+    /// The older bare-array payload (no `note`) still works, and the internal
+    /// output-budget prompt matches on the option label, which must stay intact.
+    #[test]
+    fn legacy_array_payload_still_works() {
+        let out = format_ask_answers(&json!([
+            { "question": "输出额度不足", "answer": "调大到 8000 重试" }
+        ]));
+        assert!(out.contains("调大到 8000 重试"), "{out}");
+        assert!(!out.contains("补充说明"), "{out}");
+    }
+
+    /// An unusable payload is passed through verbatim rather than replaced by an
+    /// empty (and therefore misleading) answer.
+    #[test]
+    fn unrecognisable_payload_passes_through() {
+        assert_eq!(format_ask_answers(&json!("nonsense")), "\"nonsense\"");
+    }
+
+    /// Doubling a cap of 0 (max_tokens unset) must not offer "retry with 0".
+    #[test]
+    fn cap_bumps_double_with_a_floor_and_ceiling() {
+        assert_eq!(bump_output_cap(4096), 8192);
+        assert_eq!(bump_output_cap(0), 1024);
+        assert_eq!(bump_output_cap(100), 1024);
+        assert_eq!(bump_output_cap(u32::MAX), 128 * 1024);
+    }
+
+    /// A truncated think hands back its tail — that is the part worth
+    /// continuing — and an empty one hands back nothing at all.
+    #[test]
+    fn reasoning_draft_keeps_the_tail() {
+        assert_eq!(reasoning_draft("   "), "");
+
+        let draft = reasoning_draft("step one. step two.");
+        assert!(draft.contains("continue FROM it"), "{draft}");
+        assert!(draft.contains("step one. step two."), "{draft}");
+
+        let long = "x".repeat(REASONING_DRAFT_CAP + 500);
+        let capped = reasoning_draft(&long);
+        assert!(capped.len() < long.len(), "must be capped");
+        assert!(capped.ends_with('x'));
     }
 }

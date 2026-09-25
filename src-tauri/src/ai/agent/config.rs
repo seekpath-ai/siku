@@ -21,6 +21,11 @@ pub struct LlmConfigBlock {
     pub extra_body: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_vision: Option<bool>,
+    /// Send each assistant message's `reasoning_content` back to the API.
+    /// `None`/absent = auto: on for the DeepSeek endpoint (its thinking models
+    /// return 400 without it when tools are in play), off elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_passthrough: Option<bool>,
 }
 
 impl std::fmt::Debug for LlmConfigBlock {
@@ -51,6 +56,7 @@ impl Default for LlmConfigBlock {
             temperature: None,
             extra_body: None,
             is_vision: None,
+            reasoning_passthrough: None,
         }
     }
 }
@@ -80,6 +86,7 @@ impl LlmConfigBlock {
             max_tokens: self.max_tokens.unwrap_or(4096) as u32,
             temperature: self.temperature.unwrap_or(0.7),
             is_vision: self.is_vision.unwrap_or(false),
+            reasoning_passthrough: self.reasoning_passthrough,
         }
     }
 }

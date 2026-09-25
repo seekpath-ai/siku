@@ -47,6 +47,28 @@ pub struct LlmConfig {
     pub max_tokens: u32,
     pub temperature: f32,
     pub is_vision: bool,
+    /// Whether `reasoning_content` from earlier assistant turns is sent back.
+    /// `None` = auto (see `passes_reasoning_back`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_passthrough: Option<bool>,
+}
+
+impl LlmConfig {
+    /// Should assistant history carry its `reasoning_content` back to the API?
+    ///
+    /// DeepSeek's thinking models **require** it whenever the request carries
+    /// `tools` — their docs state the API returns a 400 otherwise, and that the
+    /// passed-back reasoning is concatenated into the context (which is what
+    /// lets a model continue its previous train of thought). Other
+    /// OpenAI-compatible endpoints generally ignore the field, and legacy
+    /// `deepseek-reasoner` rejected it, so the default is narrowed to the real
+    /// DeepSeek endpoint and every other provider can opt in explicitly.
+    pub fn passes_reasoning_back(&self) -> bool {
+        self.reasoning_passthrough.unwrap_or_else(|| {
+            matches!(self.provider, LlmProvider::DeepSeek)
+                && self.base_url.contains("api.deepseek.com")
+        })
+    }
 }
 
 impl std::fmt::Debug for LlmConfig {
@@ -60,6 +82,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
             .field("is_vision", &self.is_vision)
+            .field("reasoning_passthrough", &self.passes_reasoning_back())
             .finish()
     }
 }
@@ -78,6 +101,7 @@ impl Default for LlmConfig {
             max_tokens: 4096,
             temperature: 0.7,
             is_vision: false,
+            reasoning_passthrough: None,
         }
     }
 }
@@ -96,6 +120,15 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The model's chain of thought for this assistant message.
+    ///
+    /// DeepSeek's thinking models require it back on every request that carries
+    /// `tools` (400 otherwise) and concatenate it into the context, which is
+    /// what lets a model carry on its previous reasoning across tool calls and
+    /// turns. Only sent when the provider wants it — see
+    /// `LlmConfig::passes_reasoning_back`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// An image payload (base64) for vision requests.

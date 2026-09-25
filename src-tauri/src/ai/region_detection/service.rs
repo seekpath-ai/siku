@@ -273,7 +273,7 @@ pub async fn detect_regions(
     let layout_desc = build_layout_prompt(&request);
 
     let messages = vec![
-        ChatMessage {
+        ChatMessage { reasoning_content: None,
             role: "system".to_string(),
             content: SYSTEM_PROMPT.to_string(),
             attachments: None,
@@ -281,7 +281,7 @@ pub async fn detect_regions(
             tool_call_id: None,
             name: None,
         },
-        ChatMessage {
+        ChatMessage { reasoning_content: None,
             role: "user".to_string(),
             content: layout_desc,
             attachments: None,

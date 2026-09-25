@@ -76,7 +76,42 @@ fn parse_stream_usage(usage: &serde_json::Map<String, serde_json::Value>) -> (u3
 
 #[cfg(test)]
 mod tests {
-    use super::parse_stream_usage;
+    use super::{message_to_openai_json, parse_stream_usage};
+    use crate::ai::llm::ChatMessage;
+
+    fn assistant(reasoning: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: "answer".into(),
+            attachments: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: reasoning.map(|r| r.to_string()),
+        }
+    }
+
+    /// DeepSeek's thinking models 400 when earlier assistant reasoning is
+    /// missing from a request that carries `tools`, so the field must actually
+    /// leave the client when the provider wants it.
+    #[test]
+    fn reasoning_is_sent_when_enabled() {
+        let json = message_to_openai_json(&assistant(Some("thinking hard")), true);
+        assert_eq!(json["reasoning_content"], serde_json::json!("thinking hard"));
+        assert_eq!(json["content"], serde_json::json!("answer"));
+    }
+
+    /// …and stays out otherwise, because most providers neither expect nor
+    /// accept the field (legacy `deepseek-reasoner` rejected it outright).
+    #[test]
+    fn reasoning_is_dropped_when_disabled_or_empty() {
+        let off = message_to_openai_json(&assistant(Some("thinking hard")), false);
+        assert!(off.get("reasoning_content").is_none(), "{off}");
+        let blank = message_to_openai_json(&assistant(Some("   ")), true);
+        assert!(blank.get("reasoning_content").is_none(), "{blank}");
+        let none = message_to_openai_json(&assistant(None), true);
+        assert!(none.get("reasoning_content").is_none(), "{none}");
+    }
 
     #[test]
     fn usage_with_deepseek_cache_fields() {
@@ -102,7 +137,7 @@ mod tests {
 /// Convert a ChatMessage to the JSON shape expected by OpenAI-compatible APIs.
 /// When attachments are present, content becomes a block array with a leading
 /// text block followed by image_url blocks.
-fn message_to_openai_json(msg: &ChatMessage) -> serde_json::Value {
+fn message_to_openai_json(msg: &ChatMessage, include_reasoning: bool) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("role".to_string(), serde_json::Value::String(msg.role.clone()));
 
@@ -137,6 +172,16 @@ fn message_to_openai_json(msg: &ChatMessage) -> serde_json::Value {
     if let Some(ref name) = msg.name {
         obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
     }
+    // DeepSeek's thinking models require every earlier assistant message's
+    // reasoning back (400 otherwise, whenever the request carries `tools`) and
+    // concatenate it into the context — that is how the model continues its
+    // previous train of thought instead of starting over. Providers that do not
+    // want it never see the field (see `passes_reasoning_back`).
+    if include_reasoning {
+        if let Some(reasoning) = msg.reasoning_content.as_deref().filter(|r| !r.trim().is_empty()) {
+            obj.insert("reasoning_content".to_string(), serde_json::Value::String(reasoning.to_string()));
+        }
+    }
 
     serde_json::Value::Object(obj)
 }
@@ -151,7 +196,9 @@ impl LlmClient for OpenAiClient {
     ) -> Result<LlmResponse, String> {
         let body = serde_json::json!({
             "model": self.config.model,
-            "messages": messages.iter().map(message_to_openai_json).collect::<Vec<_>>(),
+            "messages": messages.iter()
+                .map(|m| message_to_openai_json(m, self.config.passes_reasoning_back()))
+                .collect::<Vec<_>>(),
             "tools": tools,
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
@@ -303,7 +350,9 @@ impl LlmClient for OpenAiClient {
     ) -> Result<(), String> {
         let body = serde_json::json!({
             "model": self.config.model,
-            "messages": messages.iter().map(message_to_openai_json).collect::<Vec<_>>(),
+            "messages": messages.iter()
+                .map(|m| message_to_openai_json(m, self.config.passes_reasoning_back()))
+                .collect::<Vec<_>>(),
             "tools": tools,
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,

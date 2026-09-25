@@ -12,6 +12,13 @@
 //! deliberately cheap: the write path compares metadata only, and a stale
 //! entry (file touched by something else) simply forces one `file_read` before
 //! the overwrite. Keys are canonicalized so `a/../b` and `b` are the same file.
+//!
+//! Precision: length + mtime misses a rewrite that keeps the byte count *and*
+//! lands in the same timestamp tick (coarse-mtime filesystems, or a fast
+//! writer). Catching that needs content identity — a hash of a file the write
+//! path would have to re-read — and the guard is a best-effort safety net
+//! anyway: the real protections are create-by-default, the approval prompt
+//! (which shows the content) and the atomic replace.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

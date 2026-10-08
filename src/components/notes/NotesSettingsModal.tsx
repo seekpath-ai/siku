@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
   X, Info, Palette, Layout, NotebookPen, KeyRound, Blocks,
-  GitMerge, Link2, Zap, Command, List, Tag, CalendarDays, LayoutTemplate, History,
+  GitMerge, Link2, Zap, Command, Tag, CalendarDays, LayoutTemplate, History,
   Plug, Minus, Plus,
 } from 'lucide-react';
 import { useNotesSettingsStore, FONT_SIZE_MIN, FONT_SIZE_MAX, type NotesDefaultMode } from '@/stores/notesSettingsStore';
@@ -38,7 +38,6 @@ const CORE_PLUGINS: PluginItem[] = [
   { key: 'backlinks', label: '反向链接', icon: <Link2 size={13} />, desc: '显示链接到当前笔记的其他笔记' },
   { key: 'quick-switcher', label: '快速切换', icon: <Zap size={13} />, desc: '通过搜索快速跳转到任何笔记' },
   { key: 'command-palette', label: '命令面板', icon: <Command size={13} />, desc: '通过命令面板执行任何命令' },
-  { key: 'outline', label: '大纲', icon: <List size={13} />, desc: '显示当前笔记的标题大纲' },
   { key: 'tag-pane', label: '标签面板', icon: <Tag size={13} />, desc: '以面板形式浏览所有标签' },
   { key: 'daily-notes', label: '日记', icon: <CalendarDays size={13} />, desc: '创建并导航每日笔记' },
   { key: 'templates', label: '模板', icon: <LayoutTemplate size={13} />, desc: '从模板快速创建笔记' },

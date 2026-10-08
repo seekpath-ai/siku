@@ -19,13 +19,16 @@ import {
   Wand2,
   Code,
   KeyRound,
+  List,
 } from 'lucide-react';
 import { WikiMarkdown } from './WikiMarkdown';
 import { PrintNotePortal } from './PrintNotePortal';
 import { BacklinksPanel } from './BacklinksPanel';
+import { OutlinePanel } from './OutlinePanel';
 import { VersionHistoryDialog } from './VersionHistoryDialog';
 import { ContextMenu } from '@/components/ui/ContextMenu';
 import { escapePw } from '@/lib/passwordToken';
+import { scanHeadings, mapHeadingsToEls, type HeadingItem } from '@/lib/headings';
 import { saveTextFile, fileBrowserRevealInSystem, noteVersionRestore, vaultAttachmentsDir } from '@/lib/tauri';
 import { EditorView } from '@codemirror/view';
 import { MarkdownEditor } from '@/components/editor/MarkdownEditor';
@@ -97,8 +100,10 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   const menuRef = useRef<HTMLDivElement>(null);
   const noteTags = useMemo(() => parseNoteTags(note), [note]);
   const aliases = useMemo(() => parseNoteAliases(note), [note]);
-  // Global notes settings (device-local): editor/reading font size.
+  // Global notes settings (device-local): editor/reading font size, outline.
   const editorFontSize = useNotesSettingsStore((s) => s.editorFontSize);
+  const outlineOpen = useNotesSettingsStore((s) => s.outlineOpen);
+  const setNotesSettings = useNotesSettingsStore((s) => s.set);
 
   // Breadcrumb path relative to the notes root (parent chain), like Obsidian.
   const notePath = useMemo(() => {
@@ -379,6 +384,71 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   // on every render; defer it so typing in split/reading view stays responsive.
   const previewContent = useDeferredValue(content);
 
+  // ── Outline panel ─────────────────────────────────────────────────
+  // Items come from a raw-source line scan (fenced code skipped); jump
+  // targets are source offsets in edit views and text-matched DOM headings in
+  // reading view.
+  const outlineItems = useMemo(() => scanHeadings(content), [content]);
+  const [readingActiveIdx, setReadingActiveIdx] = useState(-1);
+
+  // Reading view: current heading = the last one scrolled above a threshold
+  // near the container top. rAF-throttled; also recomputed on content/mode
+  // changes (the effect below) so opening the panel shows a sane state.
+  const readingActiveRaf = useRef(0);
+  const updateReadingActive = useCallback(() => {
+    cancelAnimationFrame(readingActiveRaf.current);
+    readingActiveRaf.current = requestAnimationFrame(() => {
+      const container = previewScrollRef.current;
+      if (!container) return;
+      const els = mapHeadingsToEls(container, outlineItems);
+      const threshold = container.getBoundingClientRect().top + 80;
+      let idx = -1;
+      for (let i = 0; i < els.length; i++) {
+        const el = els[i];
+        if (el && el.getBoundingClientRect().top <= threshold) idx = i;
+      }
+      setReadingActiveIdx(idx);
+    });
+  }, [outlineItems]);
+
+  useEffect(() => {
+    if (mode === 'reading' && outlineOpen) updateReadingActive();
+    return () => cancelAnimationFrame(readingActiveRaf.current);
+  }, [content, mode, outlineOpen, updateReadingActive]);
+
+  // Edit/source/split views: current heading follows the caret (cursorPos is
+  // already tracked for the status bar).
+  const activeHeadingIdx = useMemo(() => {
+    if (mode === 'reading') return readingActiveIdx;
+    let idx = -1;
+    for (let i = 0; i < outlineItems.length; i++) {
+      if (outlineItems[i].offset <= cursorPos) idx = i;
+      else break;
+    }
+    return idx;
+  }, [mode, readingActiveIdx, outlineItems, cursorPos]);
+
+  const handleOutlineJump = useCallback(
+    (item: HeadingItem) => {
+      if (mode === 'reading') {
+        const container = previewScrollRef.current;
+        if (!container) return;
+        const idx = outlineItems.indexOf(item);
+        const el = mapHeadingsToEls(container, outlineItems)[idx];
+        if (el) {
+          el.scrollIntoView({ block: 'start' });
+          setReadingActiveIdx(idx);
+        }
+        return;
+      }
+      const view = viewRef.current;
+      if (!view) return;
+      view.dispatch({ selection: { anchor: item.offset }, scrollIntoView: true });
+      view.focus();
+    },
+    [mode, outlineItems]
+  );
+
   // Stable editor callbacks: inline closures here used to rebuild
   // MarkdownEditor's extensions array on every render (cursor moves included),
   // forcing a full CodeMirror reconfigure per keystroke.
@@ -469,7 +539,10 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   const previewEl = (
     <div
       ref={previewScrollRef}
-      onScroll={() => syncScroll('preview')}
+      onScroll={() => {
+        syncScroll('preview');
+        if (outlineOpen) updateReadingActive();
+      }}
       className="h-full overflow-y-auto p-8 md:px-16 prose prose-base prose-invert max-w-none"
       // Inline style overrides prose-base: Tailwind typography sizes children
       // in em, so the whole reading view scales from this one value.
@@ -591,6 +664,17 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
                   <Rows2 size={13} />
                   <span className="flex-1">上下分屏</span>
                   {mode === 'split-v' && <Check size={13} className="text-primary" />}
+                </button>
+                <button
+                  className="flex items-center gap-2 px-3 py-1.5 text-[12px] text-text-secondary hover:bg-surface-hover hover:text-text-primary w-full text-left"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    setNotesSettings({ outlineOpen: !outlineOpen });
+                  }}
+                >
+                  <List size={13} />
+                  <span className="flex-1">大纲</span>
+                  {outlineOpen && <Check size={13} className="text-primary" />}
                 </button>
                 <button
                   className="flex items-center gap-2 px-3 py-1.5 text-[12px] text-text-secondary hover:bg-surface-hover hover:text-text-primary w-full text-left"
@@ -749,26 +833,31 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
         </div>
       )}
 
-      {/* Editor / Reading / Split / Backlinks views */}
-      <div className="flex-1 min-h-0 relative overflow-hidden">
-        {mode === 'backlinks' ? (
-          <BacklinksPanel
-            activeNote={note}
-            notes={notes}
-            backlinks={backlinks}
-            onNavigate={onNavigate}
-            onConvertMention={onConvertMention}
-          />
-        ) : mode === 'reading' ? (
-          previewEl
-        ) : mode === 'split-h' || mode === 'split-v' ? (
-          <div className={`flex h-full ${mode === 'split-v' ? 'flex-col' : ''}`}>
-            <div className={`min-h-0 min-w-0 ${mode === 'split-h' ? 'w-1/2' : 'h-1/2'}`}>{editorEl}</div>
-            <div className={mode === 'split-h' ? 'w-px bg-surface-hover' : 'h-px bg-surface-hover'} />
-            <div className={`min-h-0 min-w-0 ${mode === 'split-h' ? 'w-1/2' : 'h-1/2'}`}>{previewEl}</div>
-          </div>
-        ) : (
-          editorEl
+      {/* Editor / Reading / Split / Backlinks views (+ outline panel) */}
+      <div className="flex-1 min-h-0 relative overflow-hidden flex">
+        <div className="flex-1 min-w-0 min-h-0 relative overflow-hidden">
+          {mode === 'backlinks' ? (
+            <BacklinksPanel
+              activeNote={note}
+              notes={notes}
+              backlinks={backlinks}
+              onNavigate={onNavigate}
+              onConvertMention={onConvertMention}
+            />
+          ) : mode === 'reading' ? (
+            previewEl
+          ) : mode === 'split-h' || mode === 'split-v' ? (
+            <div className={`flex h-full ${mode === 'split-v' ? 'flex-col' : ''}`}>
+              <div className={`min-h-0 min-w-0 ${mode === 'split-h' ? 'w-1/2' : 'h-1/2'}`}>{editorEl}</div>
+              <div className={mode === 'split-h' ? 'w-px bg-surface-hover' : 'h-px bg-surface-hover'} />
+              <div className={`min-h-0 min-w-0 ${mode === 'split-h' ? 'w-1/2' : 'h-1/2'}`}>{previewEl}</div>
+            </div>
+          ) : (
+            editorEl
+          )}
+        </div>
+        {outlineOpen && mode !== 'backlinks' && (
+          <OutlinePanel items={outlineItems} activeIdx={activeHeadingIdx} onJump={handleOutlineJump} />
         )}
       </div>
 

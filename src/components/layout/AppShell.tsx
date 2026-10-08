@@ -14,7 +14,7 @@ import { runFileBatch, useBatchImportStore } from '@/stores/batchImportStore';
 import { useImportPaper } from '@/hooks/useLibrary';
 import { useShellStore } from '@/stores/shellStore';
 import { useTabStore } from '@/stores/tabStore';
-import { notesCreate, bookmarksCreate, settingsAppGet, settingsAppSave, screenshotHotkeySync } from '@/lib/tauri';
+import { notesCreate, bookmarksCreate, settingsAppGet, settingsAppSave, screenshotHotkeySync, screenshotStart } from '@/lib/tauri';
 import { openNoteTab } from '@/lib/openNote';
 import { listen } from '@tauri-apps/api/event';
 
@@ -112,14 +112,23 @@ export function AppShell({ children }: AppShellProps) {
     };
   }, [isReader]);
 
-  // Global screenshot hotkey: apply the setting at startup, and forward the
-  // backend's trigger event into the in-app screenshot flow (the chat
-  // input's useImageAttachments listens for this DOM event).
+  // Global screenshot hotkey: apply the setting at startup, and route the
+  // backend's trigger event. Chat page: forward to the message input, which
+  // launches the snipping tool and auto-attaches the result. Everywhere else
+  // (notes, reader, …): just launch the tool — the shot lands in the system
+  // clipboard and stays there for manual pasting (Ctrl+V / right-click in the
+  // note editor) or other apps; nothing auto-attaches.
+  const pathnameRef = useRef(location.pathname);
+  pathnameRef.current = location.pathname;
   useEffect(() => {
     screenshotHotkeySync().catch((err) => console.warn('global screenshot hotkey:', err));
     let unlisten: (() => void) | undefined;
     listen('siku:global-screenshot', () => {
-      window.dispatchEvent(new CustomEvent('siku:screenshot-hotkey'));
+      if (pathnameRef.current === '/chat') {
+        window.dispatchEvent(new CustomEvent('siku:screenshot-hotkey'));
+      } else {
+        screenshotStart().catch((err) => console.warn('screenshot start:', err));
+      }
     }).then((u) => {
       unlisten = u;
     });

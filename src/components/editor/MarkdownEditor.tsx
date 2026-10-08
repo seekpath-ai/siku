@@ -11,6 +11,7 @@ import { open as shellOpen } from '@tauri-apps/plugin-shell';
 import katex from 'katex';
 import { saveAttachmentBytes } from '@/lib/tauri';
 import { pwTokenRe, unescapePw } from '@/lib/passwordToken';
+import { readClipboardShot, shotStamp, base64ToBytes } from '@/lib/clipboardImage';
 import { resolveImageUrl, resolveLocalImageUrl, type ResolveImageOptions } from '@/lib/imageCache';
 import type { Note } from '@/lib/types';
 
@@ -1957,47 +1958,75 @@ export function MarkdownEditor({
   // directory, and insert a standard Markdown image link at the cursor.
   const imagePasteDropExtension = useMemo<Extension | null>(() => {
     if (!vaultId) return null;
+    // Shared tail: save bytes under a 截图-<timestamp> name and insert the
+    // markdown image link at the caret.
+    const saveAndInsert = async (view: EditorView, bytes: number[], ext: string) => {
+      const stamp = shotStamp();
+      const relPath = await saveAttachmentBytes({
+        bytes,
+        filename: `截图-${stamp}.${ext}`,
+        vaultId,
+      });
+      const pos = view.state.selection.main.from;
+      const insert = `![截图-${stamp}.${ext}](${relPath})`;
+      view.dispatch({
+        changes: { from: pos, insert },
+        selection: { anchor: pos + insert.length },
+        scrollIntoView: true,
+      });
+    };
     return EditorView.domEventHandlers({
       paste(event, view) {
         const clipboardData = event.clipboardData;
         if (!clipboardData) return false;
         const types = Array.from(clipboardData.types || []);
         const hasImage = types.some((t) => t === 'Files' || t.startsWith('image/'));
-        if (!hasImage) return false;
-        // Read the image straight from the paste payload instead of the system
-        // clipboard: the webview receives the real file/bitmap here, while a raw
-        // clipboard read fails when the source only put a file list or a format
-        // that cannot be decoded (e.g. arboard ConversionFailure on Windows).
-        const item = Array.from(clipboardData.items || []).find(
-          (it) => it.kind === 'file' && it.type.startsWith('image/'),
-        );
-        const file =
-          item?.getAsFile() ??
-          Array.from(clipboardData.files || []).find((f) => f.type.startsWith('image/'));
-        if (!file) return false;
+        if (hasImage) {
+          // Read the image straight from the paste payload instead of the system
+          // clipboard: the webview receives the real file/bitmap here, while a raw
+          // clipboard read fails when the source only put a file list or a format
+          // that cannot be decoded (e.g. arboard ConversionFailure on Windows).
+          const item = Array.from(clipboardData.items || []).find(
+            (it) => it.kind === 'file' && it.type.startsWith('image/'),
+          );
+          const file =
+            item?.getAsFile() ??
+            Array.from(clipboardData.files || []).find((f) => f.type.startsWith('image/'));
+          if (!file) return false;
+          event.preventDefault();
+          (async () => {
+            try {
+              const buffer = await file.arrayBuffer();
+              const bytes = Array.from(new Uint8Array(buffer));
+              const extByType: Record<string, string> = {
+                'image/png': 'png',
+                'image/jpeg': 'jpg',
+                'image/gif': 'gif',
+                'image/webp': 'webp',
+                'image/bmp': 'bmp',
+                'image/svg+xml': 'svg',
+              };
+              const ext = file.name ? file.name.split('.').pop() ?? 'png' : extByType[file.type] ?? 'png';
+              await saveAndInsert(view, bytes, ext);
+            } catch (err) {
+              console.error('paste image:', err);
+            }
+          })();
+          return true;
+        }
+        // WebKitGTK (Linux) reports NO Files/image types for a clipboard
+        // bitmap — same gap the chat input handles. When the clipboard carries
+        // no text either, fall back to the native clipboard read so a
+        // screenshot pasted with Ctrl+V still lands as an attachment.
+        const hasText = Array.from(clipboardData.items || []).some((i) => i.kind === 'string');
+        if (hasText) return false;
         event.preventDefault();
         (async () => {
           try {
-            const buffer = await file.arrayBuffer();
-            const bytes = Array.from(new Uint8Array(buffer));
-            const extByType: Record<string, string> = {
-              'image/png': 'png',
-              'image/jpeg': 'jpg',
-              'image/gif': 'gif',
-              'image/webp': 'webp',
-              'image/bmp': 'bmp',
-              'image/svg+xml': 'svg',
-            };
-            const ext = file.name ? file.name.split('.').pop() : extByType[file.type] ?? 'png';
-            const relPath = await saveAttachmentBytes({
-              bytes,
-              filename: file.name || `pasted-image.${ext}`,
-              vaultId,
-            });
-            const md = `![Pasted image](${relPath})`;
-            view.dispatch({ changes: { from: view.state.selection.main.from, insert: md } });
+            const shot = await readClipboardShot();
+            if (shot) await saveAndInsert(view, base64ToBytes(shot.base64), 'png');
           } catch (err) {
-            console.error('paste image:', err);
+            console.error('paste clipboard image:', err);
           }
         })();
         return true;

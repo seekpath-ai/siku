@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { readImage } from '@tauri-apps/plugin-clipboard-manager';
 import { screenshotStart } from '@/lib/tauri';
+import { readClipboardShot, shotStamp } from '@/lib/clipboardImage';
 
 /** Local image attachment staged in an input box (sent as ChatAttachment). */
 export interface ImageAttachment {
@@ -24,35 +24,6 @@ export function fileToBase64(file: File): Promise<{ base64: string; mime: string
     reader.onerror = reject;
     reader.readAsDataURL(file);
   });
-}
-
-interface ClipboardShot {
-  /** Cheap content fingerprint, to tell a fresh screenshot from stale clipboard content. */
-  sig: string;
-  dataUrl: string;
-  base64: string;
-}
-
-/** Read the clipboard image (if any) and convert it to a PNG data URL. */
-async function readClipboardShot(): Promise<ClipboardShot | null> {
-  try {
-    const img = await readImage();
-    const { width, height } = await img.size();
-    const rgba = await img.rgba();
-    if (!width || !height || rgba.length === 0) return null;
-    let sum = 0;
-    for (let i = 0; i < rgba.length; i += 997) sum = (sum + rgba[i]) & 0xffffff;
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return null;
-    ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0);
-    const dataUrl = canvas.toDataURL('image/png');
-    return { sig: `${width}x${height}:${rgba.length}:${sum}`, dataUrl, base64: dataUrl.split(',')[1] ?? '' };
-  } catch {
-    return null; // clipboard holds no image
-  }
 }
 
 /** Window during which a fresh clipboard image is treated as the screenshot
@@ -147,9 +118,8 @@ export function useImageAttachments({
       return;
     }
     setShotArmed(false);
-    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
     addImageData({
-      name: `截图-${stamp}.png`,
+      name: `截图-${shotStamp()}.png`,
       mime: 'image/png',
       base64: shot.base64,
       previewUrl: shot.dataUrl,
@@ -227,9 +197,8 @@ export function useImageAttachments({
       const shot = await readClipboardShot();
       if (shot) {
         e.preventDefault();
-        const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
         addImageData({
-          name: `粘贴-${stamp}.png`,
+          name: `粘贴-${shotStamp()}.png`,
           mime: 'image/png',
           base64: shot.base64,
           previewUrl: shot.dataUrl,

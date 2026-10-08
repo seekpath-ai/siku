@@ -20,6 +20,7 @@ import {
   Code,
   KeyRound,
   List,
+  Image as ImageIcon,
 } from 'lucide-react';
 import { WikiMarkdown } from './WikiMarkdown';
 import { PrintNotePortal } from './PrintNotePortal';
@@ -29,7 +30,8 @@ import { VersionHistoryDialog } from './VersionHistoryDialog';
 import { ContextMenu } from '@/components/ui/ContextMenu';
 import { escapePw } from '@/lib/passwordToken';
 import { scanHeadings, mapHeadingsToEls, type HeadingItem } from '@/lib/headings';
-import { saveTextFile, fileBrowserRevealInSystem, noteVersionRestore, vaultAttachmentsDir } from '@/lib/tauri';
+import { readClipboardShot, shotStamp, base64ToBytes } from '@/lib/clipboardImage';
+import { saveTextFile, fileBrowserRevealInSystem, noteVersionRestore, vaultAttachmentsDir, saveAttachmentBytes } from '@/lib/tauri';
 import { EditorView } from '@codemirror/view';
 import { MarkdownEditor } from '@/components/editor/MarkdownEditor';
 import type { Note, NoteVersion } from '@/lib/types';
@@ -476,6 +478,36 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
     });
     view.focus();
   }, []);
+
+  // Editor right-click menu: paste a clipboard image (e.g. a screenshot taken
+  // with Ctrl+Shift+S) — save it to the vault attachments directory and insert
+  // the markdown image link at the caret. The clipboard is only read, never
+  // cleared, so the image stays available to other apps. No-op (silently)
+  // when the clipboard holds no image.
+  const pasteClipboardImage = useCallback(async () => {
+    const view = viewRef.current;
+    if (!view) return;
+    const shot = await readClipboardShot();
+    if (!shot) return;
+    try {
+      const stamp = shotStamp();
+      const relPath = await saveAttachmentBytes({
+        bytes: base64ToBytes(shot.base64),
+        filename: `截图-${stamp}.png`,
+        vaultId: note.vault_id,
+      });
+      const pos = view.state.selection.main.from;
+      const insert = `![截图-${stamp}.png](${relPath})`;
+      view.dispatch({
+        changes: { from: pos, insert },
+        selection: { anchor: pos + insert.length },
+        scrollIntoView: true,
+      });
+      view.focus();
+    } catch (err) {
+      console.error('paste clipboard image:', err);
+    }
+  }, [note.vault_id]);
   const handleEditorScroll = useCallback(() => {
     syncScroll('editor');
     const top = viewRef.current?.scrollDOM.scrollTop;
@@ -916,6 +948,11 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
               label: '插入密码字段',
               icon: <KeyRound size={13} />,
               onClick: insertPasswordField,
+            },
+            {
+              label: '粘贴图片',
+              icon: <ImageIcon size={13} />,
+              onClick: () => void pasteClipboardImage(),
             },
           ]}
         />

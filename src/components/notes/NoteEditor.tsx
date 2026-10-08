@@ -32,6 +32,7 @@ import { MarkdownEditor } from '@/components/editor/MarkdownEditor';
 import type { Note, NoteVersion } from '@/lib/types';
 import { parseNoteTags, parseNoteAliases } from '@/lib/types';
 import { useNoteEditorStore, type NoteViewMode } from '@/stores/noteEditorStore';
+import { useNotesSettingsStore } from '@/stores/notesSettingsStore';
 
 interface Props {
   note: Note;
@@ -96,6 +97,8 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   const menuRef = useRef<HTMLDivElement>(null);
   const noteTags = useMemo(() => parseNoteTags(note), [note]);
   const aliases = useMemo(() => parseNoteAliases(note), [note]);
+  // Global notes settings (device-local): editor/reading font size.
+  const editorFontSize = useNotesSettingsStore((s) => s.editorFontSize);
 
   // Breadcrumb path relative to the notes root (parent chain), like Obsidian.
   const notePath = useMemo(() => {
@@ -459,6 +462,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
       extensions={editorExtensions}
       vaultId={note.vault_id}
       attachmentsDir={attachmentsDir}
+      fontSize={editorFontSize}
     />
     </div>
   );
@@ -467,6 +471,9 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
       ref={previewScrollRef}
       onScroll={() => syncScroll('preview')}
       className="h-full overflow-y-auto p-8 md:px-16 prose prose-base prose-invert max-w-none"
+      // Inline style overrides prose-base: Tailwind typography sizes children
+      // in em, so the whole reading view scales from this one value.
+      style={{ fontSize: `${editorFontSize}px` }}
     >
       <WikiMarkdown
         content={previewContent || ' '}

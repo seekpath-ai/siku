@@ -1831,7 +1831,9 @@ function resolveTarget(raw: string, notes: Note[]): { id: string | null; title: 
 }
 
 const editorTheme = EditorView.theme({
-  '&': { backgroundColor: 'transparent', fontSize: '16px', height: '100%' },
+  // fontSize intentionally NOT set here: it comes from the `fontSize` prop
+  // (notes settings) via fontSizeTheme appended after this theme.
+  '&': { backgroundColor: 'transparent', height: '100%' },
   '.cm-scroller': { fontFamily: 'inherit', lineHeight: '1.65' },
   '.cm-gutters': {
     backgroundColor: 'transparent',
@@ -1863,6 +1865,8 @@ interface Props {
   vaultId?: string;
   /** Absolute path to the vault attachments directory (for resolving relative image paths). */
   attachmentsDir?: string;
+  /** Editor font size in px (notes settings). Default 16. */
+  fontSize?: number;
   /** false = source mode: raw markdown without live-preview rendering. */
   livePreview?: boolean;
 }
@@ -1879,6 +1883,7 @@ export function MarkdownEditor({
   extensions,
   vaultId,
   attachmentsDir,
+  fontSize = 16,
   livePreview = true,
 }: Props) {
   // Ctrl/Cmd+click handling: wiki links navigate (or create); external
@@ -1941,6 +1946,12 @@ export function MarkdownEditor({
   }, [notes, onNavigate, onCreateLink]);
 
   const imageOptions = useMemo<ResolveImageOptions>(() => ({ attachmentsDir }), [attachmentsDir]);
+
+  // Appended after editorTheme so the notes-settings font size wins.
+  const fontSizeTheme = useMemo(
+    () => EditorView.theme({ '&': { fontSize: `${fontSize}px` } }),
+    [fontSize]
+  );
 
   // Paste / drop image files into the editor, save them to the vault attachments
   // directory, and insert a standard Markdown image link at the cursor.
@@ -2031,6 +2042,7 @@ export function MarkdownEditor({
       tableKeymap,
       oneDark,
       editorTheme,
+      fontSizeTheme,
       EditorView.lineWrapping,
       EditorView.domEventHandlers({ scroll: () => onEditorScroll?.() }),
       imageOptionsFacet.of(imageOptions),
@@ -2040,7 +2052,7 @@ export function MarkdownEditor({
     if (imagePasteDropExtension) list.push(imagePasteDropExtension);
     if (extensions) list.push(...extensions);
     return list;
-  }, [notes, currentNoteId, linkClick, onEditorScroll, extensions, imageOptions, imagePasteDropExtension, livePreview]);
+  }, [notes, currentNoteId, linkClick, onEditorScroll, extensions, imageOptions, imagePasteDropExtension, livePreview, fontSizeTheme]);
 
   return (
     <CodeMirror
@@ -2051,7 +2063,7 @@ export function MarkdownEditor({
       onChange={onChange}
       extensions={assembled}
       height="100%"
-      style={{ height: '100%', fontSize: '16px' }}
+      style={{ height: '100%', fontSize: `${fontSize}px` }}
       basicSetup={{ foldGutter: false, highlightActiveLine: false }}
       className="h-full overflow-hidden"
     />

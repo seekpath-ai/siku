@@ -2,8 +2,9 @@ import { useEffect, useState } from 'react';
 import {
   X, Info, Palette, Layout, NotebookPen, KeyRound, Blocks,
   GitMerge, Link2, Zap, Command, List, Tag, CalendarDays, LayoutTemplate, History,
-  Plug,
+  Plug, Minus, Plus,
 } from 'lucide-react';
+import { useNotesSettingsStore, FONT_SIZE_MIN, FONT_SIZE_MAX, type NotesDefaultMode } from '@/stores/notesSettingsStore';
 
 interface Props {
   onClose: () => void;
@@ -43,6 +44,108 @@ const CORE_PLUGINS: PluginItem[] = [
   { key: 'templates', label: '模板', icon: <LayoutTemplate size={13} />, desc: '从模板快速创建笔记' },
   { key: 'file-recovery', label: '文件恢复', icon: <History size={13} />, desc: '恢复意外丢失的内容' },
 ];
+
+/** Small iOS-style toggle used by the editor settings rows. */
+function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <button
+      role="switch"
+      aria-checked={checked}
+      onClick={() => onChange(!checked)}
+      className={`relative w-8 h-[18px] rounded-full transition-colors shrink-0 ${
+        checked ? 'bg-primary' : 'bg-surface-hover'
+      }`}
+    >
+      <span
+        className={`absolute top-[2px] w-[14px] h-[14px] rounded-full bg-white transition-all ${
+          checked ? 'left-[16px]' : 'left-[2px]'
+        }`}
+      />
+    </button>
+  );
+}
+
+function SettingRow({ label, desc, children }: { label: string; desc: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-6 py-3 border-b border-surface-hover/60 last:border-0">
+      <div className="min-w-0">
+        <div className="text-[13px] text-text-primary">{label}</div>
+        <div className="text-[11px] text-text-secondary/70 mt-0.5 leading-relaxed">{desc}</div>
+      </div>
+      <div className="shrink-0 flex items-center">{children}</div>
+    </div>
+  );
+}
+
+const DEFAULT_MODE_OPTIONS: { value: NotesDefaultMode; label: string }[] = [
+  { value: 'edit', label: '编辑' },
+  { value: 'source', label: '源码' },
+  { value: 'reading', label: '阅读' },
+];
+
+/** 「编辑器」分区：默认打开模式 / 代码块折行 / 严格换行 / 字号。 */
+function EditorSettings() {
+  const { defaultMode, codeBlockWrap, strictLineBreaks, editorFontSize, set } = useNotesSettingsStore();
+  return (
+    <div>
+      <h2 className="text-sm font-semibold text-text-primary mb-1">编辑器</h2>
+      <p className="text-xs text-text-secondary/70 mb-2">编辑与显示行为（仅本设备，不随同步）。</p>
+      <SettingRow
+        label="默认打开模式"
+        desc="打开已有笔记时的默认视图；手动切换过的笔记仍记住自己的选择。新建笔记始终以编辑模式打开。"
+      >
+        <div className="flex rounded-md border border-surface-hover overflow-hidden">
+          {DEFAULT_MODE_OPTIONS.map((o) => (
+            <button
+              key={o.value}
+              onClick={() => set({ defaultMode: o.value })}
+              className={`px-2.5 py-1 text-[12px] transition-colors ${
+                defaultMode === o.value
+                  ? 'bg-primary/15 text-primary'
+                  : 'text-text-secondary hover:text-text-primary hover:bg-surface-hover'
+              }`}
+            >
+              {o.label}
+            </button>
+          ))}
+        </div>
+      </SettingRow>
+      <SettingRow
+        label="代码块自动折行"
+        desc="阅读视图与对话气泡中的代码块默认折行；每个代码块上的折行按钮仍可单独覆盖。"
+      >
+        <Toggle checked={codeBlockWrap} onChange={(v) => set({ codeBlockWrap: v })} />
+      </SettingRow>
+      <SettingRow
+        label="严格换行"
+        desc="开启后阅读视图中单个回车即换行（Obsidian 风格）；关闭后遵循标准 Markdown，单回车合并为空格。"
+      >
+        <Toggle checked={strictLineBreaks} onChange={(v) => set({ strictLineBreaks: v })} />
+      </SettingRow>
+      <SettingRow label="编辑器字号" desc="编辑视图与阅读视图正文的字号（12–24px）。">
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={() => set({ editorFontSize: editorFontSize - 1 })}
+            disabled={editorFontSize <= FONT_SIZE_MIN}
+            className="p-1 rounded border border-surface-hover text-text-secondary hover:text-text-primary disabled:opacity-30"
+            aria-label="减小字号"
+          >
+            <Minus size={12} />
+          </button>
+          <span className="w-10 text-center text-[12px] text-text-primary tabular-nums">{editorFontSize}px</span>
+          <button
+            onClick={() => set({ editorFontSize: editorFontSize + 1 })}
+            disabled={editorFontSize >= FONT_SIZE_MAX}
+            className="p-1 rounded border border-surface-hover text-text-secondary hover:text-text-primary disabled:opacity-30"
+            aria-label="增大字号"
+          >
+            <Plus size={12} />
+          </button>
+        </div>
+      </SettingRow>
+    </div>
+  );
+}
 
 /** Obsidian-style settings modal for the notes page (stubbed, two columns). */
 export function NotesSettingsModal({ onClose }: Props) {
@@ -146,6 +249,8 @@ export function NotesSettingsModal({ onClose }: Props) {
                   尚未安装任何社区插件<br />插件市场即将推出
                 </div>
               </div>
+            ) : selectedKey === 'editor' && section === 'options' ? (
+              <EditorSettings />
             ) : selected ? (
               <div>
                 <h2 className="text-sm font-semibold text-text-primary mb-1">{selected.label}</h2>

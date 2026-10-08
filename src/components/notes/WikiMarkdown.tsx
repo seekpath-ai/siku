@@ -13,6 +13,7 @@ import { resolveImageUrl } from '@/lib/imageCache';
 import { parseReaderUrl } from '@/lib/evidence';
 import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
 import { rewritePasswordTokens } from '@/lib/passwordToken';
+import { useNotesSettingsStore } from '@/stores/notesSettingsStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
 import type { Note } from '@/lib/types';
 
@@ -379,9 +380,19 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
   // inline is decided by structure (pre > code vs bare code), so a
   // language-less single-line fence is never mistaken for inline code.
 
+  // Global setting (notes → 设置 → 编辑器): strict line breaks on = a single
+  // Enter is a <br> (Obsidian style); off = CommonMark (soft break collapses
+  // to a space). Memoized — a fresh plugins array per render would re-run the
+  // whole pipeline on every keystroke's deferred re-render.
+  const strictLineBreaks = useNotesSettingsStore((s) => s.strictLineBreaks);
+  const remarkPlugins = useMemo(
+    () => (strictLineBreaks ? [remarkGfm, remarkMath, remarkStrictLineBreaks] : [remarkGfm, remarkMath]),
+    [strictLineBreaks]
+  );
+
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath, remarkStrictLineBreaks]}
+      remarkPlugins={remarkPlugins}
       rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
       components={{ a: LinkComponent, code: MarkdownCode, pre: MarkdownPre, img: ImageComponent, td: TdComponent, th: ThComponent }}
       urlTransform={allowCustomProtocols}

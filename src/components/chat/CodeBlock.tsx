@@ -1,5 +1,6 @@
 import { useState, type ReactElement, type ReactNode } from 'react';
 import { Check, Copy, WrapText } from 'lucide-react';
+import { useNotesSettingsStore } from '@/stores/notesSettingsStore';
 
 interface CodeBlockProps {
   code: string;
@@ -60,8 +61,12 @@ export function CodeBlock({ code, language = 'text', inline }: CodeBlockProps) {
   const [copied, setCopied] = useState(false);
   // Long single-line code scrolls horizontally by default (indentation stays
   // readable); the toggle wraps it instead — easier to read/copy in narrow
-  // panels. Per-block, matching GitHub's code view / VS Code Alt+Z.
-  const [wrapped, setWrapped] = useState(false);
+  // panels. The global notes setting (`codeBlockWrap`) provides the default;
+  // the per-block toggle overrides it for this block until remount (matching
+  // GitHub's code view / VS Code Alt+Z).
+  const globalWrap = useNotesSettingsStore((s) => s.codeBlockWrap);
+  const [wrapOverride, setWrapOverride] = useState<boolean | null>(null);
+  const wrapped = wrapOverride ?? globalWrap;
 
   const handleCopy = async () => {
     try {
@@ -113,7 +118,7 @@ export function CodeBlock({ code, language = 'text', inline }: CodeBlockProps) {
             the font size, so without it the labelled button was stretched to the
             inherited line height and sat taller than the icon-only one. */}
         <button
-          onClick={() => setWrapped((w) => !w)}
+          onClick={() => setWrapOverride(!wrapped)}
           title={wrapped ? '取消折行' : '自动折行'}
           className={`flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded border leading-none transition-colors ${
             wrapped

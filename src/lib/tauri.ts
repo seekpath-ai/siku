@@ -1173,7 +1173,16 @@ export async function searchRagQuery(query: string, topK?: number): Promise<stri
 // ============================================================
 
 export async function notesCreate(title: string, content: string, paperId?: string, parentId?: string, isFolder?: boolean): Promise<Note> {
-  return invoke<Note>('notes_create', { title, content, paperId, parentId, isFolder });
+  const note = await invoke<Note>('notes_create', { title, content, paperId, parentId, isFolder });
+  // New notes always open in edit mode regardless of the global default view
+  // mode — the intent of creating a note is writing. Set here (the single
+  // choke point) so every creation path (notes page, Ctrl+N, quick capture)
+  // gets the behaviour.
+  if (!note.is_folder) {
+    const { useNoteEditorStore } = await import('@/stores/noteEditorStore');
+    useNoteEditorStore.getState().setState(note.id, { mode: 'edit' });
+  }
+  return note;
 }
 export async function notesGet(id: string): Promise<Note> {
   return invoke<Note>('notes_get', { id });

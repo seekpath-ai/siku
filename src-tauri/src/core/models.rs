@@ -116,6 +116,7 @@ pub struct Note {
     pub parent_id: Option<String>,
     pub sort_order: i32,
     pub is_literature_note: i32,
+    pub is_locked: i32,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -125,6 +126,8 @@ pub struct Note {
 pub struct Vault {
     pub id: String,
     pub name: String,
+    pub lock_hash: Option<String>,
+    pub lock_salt: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

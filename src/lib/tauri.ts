@@ -1196,8 +1196,8 @@ export async function notesUpdate(id: string, title?: string, content?: string, 
 export async function notesDelete(id: string): Promise<void> {
   return invoke<void>('notes_delete', { id });
 }
-export async function notesList(paperId?: string, search?: string, parentId?: string): Promise<Note[]> {
-  return invoke<Note[]>('notes_list', { paperId, search, parentId });
+export async function notesList(paperId?: string, search?: string, parentId?: string, unlockedIds?: string[]): Promise<Note[]> {
+  return invoke<Note[]>('notes_list', { paperId, search, parentId, unlockedIds });
 }
 export async function notesListAll(): Promise<Note[]> {
   return invoke<Note[]>('notes_list_all');
@@ -1205,8 +1205,8 @@ export async function notesListAll(): Promise<Note[]> {
 export async function notesMove(id: string, parentId?: string | null, sortOrder?: number): Promise<Note> {
   return invoke<Note>('notes_move', { id, parentId, sortOrder });
 }
-export async function notesGetBacklinks(noteId: string): Promise<{ id: string; title: string; context: string; created_at: string }[]> {
-  return invoke('notes_get_backlinks', { noteId });
+export async function notesGetBacklinks(noteId: string, unlockedIds?: string[]): Promise<{ id: string; title: string; context: string; created_at: string }[]> {
+  return invoke('notes_get_backlinks', { noteId, unlockedIds });
 }
 
 export interface NoteSearchResult {
@@ -1217,8 +1217,25 @@ export interface NoteSearchResult {
 }
 
 /** Full-text search across all notes (ranked, with snippets). */
-export async function notesSearch(query: string, limit?: number): Promise<NoteSearchResult[]> {
-  return invoke<NoteSearchResult[]>('notes_search', { query, limit });
+export async function notesSearch(query: string, limit?: number, unlockedIds?: string[]): Promise<NoteSearchResult[]> {
+  return invoke<NoteSearchResult[]>('notes_search', { query, limit, unlockedIds });
+}
+
+// ============================================================
+// Note view lock (privacy lock — view-only, session-scoped unlock)
+// ============================================================
+
+export async function vaultLockStatus(): Promise<{ has_password: boolean }> {
+  return invoke('vault_lock_status');
+}
+export async function vaultSetLockPassword(password: string): Promise<void> {
+  return invoke('vault_set_lock_password', { password });
+}
+export async function vaultVerifyLockPassword(password: string): Promise<boolean> {
+  return invoke('vault_verify_lock_password', { password });
+}
+export async function notesSetLocked(id: string, locked: boolean): Promise<Note> {
+  return invoke<Note>('notes_set_locked', { id, locked });
 }
 
 // ============================================================

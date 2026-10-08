@@ -55,6 +55,10 @@ impl Tool for NoteWriteTool {
         let now = time::now_iso();
 
         if let Some(note_id) = args["note_id"].as_str() {
+            // Privacy lock: the agent must not modify locked notes.
+            if crate::core::note_service::is_note_effectively_locked(&self.db, note_id).await? {
+                return Err("该笔记已锁定，无法修改".to_string());
+            }
             // Snapshot the current content before the AI edit (version history).
             let old: Option<(String, String)> = sqlx::query_as(
                 "SELECT title, content FROM notes WHERE id = ?"

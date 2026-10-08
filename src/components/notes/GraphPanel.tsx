@@ -23,11 +23,13 @@ interface Props {
   activeNoteId: string;
   nodes: GraphNode[];
   edges: GraphEdge[];
+  /** Locked (not session-unlocked) note ids — filtered out with their edges. */
+  lockedIds?: Set<string>;
   onNodeClick: (id: string) => void;
   onClose?: () => void;
 }
 
-export function GraphPanel({ activeNoteId, nodes, edges, onNodeClick, onClose }: Props) {
+export function GraphPanel({ activeNoteId, nodes, edges, lockedIds, onNodeClick, onClose }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
 
@@ -45,10 +47,11 @@ export function GraphPanel({ activeNoteId, nodes, edges, onNodeClick, onClose }:
   }, []);
 
   const data = useMemo(() => {
+    const visibleNodes = lockedIds ? nodes.filter((n) => !lockedIds.has(n.id)) : nodes;
     const nodeMap = new Map<string, GraphNode>();
-    nodes.forEach((n) => nodeMap.set(n.id, n));
+    visibleNodes.forEach((n) => nodeMap.set(n.id, n));
     return {
-      nodes: nodes.map((n) => ({
+      nodes: visibleNodes.map((n) => ({
         ...n,
         val: n.id === activeNoteId ? 8 : 5,
       })),
@@ -59,7 +62,7 @@ export function GraphPanel({ activeNoteId, nodes, edges, onNodeClick, onClose }:
           target: e.target,
         })),
     };
-  }, [nodes, edges, activeNoteId]);
+  }, [nodes, edges, activeNoteId, lockedIds]);
 
   return (
     <div ref={containerRef} className="w-64 border-l border-surface-hover flex flex-col bg-background">

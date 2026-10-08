@@ -27,6 +27,7 @@ import { PrintNotePortal } from './PrintNotePortal';
 import { BacklinksPanel } from './BacklinksPanel';
 import { OutlinePanel } from './OutlinePanel';
 import { VersionHistoryDialog } from './VersionHistoryDialog';
+import { LockedNoteCover } from './LockPasswordDialog';
 import { ContextMenu } from '@/components/ui/ContextMenu';
 import { escapePw } from '@/lib/passwordToken';
 import { scanHeadings, mapHeadingsToEls, type HeadingItem } from '@/lib/headings';
@@ -38,6 +39,8 @@ import type { Note, NoteVersion } from '@/lib/types';
 import { parseNoteTags, parseNoteAliases } from '@/lib/types';
 import { useNoteEditorStore, type NoteViewMode } from '@/stores/noteEditorStore';
 import { useNotesSettingsStore } from '@/stores/notesSettingsStore';
+import { useNoteLockStore } from '@/stores/noteLockStore';
+import { computeEffectiveLockedSet } from '@/lib/noteLock';
 
 interface Props {
   note: Note;
@@ -107,6 +110,14 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   // Outline panel: per-note state (like the view mode), persisted via
   // noteEditorStore. Notes never opened keep the default (closed).
   const outlineOpen = useNoteEditorStore((s) => s.states[note.id]?.outline ?? false);
+
+  // View lock: effectively locked (self or an ancestor) and not unlocked this
+  // session → the whole content area is replaced by the unlock cover.
+  const lockUnlocked = useNoteLockStore(
+    (s) => s.unlockedByVault[note.vault_id]?.includes(note.id) ?? false
+  );
+  const lockedSet = useMemo(() => computeEffectiveLockedSet(notes), [notes]);
+  const lockedView = lockedSet.has(note.id) && !lockUnlocked;
 
   // Breadcrumb path relative to the notes root (parent chain), like Obsidian.
   const notePath = useMemo(() => {
@@ -631,6 +642,8 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
           ))}
         </div>
         <div className="flex items-center gap-0.5 ml-auto shrink-0">
+          {!lockedView && (
+            <>
           <button
             onClick={() => toggleMode('reading')}
             title={
@@ -790,12 +803,14 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
               </div>
             )}
           </div>
+            </>
+          )}
         </div>
       </div>
 
       {/* Note title — single click to rename (Obsidian-style) */}
       <div className="px-6 pb-1 shrink-0">
-        {editingTitle ? (
+        {editingTitle && !lockedView ? (
           <input
             autoFocus
             value={titleInput}
@@ -815,9 +830,12 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
           />
         ) : (
           <h1
-            className="text-center text-2xl font-bold text-text-primary truncate cursor-text hover:text-accent transition-colors"
-            title="单击重命名"
+            className={`text-center text-2xl font-bold text-text-primary truncate transition-colors ${
+              lockedView ? '' : 'cursor-text hover:text-accent'
+            }`}
+            title={lockedView ? undefined : '单击重命名'}
             onClick={() => {
+              if (lockedView) return;
               setTitleInput(note.title);
               setEditingTitle(true);
             }}
@@ -828,7 +846,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
       </div>
 
       {/* Tags & aliases */}
-      {(noteTags.length > 0 || aliases.length > 0 || onUpdateAliases) && (
+      {!lockedView && (noteTags.length > 0 || aliases.length > 0 || onUpdateAliases) && (
         <div className="flex flex-wrap items-center gap-1 px-6 pb-1 shrink-0">
           {noteTags.map((t) => (
             <span key={t} className="px-1.5 py-0.5 rounded text-[10px] bg-primary/10 text-primary">
@@ -866,7 +884,13 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
         </div>
       )}
 
-      {/* Editor / Reading / Split / Backlinks views (+ outline panel) */}
+      {/* Editor / Reading / Split / Backlinks views (+ outline panel) — a
+          locked note replaces the whole region with the unlock cover. */}
+      {lockedView ? (
+        <div className="flex-1 min-h-0 relative overflow-hidden">
+          <LockedNoteCover note={note} />
+        </div>
+      ) : (
       <div className="flex-1 min-h-0 relative overflow-hidden flex">
         <div className="flex-1 min-w-0 min-h-0 relative overflow-hidden">
           {mode === 'backlinks' ? (
@@ -893,8 +917,14 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
           <OutlinePanel items={outlineItems} activeIdx={activeHeadingIdx} onJump={handleOutlineJump} />
         )}
       </div>
+      )}
 
       {/* Status bar */}
+      {lockedView ? (
+        <div className="flex items-center justify-between px-4 py-1.5 border-t border-surface-hover text-[11px] text-text-secondary/70 gap-4 shrink-0">
+          <span>已锁定</span>
+        </div>
+      ) : (
       <div className="flex items-center justify-between px-4 py-1.5 border-t border-surface-hover text-[11px] text-text-secondary/70 gap-4 shrink-0">
         <div className={`flex items-center gap-1 ${saveIndicator.class}`}>
           <saveIndicator.icon size={12} />
@@ -920,6 +950,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
           <span>行 {line}, 列 {col}</span>
         </div>
       </div>
+      )}
 
       {versionOpen && (
         <VersionHistoryDialog

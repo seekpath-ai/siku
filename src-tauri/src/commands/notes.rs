@@ -97,8 +97,21 @@ pub async fn notes_delete(state: State<'_, AppState>, id: String) -> Result<(), 
 pub async fn notes_list(
     state: State<'_, AppState>, paper_id: Option<String>,
     search: Option<String>, parent_id: Option<String>,
+    unlocked_ids: Option<Vec<String>>,
 ) -> Result<Vec<Note>, String> {
-    crate::core::note_service::list_notes(&state.db, paper_id.as_deref(), search.as_deref(), parent_id.as_deref()).await
+    crate::core::note_service::list_notes(&state.db, paper_id.as_deref(), search.as_deref(), parent_id.as_deref(), &unlocked_ids.unwrap_or_default()).await
+}
+
+/// Set the privacy-lock flag on a note or folder (folder locks cover the
+/// whole subtree). Returns the updated note.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn notes_set_locked(
+    state: State<'_, AppState>,
+    id: String,
+    locked: bool,
+) -> Result<Note, String> {
+    crate::core::note_service::set_note_locked(&state.db, &id, locked).await
 }
 
 #[tauri::command]
@@ -123,9 +136,10 @@ pub async fn notes_move(
 #[instrument(skip(state))]
 pub async fn notes_get_backlinks(
     state: State<'_, AppState>, note_id: String,
+    unlocked_ids: Option<Vec<String>>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let vault_id = crate::core::vault_service::get_current_vault_id(&state.db).await?;
-    let backlinks = crate::core::note_service::get_backlinks(&state.db, &note_id, &vault_id).await?;
+    let backlinks = crate::core::note_service::get_backlinks(&state.db, &note_id, &vault_id, &unlocked_ids.unwrap_or_default()).await?;
     Ok(backlinks.into_iter().map(|(note, ctx)| serde_json::json!({
         "id": note.id, "title": note.title, "context": ctx,
         "created_at": note.created_at,
@@ -139,9 +153,10 @@ pub async fn notes_search(
     state: State<'_, AppState>,
     query: String,
     limit: Option<i64>,
+    unlocked_ids: Option<Vec<String>>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let vault_id = crate::core::vault_service::get_current_vault_id(&state.db).await?;
-    crate::core::note_service::search_notes(&state.db, &query, limit.unwrap_or(30).clamp(1, 100), &vault_id).await
+    crate::core::note_service::search_notes(&state.db, &query, limit.unwrap_or(30).clamp(1, 100), &vault_id, &unlocked_ids.unwrap_or_default()).await
 }
 
 /// List version snapshots for a note (newest first).

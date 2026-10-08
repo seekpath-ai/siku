@@ -4,15 +4,22 @@ import {
   MoreHorizontal, FolderPlus, FilePlus, ArrowUpToLine, X, Crosshair,
   Settings, HelpCircle, Database, Move, Bookmark, Copy, BookOpen,
   File as FileIcon, Image as ImageIcon, FileSpreadsheet, ExternalLink,
+  Lock, LockOpen,
 } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import type { Note, FileItem } from '@/lib/types';
 import { parseNoteTags } from '@/lib/types';
-import { notesSearch, type NoteSearchResult } from '@/lib/tauri';
+import {
+  notesSearch, notesSetLocked, vaultLockStatus, vaultVerifyLockPassword,
+  type NoteSearchResult,
+} from '@/lib/tauri';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
 import { MoveNoteDialog } from '@/components/notes/MoveNoteDialog';
+import { LockPasswordDialog } from '@/components/notes/LockPasswordDialog';
 import { useDialog } from '@/hooks/useDialog';
 import { useNoteListStore } from '@/stores/noteListStore';
+import { useNoteLockStore, getAllUnlockedIds, useAllUnlockedSet } from '@/stores/noteLockStore';
+import { computeEffectiveLockedSet } from '@/lib/noteLock';
 
 interface Props {
   notes: Note[];
@@ -51,6 +58,8 @@ interface Props {
   onFileOpen?: (id: string) => void;
   /** Import a vault file (PDF) into the paper library. */
   onFileImportToLibrary?: (id: string) => void;
+  /** Toggle a note/folder's locked flag (notes_set_locked) and refresh state. */
+  onSetLocked?: (id: string, locked: boolean) => Promise<void>;
   /** Current vault id — tree UI state (expanded/scroll) is persisted per vault. */
   vaultId?: string;
   onClose?: () => void;
@@ -119,6 +128,7 @@ export function NoteList({
   onFileDelete,
   onFileOpen,
   onFileImportToLibrary,
+  onSetLocked,
   vaultId,
   onClose,
   title = '文件列表',
@@ -164,6 +174,89 @@ export function NoteList({
   >(null);
   const autoScrollTimerRef = useRef<number | null>(null);
   const lastMouseYRef = useRef<number | null>(null);
+
+  // ── Note view lock ──────────────────────────────────────────────
+  // Effective lock set (locked nodes + descendants) minus this session's
+  // unlocked ids = items hidden behind a password.
+  const vaultKey = vaultId ?? '';
+  const unlockedSet = useAllUnlockedSet();
+  const lockedSet = useMemo(() => computeEffectiveLockedSet(notes), [notes]);
+  const isLockedView = useCallback(
+    (id: string) => lockedSet.has(id) && !unlockedSet.has(id),
+    [lockedSet, unlockedSet]
+  );
+  // Pending password dialog: setup (first lock ever), verify-to-unlock, or
+  // verify-to-expand a locked folder in the tree.
+  const [lockDialog, setLockDialog] = useState<{
+    mode: 'setup' | 'verify';
+    noteId: string;
+    action: 'lock' | 'unlock' | 'expand';
+  } | null>(null);
+
+  const applySetLocked = useCallback(
+    async (id: string, locked: boolean) => {
+      try {
+        if (onSetLocked) await onSetLocked(id, locked);
+        else await notesSetLocked(id, locked);
+        if (!locked) useNoteLockStore.getState().unlock(vaultKey, id);
+      } catch (err) {
+        await alert(`${locked ? '锁定' : '解锁'}失败：${err}`);
+      }
+    },
+    [onSetLocked, vaultKey, alert]
+  );
+
+  const handleLockRequest = useCallback(
+    async (note: Note) => {
+      try {
+        const status = await vaultLockStatus();
+        if (!status.has_password) {
+          setLockDialog({ mode: 'setup', noteId: note.id, action: 'lock' });
+          return;
+        }
+        await applySetLocked(note.id, true);
+      } catch (err) {
+        await alert(`锁定失败：${err}`);
+      }
+    },
+    [applySetLocked, alert]
+  );
+
+  const handleUnlockRequest = useCallback(
+    async (note: Note) => {
+      const cached = useNoteLockStore.getState().sessionPassword;
+      if (cached) {
+        try {
+          if (await vaultVerifyLockPassword(cached)) {
+            await applySetLocked(note.id, false);
+            return;
+          }
+          useNoteLockStore.getState().setSessionPassword(null);
+        } catch {
+          // Fall through to the password dialog.
+        }
+      }
+      setLockDialog({ mode: 'verify', noteId: note.id, action: 'unlock' });
+    },
+    [applySetLocked]
+  );
+
+  const handleLockDialogSuccess = useCallback(
+    (password: string) => {
+      const d = lockDialog;
+      setLockDialog(null);
+      if (!d) return;
+      useNoteLockStore.getState().setSessionPassword(password);
+      if (d.action === 'lock') void applySetLocked(d.noteId, true);
+      else if (d.action === 'unlock') void applySetLocked(d.noteId, false);
+      else {
+        // Session-unlock a locked folder and expand it (no backend change).
+        useNoteLockStore.getState().unlock(vaultKey, d.noteId);
+        setExpanded((prev) => new Set(prev).add(d.noteId));
+      }
+    },
+    [lockDialog, applySetLocked, vaultKey]
+  );
 
   const allTags = useMemo(() => {
     const set = new Set<string>();
@@ -309,7 +402,7 @@ export function NoteList({
     setSearching(true);
     const timer = setTimeout(async () => {
       try {
-        setSearchResults(await notesSearch(q, 30));
+        setSearchResults(await notesSearch(q, 30, getAllUnlockedIds()));
       } catch (err) {
         console.error('notes search:', err);
         setSearchResults([]);
@@ -328,6 +421,37 @@ export function NoteList({
       return next;
     });
   }, []);
+
+  // Expanding a locked folder requires an explicit unlock: with a cached
+  // session password the chevron click itself unlocks silently; otherwise a
+  // password dialog is shown (session unlock, no backend change). Collapsing
+  // stays free.
+  const handleToggleExpand = useCallback(
+    (node: TreeNode) => {
+      if (node.isFolder && !expanded.has(node.id) && isLockedView(node.id)) {
+        const cached = useNoteLockStore.getState().sessionPassword;
+        if (cached) {
+          void vaultVerifyLockPassword(cached)
+            .then((ok) => {
+              if (ok) {
+                useNoteLockStore.getState().unlock(vaultKey, node.id);
+                setExpanded((prev) => new Set(prev).add(node.id));
+              } else {
+                // Stale cache — drop it and ask.
+                useNoteLockStore.getState().setSessionPassword(null);
+                setLockDialog({ mode: 'verify', noteId: node.id, action: 'expand' });
+              }
+            })
+            .catch(() => setLockDialog({ mode: 'verify', noteId: node.id, action: 'expand' }));
+          return;
+        }
+        setLockDialog({ mode: 'verify', noteId: node.id, action: 'expand' });
+        return;
+      }
+      toggleExpand(node.id);
+    },
+    [expanded, isLockedView, toggleExpand, vaultKey]
+  );
 
   const collapseAll = useCallback(() => {
     setExpanded(new Set());
@@ -528,19 +652,23 @@ export function NoteList({
       if (target.id === candId) return false;
       // Dropping into its own subtree is invalid (files have no subtree).
       if (target.kind === 'folder' && isInSubtree(target.id, candId)) return false;
+      // A locked (not session-unlocked) folder rejects drops.
+      if (target.kind === 'folder' && isLockedView(target.id)) return false;
       return true;
     },
-    [isInSubtree]
+    [isInSubtree, isLockedView]
   );
 
   const handleNodeMouseDown = useCallback((e: React.MouseEvent, node: TreeNode) => {
     if (e.button !== 0) return;
     // Don't initiate drag when using multi-selection modifiers.
     if (e.shiftKey || e.ctrlKey || e.metaKey) return;
+    // Locked items can't be drag sources.
+    if (node.note && isLockedView(node.id)) return;
     dragCandidateRef.current = node.id;
     dragStartPosRef.current = { x: e.clientX, y: e.clientY };
     dragActiveRef.current = false;
-  }, []);
+  }, [isLockedView]);
 
   // Global tracking: starts the drag after a small threshold, updates the
   // floating indicator, highlights the hovered target, and auto-expands folders.
@@ -615,7 +743,7 @@ export function NoteList({
       }
 
       // Auto-expand a collapsed folder after hovering for a short delay.
-      if (target.kind === 'folder' && valid && !expanded.has(target.id)) {
+      if (target.kind === 'folder' && valid && !expanded.has(target.id) && !isLockedView(target.id)) {
         if (hoverExpandTimerRef.current) window.clearTimeout(hoverExpandTimerRef.current);
         hoverExpandTimerRef.current = window.setTimeout(() => {
           setExpanded((prev) => new Set(prev).add(target.id));
@@ -653,7 +781,12 @@ export function NoteList({
       // Use the last tracked drop target instead of re-hitting elementFromPoint,
       // because the drag indicator or a re-render can interfere on mouseup.
       const target = finalTarget ?? resolveDropTarget(e.clientX, e.clientY);
-      if (!target || !isValidDrop(target, candId)) return;
+      if (!target) return;
+      if (target.kind === 'folder' && isLockedView(target.id)) {
+        void alert('该文件夹已锁定，请先解锁');
+        return;
+      }
+      if (!isValidDrop(target, candId)) return;
 
       // Dropping on a folder lands inside it; dropping on a note/file lands
       // next to it (the target's parent folder, or root); empty area = root.
@@ -691,7 +824,7 @@ export function NoteList({
       }
       stopAutoScroll();
     };
-  }, [noteMap, fileMap, resolveDropTarget, isValidDrop, onMoveToFolder, onFileMove, parentOf, expanded, draggingId]);
+  }, [noteMap, fileMap, resolveDropTarget, isValidDrop, onMoveToFolder, onFileMove, parentOf, expanded, draggingId, isLockedView, alert]);
 
   // OS file drag-in: Tauri native drag-drop events (HTML5 file drop is
   // disabled in the webview; the payload carries absolute paths + position).
@@ -705,6 +838,10 @@ export function NoteList({
         const { paths, position } = event.payload;
         if (!paths.length) return;
         const target = resolveDropTarget(position.x, position.y);
+        if (target.kind === 'folder' && isLockedView(target.id)) {
+          void alert('该文件夹已锁定，请先解锁');
+          return;
+        }
         const parentId =
           target.kind === 'folder'
             ? target.id
@@ -721,7 +858,7 @@ export function NoteList({
       cancelled = true;
       unlisten?.();
     };
-  }, [onFileImport, resolveDropTarget, parentOf]);
+  }, [onFileImport, resolveDropTarget, parentOf, isLockedView, alert]);
 
   const handleMoveDialog = useCallback(
     (parentId: string | null) => {
@@ -744,6 +881,8 @@ export function NoteList({
 
   const buildContextItems = (note: Note): ContextMenuItem[] => {
     const isSystem = note.is_system === 1;
+    const directLocked = note.is_locked === 1;
+    const lockedView = isLockedView(note.id);
     const items: ContextMenuItem[] = [
       {
         label: '新建子笔记',
@@ -761,11 +900,13 @@ export function NoteList({
         {
           label: '重命名',
           icon: <MoreHorizontal size={12} />,
+          disabled: lockedView,
           onClick: () => startRename(note.id, note.title),
         },
         {
           label: '移动到...',
           icon: <Move size={12} />,
+          disabled: lockedView,
           onClick: () => setMoveTargetIds([note.id]),
         }
       );
@@ -773,6 +914,7 @@ export function NoteList({
         items.push({
           label: '移出文件夹',
           icon: <ArrowUpToLine size={12} />,
+          disabled: lockedView,
           onClick: () => onMoveToRoot(note.id),
         });
       }
@@ -783,6 +925,19 @@ export function NoteList({
           onClick: () => onToggleFavorite(note.id, note.is_favorite !== 1),
         });
       }
+      items.push(
+        directLocked
+          ? {
+              label: '解锁',
+              icon: <LockOpen size={12} />,
+              onClick: () => void handleUnlockRequest(note),
+            }
+          : {
+              label: '锁定',
+              icon: <Lock size={12} />,
+              onClick: () => void handleLockRequest(note),
+            }
+      );
       // 创建副本：仅普通笔记（文件夹需递归复制子树，系统目录是保留结构）
       if (onDuplicate && note.is_folder !== 1) {
         items.push({
@@ -794,6 +949,7 @@ export function NoteList({
       items.push({
         label: '删除',
         destructive: true,
+        disabled: lockedView,
         icon: <Trash2 size={12} />,
         onClick: () => onDelete(note.id),
       });
@@ -844,7 +1000,11 @@ export function NoteList({
 
   const buildBulkContextItems = (): ContextMenuItem[] => {
     const count = selectedIds.size;
-    const noteIds = selectedNotes.map((n) => n.id);
+    // Locked (not session-unlocked) notes are skipped by destructive/move
+    // bulk actions; favorite stays allowed.
+    const movableNotes = selectedNotes.filter((n) => !isLockedView(n.id));
+    const lockedSkipped = selectedNotes.length - movableNotes.length;
+    const noteIds = movableNotes.map((n) => n.id);
     const fileIds = selectedFiles.map((f) => f.id);
     const allFav = selectedNotes.length > 0 && selectedNotes.every((n) => n.is_favorite === 1);
     const items: ContextMenuItem[] = [];
@@ -854,21 +1014,25 @@ export function NoteList({
         label: `使用选中的 ${noteIds.length} 个对象创建新文件夹`,
         icon: <FolderPlus size={12} />,
         onClick: async () => {
+          if (lockedSkipped > 0) await alert(`已跳过 ${lockedSkipped} 个锁定项`);
           await onBulkCreateFolder(noteIds);
           setSelectedIds(new Set());
         },
       });
     }
-    if (onBulkMove || onFileMove) {
+    if ((onBulkMove || onFileMove) && (noteIds.length > 0 || fileIds.length > 0)) {
       items.push({
-        label: `将 ${count} 个文件移动到...`,
+        label: `将 ${count - lockedSkipped} 个文件移动到...`,
         icon: <Move size={12} />,
-        onClick: () => setMoveTargetIds([...noteIds, ...fileIds]),
+        onClick: () => {
+          if (lockedSkipped > 0) void alert(`已跳过 ${lockedSkipped} 个锁定项`);
+          setMoveTargetIds([...noteIds, ...fileIds]);
+        },
       });
     }
-    if (onToggleFavorite && noteIds.length > 0) {
+    if (onToggleFavorite && selectedNotes.length > 0) {
       items.push({
-        label: allFav ? `取消收藏 ${noteIds.length} 个` : `收藏 ${noteIds.length} 个`,
+        label: allFav ? `取消收藏 ${selectedNotes.length} 个` : `收藏 ${selectedNotes.length} 个`,
         icon: <Bookmark size={12} />,
         onClick: () => {
           for (const n of selectedNotes) onToggleFavorite!(n.id, !allFav);
@@ -876,23 +1040,26 @@ export function NoteList({
         },
       });
     }
-    items.push({
-      label: `删除 ${count} 个`,
-      destructive: true,
-      icon: <Trash2 size={12} />,
-      onClick: () => {
-        if (noteIds.length > 0) {
-          if (onBulkDelete) {
-            // One confirmation covering the union of all subtrees.
-            onBulkDelete(noteIds);
-          } else {
-            for (const n of selectedNotes) onDelete(n.id);
+    if (noteIds.length > 0 || fileIds.length > 0) {
+      items.push({
+        label: `删除 ${count - lockedSkipped} 个`,
+        destructive: true,
+        icon: <Trash2 size={12} />,
+        onClick: () => {
+          if (lockedSkipped > 0) void alert(`已跳过 ${lockedSkipped} 个锁定项`);
+          if (noteIds.length > 0) {
+            if (onBulkDelete) {
+              // One confirmation covering the union of all subtrees.
+              onBulkDelete(noteIds);
+            } else {
+              for (const n of movableNotes) onDelete(n.id);
+            }
           }
-        }
-        for (const f of selectedFiles) onFileDelete?.(f.id);
-        setSelectedIds(new Set());
-      },
-    });
+          for (const f of selectedFiles) onFileDelete?.(f.id);
+          setSelectedIds(new Set());
+        },
+      });
+    }
     return items;
   };
 
@@ -908,6 +1075,8 @@ export function NoteList({
     const isFolder = node.isFolder;
     const note = node.note;
     const isSystem = note?.is_system === 1;
+    const directLocked = note?.is_locked === 1;
+    const lockedView = isLockedView(node.id);
     const isDropTarget = dropTarget?.kind !== 'root' && dropTarget?.id === node.id;
     const dropTargetInvalid = isDropTarget && !dropTarget!.valid;
     const isDraggingSource = draggingId === node.id;
@@ -925,7 +1094,7 @@ export function NoteList({
           onClick={(e) => handleNodeClick(e, node)}
           onDoubleClick={() => {
             if (node.file) onFileOpen?.(node.id);
-            else if (!isSystem) startRename(node.id, node.title);
+            else if (!isSystem && !lockedView) startRename(node.id, node.title);
           }}
           onContextMenu={(e) => openContextMenu(e as unknown as MouseEvent, node)}
           onMouseDown={(e) => {
@@ -950,12 +1119,12 @@ export function NoteList({
         >
           {isFolder || hasChildren ? (
             <button
-              onClick={(e) => { e.stopPropagation(); toggleExpand(node.id); }}
+              onClick={(e) => { e.stopPropagation(); handleToggleExpand(node); }}
               className="shrink-0 p-0.5 rounded hover:bg-surface-hover/60 text-text-secondary/60"
             >
               <ChevronRight
                 size={14}
-                className={`transition-transform duration-150 ${isExpanded ? 'rotate-90' : ''}`}
+                className={`transition-transform duration-150 ${isExpanded && !lockedView ? 'rotate-90' : ''}`}
               />
             </button>
           ) : (
@@ -997,6 +1166,18 @@ export function NoteList({
           ) : (
             <span className="flex-1 truncate flex items-center gap-1.5">
               {node.title || 'Untitled'}
+              {lockedSet.has(node.id) &&
+                (lockedView ? (
+                  <Lock
+                    size={12}
+                    className={`shrink-0 text-text-secondary ${directLocked ? '' : 'opacity-40'}`}
+                  />
+                ) : (
+                  <LockOpen
+                    size={12}
+                    className={`shrink-0 text-amber-400 ${directLocked ? '' : 'opacity-40'}`}
+                  />
+                ))}
               {note?.is_excerpt === 1 && (
                 <span className="shrink-0 text-[9px] px-1 py-px rounded bg-primary/15 text-primary leading-none">
                   摘录
@@ -1012,7 +1193,7 @@ export function NoteList({
 
         </div>
 
-        {hasChildren && isExpanded && (
+        {hasChildren && isExpanded && !lockedView && (
           <div>
             {children.map((child) => renderNode(child, depth + 1))}
           </div>
@@ -1305,6 +1486,22 @@ export function NoteList({
           currentParentId={parentOf(moveTargetIds[0])}
           onMove={handleMoveDialog}
           onClose={() => setMoveTargetIds(null)}
+        />
+      )}
+
+      {/* Lock password dialog (setup / verify-unlock / verify-expand) */}
+      {lockDialog && (
+        <LockPasswordDialog
+          mode={lockDialog.mode}
+          title={
+            lockDialog.mode === 'setup'
+              ? '设置锁定密码'
+              : lockDialog.action === 'expand'
+                ? '解锁文件夹'
+                : '解锁'
+          }
+          onSuccess={handleLockDialogSuccess}
+          onClose={() => setLockDialog(null)}
         />
       )}
     </div>

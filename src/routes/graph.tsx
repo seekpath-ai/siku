@@ -3,8 +3,11 @@ import { createRoute, useNavigate } from '@tanstack/react-router';
 import { Route as RootRoute } from './__root';
 import { Loader2 } from 'lucide-react';
 import ForceGraph2D from 'react-force-graph-2d';
-import { graphGet } from '@/lib/tauri';
+import { graphGet, notesListAll } from '@/lib/tauri';
 import { openNoteTab } from '@/lib/openNote';
+import { useAllUnlockedSet } from '@/stores/noteLockStore';
+import { computeEffectiveLockedSet } from '@/lib/noteLock';
+import type { Note } from '@/lib/types';
 
 interface GraphNode {
   id: string; label: string; node_type: string; color: string;
@@ -56,6 +59,27 @@ function GraphPage() {
     })();
   }, []);
 
+  // Locked (not session-unlocked) notes are dropped from the graph together
+  // with their edges — node labels would leak their titles.
+  const [allNotes, setAllNotes] = useState<Note[]>([]);
+  useEffect(() => {
+    notesListAll().then(setAllNotes).catch(() => {});
+  }, []);
+  const unlockedSet = useAllUnlockedSet();
+  const hiddenIds = useMemo(() => {
+    const lockedSet = computeEffectiveLockedSet(allNotes);
+    return new Set([...lockedSet].filter((id) => !unlockedSet.has(id)));
+  }, [allNotes, unlockedSet]);
+  const visibleData = useMemo(() => {
+    if (!data) return null;
+    const nodes = data.nodes.filter((n) => !(n.node_type === 'note' && hiddenIds.has(n.id)));
+    const ids = new Set(nodes.map((n) => n.id));
+    return {
+      nodes,
+      links: data.links.filter((l) => ids.has(l.source) && ids.has(l.target)),
+    };
+  }, [data, hiddenIds]);
+
   const handleNodeClick = (node: unknown) => {
     const n = node as GraphNode;
     if (!n?.id) return;
@@ -71,26 +95,26 @@ function GraphPage() {
   // Give nodes deterministic initial positions (circular layout) so the first
   // paint has valid coordinates even before the force engine lays them out.
   const graphData = useMemo(() => {
-    if (!data) return null;
-    const n = data.nodes.length || 1;
+    if (!visibleData) return null;
+    const n = visibleData.nodes.length || 1;
     return {
-      nodes: data.nodes.map((node, i) => {
+      nodes: visibleData.nodes.map((node, i) => {
         if (node.x !== undefined && node.y !== undefined) return node;
         const angle = (i / n) * Math.PI * 2;
         const radius = 120 + (i % 5) * 40;
         return { ...node, x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
       }),
-      links: data.links,
+      links: visibleData.links,
     };
-  }, [data]);
+  }, [visibleData]);
 
   // Hover focus: the hovered node + its neighbors stay prominent, everything
   // else fades — Obsidian-style knowledge graph behavior.
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const neighbors = useMemo(() => {
-    if (!hoveredId || !data) return new Set<string>();
+    if (!hoveredId || !visibleData) return new Set<string>();
     const set = new Set<string>();
-    for (const l of data.links) {
+    for (const l of visibleData.links) {
       const link = l as { source: unknown; target: unknown };
       const s = typeof link.source === 'string'
         ? link.source
@@ -102,7 +126,7 @@ function GraphPage() {
       if (t === hoveredId) set.add(s);
     }
     return set;
-  }, [hoveredId, data]);
+  }, [hoveredId, visibleData]);
 
   const nodeIdOf = (n: unknown) => ((n as GraphNode)?.id) ?? null;
   const isFocused = (id: string) => hoveredId === null || hoveredId === id || neighbors.has(id);
@@ -113,7 +137,7 @@ function GraphPage() {
         <div className="flex items-center justify-center h-full">
           <Loader2 size={32} className="animate-spin text-text-secondary" />
         </div>
-      ) : !data?.nodes.length ? (
+      ) : !visibleData?.nodes.length ? (
         <div className="flex flex-col items-center justify-center h-full text-text-secondary">
           <p className="text-lg">暂无图谱数据</p>
           <p className="text-sm mt-2">导入论文、创建笔记后会自动生成关联图谱</p>

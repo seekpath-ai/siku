@@ -54,6 +54,7 @@ import { useLibraryStore } from '@/stores/libraryStore';
 import { useTabStore } from '@/stores/tabStore';
 import { openNoteTab } from '@/lib/openNote';
 import { useDialog } from '@/hooks/useDialog';
+import { getAllUnlockedIds } from '@/stores/noteLockStore';
 import { parseJsonArray } from '@/lib/types';
 import { isoToDisplayFull } from '@/lib/time';
 import type { ActiveFilter } from '@/stores/libraryStore';
@@ -421,7 +422,7 @@ function PaperRow({
 
   const handleExportNotes = async () => {
     try {
-      const notes = await notesList(paper.id);
+      const notes = await notesList(paper.id, undefined, undefined, getAllUnlockedIds());
       if (notes.length === 0) {
         await alert('该文献没有笔记');
         return;

@@ -54,7 +54,7 @@ pub async fn duplicate_note(db: &SqlitePool, id: &str) -> Result<Note, String> {
     if src.is_system == 1 {
         return Err("系统目录不支持创建副本".to_string());
     }
-    create_note(
+    let copy = create_note(
         db,
         &format!("{} 副本", src.title),
         &src.content,
@@ -63,7 +63,17 @@ pub async fn duplicate_note(db: &SqlitePool, id: &str) -> Result<Note, String> {
         &src.vault_id,
         false,
     )
-    .await
+    .await?;
+    // The copy inherits the privacy lock of its source.
+    if src.is_locked == 1 {
+        sqlx::query("UPDATE notes SET is_locked = 1 WHERE id = ?")
+            .bind(&copy.id)
+            .execute(db)
+            .await
+            .map_err(|e| format!("db: {e}"))?;
+        return get_note(db, &copy.id).await;
+    }
+    Ok(copy)
 }
 
 /// Update a note. When `touch` is `Some(false)` the `updated_at` timestamp is
@@ -189,6 +199,88 @@ pub async fn delete_note(db: &SqlitePool, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Ids of all notes under the privacy lock in a vault: every `is_locked = 1`
+/// row plus its whole descendant subtree (locking a folder locks its
+/// contents). Cycles in parent_id cannot loop forever — UNION is distinct.
+pub async fn effective_locked_ids(db: &SqlitePool, vault_id: &str) -> Result<Vec<String>, String> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "WITH RECURSIVE locked_tree(id) AS (
+             SELECT id FROM notes WHERE is_locked = 1 AND vault_id = ?
+             UNION
+             SELECT n.id FROM notes n JOIN locked_tree t ON n.parent_id = t.id
+         )
+         SELECT id FROM locked_tree",
+    )
+    .bind(vault_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("db: {e}"))?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Whether a note is behind the privacy lock: itself or any ancestor has
+/// `is_locked = 1`.
+pub async fn is_note_effectively_locked(db: &SqlitePool, id: &str) -> Result<bool, String> {
+    let found: Option<(String,)> = sqlx::query_as(
+        "WITH RECURSIVE ancestors(id, parent_id, is_locked) AS (
+             SELECT id, parent_id, is_locked FROM notes WHERE id = ?
+             UNION
+             SELECT p.id, p.parent_id, p.is_locked FROM notes p JOIN ancestors a ON p.id = a.parent_id
+         )
+         SELECT id FROM ancestors WHERE is_locked = 1 LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("db: {e}"))?;
+    Ok(found.is_some())
+}
+
+/// Set the privacy-lock flag on a note or folder. System folders cannot be
+/// locked. `updated_at` is deliberately untouched so locking never reorders
+/// the note tree (which sorts by updated_at).
+pub async fn set_note_locked(db: &SqlitePool, id: &str, locked: bool) -> Result<Note, String> {
+    let sys: Option<(i32,)> = sqlx::query_as("SELECT is_system FROM notes WHERE id = ?")
+        .bind(id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| format!("db: {e}"))?;
+    if let Some((1,)) = sys {
+        return Err("系统目录不支持锁定".to_string());
+    }
+    sqlx::query("UPDATE notes SET is_locked = ? WHERE id = ?")
+        .bind(locked as i32)
+        .bind(id)
+        .execute(db)
+        .await
+        .map_err(|e| format!("db: {e}"))?;
+    get_note(db, id).await
+}
+
+/// Effective locked ids minus the caller's unlocked set — the ids that must
+/// be hidden from search/list/backlink results.
+async fn excluded_locked_ids(
+    db: &SqlitePool,
+    vault_id: &str,
+    unlocked_ids: &[String],
+) -> Result<Vec<String>, String> {
+    let locked = effective_locked_ids(db, vault_id).await?;
+    Ok(locked
+        .into_iter()
+        .filter(|id| !unlocked_ids.iter().any(|u| u == id))
+        .collect())
+}
+
+/// `AND <qualifier>.id NOT IN (?, ?, ...)` for the given excluded ids, or an
+/// empty string when there is nothing to exclude.
+pub(crate) fn not_in_clause(qualifier: &str, excluded: &[String]) -> String {
+    if excluded.is_empty() {
+        return String::new();
+    }
+    let placeholders = vec!["?"; excluded.len()].join(", ");
+    format!(" AND {qualifier}.id NOT IN ({placeholders})")
+}
+
 /// List all notes regardless of parent, ordered by updated_at DESC
 #[instrument(skip(db))]
 pub async fn list_all_notes(db: &SqlitePool, vault_id: &str) -> Result<Vec<Note>, String> {
@@ -249,6 +341,7 @@ pub async fn list_notes(
     paper_id: Option<&str>,
     search: Option<&str>,
     parent_id: Option<&str>,
+    unlocked_ids: &[String],
 ) -> Result<Vec<Note>, String> {
     let mut sql = String::from("SELECT * FROM notes WHERE 1=1");
     let mut params: Vec<String> = Vec::new();
@@ -261,6 +354,12 @@ pub async fn list_notes(
         sql.push_str(" AND (title LIKE ? OR content_plain LIKE ?)");
         let p = format!("%{}%", s);
         params.push(p.clone()); params.push(p);
+        // Text search never surfaces locked notes unless the caller unlocked
+        // them this session.
+        let vault_id = crate::core::vault_service::get_current_vault_id(db).await?;
+        let excluded = excluded_locked_ids(db, &vault_id, unlocked_ids).await?;
+        sql.push_str(&not_in_clause("notes", &excluded));
+        params.extend(excluded);
     }
     if let Some(pid) = parent_id {
         sql.push_str(" AND parent_id = ?");
@@ -282,12 +381,15 @@ pub async fn list_notes(
 
 /// Full-text search across all notes (FTS5 with LIKE fallback).
 /// Returns ranked results with a snippet of the matched content.
+/// Locked notes (and descendants of locked folders) are excluded unless their
+/// id is in `unlocked_ids`.
 #[instrument(skip(db))]
 pub async fn search_notes(
     db: &SqlitePool,
     query: &str,
     limit: i64,
     vault_id: &str,
+    unlocked_ids: &[String],
 ) -> Result<Vec<serde_json::Value>, String> {
     if query.trim().is_empty() {
         return Ok(Vec::new());
@@ -298,30 +400,44 @@ pub async fn search_notes(
         .collect::<Vec<_>>()
         .join(" ");
 
-    let rows: Vec<(String, String, String, String)> = match sqlx::query_as(
+    let excluded = excluded_locked_ids(db, vault_id, unlocked_ids).await?;
+
+    let fts_sql = format!(
         "SELECT n.id, n.title, n.content, n.updated_at FROM notes_fts f JOIN notes n ON n.rowid = f.rowid \
-         WHERE notes_fts MATCH ? AND n.vault_id = ? ORDER BY bm25(notes_fts) LIMIT ?"
-    )
-    .bind(&match_expr)
-    .bind(vault_id)
-    .bind(limit)
-    .fetch_all(db)
-    .await
+         WHERE notes_fts MATCH ? AND n.vault_id = ?{} ORDER BY bm25(notes_fts) LIMIT ?",
+        not_in_clause("n", &excluded)
+    );
+    let mut fts_q = sqlx::query_as::<_, (String, String, String, String)>(&fts_sql)
+        .bind(&match_expr)
+        .bind(vault_id);
+    for id in &excluded {
+        fts_q = fts_q.bind(id);
+    }
+    let rows: Vec<(String, String, String, String)> = match fts_q
+        .bind(limit)
+        .fetch_all(db)
+        .await
     {
         Ok(rows) => rows,
         Err(_) => {
             let pattern = format!("%{}%", query);
-            sqlx::query_as::<_, (String, String, String, String)>(
+            let like_sql = format!(
                 "SELECT id, title, content, updated_at FROM notes \
-                 WHERE vault_id = ? AND (title LIKE ? OR content_plain LIKE ?) ORDER BY updated_at DESC LIMIT ?"
-            )
-            .bind(vault_id)
-            .bind(&pattern)
-            .bind(&pattern)
-            .bind(limit)
-            .fetch_all(db)
-            .await
-            .map_err(|e| format!("db: {e}"))?
+                 WHERE vault_id = ? AND (title LIKE ? OR content_plain LIKE ?){} ORDER BY updated_at DESC LIMIT ?",
+                not_in_clause("notes", &excluded)
+            );
+            let mut like_q = sqlx::query_as::<_, (String, String, String, String)>(&like_sql)
+                .bind(vault_id)
+                .bind(&pattern)
+                .bind(&pattern);
+            for id in &excluded {
+                like_q = like_q.bind(id);
+            }
+            like_q
+                .bind(limit)
+                .fetch_all(db)
+                .await
+                .map_err(|e| format!("db: {e}"))?
         }
     };
 
@@ -363,15 +479,21 @@ fn make_snippet(content: &str, query: &str, max_len: usize) -> String {
 }
 
 /// Get backlinks (notes that link to this note) — restricted to the same vault.
-pub async fn get_backlinks(db: &SqlitePool, note_id: &str, vault_id: &str) -> Result<Vec<(Note, String)>, String> {
+/// Locked source notes are hidden unless their id is in `unlocked_ids`.
+pub async fn get_backlinks(db: &SqlitePool, note_id: &str, vault_id: &str, unlocked_ids: &[String]) -> Result<Vec<(Note, String)>, String> {
     let rows = sqlx::query_as::<_, (String, String)>(
         "SELECT nl.source_id, nl.context FROM note_links nl \
          JOIN notes src ON src.id = nl.source_id \
          WHERE nl.target_id = ? AND src.vault_id = ?"
     ).bind(note_id).bind(vault_id).fetch_all(db).await.map_err(|e| format!("db: {e}"))?;
 
+    let excluded = excluded_locked_ids(db, vault_id, unlocked_ids).await?;
+
     let mut results = Vec::new();
     for (source_id, context) in rows {
+        if excluded.iter().any(|e| e == &source_id) {
+            continue;
+        }
         if let Ok(note) = get_note(db, &source_id).await {
             results.push((note, context));
         }
@@ -1244,6 +1366,140 @@ mod tests {
             .execute(&db)
             .await?;
         assert!(duplicate_note(&db, &src.id).await.is_err());
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// 隐私锁：锁定文件夹后子/孙笔记全部生效；系统目录拒绝锁定；
+    /// set_note_locked 不动 updated_at（避免树重排）；副本继承锁标记。
+    #[tokio::test]
+    async fn note_lock_covers_subtree() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-note-lock-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = crate::core::db::tests::connect_with_crsqlite(&dir.join("l.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db).await?;
+        crate::core::db::register_crr_tables(&db, crate::core::db::CORE_SYNC_TABLES).await?;
+
+        let vault = crate::core::db::DEFAULT_VAULT_ID;
+        let folder = create_note(&db, "私密文件夹", "", None, None, vault, true)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let child = create_note(&db, "子笔记", "秘密", None, Some(&folder.id), vault, false)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let grandchild = create_note(&db, "孙笔记", "更秘密", None, Some(&child.id), vault, false)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let outside = create_note(&db, "公开笔记", "随便看", None, None, vault, false)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let locked = set_note_locked(&db, &folder.id, true)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(locked.is_locked, 1);
+        assert_eq!(
+            locked.updated_at, folder.updated_at,
+            "locking must not touch updated_at (tree order)"
+        );
+
+        let ids = effective_locked_ids(&db, vault)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        for expected in [&folder.id, &child.id, &grandchild.id] {
+            assert!(ids.contains(expected), "subtree note {expected} must be effectively locked");
+        }
+        assert!(!ids.contains(&outside.id), "unrelated note must stay unlocked");
+        assert!(is_note_effectively_locked(&db, &grandchild.id).await.unwrap());
+        assert!(!is_note_effectively_locked(&db, &outside.id).await.unwrap());
+
+        // 副本继承锁标记（仅自身 is_locked=1 时继承；仅靠祖先锁生效的副本
+        // 仍通过父目录保持锁定，无需置位）
+        set_note_locked(&db, &child.id, true)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let copy = duplicate_note(&db, &child.id).await.map_err(|e| anyhow::anyhow!(e))?;
+        assert_eq!(copy.is_locked, 1, "copy of a locked note must stay locked");
+
+        // 系统目录不可锁定
+        sqlx::query("UPDATE notes SET is_system = 1 WHERE id = ?")
+            .bind(&outside.id)
+            .execute(&db)
+            .await?;
+        assert!(set_note_locked(&db, &outside.id, true).await.is_err());
+
+        // 解锁文件夹 → 仅靠祖先锁的孙笔记不再生效；自身锁定的子笔记与副本仍生效
+        set_note_locked(&db, &folder.id, false)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let ids = effective_locked_ids(&db, vault)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert!(!ids.contains(&folder.id));
+        assert!(!ids.contains(&outside.id));
+        for expected in [&child.id, &grandchild.id, &copy.id] {
+            assert!(ids.contains(expected), "{expected} must remain effectively locked");
+        }
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// 搜索不返回生效锁定的笔记；unlocked_ids 里的 id 放行。
+    #[tokio::test]
+    async fn search_notes_hides_locked_notes() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-note-lock-search-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = crate::core::db::tests::connect_with_crsqlite(&dir.join("s.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db).await?;
+        crate::core::db::register_crr_tables(&db, crate::core::db::CORE_SYNC_TABLES).await?;
+
+        let vault = crate::core::db::DEFAULT_VAULT_ID;
+        let folder = create_note(&db, "锁住的目录", "", None, None, vault, true)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let hidden = create_note(&db, "隐藏笔记", "zzzq 机密内容", None, Some(&folder.id), vault, false)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let visible = create_note(&db, "可见笔记", "zzzq 公开内容", None, None, vault, false)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        set_note_locked(&db, &folder.id, true)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let results = search_notes(&db, "zzzq", 10, vault, &[])
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let ids: Vec<&str> = results.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert_eq!(ids, vec![visible.id.as_str()], "locked subtree must be hidden");
+
+        // unlocked_ids 放行指定笔记
+        let results = search_notes(&db, "zzzq", 10, vault, &[hidden.id.clone()])
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let ids: Vec<&str> = results.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert_eq!(ids.len(), 2, "unlocked id must be searchable again");
+        assert!(ids.contains(&hidden.id.as_str()));
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;

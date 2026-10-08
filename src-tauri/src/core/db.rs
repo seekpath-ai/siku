@@ -843,6 +843,19 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     add_column_if_missing(&db, "notes", "is_folder", "INTEGER DEFAULT 0")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for notes.is_folder: {}", e))?;
+    // Privacy lock (UI gate): locked notes/folders require the vault password
+    // to view. The flag syncs via CRDT like every other notes column.
+    add_column_if_missing(&db, "notes", "is_locked", "INTEGER DEFAULT 0")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for notes.is_locked: {}", e))?;
+    // Global lock password (written to ALL vault rows): salted iterated SHA-256
+    // hash + per-install salt. Synced so other devices verify the same password.
+    add_column_if_missing(&db, "vaults", "lock_hash", "TEXT")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for vaults.lock_hash: {}", e))?;
+    add_column_if_missing(&db, "vaults", "lock_salt", "TEXT")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for vaults.lock_salt: {}", e))?;
 
     // Migration: vaults (Obsidian-style note vaults, added 2026-08-09)
     sqlx::query(

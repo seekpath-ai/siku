@@ -15,6 +15,8 @@ import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
 import { rewritePasswordTokens } from '@/lib/passwordToken';
 import { useNotesSettingsStore } from '@/stores/notesSettingsStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
+import { useAllUnlockedSet } from '@/stores/noteLockStore';
+import { computeEffectiveLockedSet } from '@/lib/noteLock';
 import type { Note } from '@/lib/types';
 
 interface Props {
@@ -235,11 +237,20 @@ function MdImage({
 
 export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, className, attachmentsDir }: Props) {
   const navigate = useNavigate();
+  // Locked (not session-unlocked) notes: embeds render a placeholder and link
+  // hover previews are scrubbed — both would otherwise leak the content.
+  const unlockedSet = useAllUnlockedSet();
+  const lockedSet = useMemo(() => computeEffectiveLockedSet(notes), [notes]);
+  const isLockHidden = useCallback(
+    (id: string) => lockedSet.has(id) && !unlockedSet.has(id),
+    [lockedSet, unlockedSet]
+  );
   const processed = useMemo(() => {
     // 1. Embeds: ![[note]] → inline the target's content (one level deep).
     let text = content.replace(EMBED_RE, (_match, raw: string) => {
       const { targetId } = resolveWikiTarget(raw, notes);
       if (!targetId) return `![[${raw}]]`;
+      if (isLockHidden(targetId)) return '\n\n*🔒 已锁定笔记*\n\n';
       const target = notes.find((n) => n.id === targetId);
       return target ? `\n\n${target.content}\n\n` : `![[${raw}]]`;
     });
@@ -257,7 +268,7 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
     });
     // 4. LLM-style math delimiters \(...\) / \[...\] → remark-math's $..$.
     return normalizeMathDelimiters(text);
-  }, [content, notes]);
+  }, [content, notes, isLockHidden]);
 
   const LinkComponent = useCallback(
     (props: React.AnchorHTMLAttributes<HTMLAnchorElement>) => {
@@ -276,14 +287,16 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
       if (href?.startsWith('note://')) {
         const id = href.slice(7);
         const target = notes.find((n) => n.id === id);
-        const preview = target
-          ? `${target.title}\n\n${(target.content_plain || '').slice(0, 200)}`
-          : '';
+        const hidden = isLockHidden(id);
+        const preview =
+          target && !hidden
+            ? `${target.title}\n\n${(target.content_plain || '').slice(0, 200)}`
+            : '';
         return (
           <a
             {...props}
             href="#"
-            title={preview || undefined}
+            title={hidden ? '🔒 已锁定笔记' : preview || undefined}
             onClick={(e) => {
               e.preventDefault();
               onNavigate(id);
@@ -364,7 +377,7 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
       }
       return <a {...props} className="text-primary hover:underline" />;
     },
-    [onNavigate, onCreateLink, notes, navigate]
+    [onNavigate, onCreateLink, notes, navigate, isLockHidden]
   );
 
   // Images are rendered by the MdImage component (remote caching + asset

@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import * as tauri from '@/lib/tauri';
+import { useNoteLockStore, getAllUnlockedIds } from '@/stores/noteLockStore';
 import type { ListPapersParams, Paper, PaperInput, PaperLinkMetadata, Collection, Tag, Note } from '@/lib/types';
 
 /** Fetch papers with caching */
@@ -21,11 +22,16 @@ export function usePaper(id: string | null) {
   });
 }
 
-/** Fetch notes linked to a paper */
+/** Fetch notes linked to a paper. Locked (not session-unlocked) notes are
+ *  excluded server-side via unlocked_ids; the key includes them so an unlock
+ *  refetches. */
 export function usePaperNotes(paperId: string | null) {
+  const unlockedIds = useNoteLockStore((s) =>
+    Object.values(s.unlockedByVault).flat().join(',')
+  );
   return useQuery<Note[]>({
-    queryKey: ['paper-notes', paperId],
-    queryFn: () => tauri.notesList(paperId!),
+    queryKey: ['paper-notes', paperId, unlockedIds],
+    queryFn: () => tauri.notesList(paperId!, undefined, undefined, getAllUnlockedIds()),
     enabled: !!paperId,
     staleTime: 30_000,
   });

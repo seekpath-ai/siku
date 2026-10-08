@@ -16,6 +16,7 @@ pub mod graph_service;
 pub mod knowledge;
 pub mod link_import;
 pub mod llm_provider_service;
+pub mod lock_service;
 pub mod logger;
 pub mod models;
 pub mod note_service;

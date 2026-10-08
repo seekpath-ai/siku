@@ -47,6 +47,12 @@ impl Tool for NoteReadTool {
 
     async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
         if let Some(id) = args["note_id"].as_str() {
+            // Privacy lock: the agent must never read locked notes (the lock
+            // is a UI gate, but the agent context would leak the content).
+            // Returned as a normal tool result so the agent loop keeps going.
+            if crate::core::note_service::is_note_effectively_locked(&self.db, id).await? {
+                return Ok("该笔记已锁定，无法读取".to_string());
+            }
             let note = sqlx::query_as::<_, crate::core::models::Note>(
                 "SELECT * FROM notes WHERE id = ?"
             ).bind(id).fetch_optional(&self.db).await
@@ -84,25 +90,49 @@ impl Tool for NoteReadTool {
         let limit = args["limit"].as_u64().unwrap_or(10).min(50) as i64;
         let offset = args["offset"].as_u64().unwrap_or(0) as i64;
 
+        // Locked notes never reach the agent (no unlocked_ids concept here).
+        let vault_id = crate::core::vault_service::get_current_vault_id(&self.db).await?;
+        let locked = crate::core::note_service::effective_locked_ids(&self.db, &vault_id).await?;
+
         let notes: Vec<(String, String, String)> = if search.trim().is_empty() {
-            sqlx::query_as(
-                "SELECT id, title, content_plain FROM notes ORDER BY updated_at DESC LIMIT ? OFFSET ?"
-            ).bind(limit).bind(offset).fetch_all(&self.db).await
+            let sql = format!(
+                "SELECT id, title, content_plain FROM notes WHERE 1=1{} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                crate::core::note_service::not_in_clause("notes", &locked)
+            );
+            let mut q = sqlx::query_as::<_, (String, String, String)>(&sql);
+            for id in &locked {
+                q = q.bind(id);
+            }
+            q.bind(limit).bind(offset).fetch_all(&self.db).await
                 .map_err(|e| format!("db error: {e}"))?
         } else {
             let match_expr = search.split_whitespace()
                 .map(|t| format!("\"{}\"*", t.trim_matches('"')))
                 .collect::<Vec<_>>().join(" ");
-            match sqlx::query_as(
+            let fts_sql = format!(
                 "SELECT n.id, n.title, n.content_plain FROM notes_fts f JOIN notes n ON n.rowid = f.rowid \
-                 WHERE notes_fts MATCH ? ORDER BY bm25(notes_fts) LIMIT ? OFFSET ?"
-            ).bind(match_expr).bind(limit).bind(offset).fetch_all(&self.db).await {
+                 WHERE notes_fts MATCH ?{} ORDER BY bm25(notes_fts) LIMIT ? OFFSET ?",
+                crate::core::note_service::not_in_clause("n", &locked)
+            );
+            let mut fts_q = sqlx::query_as::<_, (String, String, String)>(&fts_sql).bind(&match_expr);
+            for id in &locked {
+                fts_q = fts_q.bind(id);
+            }
+            match fts_q.bind(limit).bind(offset).fetch_all(&self.db).await {
                 Ok(rows) => rows,
                 Err(_) => {
                     let pattern = format!("%{}%", search);
-                    sqlx::query_as(
-                        "SELECT id, title, content_plain FROM notes WHERE title LIKE ? OR content_plain LIKE ? ORDER BY updated_at DESC LIMIT ? OFFSET ?"
-                    ).bind(&pattern).bind(&pattern).bind(limit).bind(offset).fetch_all(&self.db).await
+                    let like_sql = format!(
+                        "SELECT id, title, content_plain FROM notes WHERE (title LIKE ? OR content_plain LIKE ?){} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                        crate::core::note_service::not_in_clause("notes", &locked)
+                    );
+                    let mut like_q = sqlx::query_as::<_, (String, String, String)>(&like_sql)
+                        .bind(&pattern)
+                        .bind(&pattern);
+                    for id in &locked {
+                        like_q = like_q.bind(id);
+                    }
+                    like_q.bind(limit).bind(offset).fetch_all(&self.db).await
                         .map_err(|e| format!("db error: {e}"))?
                 }
             }

@@ -17,6 +17,7 @@ import {
   FileDown,
 } from 'lucide-react';
 import { useLibraryStore } from '@/stores/libraryStore';
+import { getAllUnlockedIds } from '@/stores/noteLockStore';
 import { usePetContextStore } from '@/stores/petContextStore';
 import { usePaper, useUpdatePaper, usePaperNotes, usePaperTags, useTags, useAddTagsToPaper, useRemoveTagsFromPaper, useCreateTag } from '@/hooks/useLibrary';
 import { useDialog } from '@/hooks/useDialog';
@@ -764,7 +765,7 @@ export function NotesTab({ paperId }: { paperId: string }) {
 
   useEffect(() => {
     if (selectedId) {
-      notesGetBacklinks(selectedId).then(setBacklinks).catch(() => setBacklinks([]));
+      notesGetBacklinks(selectedId, getAllUnlockedIds()).then(setBacklinks).catch(() => setBacklinks([]));
     } else {
       setBacklinks([]);
     }

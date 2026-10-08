@@ -146,6 +146,7 @@ CREATE TABLE IF NOT EXISTS notes (
     parent_id TEXT,
     sort_order INTEGER DEFAULT 0,
     is_literature_note INTEGER DEFAULT 0,
+    is_locked INTEGER DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT ''
 );
@@ -168,6 +169,8 @@ CREATE INDEX IF NOT EXISTS idx_note_versions_note ON note_versions(note_id);
 CREATE TABLE IF NOT EXISTS vaults (
     id TEXT PRIMARY KEY NOT NULL,
     name TEXT NOT NULL DEFAULT '',
+    lock_hash TEXT,
+    lock_salt TEXT,
     created_at TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT ''
 );

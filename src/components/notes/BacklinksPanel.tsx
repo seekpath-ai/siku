@@ -1,6 +1,8 @@
 import { useMemo } from 'react';
 import { Link2, Unlink, Plus } from 'lucide-react';
 import type { Note } from '@/lib/types';
+import { useAllUnlockedSet } from '@/stores/noteLockStore';
+import { computeEffectiveLockedSet } from '@/lib/noteLock';
 
 interface Backlink {
   id: string;
@@ -36,13 +38,22 @@ function buildSnippet(text: string, query: string, radius = 40): string {
 /** Backlinks view rendered inside the note tab (Obsidian "Show backlinks"). */
 export function BacklinksPanel({ activeNote, notes, backlinks, onNavigate, onConvertMention }: Props) {
   const linkedIds = useMemo(() => new Set(backlinks.map((bl) => bl.id)), [backlinks]);
+  // Locked (not session-unlocked) notes never show up as unlinked mentions —
+  // their content_plain would leak through the snippet.
+  const unlockedSet = useAllUnlockedSet();
+  const lockedSet = useMemo(() => computeEffectiveLockedSet(notes), [notes]);
 
   const unlinked = useMemo<UnlinkedMention[]>(() => {
     const title = activeNote.title.trim();
     if (!title) return [];
 
     return notes
-      .filter((n) => n.id !== activeNote.id && !linkedIds.has(n.id))
+      .filter(
+        (n) =>
+          n.id !== activeNote.id &&
+          !linkedIds.has(n.id) &&
+          !(lockedSet.has(n.id) && !unlockedSet.has(n.id))
+      )
       .map((n) => {
         const text = n.content_plain || '';
         const idx = text.toLowerCase().indexOf(title.toLowerCase());
@@ -54,7 +65,7 @@ export function BacklinksPanel({ activeNote, notes, backlinks, onNavigate, onCon
         };
       })
       .filter((m): m is UnlinkedMention => m !== null);
-  }, [activeNote, notes, linkedIds]);
+  }, [activeNote, notes, linkedIds, lockedSet, unlockedSet]);
 
   return (
     <div className="h-full overflow-y-auto">

@@ -474,6 +474,7 @@ export interface Note {
   is_favorite: number;
   is_folder: number;
   is_system: number;
+  is_locked: number;
   source_collection_id: string | null;
   is_excerpt: number;
   agent_edited_at: string | null;

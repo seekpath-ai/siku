@@ -31,6 +31,7 @@ import {
 import type { NoteSearchResult } from '@/lib/tauri';
 import type { Paper, KnowledgeItem, AgentSession, Bookmark as BookmarkType } from '@/lib/types';
 import { useChatStore } from '@/stores/chatStore';
+import { getAllUnlockedIds } from '@/stores/noteLockStore';
 
 interface SearchItem {
   id: string;
@@ -249,7 +250,7 @@ export function GlobalSearch({ onImportPdf }: GlobalSearchProps) {
       try {
         const limit = 8;
         const [notes, papers, knowledge, chats] = await Promise.allSettled([
-          notesSearch(trimmed, limit).catch(() => [] as NoteSearchResult[]),
+          notesSearch(trimmed, limit, getAllUnlockedIds()).catch(() => [] as NoteSearchResult[]),
           listPapers({ search: trimmed, limit }).catch(() => [] as Paper[]),
           knowledgeListItems(undefined, trimmed, undefined, limit).catch(() => [] as KnowledgeItem[]),
           listChatSessions().catch(() => [] as AgentSession[]),

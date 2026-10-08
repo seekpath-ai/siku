@@ -23,6 +23,7 @@ import {
   notesUpdate,
   notesDelete,
   notesMove,
+  notesSetLocked,
   notesGetBacklinks,
   vaultList,
   vaultCurrent,
@@ -42,6 +43,8 @@ import {
 } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
 import { openNoteTab } from '@/lib/openNote';
+import { useNoteLockStore, getAllUnlockedIds } from '@/stores/noteLockStore';
+import { computeEffectiveLockedSet } from '@/lib/noteLock';
 
 function NotesPage() {
   const [notes, setNotes] = useState<Note[]>([]);
@@ -92,6 +95,9 @@ function NotesPage() {
 
   const handleSwitchVault = async (id: string) => {
     try {
+      // Session unlocks belong to the old vault — forget them so the new
+      // vault (and a later switch back) starts fully locked.
+      if (currentVault) useNoteLockStore.getState().clearVault(currentVault.id);
       const v = await vaultSetCurrent(id);
       setCurrentVault(v);
       setActiveId(null);
@@ -106,6 +112,7 @@ function NotesPage() {
 
   const handleCreateVault = async (name: string) => {
     try {
+      if (currentVault) useNoteLockStore.getState().clearVault(currentVault.id);
       const v = await vaultCreate(name);
       await vaultSetCurrent(v.id);
       setCurrentVault(v);
@@ -132,6 +139,7 @@ function NotesPage() {
   const handleDeleteVault = async (id: string) => {
     try {
       await vaultDelete(id);
+      useNoteLockStore.getState().clearVault(id);
       if (currentVault?.id === id) {
         setActiveId(null);
         setActiveFileId(null);
@@ -241,13 +249,6 @@ function NotesPage() {
     if (activeId) {
       const n = notes.find((note) => note.id === activeId);
       setActiveNote(n || null);
-      // Keep the note tab's title in sync (covers AI renames / sync writes
-      // that bypass the rename handlers).
-      if (n) {
-        const title = n.title || '未命名笔记';
-        const tab = useTabStore.getState().findById(`note_${n.id}`);
-        if (tab && tab.title !== title) useTabStore.getState().updateTab(tab.id, { title });
-      }
       // Expose the focused note to the global pet.
       usePetContextStore.getState().setContext(
         n ? { page: 'notes', objectId: n.id, title: n.title || '未命名笔记' } : null
@@ -260,12 +261,31 @@ function NotesPage() {
     }
   }, [activeId, notes]);
 
+  // Keep note tab titles in sync with the notes list (covers AI renames /
+  // sync writes that bypass the rename handlers) AND mask locked-but-not-
+  // unlocked notes as「🔒 已锁定」so tab titles don't leak them.
+  const unlockedByVault = useNoteLockStore((s) => s.unlockedByVault);
+  useEffect(() => {
+    const lockedSet = computeEffectiveLockedSet(notes);
+    const unlocked = new Set(Object.values(unlockedByVault).flat());
+    const noteMap = new Map(notes.map((n) => [n.id, n]));
+    const tabStore = useTabStore.getState();
+    for (const tab of tabStore.tabs) {
+      if (!tab.id.startsWith('note_')) continue;
+      const note = noteMap.get(tab.id.slice(5));
+      if (!note) continue;
+      const hidden = lockedSet.has(note.id) && !unlocked.has(note.id);
+      const title = hidden ? '🔒 已锁定' : note.title || '未命名笔记';
+      if (tab.title !== title) tabStore.updateTab(tab.id, { title });
+    }
+  }, [notes, unlockedByVault]);
+
   // Clear the pet context when leaving the notes page.
   useEffect(() => () => usePetContextStore.getState().setContext(null), []);
 
   const loadBacklinks = async (id: string) => {
     try {
-      setBacklinks(await notesGetBacklinks(id));
+      setBacklinks(await notesGetBacklinks(id, getAllUnlockedIds()));
     } catch {
       setBacklinks([]);
     }
@@ -631,8 +651,20 @@ function NotesPage() {
   const openNote = useCallback((id: string) => {
     setActiveFileId(null);
     const n = notes.find((x) => x.id === id);
-    openNoteTab(navigate, { id, title: n?.title });
+    // Mask the tab title of a locked (not session-unlocked) note right away —
+    // the sync effect above only runs when the notes list changes.
+    const hidden =
+      n != null &&
+      computeEffectiveLockedSet(notes).has(id) &&
+      !getAllUnlockedIds().includes(id);
+    openNoteTab(navigate, { id, title: hidden ? '🔒 已锁定' : n?.title });
   }, [navigate, notes]);
+
+  /** 右键「锁定/解锁」：切换 is_locked 并原地更新列表。 */
+  const handleSetLocked = async (id: string, locked: boolean) => {
+    const updated = await notesSetLocked(id, locked);
+    setNotes((prev) => prev.map((n) => (n.id === id ? updated : n)));
+  };
 
   return (
     <div className="flex h-full">
@@ -663,6 +695,7 @@ function NotesPage() {
           onFileDelete={handleFileDelete}
           onFileOpen={handleFileOpen}
           onFileImportToLibrary={handleFileImportToLibrary}
+          onSetLocked={handleSetLocked}
           onClose={() => setSidePanelCollapsed(true)}
           currentVaultName={currentVault?.name ?? 'cognitive-archive'}
           onOpenVault={() => setVaultOpen(true)}

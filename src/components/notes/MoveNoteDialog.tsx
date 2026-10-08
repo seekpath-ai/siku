@@ -1,6 +1,8 @@
 import { useMemo, useEffect, useRef } from 'react';
-import { X, Folder, ArrowUpToLine } from 'lucide-react';
+import { X, Folder, ArrowUpToLine, Lock } from 'lucide-react';
 import type { Note } from '@/lib/types';
+import { useAllUnlockedSet } from '@/stores/noteLockStore';
+import { computeEffectiveLockedSet } from '@/lib/noteLock';
 
 interface Props {
   notes: Note[];
@@ -26,6 +28,10 @@ export function MoveNoteDialog({ notes, noteIds, currentParentId, onMove, onClos
 
   const folders = useMemo(() => notes.filter((n) => n.is_folder === 1), [notes]);
   const noteMap = useMemo(() => new Map(notes.map((n) => [n.id, n])), [notes]);
+  // Locked (not session-unlocked) folders can't be move targets.
+  const unlockedSet = useAllUnlockedSet();
+  const lockedSet = useMemo(() => computeEffectiveLockedSet(notes), [notes]);
+  const isFolderLocked = (id: string) => lockedSet.has(id) && !unlockedSet.has(id);
 
   const childrenMap = useMemo(() => {
     const map = new Map<string, Note[]>();
@@ -54,7 +60,8 @@ export function MoveNoteDialog({ notes, noteIds, currentParentId, onMove, onClos
 
   const renderFolder = (folder: Note, depth: number) => {
     const isCurrent = currentParentId === folder.id;
-    const disabled = isInSubtree(folder.id);
+    const locked = isFolderLocked(folder.id);
+    const disabled = isInSubtree(folder.id) || locked;
     return (
       <div key={folder.id}>
         <button
@@ -68,9 +75,13 @@ export function MoveNoteDialog({ notes, noteIds, currentParentId, onMove, onClos
                 : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
           }`}
           style={{ paddingLeft: `${12 + depth * 16}px` }}
-          title={disabled ? '不能移动到自身或其子目录' : `移动到「${folder.title}」`}
+          title={locked ? '已锁定，无法移动到此处' : disabled ? '不能移动到自身或其子目录' : `移动到「${folder.title}」`}
         >
-          <Folder size={14} className="shrink-0 text-text-secondary/60" />
+          {locked ? (
+            <Lock size={14} className="shrink-0 text-text-secondary/60" />
+          ) : (
+            <Folder size={14} className="shrink-0 text-text-secondary/60" />
+          )}
           <span className="flex-1 truncate">{folder.title || '未命名'}</span>
           {isCurrent && <span className="text-[10px] text-primary shrink-0">当前所在</span>}
         </button>

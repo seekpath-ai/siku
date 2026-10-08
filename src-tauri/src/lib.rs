@@ -858,6 +858,7 @@ pub fn run() {
             commands::notes::notes_list,
             commands::notes::notes_list_all,
             commands::notes::notes_move,
+            commands::notes::notes_set_locked,
             commands::notes::notes_get_backlinks,
             commands::notes::notes_search,
             commands::notes::note_versions_list,
@@ -884,6 +885,9 @@ pub fn run() {
             commands::vault::vault_set_current,
             commands::vault::vault_export,
             commands::vault::vault_import,
+            commands::vault::vault_lock_status,
+            commands::vault::vault_set_lock_password,
+            commands::vault::vault_verify_lock_password,
             // File Browser
             commands::file_browser::file_browser_list_dir,
             commands::file_browser::file_browser_get_info,

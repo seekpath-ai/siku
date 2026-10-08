@@ -3,6 +3,7 @@ import { X } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { notesListAll, notesCreate, notesUpdate, notesDelete, notesGetBacklinks } from '@/lib/tauri';
 import { NoteEditor } from '@/components/notes/NoteEditor';
+import { getAllUnlockedIds } from '@/stores/noteLockStore';
 import type { Note } from '@/lib/types';
 
 interface Backlink {
@@ -38,7 +39,7 @@ export function NoteWindow() {
     const n = notes.find((x) => x.id === activeId);
     setActiveNote(n ?? null);
     if (n) {
-      notesGetBacklinks(activeId)
+      notesGetBacklinks(activeId, getAllUnlockedIds())
         .then(setBacklinks)
         .catch(() => setBacklinks([]));
     } else {

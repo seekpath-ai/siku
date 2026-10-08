@@ -10,6 +10,7 @@ import { autocompletion, completionStatus, type CompletionContext } from '@codem
 import { open as shellOpen } from '@tauri-apps/plugin-shell';
 import katex from 'katex';
 import { saveAttachmentBytes } from '@/lib/tauri';
+import { pwTokenRe, unescapePw } from '@/lib/passwordToken';
 import { resolveImageUrl, resolveLocalImageUrl, type ResolveImageOptions } from '@/lib/imageCache';
 import type { Note } from '@/lib/types';
 
@@ -100,6 +101,8 @@ class MathWidget extends WidgetType {
 // Lucide "copy" / "check" glyphs, inlined because widget DOM is built outside React.
 const COPY_ICON = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
 const CHECK_ICON = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+const EYE_ICON = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF_ICON = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><line x1="2" x2="22" y1="2" y2="22"/></svg>';
 
 /** Copy `text` to the clipboard and flash a check glyph on the button. */
 function copyWithFeedback(text: string, btn: HTMLElement) {
@@ -437,12 +440,19 @@ class TableWidget extends WidgetType {
         copyWithFeedback(this.markdown, tableBtn);
         return;
       }
+      // Masked password token in a cell: click toggles the reveal in place.
+      const pwEl = target.closest('.cm-live-pw') as HTMLElement | null;
+      if (pwEl && wrap.contains(pwEl)) {
+        const revealed = pwEl.classList.toggle('revealed');
+        pwEl.textContent = revealed ? (pwEl.dataset.secret ?? '') : '••••••••';
+        return;
+      }
       const cellBtn = target.closest('.cm-live-table-cellcopy');
       if (cellBtn) {
-        // The button holds only an SVG (no text), so the cell's innerText is
-        // exactly the cell content.
+        // cellCopyText (not innerText): masked password tokens contribute
+        // their real secret, the button itself contributes nothing.
         const cell = cellBtn.closest('td, th') as HTMLElement | null;
-        copyWithFeedback(cell?.innerText.trim() ?? '', cellBtn as HTMLElement);
+        copyWithFeedback(cell ? cellCopyText(cell).trim() : '', cellBtn as HTMLElement);
         return;
       }
       if (target.closest('.cm-live-table-addrow')) {
@@ -618,6 +628,61 @@ class TaskCheckWidget extends WidgetType {
   }
 }
 
+/** Rendered `!pw[secret]` password token: masked dots + eye toggle + copy.
+ *  The reveal state lives in the toDOM closure; eq() is secret-based, so a
+ *  decoration rebuild that reuses the DOM keeps the toggle. Clicking the dots
+ *  drops the caret at the token source, which tears the widget back down into
+ *  editable raw text (same contract as MathWidget). */
+class PasswordWidget extends WidgetType {
+  constructor(readonly secret: string) {
+    super();
+  }
+
+  toDOM(view: EditorView) {
+    const wrap = document.createElement('span');
+    wrap.className = 'cm-live-pw';
+    const text = document.createElement('span');
+    text.className = 'cm-live-pw-text';
+    text.textContent = '••••••••';
+    const eye = document.createElement('button');
+    eye.className = 'cm-live-pw-btn';
+    eye.title = '显示/隐藏';
+    eye.innerHTML = EYE_ICON;
+    const copy = document.createElement('button');
+    copy.className = 'cm-live-pw-btn';
+    copy.title = '复制密码';
+    copy.innerHTML = COPY_ICON;
+    let revealed = false;
+    eye.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      revealed = !revealed;
+      text.textContent = revealed ? this.secret : '••••••••';
+      eye.innerHTML = revealed ? EYE_OFF_ICON : EYE_ICON;
+    });
+    copy.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      copyWithFeedback(this.secret, copy);
+    });
+    wrap.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      view.dispatch({ selection: { anchor: view.posAtDOM(wrap) }, scrollIntoView: true });
+    });
+    wrap.append(text, eye, copy);
+    return wrap;
+  }
+
+  ignoreEvent(event: Event) {
+    return event.type === 'mousedown';
+  }
+
+  eq(other: PasswordWidget) {
+    return other.secret === this.secret;
+  }
+}
+
 function isRemoteImageSrc(src: string): boolean {
   return /^https?:\/\//.test(src);
 }
@@ -697,7 +762,38 @@ function inlineCellHtml(text: string): string {
     /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
     '<a class="cm-live-link" href="$2" target="_blank" rel="noreferrer">$1</a>'
   );
+  // Password tokens render as masked dots. The secret rides along in
+  // data-secret so clicking toggles the reveal and the cell copy button can
+  // substitute the real value (copying a password field must copy the
+  // password, not the dots). Escape contract (`\\` `\]`; `\|` was already
+  // resolved by splitTableRowSpans) lives in @/lib/passwordToken. `"` is not
+  // covered by escapeHtml — escape it for the attribute.
+  html = html.replace(pwTokenRe(), (_m, s: string) => {
+    const secret = unescapePw(s).replace(/"/g, '&quot;');
+    return `<span class="cm-live-pw cm-live-pw-cell" data-secret="${secret}">••••••••</span>`;
+  });
   return html;
+}
+
+/** Text of a rendered table cell for copying: `.cm-live-pw` masks contribute
+ *  their real secret (from data-secret — the DOM may be showing dots), the
+ *  per-cell copy button contributes nothing. Recursive because a mask may sit
+ *  inside <code>/<strong>/<a> wrappers produced by inlineCellHtml. */
+function cellCopyText(el: Node): string {
+  let out = '';
+  el.childNodes.forEach((n) => {
+    if (n instanceof HTMLElement) {
+      if (n.classList.contains('cm-live-table-cellcopy')) return;
+      if (n.classList.contains('cm-live-pw')) {
+        out += n.dataset.secret ?? '';
+        return;
+      }
+      out += cellCopyText(n);
+      return;
+    }
+    out += n.textContent ?? '';
+  });
+  return out;
 }
 
 /**
@@ -1467,6 +1563,19 @@ function buildLivePreview(view: EditorView): DecorationSet {
         adds.push(replaceItem(to - 2, to, {}));
         adds.push(markItem(from + 2, to - 2, 'cm-live-highlight'));
       }
+    }
+
+    // !pw[secret] password tokens: replaced by a masked widget while the
+    // caret is away; the caret inside/adjacent keeps the raw source editable.
+    // Escape contract (`\\` `\]` `\|`) lives in @/lib/passwordToken — the
+    // widget gets the unescaped secret.
+    const pwRe = pwTokenRe();
+    while ((m = pwRe.exec(vtext))) {
+      const from = base + m.index;
+      const to = from + m[0].length;
+      if (inCode(from, to)) continue;
+      if (near(from - 1, to + 1)) continue;
+      adds.push(replaceItem(from, to, { widget: new PasswordWidget(unescapePw(m[1])) }));
     }
 
     // Block math $$...$$ is rendered by livePreviewBlockField; here we only

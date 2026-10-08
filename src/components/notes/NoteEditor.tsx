@@ -25,6 +25,7 @@ import { PrintNotePortal } from './PrintNotePortal';
 import { BacklinksPanel } from './BacklinksPanel';
 import { VersionHistoryDialog } from './VersionHistoryDialog';
 import { ContextMenu } from '@/components/ui/ContextMenu';
+import { escapePw } from '@/lib/passwordToken';
 import { saveTextFile, fileBrowserRevealInSystem, noteVersionRestore, vaultAttachmentsDir } from '@/lib/tauri';
 import { EditorView } from '@codemirror/view';
 import { MarkdownEditor } from '@/components/editor/MarkdownEditor';
@@ -383,16 +384,17 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   }, []);
 
   // Editor right-click menu: insert a `!pw[...]` password token at the caret
-  // (rendered masked in the reading view; see WikiMarkdown's remarkPassword).
-  // Selected text becomes the token's content, so existing plaintext can be
-  // masked by selecting it and right-clicking.
+  // (rendered masked in the reading view and live preview). Selected text
+  // becomes the token's content — escaped first (`\\` `\]` `|`, see
+  // @/lib/passwordToken) — so existing plaintext can be masked by selecting
+  // it and right-clicking.
   const [editorMenu, setEditorMenu] = useState<{ x: number; y: number } | null>(null);
   const insertPasswordField = useCallback(() => {
     const view = viewRef.current;
     if (!view) return;
     const { from, to } = view.state.selection.main;
     const selected = view.state.doc.sliceString(from, to);
-    const insert = `!pw[${selected}]`;
+    const insert = `!pw[${escapePw(selected)}]`;
     view.dispatch({
       changes: { from, to, insert },
       // Caret inside the brackets when empty, after the token when wrapping.
@@ -433,7 +435,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
           const start = cellInput.selectionStart ?? cellInput.value.length;
           const end = cellInput.selectionEnd ?? start;
           const selected = cellInput.value.slice(start, end);
-          cellInput.setRangeText(`!pw[${selected}]`, start, end, selected ? 'end' : 'start');
+          cellInput.setRangeText(`!pw[${escapePw(selected)}]`, start, end, selected ? 'end' : 'start');
           if (!selected) cellInput.setSelectionRange(start + 4, start + 4); // caret inside the brackets
           return;
         }

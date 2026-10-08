@@ -1,6 +1,5 @@
 import { useMemo, useCallback, useState, useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
-import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
@@ -13,6 +12,7 @@ import { openInBrowser } from '@/lib/externalLinks';
 import { resolveImageUrl } from '@/lib/imageCache';
 import { parseReaderUrl } from '@/lib/evidence';
 import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
+import { rewritePasswordTokens } from '@/lib/passwordToken';
 import { useEvidenceStore } from '@/stores/evidenceStore';
 import type { Note } from '@/lib/types';
 
@@ -31,9 +31,9 @@ const WIKI_LINK_RE = /\[\[([^\]]+?)\]\]/g;
 const EMBED_RE = /!\[\[([^\]]+?)\]\]/g;
 
 // ReactMarkdown v9 strips unknown protocols by default. We need `note://`,
-// `note-create://` and `siku-reader://` preserved so our custom link
-// component can handle navigation / evidence highlighting.
-const ALLOWED_URL_PROTOCOLS = /^(https?|mailto|tel|note|note-create|siku-reader)$/i;
+// `note-create://`, `siku-reader://` and `pw://` preserved so our custom link
+// component can handle navigation / evidence highlighting / password fields.
+const ALLOWED_URL_PROTOCOLS = /^(https?|mailto|tel|note|note-create|siku-reader|pw)$/i;
 function allowCustomProtocols(url: string): string | undefined {
   // Local absolute paths (img src from tools/notes): a single-letter
   // "protocol" followed by a separator is a Windows drive letter, not a
@@ -44,49 +44,12 @@ function allowCustomProtocols(url: string): string | undefined {
   return ALLOWED_URL_PROTOCOLS.test(url.slice(0, colon)) ? url : undefined;
 }
 
-// Password tokens `!pw[secret]` (inserted via the editor's right-click menu):
-// split them out of text nodes into a custom element rendered by PasswordField.
-// The secret stays plaintext in the note source — this is visual masking only
-// (reading view / PDF export), not encryption. The `]` char cannot appear in a
-// secret (it terminates the token).
-const PASSWORD_RE = /!pw\[([^\]\n]+)\]/g;
-function remarkPassword() {
-  return (tree: { children?: unknown[] }) => {
-    const walk = (node: { type?: string; children?: unknown[] }) => {
-      if (!Array.isArray(node.children)) return;
-      let i = 0;
-      while (i < node.children.length) {
-        const child = node.children[i] as { type?: string; value?: string };
-        if (child.type === 'text' && typeof child.value === 'string' && child.value.includes('!pw[')) {
-          const parts: { type: string; value?: string; data?: unknown }[] = [];
-          let last = 0;
-          let m: RegExpExecArray | null;
-          PASSWORD_RE.lastIndex = 0;
-          while ((m = PASSWORD_RE.exec(child.value))) {
-            if (m.index > last) parts.push({ type: 'text', value: child.value.slice(last, m.index) });
-            parts.push({
-              type: 'password',
-              data: { hName: 'pw-field', hProperties: { secret: m[1] } },
-            });
-            last = m.index + m[0].length;
-          }
-          if (parts.length > 0) {
-            if (last < child.value.length) parts.push({ type: 'text', value: child.value.slice(last) });
-            node.children.splice(i, 1, ...parts);
-            i += parts.length;
-            continue;
-          }
-        }
-        walk(child as { type?: string; children?: unknown[] });
-        i += 1;
-      }
-    };
-    walk(tree);
-  };
-}
-
 // Masked password field: dots by default, eye toggle reveals the plaintext,
-// copy button puts it on the clipboard without revealing it on screen.
+// copy button puts it on the clipboard without revealing it on screen. The
+// `!pw[...]` token becomes a `pw://` link in preprocessing (see
+// rewritePasswordTokens in @/lib/passwordToken) and lands here via
+// LinkComponent. The secret stays plaintext in the note source — this is
+// visual masking only (reading view / PDF export), not encryption.
 function PasswordField({ secret }: { secret?: string }) {
   const [visible, setVisible] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -279,7 +242,11 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
       const target = notes.find((n) => n.id === targetId);
       return target ? `\n\n${target.content}\n\n` : `![[${raw}]]`;
     });
-    // 2. Wiki links → note:// or note-create:// links.
+    // 2. Password tokens `!pw[...]` → `pw://` links rendered as masked fields
+    //    by LinkComponent. Runs before wiki-link rewriting so a secret
+    //    containing `[[` is never linkified; code spans/blocks are untouched.
+    text = rewritePasswordTokens(text);
+    // 3. Wiki links → note:// or note-create:// links.
     text = text.replace(WIKI_LINK_RE, (_match, raw: string) => {
       const { targetId, display } = resolveWikiTarget(raw, notes);
       if (!targetId) {
@@ -287,13 +254,24 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
       }
       return `[${display}](note://${targetId})`;
     });
-    // 3. LLM-style math delimiters \(...\) / \[...\] → remark-math's $..$.
+    // 4. LLM-style math delimiters \(...\) / \[...\] → remark-math's $..$.
     return normalizeMathDelimiters(text);
   }, [content, notes]);
 
   const LinkComponent = useCallback(
     (props: React.AnchorHTMLAttributes<HTMLAnchorElement>) => {
       const { href, children } = props;
+      // Password field: `!pw[...]` was rewritten to a `pw://<encoded>` link in
+      // preprocessing; the link text (dots) is ignored.
+      if (href?.startsWith('pw://')) {
+        let secret = href.slice(5);
+        try {
+          secret = decodeURIComponent(secret);
+        } catch {
+          // keep the raw payload
+        }
+        return <PasswordField secret={secret} />;
+      }
       if (href?.startsWith('note://')) {
         const id = href.slice(7);
         const target = notes.find((n) => n.id === id);
@@ -403,9 +381,9 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
 
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath, remarkPassword, remarkStrictLineBreaks]}
+      remarkPlugins={[remarkGfm, remarkMath, remarkStrictLineBreaks]}
       rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
-      components={{ a: LinkComponent, code: MarkdownCode, pre: MarkdownPre, img: ImageComponent, td: TdComponent, th: ThComponent, 'pw-field': PasswordField } as Components}
+      components={{ a: LinkComponent, code: MarkdownCode, pre: MarkdownPre, img: ImageComponent, td: TdComponent, th: ThComponent }}
       urlTransform={allowCustomProtocols}
       className={className}
     >

@@ -221,6 +221,30 @@ body.in-tauri {
 /* ==highlight== (Obsidian flavour) */
 .cm-live-highlight { background: rgba(250, 204, 21, 0.28); border-radius: 2px; padding: 0 1px; }
 
+/* !pw[...] password token: masked dots widget (editor live preview) and
+   masked span inside rendered table cells. Click the dots to edit (widget)
+   or reveal (cell); the buttons never take the editor caret. */
+.cm-live-pw {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  user-select: none;
+  cursor: text;
+}
+.cm-live-pw-btn {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.cm-live-pw-btn:hover { color: var(--text-primary); }
+.cm-live-pw-cell { cursor: pointer; }
+
 /* Rendered task checkbox is clickable (toggles [ ]/[x]) */
 .cm-live-task { cursor: pointer; user-select: none; }
 

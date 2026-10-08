@@ -1,9 +1,10 @@
 import { useMemo, useCallback, useState, useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
+import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
-import { Check, Copy } from 'lucide-react';
+import { Check, Copy, Eye, EyeOff } from 'lucide-react';
 import { useNavigate } from '@tanstack/react-router';
 import { emit } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -41,6 +42,88 @@ function allowCustomProtocols(url: string): string | undefined {
   const colon = url.indexOf(':');
   if (colon === -1) return url;
   return ALLOWED_URL_PROTOCOLS.test(url.slice(0, colon)) ? url : undefined;
+}
+
+// Password tokens `!pw[secret]` (inserted via the editor's right-click menu):
+// split them out of text nodes into a custom element rendered by PasswordField.
+// The secret stays plaintext in the note source — this is visual masking only
+// (reading view / PDF export), not encryption. The `]` char cannot appear in a
+// secret (it terminates the token).
+const PASSWORD_RE = /!pw\[([^\]\n]+)\]/g;
+function remarkPassword() {
+  return (tree: { children?: unknown[] }) => {
+    const walk = (node: { type?: string; children?: unknown[] }) => {
+      if (!Array.isArray(node.children)) return;
+      let i = 0;
+      while (i < node.children.length) {
+        const child = node.children[i] as { type?: string; value?: string };
+        if (child.type === 'text' && typeof child.value === 'string' && child.value.includes('!pw[')) {
+          const parts: { type: string; value?: string; data?: unknown }[] = [];
+          let last = 0;
+          let m: RegExpExecArray | null;
+          PASSWORD_RE.lastIndex = 0;
+          while ((m = PASSWORD_RE.exec(child.value))) {
+            if (m.index > last) parts.push({ type: 'text', value: child.value.slice(last, m.index) });
+            parts.push({
+              type: 'password',
+              data: { hName: 'pw-field', hProperties: { secret: m[1] } },
+            });
+            last = m.index + m[0].length;
+          }
+          if (parts.length > 0) {
+            if (last < child.value.length) parts.push({ type: 'text', value: child.value.slice(last) });
+            node.children.splice(i, 1, ...parts);
+            i += parts.length;
+            continue;
+          }
+        }
+        walk(child as { type?: string; children?: unknown[] });
+        i += 1;
+      }
+    };
+    walk(tree);
+  };
+}
+
+// Masked password field: dots by default, eye toggle reveals the plaintext,
+// copy button puts it on the clipboard without revealing it on screen.
+function PasswordField({ secret }: { secret?: string }) {
+  const [visible, setVisible] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const value = secret ?? '';
+
+  const handleCopy = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    navigator.clipboard.writeText(value).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }).catch(() => { /* ignore */ });
+  };
+
+  return (
+    <span className="inline-flex items-center gap-1 mx-0.5 px-1.5 py-0.5 rounded bg-surface-hover/60 border border-surface-hover align-middle not-prose">
+      <span className="font-mono text-[0.85em] text-text-primary select-none">
+        {visible ? value : '••••••••'}
+      </span>
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          setVisible((v) => !v);
+        }}
+        title={visible ? '隐藏' : '显示'}
+        className="text-text-secondary hover:text-text-primary print:hidden"
+      >
+        {visible ? <EyeOff size={12} /> : <Eye size={12} />}
+      </button>
+      <button
+        onClick={handleCopy}
+        title="复制"
+        className="text-text-secondary hover:text-text-primary print:hidden"
+      >
+        {copied ? <Check size={12} className="text-accent" /> : <Copy size={12} />}
+      </button>
+    </span>
+  );
 }
 
 // Convert soft line breaks inside paragraphs into hard `<br>` breaks so that
@@ -320,9 +403,9 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
 
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath, remarkStrictLineBreaks]}
+      remarkPlugins={[remarkGfm, remarkMath, remarkPassword, remarkStrictLineBreaks]}
       rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
-      components={{ a: LinkComponent, code: MarkdownCode, pre: MarkdownPre, img: ImageComponent, td: TdComponent, th: ThComponent }}
+      components={{ a: LinkComponent, code: MarkdownCode, pre: MarkdownPre, img: ImageComponent, td: TdComponent, th: ThComponent, 'pw-field': PasswordField } as Components}
       urlTransform={allowCustomProtocols}
       className={className}
     >

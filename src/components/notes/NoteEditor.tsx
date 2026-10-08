@@ -18,11 +18,13 @@ import {
   History,
   Wand2,
   Code,
+  KeyRound,
 } from 'lucide-react';
 import { WikiMarkdown } from './WikiMarkdown';
 import { PrintNotePortal } from './PrintNotePortal';
 import { BacklinksPanel } from './BacklinksPanel';
 import { VersionHistoryDialog } from './VersionHistoryDialog';
+import { ContextMenu } from '@/components/ui/ContextMenu';
 import { saveTextFile, fileBrowserRevealInSystem, noteVersionRestore, vaultAttachmentsDir } from '@/lib/tauri';
 import { EditorView } from '@codemirror/view';
 import { MarkdownEditor } from '@/components/editor/MarkdownEditor';
@@ -379,6 +381,26 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   const handleEditorRef = useCallback((view: EditorView | null) => {
     viewRef.current = view;
   }, []);
+
+  // Editor right-click menu: insert a `!pw[...]` password token at the caret
+  // (rendered masked in the reading view; see WikiMarkdown's remarkPassword).
+  // Selected text becomes the token's content, so existing plaintext can be
+  // masked by selecting it and right-clicking.
+  const [editorMenu, setEditorMenu] = useState<{ x: number; y: number } | null>(null);
+  const insertPasswordField = useCallback(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const { from, to } = view.state.selection.main;
+    const selected = view.state.doc.sliceString(from, to);
+    const insert = `!pw[${selected}]`;
+    view.dispatch({
+      changes: { from, to, insert },
+      // Caret inside the brackets when empty, after the token when wrapping.
+      selection: { anchor: selected ? from + insert.length : from + 4 },
+      scrollIntoView: true,
+    });
+    view.focus();
+  }, []);
   const handleEditorScroll = useCallback(() => {
     syncScroll('editor');
     const top = viewRef.current?.scrollDOM.scrollTop;
@@ -395,7 +417,33 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   }[saveStatus];
 
   const editorEl = (
-    <MarkdownEditor
+    <div
+      className="h-full"
+      onContextMenu={(e) => {
+        e.preventDefault();
+        const target = e.target as HTMLElement;
+        // Rendered table cell editor: its selection lives in the cell's own
+        // HTML input, not in CodeMirror's selection, so the caret-based menu
+        // would insert at a stale position. Wrap the input's selection in
+        // place instead (the normal blur-commit path writes it back). No menu
+        // is shown here: opening one blurs the input and the blur-commit
+        // would race ahead of the click, losing the conversion.
+        const cellInput = target.closest<HTMLInputElement>('.cm-live-table-input');
+        if (cellInput) {
+          const start = cellInput.selectionStart ?? cellInput.value.length;
+          const end = cellInput.selectionEnd ?? start;
+          const selected = cellInput.value.slice(start, end);
+          cellInput.setRangeText(`!pw[${selected}]`, start, end, selected ? 'end' : 'start');
+          if (!selected) cellInput.setSelectionRange(start + 4, start + 4); // caret inside the brackets
+          return;
+        }
+        // Rendered table chrome outside the cell editor: no menu, the caret
+        // position has no meaningful relation to the clicked cell.
+        if (target.closest('.cm-live-table')) return;
+        setEditorMenu({ x: e.clientX, y: e.clientY });
+      }}
+    >
+      <MarkdownEditor
       value={content}
       onChange={handleContentChange}
       notes={notes}
@@ -410,6 +458,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
       vaultId={note.vault_id}
       attachmentsDir={attachmentsDir}
     />
+    </div>
   );
   const previewEl = (
     <div
@@ -756,6 +805,21 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
           notes={notes}
           attachmentsDir={attachmentsDir}
           onDone={handlePrintDone}
+        />
+      )}
+
+      {editorMenu && (
+        <ContextMenu
+          x={editorMenu.x}
+          y={editorMenu.y}
+          onClose={() => setEditorMenu(null)}
+          items={[
+            {
+              label: '插入密码字段',
+              icon: <KeyRound size={13} />,
+              onClick: insertPasswordField,
+            },
+          ]}
         />
       )}
     </div>

@@ -102,10 +102,11 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   const menuRef = useRef<HTMLDivElement>(null);
   const noteTags = useMemo(() => parseNoteTags(note), [note]);
   const aliases = useMemo(() => parseNoteAliases(note), [note]);
-  // Global notes settings (device-local): editor/reading font size, outline.
+  // Global notes settings (device-local): editor/reading font size.
   const editorFontSize = useNotesSettingsStore((s) => s.editorFontSize);
-  const outlineOpen = useNotesSettingsStore((s) => s.outlineOpen);
-  const setNotesSettings = useNotesSettingsStore((s) => s.set);
+  // Outline panel: per-note state (like the view mode), persisted via
+  // noteEditorStore. Notes never opened keep the default (closed).
+  const outlineOpen = useNoteEditorStore((s) => s.states[note.id]?.outline ?? false);
 
   // Breadcrumb path relative to the notes root (parent chain), like Obsidian.
   const notePath = useMemo(() => {
@@ -701,7 +702,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
                   className="flex items-center gap-2 px-3 py-1.5 text-[12px] text-text-secondary hover:bg-surface-hover hover:text-text-primary w-full text-left"
                   onClick={() => {
                     setMenuOpen(false);
-                    setNotesSettings({ outlineOpen: !outlineOpen });
+                    useNoteEditorStore.getState().setState(noteIdRef.current, { outline: !outlineOpen });
                   }}
                 >
                   <List size={13} />

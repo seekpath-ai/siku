@@ -10,6 +10,8 @@ export interface NoteEditorState {
   scroll: number;
   /** Cursor offset in the document. */
   cursor: number;
+  /** Outline panel open (per-note, like the view mode). */
+  outline: boolean;
 }
 
 interface NoteEditorStoreState {
@@ -21,7 +23,7 @@ interface NoteEditorStoreState {
   remove: (noteId: string) => void;
 }
 
-const DEFAULT_STATE: NoteEditorState = { mode: 'edit', scroll: 0, cursor: 0 };
+const DEFAULT_STATE: NoteEditorState = { mode: 'edit', scroll: 0, cursor: 0, outline: false };
 
 /** Cap on persisted per-note entries; oldest-touched are dropped (the map is
  *  re-inserted on every setState, so key order is LRU order). */

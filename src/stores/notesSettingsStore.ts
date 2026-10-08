@@ -7,8 +7,6 @@ export type NotesDefaultMode = 'edit' | 'source' | 'reading';
 
 interface NotesSettingsState {
   defaultMode: NotesDefaultMode;
-  /** Right-side outline panel (note editor "⋯" menu toggle). */
-  outlineOpen: boolean;
   /** Default line-wrapping for rendered code blocks (reading view AND chat
    *  bubbles — CodeBlock is shared). Per-block toggle overrides per session. */
   codeBlockWrap: boolean;
@@ -30,7 +28,6 @@ export const useNotesSettingsStore = create<NotesSettingsState>()(
   persist(
     (set) => ({
       defaultMode: 'edit',
-      outlineOpen: false,
       codeBlockWrap: false,
       strictLineBreaks: true,
       editorFontSize: 16,

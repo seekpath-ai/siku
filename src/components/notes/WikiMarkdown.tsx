@@ -16,7 +16,7 @@ import { rewritePasswordTokens } from '@/lib/passwordToken';
 import { useNotesSettingsStore } from '@/stores/notesSettingsStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
 import { useAllUnlockedSet } from '@/stores/noteLockStore';
-import { computeEffectiveLockedSet } from '@/lib/noteLock';
+import { computeHiddenSet } from '@/lib/noteLock';
 import type { Note } from '@/lib/types';
 
 interface Props {
@@ -237,14 +237,12 @@ function MdImage({
 
 export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, className, attachmentsDir }: Props) {
   const navigate = useNavigate();
-  // Locked (not session-unlocked) notes: embeds render a placeholder and link
-  // hover previews are scrubbed — both would otherwise leak the content.
+  // Gated notes (subtrees of not-yet-unlocked lock roots): embeds render a
+  // placeholder and link hover previews are scrubbed — both would otherwise
+  // leak the content.
   const unlockedSet = useAllUnlockedSet();
-  const lockedSet = useMemo(() => computeEffectiveLockedSet(notes), [notes]);
-  const isLockHidden = useCallback(
-    (id: string) => lockedSet.has(id) && !unlockedSet.has(id),
-    [lockedSet, unlockedSet]
-  );
+  const hiddenSet = useMemo(() => computeHiddenSet(notes, unlockedSet), [notes, unlockedSet]);
+  const isLockHidden = useCallback((id: string) => hiddenSet.has(id), [hiddenSet]);
   const processed = useMemo(() => {
     // 1. Embeds: ![[note]] → inline the target's content (one level deep).
     let text = content.replace(EMBED_RE, (_match, raw: string) => {

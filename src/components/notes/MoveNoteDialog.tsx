@@ -2,7 +2,7 @@ import { useMemo, useEffect, useRef } from 'react';
 import { X, Folder, ArrowUpToLine, Lock } from 'lucide-react';
 import type { Note } from '@/lib/types';
 import { useAllUnlockedSet } from '@/stores/noteLockStore';
-import { computeEffectiveLockedSet } from '@/lib/noteLock';
+import { computeHiddenSet } from '@/lib/noteLock';
 
 interface Props {
   notes: Note[];
@@ -28,10 +28,11 @@ export function MoveNoteDialog({ notes, noteIds, currentParentId, onMove, onClos
 
   const folders = useMemo(() => notes.filter((n) => n.is_folder === 1), [notes]);
   const noteMap = useMemo(() => new Map(notes.map((n) => [n.id, n])), [notes]);
-  // Locked (not session-unlocked) folders can't be move targets.
+  // Gated folders (subtrees of not-yet-unlocked lock roots) can't be move
+  // targets; a session-unlocked locked folder accepts drops again.
   const unlockedSet = useAllUnlockedSet();
-  const lockedSet = useMemo(() => computeEffectiveLockedSet(notes), [notes]);
-  const isFolderLocked = (id: string) => lockedSet.has(id) && !unlockedSet.has(id);
+  const hiddenSet = useMemo(() => computeHiddenSet(notes, unlockedSet), [notes, unlockedSet]);
+  const isFolderLocked = (id: string) => hiddenSet.has(id);
 
   const childrenMap = useMemo(() => {
     const map = new Map<string, Note[]>();

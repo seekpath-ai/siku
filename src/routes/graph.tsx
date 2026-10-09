@@ -6,7 +6,7 @@ import ForceGraph2D from 'react-force-graph-2d';
 import { graphGet, notesListAll } from '@/lib/tauri';
 import { openNoteTab } from '@/lib/openNote';
 import { useAllUnlockedSet } from '@/stores/noteLockStore';
-import { computeEffectiveLockedSet } from '@/lib/noteLock';
+import { computeHiddenSet } from '@/lib/noteLock';
 import type { Note } from '@/lib/types';
 
 interface GraphNode {
@@ -59,17 +59,14 @@ function GraphPage() {
     })();
   }, []);
 
-  // Locked (not session-unlocked) notes are dropped from the graph together
-  // with their edges — node labels would leak their titles.
+  // Gated notes (subtrees of not-yet-unlocked lock roots) are dropped from
+  // the graph together with their edges — node labels would leak their titles.
   const [allNotes, setAllNotes] = useState<Note[]>([]);
   useEffect(() => {
     notesListAll().then(setAllNotes).catch(() => {});
   }, []);
   const unlockedSet = useAllUnlockedSet();
-  const hiddenIds = useMemo(() => {
-    const lockedSet = computeEffectiveLockedSet(allNotes);
-    return new Set([...lockedSet].filter((id) => !unlockedSet.has(id)));
-  }, [allNotes, unlockedSet]);
+  const hiddenIds = useMemo(() => computeHiddenSet(allNotes, unlockedSet), [allNotes, unlockedSet]);
   const visibleData = useMemo(() => {
     if (!data) return null;
     const nodes = data.nodes.filter((n) => !(n.node_type === 'note' && hiddenIds.has(n.id)));

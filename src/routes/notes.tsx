@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { createRoute, useNavigate } from '@tanstack/react-router';
 import { listen } from '@tauri-apps/api/event';
 import { Route as RootRoute } from './__root';
@@ -44,7 +44,7 @@ import {
 import { pickDirectory } from '@/lib/pickDirectory';
 import { openNoteTab } from '@/lib/openNote';
 import { useNoteLockStore, getAllUnlockedIds } from '@/stores/noteLockStore';
-import { computeEffectiveLockedSet } from '@/lib/noteLock';
+import { computeHiddenSet } from '@/lib/noteLock';
 
 function NotesPage() {
   const [notes, setNotes] = useState<Note[]>([]);
@@ -262,23 +262,38 @@ function NotesPage() {
   }, [activeId, notes]);
 
   // Keep note tab titles in sync with the notes list (covers AI renames /
-  // sync writes that bypass the rename handlers) AND mask locked-but-not-
-  // unlocked notes as「🔒 已锁定」so tab titles don't leak them.
+  // sync writes that bypass the rename handlers) AND mask gated (locked,
+  // not session-unlocked) notes as「🔒 已锁定」so tab titles don't leak them.
   const unlockedByVault = useNoteLockStore((s) => s.unlockedByVault);
   useEffect(() => {
-    const lockedSet = computeEffectiveLockedSet(notes);
     const unlocked = new Set(Object.values(unlockedByVault).flat());
+    const hiddenSet = computeHiddenSet(notes, unlocked);
     const noteMap = new Map(notes.map((n) => [n.id, n]));
     const tabStore = useTabStore.getState();
     for (const tab of tabStore.tabs) {
       if (!tab.id.startsWith('note_')) continue;
       const note = noteMap.get(tab.id.slice(5));
       if (!note) continue;
-      const hidden = lockedSet.has(note.id) && !unlocked.has(note.id);
+      const hidden = hiddenSet.has(note.id);
       const title = hidden ? '🔒 已锁定' : note.title || '未命名笔记';
       if (tab.title !== title) tabStore.updateTab(tab.id, { title });
     }
   }, [notes, unlockedByVault]);
+
+  // 失焦即回锁：切换活动笔记时，上一篇解锁的笔记（非文件夹）从 unlocked 集
+  // 移除；文件夹的解锁态由 NoteList 的折叠逻辑管理。
+  const prevActiveRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (prevActiveRef.current === activeId) return;
+    prevActiveRef.current = activeId;
+    const store = useNoteLockStore.getState();
+    const vaultKey = currentVault?.id ?? '';
+    const folderIds = new Set(notes.filter((n) => n.is_folder === 1).map((n) => n.id));
+    const toRelock = (store.unlockedByVault[vaultKey] ?? []).filter(
+      (id) => id !== activeId && !folderIds.has(id)
+    );
+    if (toRelock.length > 0) store.relock(vaultKey, toRelock);
+  }, [activeId, notes, currentVault]);
 
   // Clear the pet context when leaving the notes page.
   useEffect(() => () => usePetContextStore.getState().setContext(null), []);
@@ -651,12 +666,11 @@ function NotesPage() {
   const openNote = useCallback((id: string) => {
     setActiveFileId(null);
     const n = notes.find((x) => x.id === id);
-    // Mask the tab title of a locked (not session-unlocked) note right away —
-    // the sync effect above only runs when the notes list changes.
+    // Mask the tab title of a gated (locked, not session-unlocked) note right
+    // away — the sync effect above only runs when the notes list changes.
     const hidden =
       n != null &&
-      computeEffectiveLockedSet(notes).has(id) &&
-      !getAllUnlockedIds().includes(id);
+      computeHiddenSet(notes, new Set(getAllUnlockedIds())).has(id);
     openNoteTab(navigate, { id, title: hidden ? '🔒 已锁定' : n?.title });
   }, [navigate, notes]);
 

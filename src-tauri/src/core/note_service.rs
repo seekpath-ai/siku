@@ -257,18 +257,45 @@ pub async fn set_note_locked(db: &SqlitePool, id: &str, locked: bool) -> Result<
     get_note(db, id).await
 }
 
-/// Effective locked ids minus the caller's unlocked set — the ids that must
-/// be hidden from search/list/backlink results.
+/// Ids that must be hidden from search/list/backlink results: the subtrees of
+/// every locked (`is_locked = 1`) node the caller has NOT unlocked this
+/// session. Unlocking a folder releases its whole subtree — descendants that
+/// are themselves locked stay hidden behind their own lock (their root is not
+/// in `unlocked_ids`). Unlocking an individual note releases exactly itself.
 async fn excluded_locked_ids(
     db: &SqlitePool,
     vault_id: &str,
     unlocked_ids: &[String],
 ) -> Result<Vec<String>, String> {
-    let locked = effective_locked_ids(db, vault_id).await?;
-    Ok(locked
-        .into_iter()
-        .filter(|id| !unlocked_ids.iter().any(|u| u == id))
-        .collect())
+    let roots: Vec<String> = sqlx::query_as::<_, (String,)>(
+        "SELECT id FROM notes WHERE is_locked = 1 AND vault_id = ?",
+    )
+    .bind(vault_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("db: {e}"))?
+    .into_iter()
+    .map(|(id,)| id)
+    .filter(|id| !unlocked_ids.iter().any(|u| u == id))
+    .collect();
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; roots.len()].join(", ");
+    let sql = format!(
+        "WITH RECURSIVE locked_tree(id) AS (
+             SELECT id FROM notes WHERE id IN ({placeholders})
+             UNION
+             SELECT n.id FROM notes n JOIN locked_tree t ON n.parent_id = t.id
+         )
+         SELECT id FROM locked_tree"
+    );
+    let mut q = sqlx::query_as::<_, (String,)>(&sql);
+    for r in &roots {
+        q = q.bind(r);
+    }
+    let rows = q.fetch_all(db).await.map_err(|e| format!("db: {e}"))?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
 /// `AND <qualifier>.id NOT IN (?, ?, ...)` for the given excluded ids, or an
@@ -1457,7 +1484,7 @@ mod tests {
         Ok(())
     }
 
-    /// 搜索不返回生效锁定的笔记；unlocked_ids 里的 id 放行。
+    /// 搜索不返回锁定子树；unlocked_ids 里的锁定根节点放行其整棵子树。
     #[tokio::test]
     async fn search_notes_hides_locked_notes() -> anyhow::Result<()> {
         let dir = std::env::temp_dir().join(format!(
@@ -1493,12 +1520,33 @@ mod tests {
         let ids: Vec<&str> = results.iter().filter_map(|r| r["id"].as_str()).collect();
         assert_eq!(ids, vec![visible.id.as_str()], "locked subtree must be hidden");
 
-        // unlocked_ids 放行指定笔记
+        // 子项自身不是锁根——把它放进 unlocked_ids 不放行（锁在文件夹上）。
         let results = search_notes(&db, "zzzq", 10, vault, &[hidden.id.clone()])
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
         let ids: Vec<&str> = results.iter().filter_map(|r| r["id"].as_str()).collect();
-        assert_eq!(ids.len(), 2, "unlocked id must be searchable again");
+        assert_eq!(ids, vec![visible.id.as_str()], "unlocking a non-root id must not release it");
+
+        // 解锁锁定文件夹 → 放行整棵子树。
+        let results = search_notes(&db, "zzzq", 10, vault, &[folder.id.clone()])
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let ids: Vec<&str> = results.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert_eq!(ids.len(), 2, "unlocked folder must release its subtree");
+        assert!(ids.contains(&hidden.id.as_str()));
+
+        // 嵌套锁：文件夹解锁后，自己加过锁的子笔记仍然隐藏。
+        let inner = create_note(&db, "内层锁笔记", "zzzq 更机密", None, Some(&folder.id), vault, false)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        set_note_locked(&db, &inner.id, true)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let results = search_notes(&db, "zzzq", 10, vault, &[folder.id.clone()])
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let ids: Vec<&str> = results.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert!(!ids.contains(&inner.id.as_str()), "individually locked child stays hidden");
         assert!(ids.contains(&hidden.id.as_str()));
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;

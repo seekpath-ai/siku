@@ -10,7 +10,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import type { Note, FileItem } from '@/lib/types';
 import { parseNoteTags } from '@/lib/types';
 import {
-  notesSearch, notesSetLocked, vaultLockStatus, vaultVerifyLockPassword,
+  notesSearch, notesSetLocked, vaultLockStatus,
   type NoteSearchResult,
 } from '@/lib/tauri';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
@@ -19,7 +19,7 @@ import { LockPasswordDialog } from '@/components/notes/LockPasswordDialog';
 import { useDialog } from '@/hooks/useDialog';
 import { useNoteListStore } from '@/stores/noteListStore';
 import { useNoteLockStore, getAllUnlockedIds, useAllUnlockedSet } from '@/stores/noteLockStore';
-import { computeEffectiveLockedSet } from '@/lib/noteLock';
+import { computeHiddenSet } from '@/lib/noteLock';
 
 interface Props {
   notes: Note[];
@@ -176,15 +176,13 @@ export function NoteList({
   const lastMouseYRef = useRef<number | null>(null);
 
   // ── Note view lock ──────────────────────────────────────────────
-  // Effective lock set (locked nodes + descendants) minus this session's
-  // unlocked ids = items hidden behind a password.
+  // Hidden set = subtrees of unlocked-lock-roots (a locked folder releases
+  // its whole subtree once session-unlocked). Membership = gated behind a
+  // password. Badges are separate: only explicit is_locked === 1 items.
   const vaultKey = vaultId ?? '';
   const unlockedSet = useAllUnlockedSet();
-  const lockedSet = useMemo(() => computeEffectiveLockedSet(notes), [notes]);
-  const isLockedView = useCallback(
-    (id: string) => lockedSet.has(id) && !unlockedSet.has(id),
-    [lockedSet, unlockedSet]
-  );
+  const hiddenSet = useMemo(() => computeHiddenSet(notes, unlockedSet), [notes, unlockedSet]);
+  const isLockedView = useCallback((id: string) => hiddenSet.has(id), [hiddenSet]);
   // Pending password dialog: setup (first lock ever), verify-to-unlock, or
   // verify-to-expand a locked folder in the tree.
   const [lockDialog, setLockDialog] = useState<{
@@ -198,12 +196,11 @@ export function NoteList({
       try {
         if (onSetLocked) await onSetLocked(id, locked);
         else await notesSetLocked(id, locked);
-        if (!locked) useNoteLockStore.getState().unlock(vaultKey, id);
       } catch (err) {
         await alert(`${locked ? '锁定' : '解锁'}失败：${err}`);
       }
     },
-    [onSetLocked, vaultKey, alert]
+    [onSetLocked, alert]
   );
 
   const handleLockRequest = useCallback(
@@ -222,31 +219,16 @@ export function NoteList({
     [applySetLocked, alert]
   );
 
-  const handleUnlockRequest = useCallback(
-    async (note: Note) => {
-      const cached = useNoteLockStore.getState().sessionPassword;
-      if (cached) {
-        try {
-          if (await vaultVerifyLockPassword(cached)) {
-            await applySetLocked(note.id, false);
-            return;
-          }
-          useNoteLockStore.getState().setSessionPassword(null);
-        } catch {
-          // Fall through to the password dialog.
-        }
-      }
-      setLockDialog({ mode: 'verify', noteId: note.id, action: 'unlock' });
-    },
-    [applySetLocked]
-  );
+  // 右键「解锁」（清除锁标记）：没有缓存密码捷径，永远要求输入密码。
+  const handleUnlockRequest = useCallback((note: Note) => {
+    setLockDialog({ mode: 'verify', noteId: note.id, action: 'unlock' });
+  }, []);
 
   const handleLockDialogSuccess = useCallback(
-    (password: string) => {
+    (_password: string) => {
       const d = lockDialog;
       setLockDialog(null);
       if (!d) return;
-      useNoteLockStore.getState().setSessionPassword(password);
       if (d.action === 'lock') void applySetLocked(d.noteId, true);
       else if (d.action === 'unlock') void applySetLocked(d.noteId, false);
       else {
@@ -422,40 +404,65 @@ export function NoteList({
     });
   }, []);
 
-  // Expanding a locked folder requires an explicit unlock: with a cached
-  // session password the chevron click itself unlocks silently; otherwise a
-  // password dialog is shown (session unlock, no backend change). Collapsing
-  // stays free.
+  // True when `id` is `rootId` itself or anywhere under it in the tree
+  // (childrenMap covers notes and files).
+  const isInTreeSubtree = useCallback(
+    (rootId: string, id: string): boolean => {
+      if (rootId === id) return true;
+      const stack = [rootId];
+      const seen = new Set<string>();
+      while (stack.length > 0) {
+        const cur = stack.pop()!;
+        if (!seen.add(cur)) continue;
+        for (const c of childrenMap.get(cur) ?? []) {
+          if (c.id === id) return true;
+          stack.push(c.id);
+        }
+      }
+      return false;
+    },
+    [childrenMap]
+  );
+
+  // Collapsing a session-unlocked folder relocks it (next expand asks for the
+  // password again) — unless the active note lives inside its subtree, so the
+  // content being viewed is never covered by its own collapse.
+  const maybeRelockFolder = useCallback(
+    (folderId: string) => {
+      if (!unlockedSet.has(folderId)) return;
+      if (activeNoteId && isInTreeSubtree(folderId, activeNoteId)) return;
+      useNoteLockStore.getState().relock(vaultKey, [folderId]);
+    },
+    [unlockedSet, activeNoteId, isInTreeSubtree, vaultKey]
+  );
+
+  // Expanding a locked folder always asks for the password (no cached
+  // shortcut); collapsing stays free but may relock the folder.
   const handleToggleExpand = useCallback(
     (node: TreeNode) => {
       if (node.isFolder && !expanded.has(node.id) && isLockedView(node.id)) {
-        const cached = useNoteLockStore.getState().sessionPassword;
-        if (cached) {
-          void vaultVerifyLockPassword(cached)
-            .then((ok) => {
-              if (ok) {
-                useNoteLockStore.getState().unlock(vaultKey, node.id);
-                setExpanded((prev) => new Set(prev).add(node.id));
-              } else {
-                // Stale cache — drop it and ask.
-                useNoteLockStore.getState().setSessionPassword(null);
-                setLockDialog({ mode: 'verify', noteId: node.id, action: 'expand' });
-              }
-            })
-            .catch(() => setLockDialog({ mode: 'verify', noteId: node.id, action: 'expand' }));
-          return;
-        }
         setLockDialog({ mode: 'verify', noteId: node.id, action: 'expand' });
         return;
       }
+      if (node.isFolder && expanded.has(node.id)) {
+        maybeRelockFolder(node.id);
+      }
       toggleExpand(node.id);
     },
-    [expanded, isLockedView, toggleExpand, vaultKey]
+    [expanded, isLockedView, toggleExpand, maybeRelockFolder]
   );
 
   const collapseAll = useCallback(() => {
+    const toRelock: string[] = [];
+    for (const id of expanded) {
+      if (!unlockedSet.has(id)) continue;
+      if (noteMap.get(id)?.is_folder !== 1) continue;
+      if (activeNoteId && isInTreeSubtree(id, activeNoteId)) continue;
+      toRelock.push(id);
+    }
+    if (toRelock.length > 0) useNoteLockStore.getState().relock(vaultKey, toRelock);
     setExpanded(new Set());
-  }, []);
+  }, [expanded, unlockedSet, noteMap, activeNoteId, isInTreeSubtree, vaultKey]);
 
   const expandAll = useCallback(() => {
     const next = new Set<string>();
@@ -1166,17 +1173,11 @@ export function NoteList({
           ) : (
             <span className="flex-1 truncate flex items-center gap-1.5">
               {node.title || 'Untitled'}
-              {lockedSet.has(node.id) &&
-                (lockedView ? (
-                  <Lock
-                    size={12}
-                    className={`shrink-0 text-text-secondary ${directLocked ? '' : 'opacity-40'}`}
-                  />
+              {directLocked &&
+                (unlockedSet.has(node.id) ? (
+                  <LockOpen size={12} className="shrink-0 text-amber-400" />
                 ) : (
-                  <LockOpen
-                    size={12}
-                    className={`shrink-0 text-amber-400 ${directLocked ? '' : 'opacity-40'}`}
-                  />
+                  <Lock size={12} className="shrink-0 text-text-secondary" />
                 ))}
               {note?.is_excerpt === 1 && (
                 <span className="shrink-0 text-[9px] px-1 py-px rounded bg-primary/15 text-primary leading-none">

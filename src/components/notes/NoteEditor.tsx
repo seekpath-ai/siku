@@ -39,8 +39,8 @@ import type { Note, NoteVersion } from '@/lib/types';
 import { parseNoteTags, parseNoteAliases } from '@/lib/types';
 import { useNoteEditorStore, type NoteViewMode } from '@/stores/noteEditorStore';
 import { useNotesSettingsStore } from '@/stores/notesSettingsStore';
-import { useNoteLockStore } from '@/stores/noteLockStore';
-import { computeEffectiveLockedSet } from '@/lib/noteLock';
+import { useAllUnlockedSet } from '@/stores/noteLockStore';
+import { computeHiddenSet, computeGateIds } from '@/lib/noteLock';
 
 interface Props {
   note: Note;
@@ -111,13 +111,16 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   // noteEditorStore. Notes never opened keep the default (closed).
   const outlineOpen = useNoteEditorStore((s) => s.states[note.id]?.outline ?? false);
 
-  // View lock: effectively locked (self or an ancestor) and not unlocked this
-  // session → the whole content area is replaced by the unlock cover.
-  const lockUnlocked = useNoteLockStore(
-    (s) => s.unlockedByVault[note.vault_id]?.includes(note.id) ?? false
+  // View lock: gated = inside the subtree of a lock root (locked item that
+  // has not been session-unlocked). The cover unlocks the whole gate chain at
+  // once, so a note inside a locked folder releases the folder's subtree.
+  const unlockedSet = useAllUnlockedSet();
+  const hiddenSet = useMemo(() => computeHiddenSet(notes, unlockedSet), [notes, unlockedSet]);
+  const lockedView = hiddenSet.has(note.id);
+  const gateIds = useMemo(
+    () => (lockedView ? computeGateIds(notes, note.id, unlockedSet) : []),
+    [lockedView, notes, note.id, unlockedSet]
   );
-  const lockedSet = useMemo(() => computeEffectiveLockedSet(notes), [notes]);
-  const lockedView = lockedSet.has(note.id) && !lockUnlocked;
 
   // Breadcrumb path relative to the notes root (parent chain), like Obsidian.
   const notePath = useMemo(() => {
@@ -888,7 +891,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
           locked note replaces the whole region with the unlock cover. */}
       {lockedView ? (
         <div className="flex-1 min-h-0 relative overflow-hidden">
-          <LockedNoteCover note={note} />
+          <LockedNoteCover note={note} gateIds={gateIds} />
         </div>
       ) : (
       <div className="flex-1 min-h-0 relative overflow-hidden flex">

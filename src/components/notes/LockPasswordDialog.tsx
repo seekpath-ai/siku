@@ -149,51 +149,26 @@ export function LockPasswordDialog({ mode, title, onSuccess, onClose }: DialogPr
 
 interface CoverProps {
   note: Note;
+  /** Lock-root ids gating this note (itself + not-yet-unlocked locked
+   *  ancestors). One successful verification session-unlocks all of them, so
+   *  opening a note inside a locked folder releases the folder's subtree. */
+  gateIds: string[];
   /** Extra callback after a successful unlock (store is already updated). */
   onUnlocked?: () => void;
 }
 
 /** Full-area cover for a locked note: hides the whole content region behind a
- *  centered unlock prompt. Never unlocks on mount — the gate only opens on an
- *  explicit user action: one click when a session password is cached, or
- *  typing the password otherwise. */
-export function LockedNoteCover({ note, onUnlocked }: CoverProps) {
+ *  centered password prompt. No cached/silent unlock — the password must be
+ *  typed every time. */
+export function LockedNoteCover({ note, gateIds, onUnlocked }: CoverProps) {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const sessionPassword = useNoteLockStore((s) => s.sessionPassword);
-  // Set when the cached session password turns out stale — force the input.
-  const [forceInput, setForceInput] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const showInput = !sessionPassword || forceInput;
-
   useEffect(() => {
-    if (showInput) inputRef.current?.focus();
-  }, [showInput]);
-
-  /** One-click unlock with the session-cached password (no retyping). */
-  const quickUnlock = async () => {
-    const cached = useNoteLockStore.getState().sessionPassword;
-    if (!cached || busy) return;
-    setBusy(true);
-    setError('');
-    try {
-      const ok = await vaultVerifyLockPassword(cached);
-      if (ok) {
-        useNoteLockStore.getState().unlock(note.vault_id, note.id);
-        onUnlocked?.();
-      } else {
-        // Stale cache (password changed elsewhere) — drop it and ask.
-        useNoteLockStore.getState().setSessionPassword(null);
-        setForceInput(true);
-      }
-    } catch {
-      setForceInput(true);
-    } finally {
-      setBusy(false);
-    }
-  };
+    inputRef.current?.focus();
+  }, []);
 
   const submit = async () => {
     if (!password || busy) return;
@@ -202,9 +177,9 @@ export function LockedNoteCover({ note, onUnlocked }: CoverProps) {
     try {
       const ok = await vaultVerifyLockPassword(password);
       if (ok) {
-        const store = useNoteLockStore.getState();
-        store.setSessionPassword(password);
-        store.unlock(note.vault_id, note.id);
+        useNoteLockStore
+          .getState()
+          .unlockMany(note.vault_id, gateIds.length > 0 ? gateIds : [note.id]);
         onUnlocked?.();
       } else {
         setError('密码错误');
@@ -222,43 +197,31 @@ export function LockedNoteCover({ note, onUnlocked }: CoverProps) {
         <Lock size={26} className="text-text-secondary" />
       </div>
       <p className="text-sm text-text-primary">此笔记已锁定</p>
-      {!showInput && (
+      <form
+        className="flex flex-col items-center gap-2 w-[240px]"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submit();
+        }}
+      >
+        <input
+          ref={inputRef}
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          placeholder="输入密码解锁"
+          className="w-full h-9 bg-surface text-text-primary text-[13px] px-3 rounded border border-surface-hover focus:border-primary/50 focus:outline-none placeholder:text-text-secondary/40 text-center"
+        />
+        {error && <p className="text-[11px] text-red-400">{error}</p>}
         <button
-          onClick={() => void quickUnlock()}
-          disabled={busy}
-          className="w-[240px] h-8 rounded bg-primary/15 text-primary text-xs font-medium hover:bg-primary/25 transition-colors disabled:opacity-50 flex items-center justify-center gap-1.5"
+          type="submit"
+          disabled={busy || !password}
+          className="w-full h-8 rounded bg-primary/15 text-primary text-xs font-medium hover:bg-primary/25 transition-colors disabled:opacity-50 flex items-center justify-center gap-1.5"
         >
           {busy ? <Loader2 size={12} className="animate-spin" /> : <LockOpen size={12} />}
-          点击解锁
+          解锁
         </button>
-      )}
-      {showInput && (
-        <form
-          className="flex flex-col items-center gap-2 w-[240px]"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void submit();
-          }}
-        >
-          <input
-            ref={inputRef}
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="输入密码解锁"
-            className="w-full h-9 bg-surface text-text-primary text-[13px] px-3 rounded border border-surface-hover focus:border-primary/50 focus:outline-none placeholder:text-text-secondary/40 text-center"
-          />
-          {error && <p className="text-[11px] text-red-400">{error}</p>}
-          <button
-            type="submit"
-            disabled={busy || !password}
-            className="w-full h-8 rounded bg-primary/15 text-primary text-xs font-medium hover:bg-primary/25 transition-colors disabled:opacity-50 flex items-center justify-center gap-1.5"
-          >
-            {busy ? <Loader2 size={12} className="animate-spin" /> : <LockOpen size={12} />}
-            解锁
-          </button>
-        </form>
-      )}
+      </form>
     </div>
   );
 }

@@ -6,19 +6,20 @@
     <title>思库</title>
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
+      html { background: transparent; }
       html, body {
         width: 100%; height: 100%; overflow: hidden;
-        background: #1A1A1E;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
       }
       .splash {
         display: flex; flex-direction: column;
         align-items: center; justify-content: center;
-        height: 100vh; color: #F5F5F5;
+        width: 100vw; height: 100vh; color: #F5F5F5;
         position: relative; user-select: none;
+        background: #1A1A1E; border-radius: 14px;
       }
       .bg-pulse {
-        position: absolute; inset: 0;
+        position: absolute; inset: 0; border-radius: 14px;
         background: radial-gradient(ellipse at 50% 40%, rgba(230,126,34,0.1) 0%, transparent 65%);
         animation: bg-breathe 3s ease-in-out infinite; pointer-events: none;
       }
@@ -27,16 +28,16 @@
         50%      { opacity: 0.8; }
       }
       .logo {
-        width: 120px;
-        height: 120px;
-        margin-bottom: 1.4rem;
+        width: 64px;
+        height: 64px;
+        margin-bottom: 0.7rem;
         filter: drop-shadow(0 0 24px rgba(34, 211, 238, 0.15));
       }
       h1 {
-        font-size: 2.4rem;
+        font-size: 1.35rem;
         font-weight: 700;
         letter-spacing: 0.12em;
-        margin: 0 0 0.6rem;
+        margin: 0 0 0.3rem;
         background: linear-gradient(135deg, #E67E22 0%, #F5A623 60%, #E67E22 100%);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
@@ -44,15 +45,15 @@
       }
       .subtitle {
         color: #9CA3AF;
-        font-size: 0.95rem;
+        font-size: 0.72rem;
         letter-spacing: 0.15em;
-        margin-bottom: 2.2rem;
+        margin-bottom: 1.1rem;
       }
       .loader {
         display: flex; gap: 6px; align-items: center;
       }
       .loader .dot {
-        width: 7px; height: 7px; border-radius: 50%;
+        width: 6px; height: 6px; border-radius: 50%;
         background: #E67E22;
         animation: pulse-dot 1.2s ease-in-out infinite;
       }
@@ -64,14 +65,14 @@
       }
       #status {
         color: #8B8B96;
-        font-size: 0.78rem;
-        margin-top: 1.2rem;
+        font-size: 0.7rem;
+        margin-top: 0.8rem;
         min-height: 1.2em;
         letter-spacing: 0.05em;
       }
       .version {
-        position: absolute; bottom: 20px;
-        color: #5A5A66; font-size: 0.65rem;
+        position: absolute; bottom: 12px;
+        color: #5A5A66; font-size: 0.62rem;
         letter-spacing: 0.04em;
       }
     </style>
@@ -88,9 +89,13 @@
         <div class="dot"></div>
       </div>
       <p id="status">正在初始化...</p>
-      <p class="version">v0.1.0</p>
+      <p class="version"></p>
     </div>
     <script type="module">
+      try {
+        // Build-time injected from tauri.conf.json (see vite.config.ts define).
+        document.querySelector('.version').textContent = 'v' + __APP_VERSION__;
+      } catch { /* version stays empty */ }
       try {
         const { listen } = await import('@tauri-apps/api/event');
         const statusEl = document.getElementById('status');

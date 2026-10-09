@@ -1,23 +1,45 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="思库 Siku">
-  <!-- 背景：深青黑，比 Windows 深色任务栏略深但带明显青调 -->
-  <rect width="1024" height="1024" rx="220" fill="#0B1724"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Siku Siku">
+  <defs>
+    <!-- 背景：深青黑，顶部微亮增加纵深 -->
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#16293E"/>
+      <stop offset="100%" stop-color="#0A141F"/>
+    </linearGradient>
+    <!-- 方块：青蓝渐变，顶部提亮 -->
+    <linearGradient id="cell" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#7FE9FC"/>
+      <stop offset="100%" stop-color="#17B6D6"/>
+    </linearGradient>
+    <!-- 光晕：收紧、提亮，置于方块之后只在十字间隙透出 -->
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFC94D" stop-opacity="0.6"/>
+      <stop offset="60%" stop-color="#FB8500" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#FB8500" stop-opacity="0"/>
+    </radialGradient>
+    <!-- 火花：中心亮、尖端深 -->
+    <radialGradient id="spark" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFD166"/>
+      <stop offset="100%" stop-color="#F97316"/>
+    </radialGradient>
+  </defs>
 
-  <!-- 四库方块：纯色高亮青蓝 -->
-  <g fill="#22D3EE">
-    <rect x="192" y="192" width="300" height="300" rx="56"/>
-    <rect x="532" y="192" width="300" height="300" rx="56"/>
-    <rect x="192" y="532" width="300" height="300" rx="56"/>
-    <rect x="532" y="532" width="300" height="300" rx="56"/>
+  <!-- 圆角背景（macOS squircle 比例 ~22%） -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="url(#bg)"/>
+
+  <!-- 内侧细描边：深色桌面下的边缘界定 -->
+  <rect x="14" y="14" width="996" height="996" rx="210" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="4"/>
+
+  <!-- 中心光晕：画在方块之后，只在十字间隙可见，避免染脏方块 -->
+  <circle cx="512" cy="512" r="270" fill="url(#glow)"/>
+
+  <!-- 四库方块：gap 96，16px 下仍可分辨 -->
+  <g fill="url(#cell)">
+    <rect x="152" y="152" width="312" height="312" rx="64"/>
+    <rect x="560" y="152" width="312" height="312" rx="64"/>
+    <rect x="152" y="560" width="312" height="312" rx="64"/>
+    <rect x="560" y="560" width="312" height="312" rx="64"/>
   </g>
 
-  <!-- 十字分隔 -->
-  <g stroke="#0B1724" stroke-width="22" stroke-linecap="round">
-    <line x1="512" y1="192" x2="512" y2="832"/>
-    <line x1="192" y1="512" x2="832" y2="512"/>
-  </g>
-
-  <!-- 中心火花：纯色同心圆，跨渲染器一致 -->
-  <circle cx="512" cy="512" r="96" fill="#FB8500" opacity="0.55"/>
-  <circle cx="512" cy="512" r="58" fill="#FFB703"/>
-  <circle cx="512" cy="512" r="24" fill="#FFFFFF" opacity="0.95"/>
+  <!-- 中心火花：实心四角星（无白心，避免甜甜圈感） -->
+  <path d="M 512 372 Q 542 482 652 512 Q 542 542 512 652 Q 482 542 372 512 Q 482 482 512 372 Z" fill="url(#spark)"/>
 </svg>

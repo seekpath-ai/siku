@@ -5,6 +5,11 @@
       <stop offset="60%" stop-color="#FB8500" stop-opacity="0.5"/>
       <stop offset="100%" stop-color="#FB8500" stop-opacity="0"/>
     </radialGradient>
+    <!-- 火花本体：中心亮、尖端深（与图标四角星一致） -->
+    <radialGradient id="splashStar" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFD166"/>
+      <stop offset="100%" stop-color="#F97316"/>
+    </radialGradient>
   </defs>
 
   <style>
@@ -28,16 +33,9 @@
     <rect x="210" y="210" width="122" height="122" rx="26"/>
   </g>
 
-  <!-- 十字分隔：与背景色融合 -->
-  <g stroke="#1A1A1E" stroke-width="10" stroke-linecap="round">
-    <line x1="200" y1="68" x2="200" y2="332"/>
-    <line x1="68" y1="200" x2="332" y2="200"/>
-  </g>
-
-  <!-- 中心火花 -->
+  <!-- 中心火花：实心四角星（与图标 master 设计一致），外圈光晕保留 -->
   <g class="spark-core">
-    <circle cx="200" cy="200" r="42" fill="url(#splashSpark)"/>
-    <circle cx="200" cy="200" r="20" fill="#FFB703"/>
-    <circle cx="200" cy="200" r="8" fill="#FFFFFF" opacity="0.95"/>
+    <circle cx="200" cy="200" r="34" fill="url(#splashSpark)"/>
+    <path d="M 200 161.7 Q 208.2 191.8 238.3 200 Q 208.2 208.2 200 238.3 Q 191.8 208.2 161.7 200 Q 191.8 191.8 200 161.7 Z" fill="url(#splashStar)"/>
   </g>
 </svg>

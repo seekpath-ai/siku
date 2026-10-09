@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Generate the full desktop icon set from public/logo-icon-taskbar.svg.
+"""Generate the full desktop icon set from public/logo-icon-v2.svg.
 
 Outputs PNGs + ICO + ICNS into src-tauri/icons/.
-Requires: ImageMagick (`convert`) and Pillow.
+Requires: cairosvg (SVG render — ImageMagick's built-in MSVG renderer drops
+gradients, do NOT use it for SVG), ImageMagick (`convert`, ICO assembly only)
+and icnsutil (ICNS assembly).
 """
 
-import os
 import subprocess
 import tempfile
 from pathlib import Path
 
-from PIL import Image
+import cairosvg
 
 try:
     from icnsutil import IcnsFile
@@ -18,7 +19,7 @@ except ImportError:
     IcnsFile = None
 
 ROOT = Path(__file__).parent.parent
-SVG_SRC = ROOT / "public" / "logo-icon-taskbar.svg"
+SVG_SRC = ROOT / "public" / "logo-icon-v2.svg"
 OUT_DIR = ROOT / "src-tauri" / "icons"
 
 # Base PNG sizes (named {w}x{h}.png)
@@ -42,20 +43,15 @@ ICO_SIZES = [16, 20, 24, 32, 40, 48, 64, 128, 256]
 
 
 def svg_to_png(svg_path: Path, size: int, out_path: Path) -> None:
-    """Render an SVG to a PNG of the given size using ImageMagick."""
-    subprocess.run(
-        [
-            "convert",
-            "-background",
-            "none",
-            "-density",
-            "300",
-            "-resize",
-            f"{size}x{size}",
-            str(svg_path),
-            str(out_path),
-        ],
-        check=True,
+    """Render an SVG to a PNG of the given size using cairosvg.
+
+    ImageMagick's internal MSVG renderer silently drops gradient fills
+    (renders this icon as a blank dark square), so SVG rasterization must
+    stay on cairosvg; ImageMagick is only used downstream for ICO assembly.
+    """
+    cairosvg.svg2png(
+        url=str(svg_path), write_to=str(out_path),
+        output_width=size, output_height=size,
     )
 
 

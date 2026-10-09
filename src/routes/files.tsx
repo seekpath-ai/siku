@@ -1,32 +1,77 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { createRoute } from '@tanstack/react-router';
 import { Route as RootRoute } from './__root';
-import { Folder, File, ChevronRight, Home, FileText, Image, Loader2 } from 'lucide-react';
+import { Folder, File, ChevronRight, Home, FileText, Image, Loader2, Database } from 'lucide-react';
+import { homeDir, desktopDir, documentDir, downloadDir, appDataDir } from '@tauri-apps/api/path';
 import { fileBrowserListDir, fileBrowserOpenInSystem } from '@/lib/tauri';
 import type { FileEntry } from '@/lib/types';
 
-function getDefaultPath(): string {
-  // Windows: use C:\ or USERPROFILE; Linux/macOS: use /home or $HOME
-  if (typeof navigator !== 'undefined' && navigator.userAgent.includes('Windows')) {
-    return 'C:\\';
-  }
-  return '/home';
+/** Last browsed directory is restored on the next visit (device-local). */
+const CWD_KEY = 'siku.files.cwd';
+
+/** Strip trailing path separators so breadcrumbs stay clean ("C:\" keeps its sep). */
+function trimSep(p: string): string {
+  const t = p.replace(/[\\/]+$/, '');
+  return t || p;
+}
+
+interface QuickPath {
+  label: string;
+  path: string;
+  muted?: boolean;
 }
 
 function FilesPage() {
-  const [cwd, setCwd] = useState(getDefaultPath());
+  const [cwd, setCwd] = useState('');
+  const [home, setHome] = useState('');
+  const [quickPaths, setQuickPaths] = useState<QuickPath[]>([]);
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => { loadDir(cwd); }, [cwd]);
+  // Resolve well-known directories once, then pick the initial directory:
+  // last browsed (if any) else the user home — never the drive root.
+  useEffect(() => {
+    (async () => {
+      const [h, desk, docs, dl, appData] = await Promise.all([
+        homeDir(), desktopDir(), documentDir(), downloadDir(), appDataDir(),
+      ]);
+      const home = trimSep(h);
+      setHome(home);
+      setQuickPaths([
+        { label: '主目录', path: home },
+        { label: '桌面', path: trimSep(desk) },
+        { label: '文档', path: trimSep(docs) },
+        { label: '下载', path: trimSep(dl) },
+        { label: '应用数据', path: trimSep(appData), muted: true },
+      ]);
+      setCwd(localStorage.getItem(CWD_KEY) || home);
+    })().catch(() => setError('无法获取系统目录'));
+  }, []);
 
-  const loadDir = async (path: string) => {
+  const loadDir = useCallback(async (path: string) => {
     setLoading(true); setError(null);
-    try { setEntries(await fileBrowserListDir(path, false)); }
-    catch (err) { setError(`${err}`); }
-    finally { setLoading(false); }
-  };
+    try {
+      setEntries(await fileBrowserListDir(path, false));
+      localStorage.setItem(CWD_KEY, path);
+    } catch (err) {
+      setError(`${err}`);
+      setEntries([]);
+      return false;
+    } finally {
+      setLoading(false);
+    }
+    return true;
+  }, []);
+
+  useEffect(() => {
+    if (!cwd) return;
+    // A stale saved path (renamed/removed dir, or a drive that no longer
+    // exists) falls back to the home directory instead of showing an error.
+    loadDir(cwd).then((ok) => {
+      if (!ok && home && cwd !== home) setCwd(home);
+    });
+  }, [cwd, home, loadDir]);
 
   const handleClick = (entry: FileEntry) => {
     if (entry.is_dir) { setCwd(entry.path); }
@@ -60,12 +105,33 @@ function FilesPage() {
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center gap-1 px-4 py-2 border-b border-surface-hover text-xs">
-        <button onClick={() => setCwd(isWindows ? 'C:\\' : '/')} className="p-1 rounded hover:bg-surface-hover">
+        <button
+          onClick={() => home && setCwd(home)}
+          className="p-1 rounded hover:bg-surface-hover"
+          title="主目录"
+        >
           <Home size={14} className="text-text-secondary" />
         </button>
+        {quickPaths.map((q) => (
+          <button
+            key={q.label}
+            onClick={() => setCwd(q.path)}
+            className={`flex items-center gap-1 px-1.5 py-0.5 rounded transition-colors ${
+              cwd === q.path
+                ? 'text-primary bg-primary/10'
+                : q.muted
+                  ? 'text-text-secondary/60 hover:text-text-secondary hover:bg-surface-hover'
+                  : 'text-text-secondary hover:text-text-primary hover:bg-surface-hover'
+            }`}
+          >
+            {q.muted && <Database size={11} />}
+            {q.label}
+          </button>
+        ))}
+        <span className="mx-1 h-3.5 w-px bg-surface-hover" />
         {pathParts.map((part, i) => (
           <span key={i} className="flex items-center gap-1">
-            <ChevronRight size={12} className="text-text-secondary/50" />
+            {i > 0 && <ChevronRight size={12} className="text-text-secondary/50" />}
             <button
               onClick={() => setCwd(buildPath(i))}
               className="hover:text-primary"

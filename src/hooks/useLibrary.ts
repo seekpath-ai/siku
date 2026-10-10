@@ -9,6 +9,14 @@ export function usePapers(params?: ListPapersParams) {
     queryKey: ['papers', params],
     queryFn: () => tauri.listPapers(params),
     staleTime: 30_000,
+    // Startup on slow machines: the router mounts as soon as AppState answers
+    // the probe, but the pool then spawns fresh connections whose after_connect
+    // loads the crsqlite extension from disk — transient failures there (or
+    // general startup contention) settle the query in error within ~3s of the
+    // default retry budget and the user has to click 重试. A longer backoff
+    // window lets those first seconds self-heal.
+    retry: 4,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
   });
 }
 
@@ -195,6 +203,9 @@ export function useCollections() {
     queryKey: ['collections'],
     queryFn: () => tauri.collectionsList(),
     staleTime: 60_000,
+    // Same startup-window resilience as usePapers.
+    retry: 4,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
   });
 }
 

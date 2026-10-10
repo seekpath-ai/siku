@@ -794,7 +794,7 @@ export function PaperList() {
     return base;
   }, [activeFilter, searchQuery, sortBy, sortOrder, yearFrom, yearTo, journalFilter, statusFilter]);
 
-  const { data: papers, isLoading, isError, refetch } = usePapers(params);
+  const { data: papers, isLoading, isError, error, refetch } = usePapers(params);
 
   const paperIds = useMemo(() => papers?.map((p) => p.id) ?? [], [papers]);
 
@@ -1165,9 +1165,17 @@ export function PaperList() {
           <Loader2 size={24} className="animate-spin" />
         </div>
       ) : isError ? (
-        <div className="flex flex-col items-center justify-center flex-1 text-text-secondary">
+        <div className="flex flex-col items-center justify-center flex-1 text-text-secondary px-8">
           <FileWarning size={40} className="mb-3 text-red-400" />
           <p className="text-sm mb-2">加载文献失败</p>
+          {/* Surface the real error: startup failures on slow machines are
+              transient and retriable, but we still need the text to diagnose
+              the ones that are not. */}
+          {error && (
+            <p className="text-[11px] text-text-secondary/60 mb-3 max-w-[420px] text-center break-all select-text">
+              {error instanceof Error ? error.message : String(error)}
+            </p>
+          )}
           <button
             onClick={() => refetch()}
             className="px-3 py-1.5 rounded-lg bg-surface border border-surface-hover text-xs hover:bg-surface-hover"

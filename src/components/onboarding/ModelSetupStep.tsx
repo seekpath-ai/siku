@@ -21,14 +21,31 @@ const SHORT_NAMES: Record<string, string> = {
   zhipu: '智谱 z.ai',
 };
 
-const BADGE_LETTERS: Record<string, string> = {
-  deepseek: 'D',
-  kimi: 'K',
-  qwen: 'Q',
-  zhipu: 'Z',
+/** Official brand marks (Simple Icons, CC0) — rendered on a white chip
+ *  because Kimi/Z.ai marks are near-black and vanish on the dark theme. */
+const LOGO_FILES: Record<string, string> = {
+  deepseek: '/llm-logos/deepseek.svg',
+  kimi: '/llm-logos/kimi.svg',
+  qwen: '/llm-logos/qwen.svg',
+  zhipu: '/llm-logos/zhipu.svg',
 };
 
 function ProviderBadge({ preset, size = 28 }: { preset: LlmPreset; size?: number }) {
+  const logo = LOGO_FILES[preset.provider];
+  if (logo) {
+    return (
+      <span
+        className="inline-flex items-center justify-center rounded-lg bg-white shrink-0"
+        style={{ width: size, height: size }}
+      >
+        <img
+          src={logo}
+          alt={preset.label}
+          style={{ width: size * 0.72, height: size * 0.72 }}
+        />
+      </span>
+    );
+  }
   return (
     <span
       className="inline-flex items-center justify-center rounded-lg text-white font-bold shrink-0"
@@ -39,7 +56,7 @@ function ProviderBadge({ preset, size = 28 }: { preset: LlmPreset; size?: number
         fontSize: size * 0.5,
       }}
     >
-      {BADGE_LETTERS[preset.provider] ?? preset.label[0]}
+      {preset.label[0]}
     </span>
   );
 }

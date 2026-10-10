@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Check, Loader2, StickyNote } from 'lucide-react';
-import { notesCreate, vaultCreate, vaultImport, vaultSetCurrent } from '@/lib/tauri';
+import { notesCreate, vaultCreate, vaultImport, vaultList, vaultSetCurrent } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
 
 /** Welcome note doubles as a living feature tour of the editor. */
@@ -73,7 +73,15 @@ export function NotesStep() {
     setObsResult(null);
     setObsError(null);
     try {
-      const name = dir.split(/[\\/]/).filter(Boolean).pop() || 'Obsidian 导入';
+      const base = dir.split(/[\\/]/).filter(Boolean).pop() || 'Obsidian 导入';
+      // Vault names are unique (the app seeds a default "cognitive-archive"
+      // vault, so an identically named Obsidian folder would clash) —
+      // auto-suffix instead of failing the import.
+      const taken = new Set((await vaultList().catch(() => [])).map((v) => v.name));
+      let name = base;
+      for (let i = 2; taken.has(name); i++) {
+        name = `${base} (${i})`;
+      }
       const vault = await vaultCreate(name);
       const result = await vaultImport(vault.id, dir);
       await vaultSetCurrent(vault.id);

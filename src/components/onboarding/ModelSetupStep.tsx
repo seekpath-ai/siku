@@ -24,10 +24,10 @@ const SHORT_NAMES: Record<string, string> = {
 /** Official brand marks (Simple Icons, CC0) — rendered on a white chip
  *  because Kimi/Z.ai marks are near-black and vanish on the dark theme. */
 const LOGO_FILES: Record<string, string> = {
-  deepseek: '/llm-logos/deepseek.svg',
-  kimi: '/llm-logos/kimi.svg',
-  qwen: '/llm-logos/qwen.svg',
-  zhipu: '/llm-logos/zhipu.svg',
+  deepseek: '/brand-logos/deepseek.svg',
+  kimi: '/brand-logos/kimi.svg',
+  qwen: '/brand-logos/qwen.svg',
+  zhipu: '/brand-logos/zhipu.svg',
 };
 
 function ProviderBadge({ preset, size = 28 }: { preset: LlmPreset; size?: number }) {

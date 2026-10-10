@@ -114,7 +114,7 @@ export function ImportPapersStep() {
       {/* Zotero import */}
       <div className="px-4 py-3 rounded-xl bg-background border border-surface-hover">
         <div className="flex items-center gap-2 text-sm text-text-primary mb-1">
-          <span className="w-3.5 h-3.5 rounded-sm bg-red-500/80 inline-block" />
+          <img src="/brand-logos/zotero.svg" alt="Zotero" className="w-3.5 h-3.5" />
           从 Zotero 导入
         </div>
         {detected === null ? (

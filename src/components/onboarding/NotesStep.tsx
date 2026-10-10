@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Check, FolderOpen, Loader2, StickyNote } from 'lucide-react';
+import { Check, Loader2, StickyNote } from 'lucide-react';
 import { notesCreate, vaultCreate, vaultImport, vaultSetCurrent } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
 
@@ -116,7 +116,7 @@ export function NotesStep() {
       {/* Obsidian import */}
       <div className="px-4 py-3 rounded-xl bg-background border border-surface-hover">
         <div className="flex items-center gap-2 text-sm text-text-primary mb-1">
-          <FolderOpen size={14} className="text-primary" />
+          <img src="/brand-logos/obsidian.svg" alt="Obsidian" className="w-3.5 h-3.5" />
           从 Obsidian 文件夹导入
         </div>
         <p className="text-[11px] text-text-secondary mb-2.5">

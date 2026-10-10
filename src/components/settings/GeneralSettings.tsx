@@ -1,9 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Folder, HardDrive, Loader2, FolderOpen, Cat, Check, Home, Camera } from 'lucide-react';
+import { Loader2, Cat, Check, Home, Camera } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
-import { settingsGetDataDir, settingsAppGet, settingsAppSave, screenshotHotkeySync } from '@/lib/tauri';
+import { settingsAppGet, settingsAppSave, screenshotHotkeySync } from '@/lib/tauri';
 import { useTabStore } from '@/stores/tabStore';
-import { pickDirectory } from '@/lib/pickDirectory';
 
 const HOME_OPTIONS = [
   { value: '/library', label: '图书馆' },
@@ -19,10 +18,6 @@ const HOME_OPTIONS = [
 ];
 
 export function GeneralSettings() {
-  const [currentDir, setCurrentDir] = useState<string>('');
-  const [dataDir, setDataDir] = useState<string>('');
-  const [dataDirSaving, setDataDirSaving] = useState(false);
-  const [dataDirSaved, setDataDirSaved] = useState(false);
   const [showPet, setShowPet] = useState<boolean>(true);
   const [globalShot, setGlobalShot] = useState<boolean>(true);
   const [globalShotSaving, setGlobalShotSaving] = useState(false);
@@ -34,10 +29,8 @@ export function GeneralSettings() {
   const [petSaved, setPetSaved] = useState(false);
 
   const loadSettings = useCallback(() => {
-    Promise.all([settingsGetDataDir(), settingsAppGet()])
-      .then(([actual, settings]) => {
-        setCurrentDir(actual);
-        setDataDir(settings.data_dir || '');
+    settingsAppGet()
+      .then((settings) => {
         setShowPet(settings.show_pet ?? true);
         setGlobalShot(settings.global_screenshot_hotkey ?? true);
         setHomepage(settings.homepage || '/library');
@@ -58,7 +51,6 @@ export function GeneralSettings() {
         settingsAppGet()
           .then((settings) => {
             setShowPet(settings.show_pet ?? true);
-            setDataDir(settings.data_dir || '');
             setHomepage(settings.homepage || '/library');
           })
           .catch((err) => console.error('Failed to refresh settings:', err));
@@ -67,27 +59,6 @@ export function GeneralSettings() {
     setup();
     return () => unlisten?.();
   }, []);
-
-  const saveDataDir = async (next: string) => {
-    setDataDirSaving(true);
-    try {
-      const current = await settingsAppGet();
-      await settingsAppSave({ ...current, data_dir: next || null });
-      setDataDirSaved(true);
-      window.setTimeout(() => setDataDirSaved(false), 2000);
-    } catch (err) {
-      console.error('Failed to save data dir:', err);
-    } finally {
-      setDataDirSaving(false);
-    }
-  };
-
-  const handlePick = async () => {
-    const selected = await pickDirectory(dataDir || currentDir);
-    if (!selected) return;
-    setDataDir(selected);
-    await saveDataDir(selected);
-  };
 
   const saveGlobalShot = async (next: boolean) => {
     setGlobalShotSaving(true);
@@ -134,42 +105,6 @@ export function GeneralSettings() {
   return (
     <div className="space-y-6">
       <h2 className="text-lg font-semibold text-text-primary">通用设置</h2>
-
-      <div className="space-y-3">
-        <div className="flex items-center gap-2 text-sm text-text-primary">
-          <HardDrive size={16} className="text-primary" />
-          <span>数据存储路径</span>
-        </div>
-        <p className="text-xs text-text-secondary">
-          数据库和论文文件存储位置。修改后需重启应用生效。
-        </p>
-
-        {loading ? (
-          <div className="flex items-center gap-2 text-sm text-text-secondary">
-            <Loader2 size={14} className="animate-spin" />加载中...
-          </div>
-        ) : (
-          <div className="flex items-center gap-3 px-4 py-3.5 bg-surface border border-surface-hover rounded-xl">
-            <code className="flex-1 min-w-0 px-3 py-2 bg-background border border-surface-hover rounded-lg text-xs text-text-primary font-mono truncate">
-              <Folder size={12} className="inline mr-1.5 text-text-secondary" />
-              {dataDir || currentDir}
-            </code>
-            <button
-              onClick={handlePick}
-              disabled={dataDirSaving}
-              className="flex items-center gap-1.5 px-3 py-2 bg-background border border-surface-hover rounded-lg text-xs text-text-secondary hover:bg-surface-hover disabled:opacity-50 transition-colors shrink-0"
-            >
-              {dataDirSaving ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
-              选择文件夹
-            </button>
-            {dataDirSaved && !dataDirSaving && (
-              <span className="flex items-center gap-1 text-xs text-accent shrink-0">
-                <Check size={12} /> 已保存
-              </span>
-            )}
-          </div>
-        )}
-      </div>
 
       {/* Homepage */}
       <div className="space-y-3">

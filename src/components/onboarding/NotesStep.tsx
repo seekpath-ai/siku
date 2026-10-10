@@ -3,40 +3,49 @@ import { Check, Loader2, StickyNote } from 'lucide-react';
 import { notesCreate, vaultCreate, vaultImport, vaultList, vaultSetCurrent } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
 
-/** Welcome note doubles as a living feature tour of the editor. */
+/** Welcome note doubles as a beginner's guide — a narrative tour, not a
+ *  feature dump: it walks the read → excerpt → AI-summarize → note loop that
+ *  makes the app more than a Zotero + Obsidian + chatbot bundle. */
 const WELCOME_NOTE = `# 欢迎使用思库
 
-这是一篇自动创建的欢迎笔记，顺手展示了编辑器的常用功能。可以随意改动或删除。
+这是一篇可以随便改、随时删的欢迎笔记。花三分钟读完，你就知道思库该怎么用了。
 
-## 常用语法
+## 思库是什么
 
-**加粗**、*斜体*、~~删除线~~、\`行内代码\`，以及 - 列表、> 引用。
+不只是文献管理、笔记、AI 对话的简单拼合——这三件事在思库里是**打通**的：
 
-## 表格
+- 📚 **图书馆**管文献（本地 PDF / Zotero 导入）
+- 📝 **笔记**承接收获（Markdown、双链、加密字段）
+- 🤖 **AI 智能体**在两者之间干活：读得懂你的文献，也写得了你的笔记
 
-| 功能 | 快捷键 |
-| ---- | ------ |
+## 一条典型的工作流
+
+**1. 导入文献**：向导里已导入的可跳过；平时把 PDF 拖进窗口即可，也可以从 Zotero 一键迁移整个文库。
+
+**2. 阅读与划线**：打开文献，选中文字——「翻译」是即看即弃的临时翻译，「摘录」则存进右侧的**智思**面板，攒成这篇文献的要点集。
+
+**3. 让 AI 帮你消化**：
+- 阅读时点击桌面的**宠物球**，它会自动变成「文献阅读助手」——让它总结要点、解释图表、翻译摘要
+- 在**笔记页面**点开宠物球，它是「笔记整理助手」——直接说「帮我整理这篇笔记」，它会读懂当前笔记并重排结构
+- 在**对话页**新建智能体，干更大的活儿，比如：
+  > 「将我的图书馆里『多智能体』集合的文献整理成一篇综述，保存到笔记」
+
+  它会自己翻阅集合里的文献、交叉对比、写成综述并存进你的笔记库——文献、笔记、AI 在这一步闭环。
+
+**4. 沉淀与输出**：笔记支持导出 PDF；表格、代码块、大纲俱全；重要内容可以右键「锁定」（首次设置全局锁密码，锁定的内容对 AI 也不可见）。
+
+## 顺手试试这些
+
+密码字段（选中文字右键「转为密码字段」，阅读时遮盖）：!pw[这是被遮盖的内容]
+
+| 常用操作 | 方式 |
+| -------- | ---- |
 | 新建笔记 | Ctrl+N |
-| 全局截图 | Ctrl+Shift+S |
+| 全局截图提问 | Ctrl+Shift+S，截图直接进对话 |
+| 笔记大纲 | 阅读视图 ⋯ 菜单 |
+| 多端同步 | 设置 → 同步（账号或局域网直连） |
 
-## 代码块
-
-\`\`\`rust
-fn main() {
-    println!("让灵感涌动");
-}
-\`\`\`
-
-## 密码字段
-
-选中文字后右键可以转成掩码字段，阅读视图下默认遮盖：
-!pw[在这里写下需要遮盖的内容]
-
-## 小贴士
-
-- 阅读视图 / 编辑视图随时切换，右上角大纲可快速跳转
-- 笔记和文献一样支持多端同步（登录同步账号后自动进行）
-- 文献阅读器里选中文字可以摘录到「智思」，还能划词临时翻译
+有问题就点开宠物球问它——它读的文档比你想象的多。祝用得顺手！
 `;
 
 /** Onboarding step 4: seed the notes page — create the welcome note, or

@@ -777,6 +777,7 @@ pub fn run() {
             commands::agent::settings_get_memory_dir,
             commands::agent::settings_ensure_directories,
             commands::agent::settings_validate_llm,
+            commands::agent::settings_list_models,
             // Chat
             commands::chat::list_chat_sessions,
             commands::chat::create_chat_session,

@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import ReactDOM from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { RouterProvider, createRouter } from '@tanstack/react-router';
@@ -186,10 +186,25 @@ function App() {
     };
   }, []);
 
-  const handleOnboardingDone = useCallback(() => {
-    markOnboardingCompletedLocal();
-    settingsSet(ONBOARDING_KEY, '1').catch(() => {});
+  // Only a real finish (or "不再显示") marks onboarding complete. Esc/✕
+  // dismisses for this launch only, so a user who never configured an LLM
+  // keeps getting the wizard instead of a broken first experience.
+  const handleOnboardingDone = useCallback((markComplete: boolean) => {
+    if (markComplete) {
+      markOnboardingCompletedLocal();
+      settingsSet(ONBOARDING_KEY, '1').catch(() => {});
+    }
     setShowOnboarding(false);
+  }, []);
+
+  // Settings → 通用 → 重新打开引导 fires this event.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    import('@tauri-apps/api/event')
+      .then(({ listen }) => listen('app:show-onboarding', () => setShowOnboarding(true)))
+      .then((fn) => { unlisten = fn; })
+      .catch(() => {});
+    return () => unlisten?.();
   }, []);
 
   return (

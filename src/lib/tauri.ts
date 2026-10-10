@@ -937,6 +937,16 @@ export async function settingsValidateLlm(
   });
 }
 
+/** List the models an API key can currently use (OpenAI-compatible GET
+ *  {baseUrl}/models). Onboarding offers this live catalog for model choice. */
+export async function settingsListModels(
+  apiKey: string,
+  baseUrl: string,
+  proxy?: string,
+): Promise<string[]> {
+  return invoke<string[]>('settings_list_models', { apiKey, baseUrl, proxy });
+}
+
 // ============================================================
 // Translation
 // ============================================================

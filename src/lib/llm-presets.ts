@@ -6,6 +6,10 @@ export interface LlmPreset {
   models: string[];
   baseURL: string;
   apiKeyEnv?: string;
+  /** Official console where the user applies for an API key (onboarding). */
+  platformUrl?: string;
+  /** Brand accent for the onboarding badge. */
+  accent?: string;
 }
 
 export const LLM_PRESETS: LlmPreset[] = [
@@ -15,6 +19,8 @@ export const LLM_PRESETS: LlmPreset[] = [
     models: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp'],
     baseURL: 'https://api.deepseek.com/v1',
     apiKeyEnv: 'DEEPSEEK_API_KEY',
+    platformUrl: 'https://platform.deepseek.com/',
+    accent: '#4D6BFE',
   },
   {
     label: 'OpenAI',
@@ -36,6 +42,8 @@ export const LLM_PRESETS: LlmPreset[] = [
     models: ['qwen-max', 'qwen-plus', 'qwen-turbo', 'qwen3-235b-a22b'],
     baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     apiKeyEnv: 'DASHSCOPE_API_KEY',
+    platformUrl: 'https://bailian.console.aliyun.com/',
+    accent: '#615CED',
   },
   {
     label: 'Zhipu / 智谱',
@@ -43,6 +51,8 @@ export const LLM_PRESETS: LlmPreset[] = [
     models: ['glm-4-plus', 'glm-4-flash', 'glm-4-air', 'glm-4.5'],
     baseURL: 'https://open.bigmodel.cn/api/paas/v4',
     apiKeyEnv: 'ZHIPU_API_KEY',
+    platformUrl: 'https://open.bigmodel.cn/',
+    accent: '#3B6CFF',
   },
   {
     label: 'Kimi / 月之暗面',
@@ -50,6 +60,8 @@ export const LLM_PRESETS: LlmPreset[] = [
     models: ['moonshot-v1-auto', 'moonshot-v1-8k', 'moonshot-v1-32k', 'kimi-latest'],
     baseURL: 'https://api.moonshot.cn/v1',
     apiKeyEnv: 'MOONSHOT_API_KEY',
+    platformUrl: 'https://platform.moonshot.cn/',
+    accent: '#8B5CF6',
   },
   {
     label: 'Gemini',

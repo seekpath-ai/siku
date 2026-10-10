@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Loader2, Cat, Check, Home, Camera } from 'lucide-react';
+import { Loader2, Cat, Check, Home, Camera, Compass } from 'lucide-react';
 import { listen } from '@tauri-apps/api/event';
 import { settingsAppGet, settingsAppSave, screenshotHotkeySync } from '@/lib/tauri';
 import { useTabStore } from '@/stores/tabStore';
@@ -142,6 +142,30 @@ export function GeneralSettings() {
             )}
           </div>
         )}
+      </div>
+
+      {/* Re-open onboarding */}
+      <div className="space-y-3">
+        <div className="flex items-center gap-2 text-sm text-text-primary">
+          <Compass size={16} className="text-primary" />
+          <span>新手引导</span>
+        </div>
+        <div className="flex items-center gap-3 px-4 py-3.5 bg-surface border border-surface-hover rounded-xl">
+          <p className="flex-1 min-w-0 text-xs text-text-secondary">
+            首次打开时的配置向导（模型、文献导入、笔记）。中途跳过的会在下次启动时再次出现。
+          </p>
+          <button
+            onClick={async () => {
+              try {
+                const { emit } = await import('@tauri-apps/api/event');
+                await emit('app:show-onboarding');
+              } catch { /* outside Tauri */ }
+            }}
+            className="flex items-center gap-1.5 px-3 py-2 bg-background border border-surface-hover rounded-lg text-xs text-text-secondary hover:bg-surface-hover transition-colors shrink-0"
+          >
+            重新打开
+          </button>
+        </div>
       </div>
 
       {/* Pet visibility */}

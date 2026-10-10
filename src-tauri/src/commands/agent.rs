@@ -1906,6 +1906,57 @@ pub async fn settings_validate_llm(
     settings_service::validate_llm_config(&config).await
 }
 
+/// List the models an API key can currently use, via the OpenAI-compatible
+/// `GET {base_url}/models` endpoint (supported by DeepSeek/Kimi/Qwen/Zhipu and
+/// friends). Onboarding uses it to offer the provider's LIVE catalog instead
+/// of a hardcoded list that goes stale.
+#[tauri::command]
+#[instrument(skip_all)] // never log the api key
+pub async fn settings_list_models(
+    api_key: String,
+    base_url: String,
+    proxy: Option<String>,
+) -> Result<Vec<String>, String> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(15));
+    if let Some(p) = proxy.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        let proxy = reqwest::Proxy::all(p).map_err(|e| format!("invalid proxy: {e}"))?;
+        builder = builder.proxy(proxy);
+    }
+    let client = builder.build().map_err(|e| format!("failed to build client: {e}"))?;
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|e| format!("获取模型列表失败: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("获取模型列表失败: HTTP {status}"));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("模型列表响应解析失败: {e}"))?;
+    let mut ids: Vec<String> = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        return Err("厂商返回了空的模型列表".to_string());
+    }
+    Ok(ids)
+}
+
 #[tauri::command]
 pub async fn settings_get_memory_dir(
     state: State<'_, AppState>,

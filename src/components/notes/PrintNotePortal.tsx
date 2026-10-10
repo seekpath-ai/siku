@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { WikiMarkdown } from './WikiMarkdown';
+import type { PdfExportOptions } from './ExportPdfDialog';
 import type { Note } from '@/lib/types';
 
 interface Props {
@@ -8,6 +9,7 @@ interface Props {
   content: string;
   notes: Note[];
   attachmentsDir?: string;
+  options: PdfExportOptions;
   /** Called after the print dialog closes (or on unmount). */
   onDone: () => void;
 }
@@ -18,7 +20,34 @@ interface Props {
  * dialog — GTK on Linux and WebView2 on Windows both offer "save as PDF".
  * The portal is removed on `afterprint`.
  */
-export function PrintNotePortal({ note, content, notes, attachmentsDir, onDone }: Props) {
+export function PrintNotePortal({ note, content, notes, attachmentsDir, options, onDone }: Props) {
+  // Figure/table auto-numbering: generated content can't attach captions to
+  // replaced elements (<img>) and markdown tables have no <caption>, so the
+  // captions are real DOM inserted once before printing. Only block images
+  // (a paragraph holding just the image) get 图 N — inline icons don't.
+  useEffect(() => {
+    if (!options.numberFigures) return;
+    const root = document.getElementById('siku-print-root');
+    if (!root) return;
+    let fig = 0;
+    root.querySelectorAll('p > img:only-child').forEach((img) => {
+      fig += 1;
+      const alt = (img.getAttribute('alt') || '').trim();
+      const cap = document.createElement('div');
+      cap.className = 'pdf-figcap';
+      cap.textContent = '图 ' + fig + (alt ? '　' + alt : '');
+      img.parentElement?.insertAdjacentElement('afterend', cap);
+    });
+    let tbl = 0;
+    root.querySelectorAll('table').forEach((table) => {
+      tbl += 1;
+      const cap = document.createElement('caption');
+      cap.className = 'pdf-tblcap';
+      cap.textContent = `表 ${tbl}`;
+      table.prepend(cap);
+    });
+  }, [options.numberFigures]);
+
   useEffect(() => {
     let cancelled = false;
     // The system "save as PDF" dialog suggests document.title as the file
@@ -67,11 +96,30 @@ export function PrintNotePortal({ note, content, notes, attachmentsDir, onDone }
       document.title = prevTitle;
       window.removeEventListener('afterprint', finish);
     };
-  }, [onDone]);
+  }, [note.title, onDone]);
+
+  const rootClass = [
+    options.numberSections ? 'pdf-number-sections' : '',
+    options.numberFigures ? 'pdf-number-figures' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
 
   return createPortal(
-    <div id="siku-print-root">
-      <h1 className="siku-print-title">{note.title || '未命名笔记'}</h1>
+    <div id="siku-print-root" className={rootClass || undefined}>
+      {options.coverPage && (
+        <div className="pdf-cover">
+          <h1 className="pdf-cover-title">{note.title || '未命名笔记'}</h1>
+          <div className="pdf-cover-date">
+            {new Date().toLocaleDateString('zh-CN', {
+              year: 'numeric',
+              month: 'long',
+              day: 'numeric',
+            })}
+          </div>
+        </div>
+      )}
+      {!options.coverPage && <h1 className="siku-print-title">{note.title || '未命名笔记'}</h1>}
       <WikiMarkdown
         content={content || ' '}
         notes={notes}

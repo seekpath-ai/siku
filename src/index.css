@@ -692,13 +692,14 @@ body.in-tauri {
   #siku-print-root h4 { font-size: 12pt; margin: 13pt 0 5pt; }
   #siku-print-root h5,
   #siku-print-root h6 { font-size: 11pt; margin: 11pt 0 4pt; }
-  /* 笔记标题（.siku-print-title）单独一套，放在最后以便覆盖通用 h1 */
+  /* 笔记题目（.siku-print-title）：居中的文档题，不是章节标题 */
   #siku-print-root .siku-print-title {
     font-size: 19pt;
     font-weight: 700;
-    margin: 0 0 6pt;
+    text-align: center;
+    margin: 0 0 14pt;
     padding-bottom: 8pt;
-    border-bottom: 1.5px solid #333;
+    border-bottom: 1px solid #bbb;
   }
 
   /* ── 正文段落：首行缩进两字 ──────────────────────────────────────── */
@@ -743,12 +744,16 @@ body.in-tauri {
     break-inside: avoid;
   }
 
-  /* ── 表格：细线、表头跨页重复 ────────────────────────────────────── */
+  /* ── 表格：细线、表头跨页重复；行不拆、表可跨页（整表 avoid 会把
+        中等大小的表整块推到下一页，留出大片空白） ─────────────────── */
   #siku-print-root table {
     width: 100%;
     border-collapse: collapse;
     font-size: 10.5pt;
     margin: 0.6em 0;
+    break-inside: auto;
+  }
+  #siku-print-root tr {
     break-inside: avoid;
   }
   #siku-print-root thead { display: table-header-group; }
@@ -768,7 +773,100 @@ body.in-tauri {
   }
   #siku-print-root img {
     max-width: 100%;
+    /* 图片同时限高：只限宽时一张超长截图会被页高裁掉 */
+    max-height: 210mm;
     break-inside: avoid;
+  }
+  /* 独占一段的图片视为插图：居中并留白（行内小图标不受影响） */
+  #siku-print-root p > img:only-child {
+    display: block;
+    margin: 0.6em auto;
+  }
+
+  /* ── 图表编号（导出选项开启时，caption 由 PrintNotePortal 插入） ── */
+  #siku-print-root .pdf-figcap {
+    text-align: center;
+    font-size: 10pt;
+    color: #333;
+    margin: 0.2em 0 0.8em;
+    text-indent: 0;
+  }
+  #siku-print-root .pdf-tblcap {
+    caption-side: top;
+    text-align: center;
+    font-size: 10pt;
+    font-weight: 600;
+    color: #333;
+    padding-bottom: 3pt;
+  }
+
+  /* ── 章节自动编号（导出选项开启时加在正文 h1–h4 上） ─────────────── */
+  #siku-print-root.pdf-number-sections { counter-reset: ph1; }
+  #siku-print-root.pdf-number-sections h1:not(.siku-print-title) {
+    counter-increment: ph1;
+    counter-reset: ph2;
+  }
+  #siku-print-root.pdf-number-sections h1:not(.siku-print-title)::before {
+    content: counter(ph1) "　";
+  }
+  #siku-print-root.pdf-number-sections h2 {
+    counter-increment: ph2;
+    counter-reset: ph3;
+  }
+  #siku-print-root.pdf-number-sections h2::before {
+    content: counter(ph1) "." counter(ph2) "　";
+  }
+  #siku-print-root.pdf-number-sections h3 {
+    counter-increment: ph3;
+    counter-reset: ph4;
+  }
+  #siku-print-root.pdf-number-sections h3::before {
+    content: counter(ph1) "." counter(ph2) "." counter(ph3) "　";
+  }
+  #siku-print-root.pdf-number-sections h4 { counter-increment: ph4; }
+  #siku-print-root.pdf-number-sections h4::before {
+    content: counter(ph1) "." counter(ph2) "." counter(ph3) "." counter(ph4) "　";
+  }
+
+  /* ── 封面页（导出选项开启时；命名页不印页码） ────────────────────── */
+  #siku-print-root .pdf-cover {
+    page: cover;
+    break-after: page;
+    padding-top: 80mm;
+    text-align: center;
+  }
+  #siku-print-root .pdf-cover-title {
+    font-size: 26pt;
+    font-weight: 700;
+    margin: 0 0 14pt;
+    border-bottom: none;
+  }
+  #siku-print-root .pdf-cover-date {
+    font-size: 12pt;
+    color: #444;
+  }
+
+  /* ── 脚注（GFM [^1]）：小字号 + 顶部分隔线 ───────────────────────── */
+  #siku-print-root .footnotes {
+    font-size: 9.5pt;
+    color: #333;
+    border-top: 0.5pt solid #999;
+    margin-top: 1.4em;
+    padding-top: 0.4em;
+  }
+  #siku-print-root .footnotes #footnote-label {
+    /* react-markdown 的默认标签标题在屏幕端由 prose 样式隐藏，打印同样不需要 */
+    display: none;
+  }
+  #siku-print-root .footnotes p {
+    text-indent: 0;
+    margin: 0;
+  }
+
+  /* ── 密码字段：交互按钮已由 print:hidden 移除，打印件只留遮盖圆点 ── */
+  #siku-print-root .pw-field {
+    background: none !important;
+    border: 0.5pt solid #999 !important;
   }
 
   /* Code blocks: print cannot scroll, so a long line used to be clipped twice
@@ -820,4 +918,17 @@ body.in-tauri {
 @page {
   size: A4;
   margin: 20mm 22mm;
+  /* 页码（Chromium 131+ 支持 @page margin boxes；不支持的引擎静默省略） */
+  @bottom-center {
+    content: counter(page) " / " counter(pages);
+    font-family: "Times New Roman", "Songti SC", "SimSun", serif;
+    font-size: 9pt;
+    color: #555;
+  }
+}
+/* 封面页（命名页）不印页码 */
+@page cover {
+  @bottom-center {
+    content: none;
+  }
 }

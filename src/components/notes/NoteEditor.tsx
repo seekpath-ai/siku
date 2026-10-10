@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import { WikiMarkdown } from './WikiMarkdown';
 import { PrintNotePortal } from './PrintNotePortal';
+import { ExportPdfDialog, type PdfExportOptions } from './ExportPdfDialog';
 import { BacklinksPanel } from './BacklinksPanel';
 import { OutlinePanel } from './OutlinePanel';
 import { VersionHistoryDialog } from './VersionHistoryDialog';
@@ -287,11 +288,12 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
     });
   }, []);
 
-  // 导出为 PDF：渲染打印副本并打开系统打印对话框（GTK/WebView2 均支持
-  // 另存为 PDF）。Markdown 原文导出见 handleExport。
-  const [printing, setPrinting] = useState(false);
-  const handleExportPdf = useCallback(() => setPrinting(true), []);
-  const handlePrintDone = useCallback(() => setPrinting(false), []);
+  // 导出为 PDF：先弹出导出选项（编号/封面），确认后渲染打印副本并打开系统
+  // 打印对话框（GTK/WebView2 均支持另存为 PDF）。Markdown 原文导出见 handleExport。
+  const [pdfOptionsOpen, setPdfOptionsOpen] = useState(false);
+  const [printOptions, setPrintOptions] = useState<PdfExportOptions | null>(null);
+  const handleExportPdf = useCallback(() => setPdfOptionsOpen(true), []);
+  const handlePrintDone = useCallback(() => setPrintOptions(null), []);
 
   // Restore a note from a version snapshot, then let the parent refresh.
   const handleVersionRestore = useCallback(
@@ -963,12 +965,24 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
         />
       )}
 
-      {printing && (
+      {pdfOptionsOpen && (
+        <ExportPdfDialog
+          noteTitle={note.title}
+          onCancel={() => setPdfOptionsOpen(false)}
+          onConfirm={(opts) => {
+            setPdfOptionsOpen(false);
+            setPrintOptions(opts);
+          }}
+        />
+      )}
+
+      {printOptions && (
         <PrintNotePortal
           note={note}
           content={content}
           notes={notes}
           attachmentsDir={attachmentsDir}
+          options={printOptions}
           onDone={handlePrintDone}
         />
       )}

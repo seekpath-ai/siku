@@ -67,7 +67,7 @@ function PasswordField({ secret }: { secret?: string }) {
   };
 
   return (
-    <span className="inline-flex items-center gap-1 mx-0.5 px-1.5 py-0.5 rounded bg-surface-hover/60 border border-surface-hover align-middle not-prose">
+    <span className="pw-field inline-flex items-center gap-1 mx-0.5 px-1.5 py-0.5 rounded bg-surface-hover/60 border border-surface-hover align-middle not-prose">
       <span className="font-mono text-[0.85em] text-text-primary select-none">
         {visible ? value : '••••••••'}
       </span>

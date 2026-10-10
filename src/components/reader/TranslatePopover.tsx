@@ -27,6 +27,36 @@ export function TranslatePopover({ selection, targetLang, onSave, onClose }: Tra
   const [done, setDone] = useState(false);
   const [copied, setCopied] = useState(false);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  const [highlightPath, setHighlightPath] = useState('');
+
+  // Keep the selection visibly highlighted while translating: dismissing the
+  // toolbar clears the viewer's selection overlay, so paint our own from the
+  // selection's stored per-page ratio rects (same math as the viewer's
+  // overlay). Viewport-fixed is fine — the popover closes on scroll.
+  useEffect(() => {
+    // The viewer's live-selection branch keeps repainting while a native
+    // selection exists; drop it so only this highlight remains.
+    window.getSelection()?.removeAllRanges();
+    const HEIGHT_FACTOR = 0.8; // same shrink the viewer's overlay applies
+    // One path for all rects, filled once: font changes produce duplicate
+    // boxes for the same span, and a single-path fill can never
+    // double-darken the overlaps (stacked translucent divs would).
+    let d = '';
+    for (const seg of selection.segments ?? []) {
+      const wrapper = document.querySelector<HTMLElement>(`[data-page-num="${seg.pageIndex}"]`);
+      if (!wrapper) continue;
+      const wr = wrapper.getBoundingClientRect();
+      const paint = seg.paintRects.length > 0 ? seg.paintRects : seg.rects;
+      for (const r of paint) {
+        const w = r.widthRatio * wr.width;
+        const h = r.heightRatio * wr.height * HEIGHT_FACTOR;
+        const x = wr.left + (r.xRatio - r.widthRatio / 2) * wr.width;
+        const y = wr.top + r.yRatio * wr.height - h / 2;
+        d += `M${x.toFixed(1)} ${y.toFixed(1)}h${w.toFixed(1)}v${h.toFixed(1)}h${(-w).toFixed(1)}Z`;
+      }
+    }
+    setHighlightPath(d);
+  }, [selection]);
 
   // Anchor below the selection, flipping above when the space below is tight.
   // Computed once: the popover closes on scroll instead of following the
@@ -106,6 +136,22 @@ export function TranslatePopover({ selection, targetLang, onSave, onClose }: Tra
   const streaming = !done && !error;
 
   return (
+    <>
+      {/* Stand-in selection highlight: keeps the translated passage marked
+          while the popover is open (the toolbar dismiss cleared the viewer's
+          own overlay). Single path, single fill — same color and overlap
+          semantics as the viewer's selection overlay. */}
+      {highlightPath && (
+        <svg
+          className="fixed inset-0 z-30 pointer-events-none"
+          style={{ width: '100vw', height: '100vh' }}
+        >
+          <path
+            d={highlightPath}
+            style={{ fill: 'color-mix(in srgb, AccentColor, transparent 50%)' }}
+          />
+        </svg>
+      )}
     <div
       ref={popRef}
       className="fixed z-40 w-[380px] max-w-[92vw] flex flex-col rounded-lg bg-surface border border-surface-hover shadow-xl"
@@ -119,7 +165,6 @@ export function TranslatePopover({ selection, targetLang, onSave, onClose }: Tra
       <div className="flex items-center gap-1.5 px-3 py-2 border-b border-surface-hover">
         <Languages size={13} className="text-primary" />
         <span className="text-xs font-medium text-text-primary">临时翻译</span>
-        {streaming && <Loader2 size={11} className="animate-spin text-text-secondary" />}
         <button
           onClick={onClose}
           className="ml-auto p-0.5 rounded text-text-secondary hover:text-text-primary hover:bg-surface-hover"
@@ -166,5 +211,6 @@ export function TranslatePopover({ selection, targetLang, onSave, onClose }: Tra
         </button>
       </div>
     </div>
+    </>
   );
 }

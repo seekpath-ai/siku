@@ -109,9 +109,15 @@ function App() {
 
     // Safety: if backend never responds (e.g. panic), show main
     // window after 10s so the user isn't stuck with a splash forever.
+    // The splash must close with it — otherwise it outlives the main
+    // window (double taskbar icons) until set_complete lands, or forever
+    // if the probe loop exhausts first. Mirrors the ErrorFallback path.
     const safetyTimer = setTimeout(() => {
-      import('@tauri-apps/api/window').then(({ getCurrentWindow }) => {
+      import('@tauri-apps/api/window').then(({ getCurrentWindow, Window }) => {
         getCurrentWindow().show().catch(() => {});
+        Window.getByLabel('splashscreen')
+          .then((splash) => splash?.close())
+          .catch(() => {});
       }).catch(() => {});
       setBackendReady(true); // show the UI even if every probe failed
     }, 10_000);
@@ -212,10 +218,10 @@ class ErrorFallback extends React.Component<
   render() {
     if (this.state.hasError) {
       // Surface the error instead of hiding it behind the splashscreen:
-      // show the main window AND close the always-on-top splash. The splash
-      // is normally closed by the backend (try_finish_startup) once both
-      // sides are ready — on a render crash that never happens, so the
-      // error UI would otherwise stay covered by the splash forever.
+      // show the main window AND close the splash. The splash is normally
+      // closed by the backend (try_finish_startup) once both sides are
+      // ready — on a render crash that never happens, so the error UI
+      // would otherwise stay covered by the splash forever.
       // (No fixed timeout involved: slow machines are never affected.)
       import('@tauri-apps/api/window').then(({ getCurrentWindow, Window }) => {
         getCurrentWindow().show().catch(() => {});

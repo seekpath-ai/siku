@@ -109,6 +109,19 @@ export function useStreamingChat() {
   // session the user switched away from). Content is dropped; only the
   // per-session streaming/loading flags are tracked so switching back
   // restores the correct input state.
+  //
+  // A turn that ends (done/cancelled/error) can no longer be waiting on
+  // AskUserQuestion answers — the backend already gave up (timeout/cancel).
+  // Clearing here closes a dialog the backend left behind; without it the
+  // dialog outlives its turn and every close attempt fails against the
+  // dead ask channel, wedging the modal open.
+  const clearStaleQuestions = useCallback((sessionId: string) => {
+    const state = useChatStore.getState();
+    if (state.pendingQuestionsSessionId === sessionId) {
+      state.setPendingQuestions(null);
+    }
+  }, []);
+
   const onForeignEvent = useCallback((e: AgentStreamEvent) => {
     const state = useChatStore.getState();
     if (e.type === 'done' || e.type === 'cancelled' || e.type === 'error') {
@@ -117,10 +130,11 @@ export function useStreamingChat() {
       // locks up permanently once that session is switched back to.
       state.setSessionStreaming(e.session_id, false);
       state.setSessionLoading(e.session_id, false);
+      clearStaleQuestions(e.session_id);
     } else if (STREAMING_START_TYPES.has(e.type)) {
       state.setSessionStreaming(e.session_id, true);
     }
-  }, []);
+  }, [clearStaleQuestions]);
 
   // Non-stream events for the active session. The hook has already flushed
   // any buffered delta/reasoning text, so the state read below observes the
@@ -187,6 +201,7 @@ export function useStreamingChat() {
 
       case 'done': {
         state.setSessionStreaming(e.session_id, false);
+        clearStaleQuestions(e.session_id);
         const currentStep = state.currentStreamingStep;
         if (currentStep) {
           finalizeStep(currentStep.step_index);
@@ -240,6 +255,7 @@ export function useStreamingChat() {
         // Generation stopped by the user; keep whatever was produced.
         state.setSessionStreaming(e.session_id, false);
         state.setSessionLoading(e.session_id, false);
+        clearStaleQuestions(e.session_id);
         const currentStep = state.currentStreamingStep;
         if (currentStep) {
           finalizeStep(currentStep.step_index);
@@ -274,6 +290,7 @@ export function useStreamingChat() {
       case 'error': {
         state.setSessionStreaming(e.session_id, false);
         state.setSessionLoading(e.session_id, false);
+        clearStaleQuestions(e.session_id);
         const currentStep = state.currentStreamingStep;
         if (currentStep) {
           finalizeStep(currentStep.step_index);
@@ -308,7 +325,7 @@ export function useStreamingChat() {
         break;
       }
     }
-  }, [finalizeStep, reloadSessionHistory]);
+  }, [finalizeStep, reloadSessionHistory, clearStaleQuestions]);
 
   useAgentEventStream({
     sessionId: activeSessionId,

@@ -243,18 +243,28 @@ export function AskUserDialog() {
     <AskUserQuestionsDialog
       questions={questions}
       onAnswer={async (answers, note) => {
-        if (!activeSessionId) return;
-        await agentAnswerUser(activeSessionId, answers, note);
-        setPendingQuestions(null);
+        // Clearing local state is unconditional: when the backend has already
+        // given up (timeout), agentAnswerUser fails against the dead channel,
+        // and the dialog must still close.
+        try {
+          if (activeSessionId) {
+            await agentAnswerUser(activeSessionId, answers, note);
+          }
+        } finally {
+          setPendingQuestions(null);
+        }
       }}
       onDismiss={async () => {
-        if (activeSessionId) {
-          await agentAnswerUser(
-            activeSessionId,
-            questions.map((q) => ({ question: q.question, answer: '用户暂不回答' }))
-          );
+        try {
+          if (activeSessionId) {
+            await agentAnswerUser(
+              activeSessionId,
+              questions.map((q) => ({ question: q.question, answer: '用户暂不回答' }))
+            );
+          }
+        } finally {
+          setPendingQuestions(null);
         }
-        setPendingQuestions(null);
       }}
     />
   );
@@ -274,15 +284,21 @@ export function PetAskUserDialog() {
     <AskUserQuestionsDialog
       questions={questions}
       onAnswer={async (answers, note) => {
-        await agentAnswerUser(sessionId, answers, note);
-        setPendingQuestions(null);
+        try {
+          await agentAnswerUser(sessionId, answers, note);
+        } finally {
+          setPendingQuestions(null);
+        }
       }}
       onDismiss={async () => {
-        await agentAnswerUser(
-          sessionId,
-          questions.map((q) => ({ question: q.question, answer: '用户暂不回答' }))
-        );
-        setPendingQuestions(null);
+        try {
+          await agentAnswerUser(
+            sessionId,
+            questions.map((q) => ({ question: q.question, answer: '用户暂不回答' }))
+          );
+        } finally {
+          setPendingQuestions(null);
+        }
       }}
     />
   );

@@ -269,12 +269,17 @@ impl AgentEngine {
 
     /// Emit an `ask_user` event with the questions and wait for the user's
     /// answers (delivered via the ask channel), with a 5-minute timeout.
+    ///
+    /// Returns the formatted answer text for the model plus the raw payload
+    /// on success — callers that branch on HOW the user answered (the engine's
+    /// own output-budget prompt) need the structured `note`/`custom` fields,
+    /// which the formatted string flattens away.
     async fn handle_ask_user(
         &self,
         event_tx: &tokio::sync::mpsc::UnboundedSender<AgentEvent>,
         args: &serde_json::Value,
         ask_rx: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
-    ) -> String {
+    ) -> (String, Option<serde_json::Value>) {
         // Tool arguments are usually { "questions": [...] } — accept both that
         // and a bare array so the frontend always receives an array.
         let questions = if args.is_array() {
@@ -295,10 +300,10 @@ impl AgentEngine {
             _ = self.cancel_token.cancelled() => None,
             result = tokio::time::timeout(std::time::Duration::from_secs(300), ask_rx.recv()) => Some(result),
         } {
-            Some(Ok(Some(answers))) => format_ask_answers(&answers),
-            Some(Ok(None)) => "AskUserQuestion failed: channel closed".to_string(),
-            Some(Err(_)) => "AskUserQuestion timed out".to_string(),
-            None => "AskUserQuestion cancelled by user".to_string(),
+            Some(Ok(Some(answers))) => (format_ask_answers(&answers), Some(answers)),
+            Some(Ok(None)) => ("AskUserQuestion failed: channel closed".to_string(), None),
+            Some(Err(_)) => ("AskUserQuestion timed out".to_string(), None),
+            None => ("AskUserQuestion cancelled by user".to_string(), None),
         }
     }
 
@@ -749,7 +754,12 @@ impl AgentEngine {
                             { "label": "不重试" }
                         ]
                     }]});
-                    let answers = self.handle_ask_user(&event_tx, &questions, ask_rx).await;
+                    let (answers, payload) = self.handle_ask_user(&event_tx, &questions, ask_rx).await;
+                    // The user may ignore the options and type a direction
+                    // instead ("别想了，直接给结论") — capture it before the
+                    // payload is flattened away; a declined bump with guidance
+                    // must redirect the model, not silently end the turn.
+                    let guidance = payload.as_ref().and_then(ask_guidance);
                     if answers.contains("调大到") {
                         let mut cfg = self.llm_config.clone();
                         cfg.max_tokens = next;
@@ -786,10 +796,16 @@ impl AgentEngine {
                                 // templates requiring the system message first
                                 // (Qwen answers with a 500 Jinja error).
                                 let draft = reasoning_draft(&round_reasoning);
+                                // A note typed alongside the bump option is
+                                // user input too — do not swallow it.
+                                let user_note = guidance
+                                    .as_deref()
+                                    .map(|g| format!("\n\nThe user also said: {g}"))
+                                    .unwrap_or_default();
                                 messages.push(ChatMessage {
                                     role: "user".into(),
                                     content: format!(
-                                        "Your previous reply exhausted the per-round output budget (max_tokens={output_cap}) during reasoning and produced no visible answer. The budget has been raised to {next}. Keep reasoning brief and produce the answer directly.{draft}"
+                                        "Your previous reply exhausted the per-round output budget (max_tokens={output_cap}) during reasoning and produced no visible answer. The budget has been raised to {next}. Keep reasoning brief and produce the answer directly.{draft}{user_note}"
                                     ),
                                     attachments: None,
                                     tool_calls: None,
@@ -807,6 +823,41 @@ impl AgentEngine {
                                 warn!(error = %e, "failed to rebuild LLM client for cap bump");
                             }
                         }
+                    } else if let Some(direction) = guidance {
+                        // Declined the bump but typed a direction: keep the
+                        // truncated round's reasoning as its own step (same as
+                        // the bump path), hand the model its interrupted draft
+                        // plus the user's words — which outrank the abandoned
+                        // line of thought — and continue at the SAME cap.
+                        // Without this branch the instruction vanished and the
+                        // turn simply exited with the truncation notice.
+                        info!(round, "user declined cap bump, continuing with their direction");
+                        if !round_reasoning.trim().is_empty() {
+                            steps.push(AgentStep {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                session_id: sid.clone(),
+                                message_id: None,
+                                step_index,
+                                reasoning_content: Some(round_reasoning.clone()),
+                                tool_calls: None,
+                                created_at: time::now_iso(),
+                            });
+                        }
+                        let draft = reasoning_draft(&round_reasoning);
+                        messages.push(ChatMessage {
+                            role: "user".into(),
+                            content: format!(
+                                "Your previous reply exhausted the per-round output budget (max_tokens={output_cap}) during reasoning and produced no visible answer. The user chose NOT to raise the budget and instead gave you this direction — follow it, it takes priority over your previous line of thought:\n\n{direction}\n\nKeep your reasoning brief so the answer fits the current budget.{draft}"
+                            ),
+                            attachments: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: None,
+                            reasoning_content: None,
+                        });
+                        cap_bumps += 1;
+                        truncated_empty = false;
+                        continue;
                     }
                 }
             }
@@ -1157,7 +1208,7 @@ impl AgentEngine {
                 // AskUserQuestion: handled inline by the engine — emit an
                 // `ask_user` event and wait for the user's answers.
                 if tc.function.name == "ask_user" {
-                    let answers = self.handle_ask_user(&event_tx, &args, ask_rx).await;
+                    let (answers, _) = self.handle_ask_user(&event_tx, &args, ask_rx).await;
                     let failed = answers.starts_with("AskUserQuestion") || answers.contains("timed out");
                     let status = if failed { "error" } else { "completed" };
                     self.emit(&event_tx, |session_id| AgentEvent::ToolResult {
@@ -1567,10 +1618,76 @@ fn format_ask_answers(payload: &serde_json::Value) -> String {
     format!("用户回答：{out}")
 }
 
+/// The user's free-form direction from an ask_user payload: the note if
+/// present, otherwise the first typed (custom) answer. Picked options are NOT
+/// guidance — they are answers to the question as posed. Used by the engine's
+/// output-budget prompt, where "declined the bump but said something" must
+/// redirect the model instead of ending the turn.
+fn ask_guidance(payload: &serde_json::Value) -> Option<String> {
+    if let Some(note) = payload
+        .get("note")
+        .and_then(|n| n.as_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        return Some(note.to_string());
+    }
+    let answers = payload.get("answers").and_then(|a| a.as_array())?;
+    for entry in answers {
+        let custom = entry.get("custom").and_then(|c| c.as_bool()).unwrap_or(false);
+        if !custom {
+            continue;
+        }
+        if let Some(answer) = entry
+            .get("answer")
+            .and_then(|a| a.as_str())
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            return Some(answer.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{bump_output_cap, format_ask_answers, reasoning_draft, REASONING_DRAFT_CAP};
+    use super::{ask_guidance, bump_output_cap, format_ask_answers, reasoning_draft, REASONING_DRAFT_CAP};
     use serde_json::json;
+
+    #[test]
+    fn guidance_prefers_the_note() {
+        let payload = json!({
+            "answers": [{ "question": "q", "answer": "不重试" }],
+            "note": "别问了，直接给结论"
+        });
+        assert_eq!(ask_guidance(&payload).as_deref(), Some("别问了，直接给结论"));
+    }
+
+    #[test]
+    fn guidance_falls_back_to_typed_answer() {
+        let payload = json!({
+            "answers": [{ "question": "q", "answer": "换个更短的思路", "custom": true }]
+        });
+        assert_eq!(ask_guidance(&payload).as_deref(), Some("换个更短的思路"));
+    }
+
+    /// A picked option ("不重试") is an answer to the question, not a
+    /// direction — it must NOT be treated as guidance, or the declined-bump
+    /// path would loop the turn instead of exiting.
+    #[test]
+    fn guidance_ignores_picked_options_and_empty() {
+        assert_eq!(ask_guidance(&json!({
+            "answers": [{ "question": "q", "answer": "不重试" }]
+        })), None);
+        assert_eq!(ask_guidance(&json!({
+            "answers": [{ "question": "q", "answer": "  ", "custom": true }]
+        })), None);
+        assert_eq!(ask_guidance(&json!({
+            "answers": [{ "question": "q", "answer": "不重试" }],
+            "note": "   "
+        })), None);
+    }
 
     #[test]
     fn formats_option_answers() {

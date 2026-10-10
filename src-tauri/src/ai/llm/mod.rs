@@ -132,19 +132,41 @@ pub struct ChatMessage {
 }
 
 /// An image payload (base64) for vision requests.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ImagePart {
     pub mime: String,
     pub base64: String,
 }
 
 /// An image attachment carried on a chat message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ImageAttachment {
     pub mime: String,
     pub base64: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+// Custom Debug for the two base64-carrying structs: tracing's #[instrument]
+// records args via Debug, and a derived impl dumps the whole payload
+// (megabytes) into the log on every agent_send_message. Log the size instead.
+impl std::fmt::Debug for ImagePart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImagePart")
+            .field("mime", &self.mime)
+            .field("base64_len", &self.base64.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ImageAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageAttachment")
+            .field("mime", &self.mime)
+            .field("base64_len", &self.base64.len())
+            .field("name", &self.name)
+            .finish()
+    }
 }
 
 /// MIME types that OpenAI-compatible vision backends decode reliably

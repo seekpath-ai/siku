@@ -21,15 +21,16 @@ body,
   cursor: grabbing;
 }
 
-/* Ball stays pinned to the window's top-left corner (screen position never
-   changes when the window resizes to show the bubble). */
+/* Ball pinned to the window's top-left corner. The ball window is always
+   48×48 and never resizes — overlays (bubble, menu) live in their own
+   ephemeral windows so this one's hit region always matches the ball. */
 .pet-ball-fixed {
   position: absolute;
   left: 4px;
   top: 4px;
 }
 
-/* Speech bubble floating below the ball (window resizes downward to show it). */
+/* Speech bubble (rendered in the standalone pet-bubble window). */
 .pet-bubble {
   position: absolute;
   bottom: 8px;

@@ -1,22 +1,18 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { LogicalSize } from '@tauri-apps/api/dpi';
-import { EyeOff } from 'lucide-react';
-import { settingsAppGet, settingsAppSave } from '@/lib/tauri';
 import './pet-window.css';
 
 /** Root component for the always-on-top pet window. Dragging the ball starts an
  *  OS-level window move (across all screens); a plain click emits `pet:click`
- *  so the main window opens the chat panel. Messages from the main window
- *  (`pet:bubble`) appear as a speech bubble in a SEPARATE ephemeral window —
- *  this window never resizes, because a transparent window still swallows
- *  mouse events across its whole rectangle. */
+ *  so the main window opens the chat panel. Anything that needs more than the
+ *  ball's 48×48 — speech bubbles, the right-click menu — lives in its own
+ *  ephemeral window: this window NEVER resizes, because a transparent window
+ *  swallows mouse events across its whole rectangle, and an enlarged
+ *  rectangle that fails to shrink back becomes an invisible click trap. */
 export function PetBallWindow() {
-  const [menuOpen, setMenuOpen] = useState(false);
   const downRef = useRef<{ x: number; y: number } | null>(null);
   const draggedRef = useRef(false);
-  const menuRef = useRef<HTMLDivElement | null>(null);
 
   const showBubble = async (text: string) => {
     try {
@@ -41,6 +37,35 @@ export function PetBallWindow() {
       });
     } catch (err) {
       console.error('show pet bubble:', err);
+    }
+  };
+
+  // Right-click menu lives in a separate ephemeral window (PetMenuWindow)
+  // that closes on blur — an in-window menu forced the ball window to grow,
+  // and its "click outside to dismiss" listener could never observe clicks
+  // on the desktop, so the enlarged hit region regularly got stuck.
+  const showMenu = async () => {
+    try {
+      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+      const existing = await WebviewWindow.getByLabel('pet-menu');
+      if (existing) await existing.close().catch(() => {});
+      // Created hidden; PetMenuWindow positions itself under the ball, then
+      // shows focused and closes on blur.
+      new WebviewWindow('pet-menu', {
+        url: 'index.html?petMenu=1',
+        title: '',
+        width: 160,
+        height: 48,
+        decorations: false,
+        transparent: true,
+        shadow: false,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        resizable: false,
+        visible: false,
+      });
+    } catch (err) {
+      console.error('show pet menu:', err);
     }
   };
 
@@ -83,8 +108,19 @@ export function PetBallWindow() {
     };
   }, []);
 
+  const closeMenu = async () => {
+    const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+    WebviewWindow.getByLabel('pet-menu')
+      .then((w) => w?.close())
+      .catch(() => {});
+  };
+
   const handleMouseDown = (e: React.MouseEvent) => {
     if (e.button !== 0) return;
+    // Dragging/clicking the ball dismisses an open menu deterministically —
+    // the ball window is unfocusable, so the menu's blur-close cannot be
+    // relied on for this case.
+    closeMenu();
     downRef.current = { x: e.clientX, y: e.clientY };
     draggedRef.current = false;
   };
@@ -96,43 +132,8 @@ export function PetBallWindow() {
 
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
-    setMenuOpen(true);
-    getCurrentWindow().setSize(new LogicalSize(160, 96)).catch(() => {});
+    showMenu();
   };
-
-  const handleHide = async () => {
-    setMenuOpen(false);
-    getCurrentWindow().setSize(new LogicalSize(48, 48)).catch(() => {});
-    try {
-      const current = await settingsAppGet();
-      await settingsAppSave({ ...current, show_pet: false });
-    } catch (err) {
-      console.error('Failed to update pet setting:', err);
-    }
-  };
-
-  // Close the context menu when clicking outside and restore the compact size.
-  useEffect(() => {
-    if (!menuOpen) return;
-    const onClick = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        setMenuOpen(false);
-        getCurrentWindow().setSize(new LogicalSize(48, 48)).catch(() => {});
-      }
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setMenuOpen(false);
-        getCurrentWindow().setSize(new LogicalSize(48, 48)).catch(() => {});
-      }
-    };
-    window.addEventListener('mousedown', onClick);
-    window.addEventListener('keydown', onKey);
-    return () => {
-      window.removeEventListener('mousedown', onClick);
-      window.removeEventListener('keydown', onKey);
-    };
-  }, [menuOpen]);
 
   return (
     <div
@@ -149,24 +150,6 @@ export function PetBallWindow() {
           <div className="absolute bottom-0.5 left-1/2 -translate-x-1/2 w-3 h-1.5 rounded-b-full bg-background/80" />
         </div>
       </div>
-      {menuOpen && (
-        <div
-          ref={menuRef}
-          onMouseDown={(e) => e.stopPropagation()}
-          className="absolute top-12 left-1/2 -translate-x-1/2 z-50 min-w-[140px] py-1 bg-surface border border-surface-hover rounded-lg shadow-xl"
-        >
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              handleHide();
-            }}
-            className="w-full flex items-center gap-2 px-3 py-2 text-xs text-text-primary hover:bg-surface-hover transition-colors"
-          >
-            <EyeOff size={13} className="text-text-secondary" />
-            隐藏宠物球
-          </button>
-        </div>
-      )}
     </div>
   );
 }

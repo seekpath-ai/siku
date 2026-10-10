@@ -9,6 +9,7 @@ import { installExternalLinkGuard } from './lib/externalLinks';
 import { OnboardingWizard } from './components/layout/OnboardingWizard';
 import { PetBallWindow } from './components/pet/PetBallWindow';
 import { PetBubbleWindow } from './components/pet/PetBubbleWindow';
+import { PetMenuWindow } from './components/pet/PetMenuWindow';
 import { PetChatWindow } from './components/pet/PetChatWindow';
 import { NoteWindow } from './components/notes/NoteWindow';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -272,11 +273,12 @@ if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
 // ball, pet-bubble the ephemeral speech bubble, pet-chat windows the
 // popped-out conversation, note windows just the opened note, everything
 // else is the app.
-let windowKind: 'app' | 'pet' | 'pet-bubble' | 'pet-chat' | 'note' = 'app';
+let windowKind: 'app' | 'pet' | 'pet-bubble' | 'pet-menu' | 'pet-chat' | 'note' = 'app';
 try {
   const label = getCurrentWindow().label;
   if (label === 'pet') windowKind = 'pet';
   else if (label === 'pet-bubble') windowKind = 'pet-bubble';
+  else if (label === 'pet-menu') windowKind = 'pet-menu';
   else if (label.startsWith('pet-chat-')) windowKind = 'pet-chat';
   else if (label.startsWith('note-')) windowKind = 'note';
 } catch {
@@ -288,6 +290,8 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     <PetBallWindow />
   ) : windowKind === 'pet-bubble' ? (
     <PetBubbleWindow />
+  ) : windowKind === 'pet-menu' ? (
+    <PetMenuWindow />
   ) : windowKind === 'pet-chat' ? (
     <PetChatWindow />
   ) : windowKind === 'note' ? (

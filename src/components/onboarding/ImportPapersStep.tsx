@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { FileText, Loader2, FolderOpen } from 'lucide-react';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { useQueryClient } from '@tanstack/react-query';
 import {
   importPapersBatch,
   zoteroDetect,
@@ -13,6 +14,7 @@ import { pickDirectory } from '@/lib/pickDirectory';
 /** Onboarding step 3: first literature import, in-wizard. Two paths — pick
  *  PDFs directly, or pull the whole Zotero library (default dir auto-detected). */
 export function ImportPapersStep() {
+  const queryClient = useQueryClient();
   const [pdfBusy, setPdfBusy] = useState(false);
   const [pdfResult, setPdfResult] = useState<string | null>(null);
 
@@ -22,6 +24,16 @@ export function ImportPapersStep() {
   const [zoteroResult, setZoteroResult] = useState<string | null>(null);
   const [zoteroError, setZoteroError] = useState<string | null>(null);
   const [detected, setDetected] = useState<boolean | null>(null);
+
+  // The library page is already mounted behind the wizard overlay and its
+  // papers/collections queries cached (empty) within staleTime — imports done
+  // here must invalidate them, or the freshly imported items stay invisible
+  // until some unrelated remount refetches.
+  const invalidateLibrary = () => {
+    queryClient.invalidateQueries({ queryKey: ['papers'] });
+    queryClient.invalidateQueries({ queryKey: ['collections'] });
+    queryClient.invalidateQueries({ queryKey: ['tags'] });
+  };
 
   // Detect the default Zotero data dir on mount and preview it immediately.
   useEffect(() => {
@@ -51,6 +63,7 @@ export function ImportPapersStep() {
       setPdfResult(null);
       const summary = await importPapersBatch(paths);
       setPdfResult(`导入 ${summary.imported} 篇，跳过 ${summary.skipped}，失败 ${summary.failed}`);
+      invalidateLibrary();
     } catch (e) {
       setPdfResult(`导入失败：${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -80,6 +93,7 @@ export function ImportPapersStep() {
     try {
       const summary = await zoteroImport(zoteroDir);
       setZoteroResult(`导入 ${summary.imported} 条，跳过 ${summary.skipped}，失败 ${summary.failed}`);
+      invalidateLibrary();
     } catch (e) {
       setZoteroError(e instanceof Error ? e.message : String(e));
     } finally {

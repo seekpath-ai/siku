@@ -165,6 +165,11 @@ pub fn create_pet_window<R: tauri::Runtime>(
     let pet = tauri::WebviewWindowBuilder::new(app, "pet", tauri::WebviewUrl::default())
         .title("思库宠物")
         .inner_size(48.0, 48.0)
+        // Structural guarantee: the ball window can never exceed the ball,
+        // no matter what any webview JS asks for — a transparent window
+        // swallows mouse events over its whole rectangle, so an oversized
+        // pet window is an invisible click trap.
+        .max_inner_size(48.0, 48.0)
         .resizable(false)
         .decorations(false)
         .transparent(true)
@@ -174,7 +179,18 @@ pub fn create_pet_window<R: tauri::Runtime>(
         .focused(false)
         .build()?;
     let _ = pet.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
-    tracing::info!("pet window created");
+    // Log the size the window manager actually gave us: the ball is a
+    // transparent window, so an oversized frame is an invisible click trap.
+    match pet.inner_size() {
+        Ok(size) => tracing::info!(width = size.width, height = size.height, "pet window created"),
+        Err(e) => tracing::warn!("pet window created; inner_size query failed: {e}"),
+    }
+    // Windows clamps the creation size of windows carrying WS_CAPTION |
+    // WS_SYSMENU (tao always sets them) to the system minimum track width
+    // (~132 DIP ≈ 131 wide at 200% scale — observed on a user's machine).
+    // That clamp only applies to CreateWindowEx and interactive tracking;
+    // SetWindowPos ignores it, so re-asserting the size here sticks.
+    let _ = pet.set_size(tauri::Size::Logical(tauri::LogicalSize::new(48.0, 48.0)));
     Ok(pet)
 }
 
@@ -670,6 +686,28 @@ pub fn run() {
             {
                 if let Some(pet) = window.get_webview_window("pet") {
                     let _ = pet.close();
+                }
+            }
+            // Self-healing clamp: the pet ball is a transparent window, so an
+            // oversized rectangle swallows mouse clicks over its invisible
+            // area. Nothing in the app resizes it, yet a user observed a
+            // ~131×48 hit region on Windows — snap any stray resize back and
+            // log the offending size so the source can be identified.
+            if window.label() == "pet" {
+                if let tauri::WindowEvent::Resized(size) = event {
+                    let scale = window.scale_factor().unwrap_or(1.0);
+                    let expected = (48.0_f64 * scale).round() as u32;
+                    if size.width != expected || size.height != expected {
+                        tracing::warn!(
+                            width = size.width,
+                            height = size.height,
+                            scale_factor = scale,
+                            "pet window resized unexpectedly; forcing back to 48x48"
+                        );
+                        let _ = window.set_size(tauri::Size::Logical(
+                            tauri::LogicalSize::new(48.0, 48.0),
+                        ));
+                    }
                 }
             }
         })

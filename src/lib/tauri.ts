@@ -952,7 +952,9 @@ export async function translateText(
 /** Streaming translation event emitted by the `translate_text_stream` command. */
 export interface TranslationStreamEvent {
   request_id: string;
-  type: 'delta' | 'done' | 'error';
+  // 'reasoning' carries the model's thinking while it works on the
+  // translation — not displayable output, but proof the stream is alive.
+  type: 'delta' | 'reasoning' | 'done' | 'error';
   content?: string;
 }
 
@@ -976,16 +978,38 @@ export async function translateTextStream(
     const finish = (action: () => void) => {
       if (settled) return;
       settled = true;
+      clearTimeout(idleTimer);
+      clearTimeout(absoluteTimer);
       unlisten?.();
       action();
     };
-    // Safety net: the backend has its own HTTP timeouts, but guard against a
-    // silently hung stream.
-    const timer = setTimeout(() => finish(() => reject(new Error('翻译超时'))), 120_000);
+    // Idle guard, not a total cap: reasoning models (qwen3.8-27b) can think
+    // for minutes before the first token and long translations stream for
+    // minutes more — the old fixed 120s wall clock killed those healthy
+    // streams mid-work. Only 120s of complete silence (no delta AND no
+    // reasoning) means the stream is hung. A 10-minute absolute backstop
+    // caps a stream that drips forever without finishing.
+    const IDLE_TIMEOUT_MS = 120_000;
+    const ABSOLUTE_TIMEOUT_MS = 600_000;
+    let idleTimer: ReturnType<typeof setTimeout>;
+    const resetIdle = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(
+        () => finish(() => reject(new Error('翻译超时（120 秒无响应）'))),
+        IDLE_TIMEOUT_MS,
+      );
+    };
+    const absoluteTimer = setTimeout(
+      () => finish(() => reject(new Error('翻译超时'))),
+      ABSOLUTE_TIMEOUT_MS,
+    );
+    resetIdle();
 
     listen<TranslationStreamEvent>('translation:event', (event) => {
       const e = event.payload;
       if (e.request_id !== requestId) return;
+      // Any event from this stream — including reasoning — is activity.
+      resetIdle();
       // Deltas drive the live display; done/error are informational because
       // resolution comes from the invoke result below.
       if (e.type === 'delta' && e.content) onDelta?.(e.content);
@@ -995,11 +1019,9 @@ export async function translateTextStream(
         return invoke<string>('translate_text_stream', { text, sourceLang, targetLang, requestId });
       })
       .then((full) => {
-        clearTimeout(timer);
         finish(() => resolve(full));
       })
       .catch((err) => {
-        clearTimeout(timer);
         finish(() => reject(err instanceof Error ? err : new Error(String(err))));
       });
   });

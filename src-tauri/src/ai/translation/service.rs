@@ -85,12 +85,14 @@ pub async fn translate_text(
     Ok(resp.content)
 }
 
-/// Stream-translate text. Deltas are forwarded to the frontend as
-/// `translation:event` payloads tagged with `request_id` for live display:
+/// Stream-translate text. Events are forwarded to the frontend as
+/// `translation:event` payloads tagged with `request_id`:
 ///
-/// - `{ "type": "delta", "content": "<incremental text>" }` while generating
-/// - `{ "type": "done",  "content": "<full translation>" }` on success
-/// - `{ "type": "error", "content": "<message>" }` on failure
+/// - `{ "type": "delta",     "content": "<incremental text>" }` while generating
+/// - `{ "type": "reasoning", "content": "<thinking>" }` while the model reasons
+///   (activity signal for the frontend idle guard; not displayable output)
+/// - `{ "type": "done",      "content": "<full translation>" }` on success
+/// - `{ "type": "error",     "content": "<message>" }` on failure
 ///
 /// The full translation is ALSO returned as the command result, so the
 /// frontend never depends on event delivery order for correctness.
@@ -133,24 +135,33 @@ pub async fn translate_text_stream(
     let messages = build_translation_messages(text, source, target);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<llm::StreamEvent>();
 
-    // Forward deltas to the frontend while accumulating the full text
+    // Forward deltas to the frontend while accumulating the full text.
+    // Reasoning events are forwarded too (never accumulated): a thinking
+    // model can spend minutes reasoning before the first translated token,
+    // and the frontend's idle guard needs the activity signal to not
+    // mistake that silence for a hung stream.
     let app_clone = app_handle.clone();
     let rid = request_id.to_string();
     let accumulator = tokio::spawn(async move {
         let mut full = String::new();
         while let Some(event) = rx.recv().await {
-            if event.event_type == "delta" {
-                if let Some(content) = event.content {
+            let kind = match event.event_type.as_str() {
+                "delta" => "delta",
+                "reasoning" => "reasoning",
+                _ => continue,
+            };
+            if let Some(content) = event.content {
+                if kind == "delta" {
                     full.push_str(&content);
-                    let _ = app_clone.emit(
-                        "translation:event",
-                        serde_json::json!({
-                            "request_id": rid,
-                            "type": "delta",
-                            "content": content,
-                        }),
-                    );
                 }
+                let _ = app_clone.emit(
+                    "translation:event",
+                    serde_json::json!({
+                        "request_id": rid,
+                        "type": kind,
+                        "content": content,
+                    }),
+                );
             }
         }
         full

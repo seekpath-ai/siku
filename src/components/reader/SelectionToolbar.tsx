@@ -157,7 +157,7 @@ export function SelectionToolbar({
       <button
         onClick={handleTranslate}
         className="flex items-center gap-1.5 px-2 py-1 rounded text-xs text-text-secondary hover:bg-surface-hover hover:text-primary transition-colors"
-        title="摘录并翻译到智思"
+        title="临时翻译（不入库，Esc 关闭）"
       >
         <Languages size={14} />
         翻译

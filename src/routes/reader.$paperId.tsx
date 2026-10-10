@@ -27,14 +27,14 @@ import {
   type ReaderTheme,
 } from '@/components/reader/themes';
 import { SnippetPanel } from '@/components/reader/SnippetPanel';
+import { TranslatePopover } from '@/components/reader/TranslatePopover';
 import { NotesTab } from '@/components/library/PaperDetailPanel';
 import { useSnippetStore } from '@/stores/snippetStore';
 import { useReaderStore } from '@/stores/readerStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
 import { useTranslationStore } from '@/stores/translationStore';
-import { useTranslationStreamStore } from '@/stores/translationStreamStore';
 import {
-  readPdfBytes, translateTextStream, annotationUpdateTranslation, paperRecordRead,
+  readPdfBytes, annotationUpdateTranslation, paperRecordRead,
   exportPdf, openPaperInSystem, paperGetParagraphs,
 } from '@/lib/tauri';
 import type { PaperParagraph } from '@/lib/tauri';
@@ -112,6 +112,9 @@ function ReaderView({ paperId }: { paperId: string }) {
   const [compareParagraphs, setCompareParagraphs] = useState<PaperParagraph[] | null>(null);
   const [compareError, setCompareError] = useState<string | null>(null);
   const [toolbarSelection, setToolbarSelection] = useState<TextSelection | null>(null);
+  /** Selection being translated in the anchored popover (nothing persisted). */
+  const [translateSel, setTranslateSel] = useState<TextSelection | null>(null);
+  const translateTargetLang = useTranslationStore((s) => s.targetLang);
   const [highlightTarget, setHighlightTarget] = useState<PdfViewerProps['highlightTarget']>(null);
   const [clearSelectionSignal, setClearSelectionSignal] = useState(0);
   const [showRegions, setShowRegions] = useState(false);
@@ -461,9 +464,20 @@ function ReaderView({ paperId }: { paperId: string }) {
     setPanel('zhisi');
   };
 
-  // Translate selected text: create a snippet card, auto-translate it, and
-  // stream the result into the card's translation display area.
-  const handleTranslateSelection = async (sel: TextSelection) => {
+  // Temporary translation: open the anchored popover, which streams the
+  // translation next to the selection. Nothing is persisted unless the user
+  // saves from the popover (handleSaveTranslationToZhisi).
+  const handleTranslateSelection = (sel: TextSelection) => {
+    setTranslateSel(sel);
+  };
+
+  // Popover "存入智思": persist the selection as a snippet together with its
+  // already-completed translation — the popover did the streaming, so this
+  // is a plain save with no re-translation.
+  const handleSaveTranslationToZhisi = (translation: string) => {
+    const sel = translateSel;
+    setTranslateSel(null);
+    if (!sel) return;
     const id = addSnippet({
       paperId,
       pageIndex: sel.pageIndex,
@@ -478,31 +492,21 @@ function ReaderView({ paperId }: { paperId: string }) {
       text: sel.text,
     });
     setPanel('zhisi');
-    const { targetLang } = useTranslationStore.getState();
-    const stream = useTranslationStreamStore.getState();
-    stream.begin(id);
+    useSnippetStore.getState().updateTranslation(id, translation);
     // Scroll the new card into view once the panel has rendered it.
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         document.querySelector(`[data-snippet-id="${id}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       });
     });
-    try {
-      const result = await translateTextStream(sel.text, null, targetLang, (delta) => {
-        useTranslationStreamStore.getState().append(id, delta);
-      });
-      useSnippetStore.getState().updateTranslation(id, result);
-      stream.finish(id);
-      // Persist to backend; retry briefly in case the snippet annotation is
-      // still being created by the panel's persist effect.
+    // Persist to backend; retry briefly in case the snippet annotation is
+    // still being created by the panel's persist effect.
+    (async () => {
       for (let i = 0; i < 5; i++) {
-        try { await annotationUpdateTranslation(id, result); break; }
+        try { await annotationUpdateTranslation(id, translation); return; }
         catch { await new Promise((r) => setTimeout(r, 250)); }
       }
-    } catch (e) {
-      stream.fail(id, e instanceof Error ? e.message : String(e));
-      // Translation failed — the snippet itself is still saved.
-    }
+    })();
   };
 
   // ── Region detection ──
@@ -1127,6 +1131,14 @@ function ReaderView({ paperId }: { paperId: string }) {
                   onSnippet={handleSnippet}
                   onTranslate={handleTranslateSelection}
                   onDismiss={handleToolbarDismiss}
+                />
+              )}
+              {translateSel && (
+                <TranslatePopover
+                  selection={translateSel}
+                  targetLang={translateTargetLang}
+                  onSave={handleSaveTranslationToZhisi}
+                  onClose={() => setTranslateSel(null)}
                 />
               )}
               {regionDetectError && (

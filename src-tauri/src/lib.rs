@@ -945,6 +945,7 @@ pub fn run() {
             commands::attachments::read_image_file,
             // System
             commands::system::system_info,
+            commands::system::export_diagnostics,
             commands::system::log_startup_metrics,
             commands::system::screenshot_start,
             commands::system::screenshot_hotkey_sync,

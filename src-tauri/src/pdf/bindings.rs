@@ -39,26 +39,59 @@ pub fn pdfium_guard() -> MutexGuard<'static, ()> {
 ///    alone made binding depend on HOW the app was launched (shortcut vs
 ///    autostart → different cwd → LoadLibrary error 126 even though the
 ///    file was right there);
-/// 4. `<cwd>/bin/<lib>` (cargo dev/test run with src-tauri as CWD, where
-///    bin/pdfium.dll / bin/libpdfium.so live);
-/// 5. the OS default search (system-wide installs).
+/// 4. macOS only: `<app bundle>/Contents/Resources/<lib>` — a .app installs
+///    resources away from the executable (Contents/MacOS), and macOS ships
+///    one dylib per architecture (`libpdfium-arm64.dylib` /
+///    `libpdfium-x64.dylib`) because a universal2 build cannot embed a
+///    single fat dylib through the resources map;
+/// 5. `<cwd>/bin/<lib>` (cargo dev/test run with src-tauri as CWD, where
+///    bin/pdfium.dll / bin/libpdfium.so / bin/libpdfium-*.dylib live);
+/// 6. the OS default search (system-wide installs).
 pub fn pdfium() -> Result<&'static Pdfium, String> {
     static INSTANCE: OnceLock<Result<Pdfium, String>> = OnceLock::new();
     INSTANCE
         .get_or_init(|| {
             let lib_name = Pdfium::pdfium_platform_library_name();
+            // macOS ships per-arch dylibs; a universal2 binary's slice picks
+            // the matching one (cfg!(target_arch) is per-slice at compile
+            // time). Other platforms carry a single library file.
+            #[cfg(target_os = "macos")]
+            let arch_lib_name: Option<&'static str> = Some(if cfg!(target_arch = "aarch64") {
+                "libpdfium-arm64.dylib"
+            } else {
+                "libpdfium-x64.dylib"
+            });
+            #[cfg(not(target_os = "macos"))]
+            let arch_lib_name: Option<&'static str> = None;
+
+            let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    dirs.push(dir.to_path_buf());
+                    dirs.push(dir.join("bin"));
+                    // .app layout: Contents/MacOS/<exe> → Contents/Resources.
+                    if let Some(resources) = dir
+                        .parent()
+                        .and_then(|contents| contents.parent())
+                        .map(|contents| contents.join("Resources"))
+                    {
+                        dirs.push(resources);
+                    }
+                }
+            }
+            if let Ok(cwd) = std::env::current_dir() {
+                dirs.push(cwd.join("bin"));
+            }
+
             let mut candidates: Vec<std::path::PathBuf> = Vec::new();
             if let Ok(p) = std::env::var("SIKU_PDFIUM_PATH") {
                 candidates.push(p.into());
             }
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(dir) = exe.parent() {
-                    candidates.push(dir.join(&lib_name));
-                    candidates.push(dir.join("bin").join(&lib_name));
+            for dir in &dirs {
+                if let Some(arch) = arch_lib_name {
+                    candidates.push(dir.join(arch));
                 }
-            }
-            if let Ok(cwd) = std::env::current_dir() {
-                candidates.push(cwd.join("bin").join(&lib_name));
+                candidates.push(dir.join(&lib_name));
             }
             for path in &candidates {
                 if path.exists() {

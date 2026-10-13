@@ -295,6 +295,153 @@ pub async fn system_info() -> Result<SystemInfo, String> {
     })
 }
 
+/// Export a diagnostics bundle (recent logs + an environment report) as a zip
+/// the user can attach to a bug report. Deliberately excludes secrets: no
+/// settings rows (sync tokens / API keys live there) and no database files —
+/// only table counts, the device id (for relay-side log correlation), and
+/// environment facts.
+#[tauri::command]
+#[instrument(skip(app, state))]
+pub async fn export_diagnostics(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    dest_path: String,
+) -> Result<String, String> {
+    let db = state.db.clone();
+    let app_data_dir = state.app_data_dir.clone();
+    let version = app.package_info().version.to_string();
+
+    // ---- async part: gather database facts ----
+    async fn count(db: &crate::core::db::Db, table: &str) -> i64 {
+        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(db)
+            .await
+            .unwrap_or(-1)
+    }
+    let mut counts: Vec<(&str, i64)> = Vec::new();
+    for table in [
+        "papers",
+        "notes",
+        "files",
+        "collections",
+        "tags",
+        "vaults",
+        "chat_sessions",
+    ] {
+        counts.push((table, count(&db, table).await));
+    }
+    let device_id: Option<String> =
+        sqlx::query_scalar("SELECT value FROM device_settings WHERE key = 'device_settings'")
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v: String| {
+                serde_json::from_str::<serde_json::Value>(&v)
+                    .ok()?
+                    .get("device_id")?
+                    .as_str()
+                    .map(|s| s.to_string())
+            });
+    let relay_url = crate::core::settings_service::get_device_setting(
+        &db,
+        crate::commands::account::ACCOUNT_RELAY_URL_KEY,
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+
+    // ---- blocking part: write the zip ----
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        use std::io::Write as _;
+
+        let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "unknown".into());
+        let cpu_count = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1);
+        let mem_total_mb = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("MemTotal:"))
+                    .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+            })
+            .map(|kb| kb / 1024)
+            .unwrap_or(0);
+
+        let mut report = format!(
+            "siku diagnostics\n\
+             ================\n\
+             exported_at : {}\n\
+             app_version : {version}\n\
+             os          : {} ({})\n\
+             hostname    : {hostname}\n\
+             cpu_count   : {cpu_count}\n\
+             memory_mb   : {mem_total_mb}\n\
+             data_dir    : {}\n\
+             device_id   : {}\n\
+             relay_url   : {}\n\
+             \n\
+             table counts\n\
+             ------------\n",
+            time::now_iso(),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            app_data_dir.display(),
+            device_id.as_deref().unwrap_or("(unknown)"),
+            if relay_url.is_empty() { "(not configured)" } else { &relay_url },
+        );
+        for (table, n) in &counts {
+            report.push_str(&format!("{table:<14} {n}\n"));
+        }
+
+        let file = std::fs::File::create(&dest_path).map_err(|e| format!("创建文件失败：{e}"))?;
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        zip.start_file("system-info.txt", opts)
+            .map_err(|e| format!("zip: {e}"))?;
+        zip.write_all(report.as_bytes())
+            .map_err(|e| format!("zip: {e}"))?;
+
+        // Logs are size-capped by the rolling appender, so bundling all of
+        // them is bounded (default ≤ 10MB × 5).
+        let log_dir = app_data_dir.join("logs");
+        if let Ok(rd) = std::fs::read_dir(&log_dir) {
+            let mut logs: Vec<_> = rd
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    name.starts_with("siku") && name.ends_with(".log")
+                })
+                .collect();
+            logs.sort_by_key(|e| e.file_name());
+            for entry in logs {
+                let name = entry.file_name().to_string_lossy().to_string();
+                match std::fs::read(entry.path()) {
+                    Ok(bytes) => {
+                        zip.start_file(format!("logs/{name}"), opts)
+                            .map_err(|e| format!("zip: {e}"))?;
+                        zip.write_all(&bytes).map_err(|e| format!("zip: {e}"))?;
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %entry.path().display(), error = %e, "diagnostics: skipping unreadable log");
+                    }
+                }
+            }
+        }
+
+        zip.finish().map_err(|e| format!("zip: {e}"))?;
+        Ok(dest_path)
+    })
+    .await
+    .map_err(|e| format!("task: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

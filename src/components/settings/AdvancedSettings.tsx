@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
-import { Loader2, SlidersHorizontal, Zap } from 'lucide-react';
+import { FileDown, Loader2, SlidersHorizontal, Zap } from 'lucide-react';
 import {
   settingsAppGet,
   settingsAppSave,
   searchEmbeddingStatus,
   searchTestEmbeddingEndpoint,
+  exportDiagnostics,
+  revealInFileManager,
 } from '@/lib/tauri';
 import { SaveButton } from '@/components/ui/SaveButton';
 import type { AppSettings, EmbeddingStatus, EmbeddingProbe } from '@/lib/tauri';
@@ -81,6 +83,8 @@ export function AdvancedSettings() {
   const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingStatus | null>(null);
   const [probe, setProbe] = useState<EmbeddingProbe | null>(null);
   const [testing, setTesting] = useState(false);
+  const [exportingDiag, setExportingDiag] = useState(false);
+  const [diagResult, setDiagResult] = useState<string | null>(null);
   // The service address is the switch: empty means no semantic search.
   const semanticEnabled = (settings.embedding_base_url || '').trim().length > 0;
 
@@ -123,6 +127,27 @@ export function AdvancedSettings() {
 
   const updateField = (key: keyof AppSettings, value: number) => {
     setSettings((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const handleExportDiagnostics = async () => {
+    setExportingDiag(true);
+    setDiagResult(null);
+    try {
+      const { save } = await import('@tauri-apps/plugin-dialog');
+      const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+      const path = await save({
+        filters: [{ name: 'Diagnostics', extensions: ['zip'] }],
+        defaultPath: `siku-diagnostics-${ts}.zip`,
+      });
+      if (!path) return;
+      const out = await exportDiagnostics(path);
+      setDiagResult(out);
+    } catch (err) {
+      console.error('Failed to export diagnostics:', err);
+      alert(`导出诊断包失败: ${err}`);
+    } finally {
+      setExportingDiag(false);
+    }
   };
 
   const updateText = (key: keyof AppSettings, value: string) => {
@@ -187,6 +212,38 @@ export function AdvancedSettings() {
       <section className="space-y-3">
         <h3 className="text-sm font-medium text-text-primary">日志与预览</h3>
         {renderFields(LOG_FIELDS)}
+        <div className="space-y-2 rounded-lg border border-surface-hover p-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={handleExportDiagnostics}
+              disabled={exportingDiag}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-surface-hover px-3 py-1.5 text-sm text-text-primary hover:border-primary disabled:opacity-50"
+            >
+              {exportingDiag ? <Loader2 size={14} className="animate-spin" /> : <FileDown size={14} />}
+              导出诊断包
+            </button>
+            <span className="text-xs text-text-secondary/70">
+              打包日志与运行环境信息（不含账号密码、API Key），反馈问题时请附上。
+            </span>
+          </div>
+          {diagResult && (
+            <p className="text-xs text-emerald-400">
+              已导出：{diagResult}
+              <button
+                type="button"
+                onClick={() =>
+                  revealInFileManager(diagResult).catch((err) =>
+                    console.error('Failed to reveal diagnostics:', err)
+                  )
+                }
+                className="ml-2 underline hover:text-primary"
+              >
+                打开所在位置
+              </button>
+            </p>
+          )}
+        </div>
       </section>
 
       <section className="space-y-3">

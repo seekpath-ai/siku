@@ -10,6 +10,16 @@ import type {
   Collection, Tag, LlmProvider, Vault, NoteVersion, Bookmark,
 } from './types';
 
+/**
+ * True when an invoke failed with Tauri's "state not managed" error — i.e.
+ * the command ran before the backend's async startup manage()d AppState.
+ * These always self-heal once init finishes, so queries should keep retrying
+ * them instead of settling in an error state.
+ */
+export function isBackendNotReadyError(err: unknown): boolean {
+  return String(err instanceof Error ? err.message : err).includes('state not managed');
+}
+
 // ============================================================
 // Library
 // ============================================================
@@ -1622,6 +1632,11 @@ export async function annotationClearPaper(paperId: string): Promise<void> {
 // ============================================================
 // System
 // ============================================================
+
+/** Export a diagnostics bundle (logs + environment report zip) to `destPath`. */
+export async function exportDiagnostics(destPath: string): Promise<string> {
+  return invoke<string>('export_diagnostics', { destPath });
+}
 
 export async function systemInfo(): Promise<SystemInfo> {
   return invoke<SystemInfo>('system_info');

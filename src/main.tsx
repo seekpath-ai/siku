@@ -3,7 +3,7 @@ import ReactDOM from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { RouterProvider, createRouter } from '@tanstack/react-router';
 import { routeTree } from './routes/routeTree';
-import { settingsGetAll, settingsSet } from './lib/tauri';
+import { settingsGetAll, settingsSet, isBackendNotReadyError } from './lib/tauri';
 import { openNoteTab } from './lib/openNote';
 import { installExternalLinkGuard } from './lib/externalLinks';
 import { OnboardingWizard } from './components/layout/OnboardingWizard';
@@ -24,7 +24,18 @@ installExternalLinkGuard();
 
 const queryClient = new QueryClient({
   defaultOptions: {
-    queries: { staleTime: 30_000, retry: 2 },
+    queries: {
+      staleTime: 30_000,
+      // Startup race backstop: AppState is manage()d only after async DB init,
+      // so any query fired before that fails with "state not managed". Keep
+      // retrying those until the backend is up (they always self-heal); all
+      // other errors keep the normal budget. This also covers windows/paths
+      // that bypass the backendReady gate (secondary windows, late mounts).
+      retry: (failureCount, error) =>
+        isBackendNotReadyError(error) || failureCount < 2,
+      retryDelay: (attempt, error) =>
+        isBackendNotReadyError(error) ? 500 : Math.min(1000 * 2 ** attempt, 30_000),
+    },
   },
 });
 
@@ -65,14 +76,6 @@ async function flushStartupMetrics() {
 
 const ONBOARDING_KEY = 'siku.onboarding.completed';
 
-function isOnboardingCompletedLocal(): boolean {
-  try {
-    return localStorage.getItem(ONBOARDING_KEY) === '1';
-  } catch {
-    return false;
-  }
-}
-
 function markOnboardingCompletedLocal() {
   try {
     localStorage.setItem(ONBOARDING_KEY, '1');
@@ -89,6 +92,10 @@ function App() {
   // a later sync:remote_applied invalidation rescues it. Gate the router on
   // backend readiness so first queries succeed on the first try.
   const [backendReady, setBackendReady] = useState(false);
+  // Set when backend init outlasts the fast probe window: the main window is
+  // shown with an "initializing" placeholder instead of the splash, but the
+  // router stays unmounted until the backend actually answers.
+  const [initStalled, setInitStalled] = useState(false);
 
   React.useEffect(() => {
     trackPhase('react_mounted');
@@ -108,11 +115,12 @@ function App() {
       }
     } catch { /* ignore */ }
 
-    // Safety: if backend never responds (e.g. panic), show main
-    // window after 10s so the user isn't stuck with a splash forever.
-    // The splash must close with it — otherwise it outlives the main
-    // window (double taskbar icons) until set_complete lands, or forever
-    // if the probe loop exhausts first. Mirrors the ErrorFallback path.
+    // Safety: if backend init outlasts the fast probe window (slow machine,
+    // first-run migrations), show the main window with an "initializing"
+    // placeholder instead of leaving the user staring at the splash — but do
+    // NOT mount the router: its queries would race AppState registration and
+    // fail with "state not managed". The slow probe below still flips
+    // backendReady once the backend actually answers.
     const safetyTimer = setTimeout(() => {
       import('@tauri-apps/api/window').then(({ getCurrentWindow, Window }) => {
         getCurrentWindow().show().catch(() => {});
@@ -120,14 +128,11 @@ function App() {
           .then((splash) => splash?.close())
           .catch(() => {});
       }).catch(() => {});
-      setBackendReady(true); // show the UI even if every probe failed
+      setInitStalled(true);
     }, 10_000);
 
     let cancelled = false;
     (async () => {
-      let onboardingCompletedInDb = false;
-      let backendOk = false;
-
       // Load persisted settings. The onboarding completion flag lives in the
       // database — a fresh DB (first install, or after deleting the data
       // directory) never has it, so the wizard shows again. We intentionally
@@ -136,15 +141,17 @@ function App() {
       // during startup, so an empty-table check is unreliable.
       //
       // Poll until the backend answers: a failed probe means AppState is not
-      // managed yet (init still running), not that the backend is dead.
-      for (let attempt = 0; attempt < 40 && !cancelled; attempt++) {
+      // managed yet (init still running), not that the backend is dead. Fast
+      // probes for ~10s, then 1s probes indefinitely — a slow machine or a
+      // large migration must never push the UI past this gate.
+      let onboardingCompletedInDb = false;
+      for (let attempt = 0; !cancelled; attempt++) {
         try {
           const entries = await settingsGetAll();
           onboardingCompletedInDb = entries.some((e) => e.key === ONBOARDING_KEY && e.value === '1');
-          backendOk = true;
           break;
         } catch {
-          await new Promise((r) => setTimeout(r, 250));
+          await new Promise((r) => setTimeout(r, attempt < 40 ? 250 : 1000));
         }
       }
       if (cancelled) return;
@@ -166,14 +173,10 @@ function App() {
       // Background update check (no-op in dev, silent on failure).
       import('./lib/updater').then(({ checkForUpdatesOnStartup }) => checkForUpdatesOnStartup()).catch(() => {});
 
-      // Show the wizard unless completion is recorded in the database.
-      // localStorage is only consulted as a fallback when the backend is
-      // unreachable (a stale WebView2 flag must not suppress the wizard
-      // after the database was wiped).
-      const onboardingCompleted = backendOk
-        ? onboardingCompletedInDb
-        : isOnboardingCompletedLocal();
-      if (!onboardingCompleted) {
+      // Show the wizard unless completion is recorded in the database. (The
+      // probe above only ends on a successful read, so the flag is always
+      // authoritative here.)
+      if (!onboardingCompletedInDb) {
         setTimeout(() => setShowOnboarding(true), 300);
       }
 
@@ -212,6 +215,18 @@ function App() {
     <QueryClientProvider client={queryClient}>
       {/* Router mounts only after the backend answers — see backendReady. */}
       {backendReady && <RouterProvider router={router} />}
+      {!backendReady && initStalled && (
+        <div style={{
+          display: 'flex', flexDirection: 'column', alignItems: 'center',
+          justifyContent: 'center', height: '100vh', background: '#1A1A1E',
+          color: '#F5F5F5', fontFamily: 'sans-serif', gap: 8,
+        }}>
+          <div>正在初始化数据库…</div>
+          <div style={{ fontSize: 12, color: '#9CA3AF' }}>
+            首次启动或数据较多时可能需要更长时间
+          </div>
+        </div>
+      )}
       {showOnboarding && (
         <OnboardingWizard onDone={handleOnboardingDone} />
       )}

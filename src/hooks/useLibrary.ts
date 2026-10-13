@@ -14,9 +14,12 @@ export function usePapers(params?: ListPapersParams) {
     // loads the crsqlite extension from disk — transient failures there (or
     // general startup contention) settle the query in error within ~3s of the
     // default retry budget and the user has to click 重试. A longer backoff
-    // window lets those first seconds self-heal.
-    retry: 4,
-    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
+    // window lets those first seconds self-heal. "state not managed" (the gate
+    // was bypassed) retries indefinitely — it always self-heals.
+    retry: (failureCount, error) =>
+      tauri.isBackendNotReadyError(error) || failureCount < 4,
+    retryDelay: (attempt, error) =>
+      tauri.isBackendNotReadyError(error) ? 500 : Math.min(1000 * 2 ** attempt, 8000),
   });
 }
 
@@ -204,8 +207,10 @@ export function useCollections() {
     queryFn: () => tauri.collectionsList(),
     staleTime: 60_000,
     // Same startup-window resilience as usePapers.
-    retry: 4,
-    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
+    retry: (failureCount, error) =>
+      tauri.isBackendNotReadyError(error) || failureCount < 4,
+    retryDelay: (attempt, error) =>
+      tauri.isBackendNotReadyError(error) ? 500 : Math.min(1000 * 2 ** attempt, 8000),
   });
 }
 

@@ -39,7 +39,7 @@ function ResearchPage() {
         </button>
       </div>
 
-      {showForm && <TopicForm onCreate={handleCreate} onCancel={() => setShowForm(false)} />}
+      {showForm && <TopicForm onSubmit={handleCreate} onCancel={() => setShowForm(false)} />}
 
       <div className="grid grid-cols-2 gap-4">
         {activeTopics.map((t) => (

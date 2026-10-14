@@ -890,6 +890,7 @@ pub fn run() {
             commands::research::research_import_source,
             commands::research::research_delete_topic,
             commands::research::research_unread_counts,
+            commands::research::research_generate_topic,
             commands::research::research_update_source_status,
             // Notes
             commands::notes::notes_create,

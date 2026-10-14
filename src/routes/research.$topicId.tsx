@@ -11,7 +11,8 @@ import { AutoDiscoveryPanel } from '@/components/research/AutoDiscoveryPanel';
 import { SourceTable } from '@/components/research/SourceTable';
 import { researchImportSource, researchUpdateSourceStatus } from '@/lib/tauri';
 import type { ResearchSource } from '@/lib/types';
-import { ArrowLeft, Loader2 } from 'lucide-react';
+import { TopicForm } from '@/components/research/TopicForm';
+import { ArrowLeft, Loader2, Pencil } from 'lucide-react';
 
 function ResearchTopicPage() {
   const { topicId } = Route.useParams();
@@ -20,10 +21,11 @@ function ResearchTopicPage() {
   const { open: openTab } = useTabStore();
   const {
     topics, sources, isDiscovering, hasMore, loadingMoreSources,
-    setActiveTopic, loadTopics, loadSources, loadMoreSources, discoverSources,
+    setActiveTopic, loadTopics, loadSources, loadMoreSources, discoverSources, updateTopic,
   } = useResearch();
   const [importingId, setImportingId] = useState<string | null>(null);
   const [discoverHint, setDiscoverHint] = useState<string | null>(null);
+  const [editing, setEditing] = useState(false);
 
   useEffect(() => {
     setActiveTopic(topicId);
@@ -148,9 +150,34 @@ function ResearchTopicPage() {
       </Link>
 
       <div>
-        <h1 className="text-xl font-semibold text-text-primary">{topic.name}</h1>
-        {topic.description && <p className="text-sm text-text-secondary mt-1">{topic.description}</p>}
+        <div className="flex items-center gap-2">
+          <h1 className="text-xl font-semibold text-text-primary">{topic.name}</h1>
+          <button
+            onClick={() => setEditing((v) => !v)}
+            className="p-1.5 rounded hover:bg-surface-hover text-text-secondary hover:text-text-primary"
+            title="编辑课题（名称 / 关键词 / 描述）"
+          >
+            <Pencil size={14} />
+          </button>
+        </div>
+        {topic.description && !editing && <p className="text-sm text-text-secondary mt-1">{topic.description}</p>}
       </div>
+
+      {editing && (
+        <TopicForm
+          initial={{
+            name: topic.name,
+            description: topic.description ?? '',
+            keywords: (() => { try { return JSON.parse(topic.keywords as unknown as string); } catch { return []; } })(),
+          }}
+          submitLabel="保存"
+          onSubmit={async (name, keywords, description) => {
+            await updateTopic(topicId, undefined, { name, keywords, description });
+            setEditing(false);
+          }}
+          onCancel={() => setEditing(false)}
+        />
+      )}
 
       <AutoDiscoveryPanel
         isDiscovering={isDiscovering}

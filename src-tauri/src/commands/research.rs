@@ -44,7 +44,7 @@ pub async fn research_list_topics(
     .fetch_all(&state.db).await.map_err(|e| format!("db: {e}"))
 }
 
-/// Update topic status
+/// Update a topic's status, description, name or keywords.
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn research_update_topic(
@@ -52,6 +52,8 @@ pub async fn research_update_topic(
     topic_id: String,
     status: Option<String>,
     description: Option<String>,
+    name: Option<String>,
+    keywords: Option<Vec<String>>,
 ) -> Result<(), String> {
     let now = time::now_iso();
     if let Some(s) = status {
@@ -62,6 +64,17 @@ pub async fn research_update_topic(
     if let Some(d) = description {
         sqlx::query("UPDATE research_topics SET description = ?, updated_at = ? WHERE id = ?")
             .bind(&d).bind(&now).bind(&topic_id)
+            .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
+    }
+    if let Some(n) = name.filter(|n| !n.trim().is_empty()) {
+        sqlx::query("UPDATE research_topics SET name = ?, updated_at = ? WHERE id = ?")
+            .bind(n.trim()).bind(&now).bind(&topic_id)
+            .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
+    }
+    if let Some(kw) = keywords {
+        let keywords_json = serde_json::to_string(&kw).map_err(|e| format!("json: {e}"))?;
+        sqlx::query("UPDATE research_topics SET keywords = ?, updated_at = ? WHERE id = ?")
+            .bind(&keywords_json).bind(&now).bind(&topic_id)
             .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
     }
     Ok(())
@@ -192,6 +205,73 @@ pub async fn research_import_source(
         "source_id": source_id,
         "status": "imported",
     }))
+}
+
+/// AI-assisted topic drafting: turn a natural-language research interest into
+/// a proposed { name, keywords, description }. Returns the proposal only —
+/// the user edits and confirms in the form; nothing is persisted here.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn research_generate_topic(
+    state: State<'_, AppState>,
+    blurb: String,
+) -> Result<serde_json::Value, String> {
+    let blurb = blurb.trim();
+    if blurb.is_empty() {
+        return Err("请先描述你的研究方向".into());
+    }
+    let llm_config = crate::core::settings_service::load_llm_config(&state.db).await?;
+    if llm_config.api_key.is_empty() && llm_config.provider != crate::ai::llm::LlmProvider::Ollama {
+        return Err("未配置 LLM，无法使用 AI 辅助生成".into());
+    }
+    let client = crate::ai::llm::client::create_llm_client(&llm_config)
+        .map_err(|e| format!("client: {e}"))?;
+
+    let prompt = format!(
+        "用户想追踪的研究方向：{blurb}\n\n\
+         请生成一个科研追踪课题，严格输出 JSON 对象，不要输出其它内容：\n\
+         {{\"name\":\"课题名称（中文，简洁）\",\"keywords\":[\"英文检索关键词\",\"...\"],\"description\":\"一两句话说明追踪范围与重点（中文）\"}}\n\
+         要求：keywords 必须是 3-6 个面向学术数据库检索的英文关键词/短语，覆盖核心术语与同义表述。"
+    );
+    let mk = |role: &str, content: String| crate::ai::llm::ChatMessage {
+        reasoning_content: None,
+        role: role.into(),
+        content,
+        attachments: None, tool_calls: None, tool_call_id: None, name: None,
+    };
+    let messages = vec![
+        mk("system", "你是科研课题设计助手，只输出 JSON。".into()),
+        mk("user", prompt),
+    ];
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.chat_completion(&messages, &[]),
+    )
+    .await
+    .map_err(|_| "生成超时，请重试".to_string())?
+    .map_err(|e| format!("LLM: {e}"))?;
+
+    // Tolerate prose around the JSON: take the outermost { … } span.
+    let text = resp.content;
+    let start = text.find('{').ok_or("模型未输出 JSON，请重试")?;
+    let end = text.rfind('}').ok_or("模型未输出 JSON，请重试")?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text[start..=end]).map_err(|e| format!("解析失败：{e}"))?;
+    let name = parsed["name"].as_str().unwrap_or("").trim().to_string();
+    let keywords: Vec<String> = parsed["keywords"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|k| k.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if name.is_empty() || keywords.is_empty() {
+        return Err("模型输出缺少名称或关键词，请重试".into());
+    }
+    let description = parsed["description"].as_str().unwrap_or("").trim().to_string();
+    Ok(serde_json::json!({ "name": name, "keywords": keywords, "description": description }))
 }
 
 /// Per-topic unread counts: sources still in 'discovered' status (found but

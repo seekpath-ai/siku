@@ -23,6 +23,7 @@ pub mod ask_user;
 pub mod skill;
 pub mod read_media_file;
 pub mod path;
+pub mod research;
 
 /// Write `content` to `target` atomically: write a sibling temp file, then
 /// rename it over the target.

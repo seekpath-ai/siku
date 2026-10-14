@@ -71,8 +71,11 @@ export function useResearch() {
     }
   };
 
-  const updateTopic = async (topicId: string, status?: string) => {
-    try { await researchUpdateTopic(topicId, status); await loadTopics(); }
+  const updateTopic = async (topicId: string, status?: string, fields?: { name?: string; description?: string; keywords?: string[] }) => {
+    try {
+      await researchUpdateTopic(topicId, status, fields?.description, fields?.name, fields?.keywords);
+      await loadTopics();
+    }
     catch (err) { reportError('更新课题', err); }
   };
 

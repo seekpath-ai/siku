@@ -1141,8 +1141,18 @@ export async function researchUpdateTopic(
   topicId: string,
   status?: string,
   description?: string,
+  name?: string,
+  keywords?: string[],
 ): Promise<void> {
-  return invoke<void>('research_update_topic', { topicId, status, description });
+  return invoke<void>('research_update_topic', { topicId, status, description, name, keywords });
+}
+
+/** AI-assisted topic drafting: natural-language blurb → proposed
+ * { name, keywords, description } (nothing is persisted — the user confirms). */
+export async function researchGenerateTopic(
+  blurb: string,
+): Promise<{ name: string; keywords: string[]; description: string }> {
+  return invoke('research_generate_topic', { blurb });
 }
 
 export async function researchDiscoverSources(

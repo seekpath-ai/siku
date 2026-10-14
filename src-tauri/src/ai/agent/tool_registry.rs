@@ -275,6 +275,8 @@ impl ToolRegistry {
         // Retrieval half of the RAG pipeline (keyword + optional semantic).
         registry.register(crate::ai::agent::tools::library_search::LibrarySearchTool::new(db.clone()));
         registry.register(crate::ai::agent::tools::paper_import::PaperImportTool::new(db.clone(), app_data_dir.to_path_buf()));
+        // Research tracking (科研追踪): create topics from chat.
+        registry.register(crate::ai::agent::tools::research::ResearchTopicCreateTool::new(db.clone()));
 
         // Note tools
         registry.register(crate::ai::agent::tools::note_read::NoteReadTool::new(db.clone()));

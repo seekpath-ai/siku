@@ -1134,81 +1134,10 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // turn) was added after the table first shipped.
     add_column_if_missing(&db, "turn_contexts", "history", "TEXT").await?;
 
-    // Migration: research_sources joins the CRR set — the legacy table carries
-    // an FK to research_topics and CHECK constraints, and NOT NULL columns
-    // without defaults; all three are forbidden on CRR tables. Rebuild it
-    // FK-free (gaining the relevance columns); fresh installs already have
-    // this shape from schema_init.sql. (added 2026-10-14)
-    {
-        let ddl: Option<(String,)> = sqlx::query_as(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'research_sources'",
-        )
-        .fetch_optional(&db)
-        .await?;
-        if ddl.map(|(sql,)| sql.contains("REFERENCES research_topics")).unwrap_or(false) {
-            sqlx::query(
-                "CREATE TABLE research_sources_new (
-                    id TEXT PRIMARY KEY NOT NULL,
-                    topic_id TEXT NOT NULL DEFAULT '',
-                    source_type TEXT NOT NULL DEFAULT '',
-                    source_id TEXT,
-                    title TEXT,
-                    authors TEXT,
-                    url TEXT,
-                    doi TEXT,
-                    status TEXT NOT NULL DEFAULT 'discovered',
-                    metadata TEXT NOT NULL DEFAULT '{}',
-                    relevance_score INTEGER,
-                    relevance_reason TEXT,
-                    discovered_at TEXT NOT NULL DEFAULT '',
-                    processed_at TEXT
-                )",
-            )
-            .execute(&db)
-            .await?;
-            sqlx::query(
-                "INSERT INTO research_sources_new (id, topic_id, source_type, source_id, title, authors, url, doi, status, metadata, discovered_at, processed_at)
-                 SELECT id, topic_id, source_type, source_id, title, authors, url, doi, status, metadata, discovered_at, processed_at FROM research_sources",
-            )
-            .execute(&db)
-            .await?;
-            sqlx::query("DROP TABLE research_sources").execute(&db).await?;
-            sqlx::query("ALTER TABLE research_sources_new RENAME TO research_sources").execute(&db).await?;
-            sqlx::query("CREATE INDEX IF NOT EXISTS idx_rs_topic ON research_sources(topic_id)").execute(&db).await?;
-            sqlx::query("CREATE INDEX IF NOT EXISTS idx_rs_status ON research_sources(status)").execute(&db).await?;
-        }
-    }
-    // research_topics: CRR requires a NOT NULL primary key and a DEFAULT on
-    // every NOT NULL column; the legacy table has a nullable
-    // `id TEXT PRIMARY KEY` and no defaults. Rebuild after research_sources
-    // (its legacy FK references this table).
-    {
-        let ddl: Option<(String,)> = sqlx::query_as(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'research_topics'",
-        )
-        .fetch_optional(&db)
-        .await?;
-        if ddl.map(|(sql,)| !sql.contains("PRIMARY KEY NOT NULL")).unwrap_or(false) {
-            sqlx::query(
-                "CREATE TABLE research_topics_new (
-                    id TEXT PRIMARY KEY NOT NULL,
-                    name TEXT NOT NULL DEFAULT '',
-                    description TEXT,
-                    keywords TEXT NOT NULL DEFAULT '[]',
-                    status TEXT NOT NULL DEFAULT 'active',
-                    created_at TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL DEFAULT ''
-                )",
-            )
-            .execute(&db)
-            .await?;
-            sqlx::query("INSERT INTO research_topics_new SELECT * FROM research_topics")
-                .execute(&db)
-                .await?;
-            sqlx::query("DROP TABLE research_topics").execute(&db).await?;
-            sqlx::query("ALTER TABLE research_topics_new RENAME TO research_topics").execute(&db).await?;
-        }
-    }
+    // Migration: research_topics/research_sources join the CRR set — their
+    // legacy shapes are CRR-incompatible. Rebuild + crash recovery lives in
+    // migrate_research_crr_tables. (added 2026-10-14)
+    migrate_research_crr_tables(&db).await?;
     add_column_if_missing(&db, "research_sources", "relevance_score", "INTEGER").await?;
     add_column_if_missing(&db, "research_sources", "relevance_reason", "TEXT").await?;
 
@@ -1515,6 +1444,205 @@ async fn table_definition_sql(
             .await?;
     Ok(sql.unwrap_or_default())
 }
+
+/// Rebuild the research-tracking tables into CRR-compatible shapes and
+/// recover from interrupted earlier attempts. (added 2026-10-14, hardened
+/// the same day after a startup crash on a stranded `research_sources_new`)
+///
+/// Legacy shapes are CRR-incompatible: `research_sources` carries an FK to
+/// research_topics plus CHECK constraints, `research_topics` has a nullable
+/// `TEXT PRIMARY KEY` and NOT NULL columns without defaults. Fresh installs
+/// get the compliant shapes from schema_init.sql directly.
+///
+/// Every rebuild runs in a single transaction, so a crash leaves no partial
+/// state; a crash *outside* the transaction window (or a broken intermediate
+/// build) can still strand a `<table>_new` copy, so the stranded copy is
+/// resolved first:
+/// - main table still legacy → the legacy data is authoritative, drop the
+///   partial copy and rebuild cleanly;
+/// - main table missing → adopt the stranded copy wholesale;
+/// - main table already new-shaped (schema_init recreated it empty, or the
+///   user added rows after the crash) → merge the stranded rows in
+///   (OR IGNORE dedups by id) and drop the copy.
+async fn migrate_research_crr_tables(db: &Db) -> anyhow::Result<()> {
+    // Single connection: the PRAGMAs below are per-connection.
+    let mut conn = db.acquire().await?;
+    sqlx::query("PRAGMA foreign_keys = OFF").execute(&mut *conn).await?;
+    // legacy_alter_table: renames must NOT rewrite REFERENCES in dependents.
+    sqlx::query("PRAGMA legacy_alter_table = ON").execute(&mut *conn).await?;
+
+    let result = migrate_research_crr_tables_inner(&mut *conn).await;
+
+    sqlx::query("PRAGMA legacy_alter_table = OFF").execute(&mut *conn).await?;
+    sqlx::query("PRAGMA foreign_keys = ON").execute(&mut *conn).await?;
+    result
+}
+
+async fn migrate_research_crr_tables_inner(conn: &mut sqlx::SqliteConnection) -> anyhow::Result<()> {
+    const SOURCES_NEW_DDL: &str =
+        "CREATE TABLE research_sources_new (
+            id TEXT PRIMARY KEY NOT NULL,
+            topic_id TEXT NOT NULL DEFAULT '',
+            source_type TEXT NOT NULL DEFAULT '',
+            source_id TEXT,
+            title TEXT,
+            authors TEXT,
+            url TEXT,
+            doi TEXT,
+            status TEXT NOT NULL DEFAULT 'discovered',
+            metadata TEXT NOT NULL DEFAULT '{}',
+            relevance_score INTEGER,
+            relevance_reason TEXT,
+            discovered_at TEXT NOT NULL DEFAULT '',
+            processed_at TEXT
+        )";
+    const SOURCES_COLS: &str = "id, topic_id, source_type, source_id, title, authors, url, doi, status, metadata, relevance_score, relevance_reason, discovered_at, processed_at";
+    const SOURCES_COLS_LEGACY: &str = "id, topic_id, source_type, source_id, title, authors, url, doi, status, metadata, discovered_at, processed_at";
+    const TOPICS_NEW_DDL: &str =
+        "CREATE TABLE research_topics_new (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            description TEXT,
+            keywords TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )";
+    const TOPICS_COLS: &str = "id, name, description, keywords, status, created_at, updated_at";
+
+    // ── research_sources (rebuilt first: its legacy FK targets topics) ──
+    {
+        let mut legacy = table_definition_sql(&mut *conn, "research_sources")
+            .await?
+            .contains("REFERENCES research_topics");
+        let new_sql = table_definition_sql(&mut *conn, "research_sources_new").await?;
+        if !new_sql.is_empty() {
+            if legacy {
+                sqlx::query("DROP TABLE research_sources_new")
+                    .execute(&mut *conn)
+                    .await
+                    .context("research_sources: drop stranded partial copy over legacy table")?;
+            } else if table_definition_sql(&mut *conn, "research_sources").await?.is_empty() {
+                sqlx::query("ALTER TABLE research_sources_new RENAME TO research_sources")
+                    .execute(&mut *conn)
+                    .await
+                    .context("research_sources: adopt stranded rebuild copy")?;
+                info!("research_sources: adopted stranded research_sources_new");
+                legacy = false;
+            } else {
+                sqlx::query(&format!(
+                    "INSERT OR IGNORE INTO research_sources ({SOURCES_COLS}) SELECT {SOURCES_COLS} FROM research_sources_new"
+                ))
+                .execute(&mut *conn)
+                .await
+                .context("research_sources: merge stranded rebuild copy")?;
+                sqlx::query("DROP TABLE research_sources_new")
+                    .execute(&mut *conn)
+                    .await
+                    .context("research_sources: drop merged rebuild copy")?;
+                info!("research_sources: merged stranded research_sources_new back");
+                legacy = false;
+            }
+        }
+
+        if legacy {
+            let mut tx = conn.begin().await?;
+            sqlx::query(SOURCES_NEW_DDL)
+                .execute(&mut *tx)
+                .await
+                .context("research_sources: create rebuild table")?;
+            sqlx::query(&format!(
+                "INSERT INTO research_sources_new ({SOURCES_COLS_LEGACY}) SELECT {SOURCES_COLS_LEGACY} FROM research_sources"
+            ))
+            .execute(&mut *tx)
+            .await
+            .context("research_sources: copy legacy rows")?;
+            sqlx::query("DROP TABLE research_sources")
+                .execute(&mut *tx)
+                .await
+                .context("research_sources: drop legacy table")?;
+            sqlx::query("ALTER TABLE research_sources_new RENAME TO research_sources")
+                .execute(&mut *tx)
+                .await
+                .context("research_sources: rename rebuild table")?;
+            tx.commit()
+                .await
+                .context("research_sources: commit rebuild")?;
+            info!("research_sources: rebuilt legacy table for CRR compatibility");
+        }
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_rs_topic ON research_sources(topic_id)")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_rs_status ON research_sources(status)")
+            .execute(&mut *conn)
+            .await?;
+    }
+
+    // ── research_topics ──
+    {
+        let mut legacy = !table_definition_sql(&mut *conn, "research_topics")
+            .await?
+            .contains("PRIMARY KEY NOT NULL");
+        let new_sql = table_definition_sql(&mut *conn, "research_topics_new").await?;
+        if !new_sql.is_empty() {
+            if legacy {
+                sqlx::query("DROP TABLE research_topics_new")
+                    .execute(&mut *conn)
+                    .await
+                    .context("research_topics: drop stranded partial copy over legacy table")?;
+            } else if table_definition_sql(&mut *conn, "research_topics").await?.is_empty() {
+                sqlx::query("ALTER TABLE research_topics_new RENAME TO research_topics")
+                    .execute(&mut *conn)
+                    .await
+                    .context("research_topics: adopt stranded rebuild copy")?;
+                info!("research_topics: adopted stranded research_topics_new");
+                legacy = false;
+            } else {
+                sqlx::query(&format!(
+                    "INSERT OR IGNORE INTO research_topics ({TOPICS_COLS}) SELECT {TOPICS_COLS} FROM research_topics_new"
+                ))
+                .execute(&mut *conn)
+                .await
+                .context("research_topics: merge stranded rebuild copy")?;
+                sqlx::query("DROP TABLE research_topics_new")
+                    .execute(&mut *conn)
+                    .await
+                    .context("research_topics: drop merged rebuild copy")?;
+                info!("research_topics: merged stranded research_topics_new back");
+                legacy = false;
+            }
+        }
+
+        if legacy {
+            let mut tx = conn.begin().await?;
+            sqlx::query(TOPICS_NEW_DDL)
+                .execute(&mut *tx)
+                .await
+                .context("research_topics: create rebuild table")?;
+            sqlx::query(&format!(
+                "INSERT INTO research_topics_new ({TOPICS_COLS}) SELECT {TOPICS_COLS} FROM research_topics"
+            ))
+            .execute(&mut *tx)
+            .await
+            .context("research_topics: copy legacy rows")?;
+            sqlx::query("DROP TABLE research_topics")
+                .execute(&mut *tx)
+                .await
+                .context("research_topics: drop legacy table")?;
+            sqlx::query("ALTER TABLE research_topics_new RENAME TO research_topics")
+                .execute(&mut *tx)
+                .await
+                .context("research_topics: rename rebuild table")?;
+            tx.commit()
+                .await
+                .context("research_topics: commit rebuild")?;
+            info!("research_topics: rebuilt legacy table for CRR compatibility");
+        }
+    }
+
+    Ok(())
+}
+
 
 /// Rebuild pre-sync tables whose schemas are incompatible with CRDT sync:
 ///
@@ -2892,5 +3020,195 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(placeholder_rows, 1, "占位向量应被改标");
         assert_eq!(real_rows, 1, "真实向量必须保持原标签");
+    }
+
+    /// Legacy (pre-CRR) research table shapes: FK + CHECK constraints and a
+    /// nullable `TEXT PRIMARY KEY`.
+    async fn setup_legacy_research_tables(db: &Db) -> anyhow::Result<()> {
+        sqlx::query(
+            "CREATE TABLE research_topics (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT, keywords TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','paused','completed','archived')), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(db)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE research_sources (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES research_topics(id) ON DELETE CASCADE, source_type TEXT NOT NULL CHECK(source_type IN ('arxiv','scholar','crossref','manual')), source_id TEXT, title TEXT, authors TEXT, url TEXT, doi TEXT, status TEXT NOT NULL DEFAULT 'discovered' CHECK(status IN ('discovered','downloaded','imported','read')), metadata TEXT NOT NULL DEFAULT '{}', discovered_at TEXT NOT NULL, processed_at TEXT)",
+        )
+        .execute(db)
+        .await?;
+        sqlx::query("INSERT INTO research_topics VALUES ('t1','AI safety',NULL,'[]','active','2026-01-01','2026-01-01')")
+            .execute(db)
+            .await?;
+        sqlx::query("INSERT INTO research_sources (id, topic_id, source_type, source_id, title, authors, url, doi, status, metadata, discovered_at) VALUES ('s1','t1','arxiv','2501.0001','Paper','[]','http://x','','discovered','{}','2026-01-01')")
+            .execute(db)
+            .await?;
+        Ok(())
+    }
+
+    async fn research_repro_db(tag: &str) -> anyhow::Result<(std::path::PathBuf, Db)> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-research-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = connect_with_crsqlite(&dir.join("r.db")).await?;
+        Ok((dir, db))
+    }
+
+    /// The legacy tables are rebuilt into CRR-compatible shapes, rows survive,
+    /// and the rebuilt tables register as CRRs without error.
+    #[tokio::test]
+    async fn research_rebuild_migrates_legacy_tables_and_keeps_rows() -> anyhow::Result<()> {
+        let (_dir, db) = research_repro_db("legacy").await?;
+        setup_legacy_research_tables(&db).await?;
+
+        super::migrate_research_crr_tables(&db).await?;
+
+        let (topic,): (String,) =
+            sqlx::query_as("SELECT name FROM research_topics WHERE id = 't1'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(topic, "AI safety", "topic rows must survive the rebuild");
+        let (title,): (String,) =
+            sqlx::query_as("SELECT title FROM research_sources WHERE id = 's1'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(title, "Paper", "source rows must survive the rebuild");
+        let topics_ddl: (String,) = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='research_topics'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert!(topics_ddl.0.contains("PRIMARY KEY NOT NULL"));
+        let sources_ddl: (String,) = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='research_sources'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert!(!sources_ddl.0.contains("REFERENCES"), "FK must be gone");
+
+        // Rebuilt tables must register as CRRs (legacy shapes were rejected).
+        register_crr_tables(&db, &["research_topics", "research_sources"]).await?;
+
+        // Idempotent: a second run is a no-op and keeps the data.
+        super::migrate_research_crr_tables(&db).await?;
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM research_sources")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(count, 1);
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Crash recovery: a previous attempt died after DROP but before RENAME;
+    /// schema_init then recreated an empty new-shaped main table while the
+    /// stranded `<table>_new` still holds all rows. The migration must merge
+    /// the stranded rows back instead of losing them or dying on the name
+    /// collision.
+    #[tokio::test]
+    async fn research_rebuild_recovers_stranded_new_tables() -> anyhow::Result<()> {
+        let (_dir, db) = research_repro_db("stranded").await?;
+
+        // Main tables: new shape, empty (recreated by schema_init).
+        sqlx::query(
+            "CREATE TABLE research_topics (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL DEFAULT '', description TEXT, keywords TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '')",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE research_sources (id TEXT PRIMARY KEY NOT NULL, topic_id TEXT NOT NULL DEFAULT '', source_type TEXT NOT NULL DEFAULT '', source_id TEXT, title TEXT, authors TEXT, url TEXT, doi TEXT, status TEXT NOT NULL DEFAULT 'discovered', metadata TEXT NOT NULL DEFAULT '{}', relevance_score INTEGER, relevance_reason TEXT, discovered_at TEXT NOT NULL DEFAULT '', processed_at TEXT)",
+        )
+        .execute(&db)
+        .await?;
+        // Stranded copies holding the pre-crash data.
+        sqlx::query(
+            "CREATE TABLE research_topics_new (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL DEFAULT '', description TEXT, keywords TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '')",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE research_sources_new (id TEXT PRIMARY KEY NOT NULL, topic_id TEXT NOT NULL DEFAULT '', source_type TEXT NOT NULL DEFAULT '', source_id TEXT, title TEXT, authors TEXT, url TEXT, doi TEXT, status TEXT NOT NULL DEFAULT 'discovered', metadata TEXT NOT NULL DEFAULT '{}', relevance_score INTEGER, relevance_reason TEXT, discovered_at TEXT NOT NULL DEFAULT '', processed_at TEXT)",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query("INSERT INTO research_topics_new VALUES ('t1','AI safety',NULL,'[]','active','2026-01-01','2026-01-01')")
+            .execute(&db)
+            .await?;
+        sqlx::query("INSERT INTO research_sources_new (id, topic_id, source_type, title, status, metadata, discovered_at) VALUES ('s1','t1','arxiv','Paper','discovered','{}','2026-01-01')")
+            .execute(&db)
+            .await?;
+        // Plus a topic created after the crash — both must survive the merge.
+        sqlx::query("INSERT INTO research_topics VALUES ('t2','Post-crash topic',NULL,'[]','active','2026-01-02','2026-01-02')")
+            .execute(&db)
+            .await?;
+
+        super::migrate_research_crr_tables(&db).await?;
+
+        let topic_names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM research_topics ORDER BY id")
+                .fetch_all(&db)
+                .await?;
+        assert_eq!(topic_names, vec!["AI safety", "Post-crash topic"]);
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM research_sources")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(count, 1, "stranded source rows must be merged back");
+        for t in ["research_topics_new", "research_sources_new"] {
+            let (left,): (i64,) = sqlx::query_as(&format!(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='{t}'"
+            ))
+            .fetch_one(&db)
+            .await?;
+            assert_eq!(left, 0, "{t} must be gone");
+        }
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// A stranded `<table>_new` over a still-legacy main table (a broken
+    /// intermediate build crashed between CREATE and INSERT) must not kill
+    /// startup with "there is already another table or index with this name":
+    /// the partial copy is dropped and the legacy data rebuilt cleanly.
+    #[tokio::test]
+    async fn research_rebuild_discards_partial_new_over_legacy() -> anyhow::Result<()> {
+        let (_dir, db) = research_repro_db("partial").await?;
+        setup_legacy_research_tables(&db).await?;
+        // Stranded EMPTY partial copies from the interrupted attempt.
+        sqlx::query(
+            "CREATE TABLE research_topics_new (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL DEFAULT '', description TEXT, keywords TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '')",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE research_sources_new (id TEXT PRIMARY KEY NOT NULL, topic_id TEXT NOT NULL DEFAULT '', source_type TEXT NOT NULL DEFAULT '', source_id TEXT, title TEXT, authors TEXT, url TEXT, doi TEXT, status TEXT NOT NULL DEFAULT 'discovered', metadata TEXT NOT NULL DEFAULT '{}', relevance_score INTEGER, relevance_reason TEXT, discovered_at TEXT NOT NULL DEFAULT '', processed_at TEXT)",
+        )
+        .execute(&db)
+        .await?;
+
+        super::migrate_research_crr_tables(&db).await?;
+
+        let (topic,): (String,) =
+            sqlx::query_as("SELECT name FROM research_topics WHERE id = 't1'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(topic, "AI safety");
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM research_sources")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(count, 1);
+        register_crr_tables(&db, &["research_topics", "research_sources"]).await?;
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
     }
 }

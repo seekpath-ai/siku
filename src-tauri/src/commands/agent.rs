@@ -202,6 +202,96 @@ fn truncated_history_note(
     Some(note)
 }
 
+/// AI-assisted review of an agent's long-term memory: the session's own model
+/// proposes a revised document (drop stale/contradictory entries, merge
+/// duplicates, compress) with human-readable notes. The command NEVER applies
+/// the revision — the memory modal shows notes + revised text and the user
+/// adopts or discards; adoption goes through the normal save path, so the
+/// previous content lands in the version history automatically.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn agent_memory_review(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    let memory = crate::core::agent_memory_service::get(&state.db, &session_id)
+        .await
+        .map_err(|e| format!("db error: {e}"))?
+        .filter(|m| !m.content.trim().is_empty())
+        .ok_or_else(|| "长期记忆为空，无可审查内容".to_string())?;
+
+    let session = sqlx::query_as::<_, ChatSession>(
+        "SELECT id, title, mode, project_id, working_dir, vision_provider_id, web_proxy, agent_mode, tools_enabled, system_prompt,
+                llm_models, llm_provider_ids, approval_config, max_loops, max_tokens, context_budget, max_memory_rounds,
+                memory_file_path, memory_dir, skills_dir, is_pinned, sort_order, archived, icon, color, domain, context, selected_skills, paper_ids, created_at, updated_at
+         FROM chat_sessions WHERE id = ?"
+    )
+    .bind(&session_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| format!("db error: {e}"))?
+    .ok_or_else(|| "session not found".to_string())?;
+
+    let config = build_agent_config(&state, &session).await?;
+    let mut llm_config = config.active_llm().to_llm_config();
+    if llm_config.api_key.is_empty()
+        && llm_config.provider != crate::ai::llm::LlmProvider::Ollama
+    {
+        return Err("API key not configured. Please set it in Settings.".to_string());
+    }
+    // The revised document must fit in one completion: a user-tuned low output
+    // cap would silently truncate it into a broken document. 4096 tokens is
+    // comfortably above the recommended 2000-char memory size.
+    llm_config.max_tokens = llm_config.max_tokens.max(4096);
+    let client = crate::ai::llm::client::create_llm_client(&llm_config)
+        .map_err(|e| format!("failed to create LLM client: {e}"))?;
+
+    let today = crate::core::time::now_iso();
+    let today = today.get(..10).unwrap_or(&today);
+    let sys = format!(
+        "你是记忆审查员。用户与智能体共同维护一份「长期记忆」文档，它会在每轮对话注入系统提示词。请审查并修订它：\n\
+         1. 删除明显过时、重复或相互矛盾的条目（矛盾时保留较新的表述；文档开头的日期戳是最后更新时间，今天是 {today}）；\n\
+         2. 合并同类条目、压缩冗长表述，但不得丢失事实细节（名称、路径、数字、偏好结论）；\n\
+         3. 不得新增文档中不存在的事实；\n\
+         4. 拿不准是否过时的条目保留，并在审查意见中说明理由。\n\
+         严格按以下格式输出，不要输出其它内容：\n\
+         ===审查意见===\n\
+         （逐条说明改动及原因；无改动则写「无需修订」）\n\
+         ===修订后文档===\n\
+         （完整的修订后 Markdown 文档；无改动则原样输出）"
+    );
+    let mk = |role: &str, content: String| crate::ai::llm::ChatMessage {
+        reasoning_content: None,
+        role: role.to_string(),
+        content,
+        attachments: None,
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    };
+    let messages = vec![mk("system", sys), mk("user", memory.content.clone())];
+    let resp = client
+        .chat_completion(&messages, &[])
+        .await
+        .map_err(|e| format!("LLM: {e}"))?;
+
+    const NOTES_MARK: &str = "===审查意见===";
+    const DOC_MARK: &str = "===修订后文档===";
+    let text = resp.content;
+    let Some(doc_pos) = text.find(DOC_MARK) else {
+        return Err("模型未按格式输出（缺少「修订后文档」段落），请重试".to_string());
+    };
+    let notes = match text.find(NOTES_MARK) {
+        Some(p) if p < doc_pos => text[p + NOTES_MARK.len()..doc_pos].trim().to_string(),
+        _ => text[..doc_pos].trim().to_string(),
+    };
+    let revised = text[doc_pos + DOC_MARK.len()..].trim().to_string();
+    if revised.is_empty() {
+        return Err("模型输出的修订稿为空，请重试".to_string());
+    }
+    Ok(serde_json::json!({ "notes": notes, "revised": revised }))
+}
+
 /// Build an AgentConfig from a ChatSession row, filling defaults from app settings.
 async fn build_agent_config(
     state: &AppState,
@@ -1164,11 +1254,22 @@ pub(crate) async fn run_agent_turn(
     };
 
     // Long-term memory: injected into the system prompt when the user has
-    // activated it for this agent (brain button in the chat input).
-    let long_term_memory = crate::core::agent_memory_service::active_content(&state.db, &session_id)
+    // activated it for this agent (brain button in the chat input). The
+    // freshness stamp lets the model discount content that has gone stale —
+    // an undated "user preference" from a year ago should not override what
+    // the user said yesterday.
+    let long_term_memory = crate::core::agent_memory_service::get(&state.db, &session_id)
         .await
         .ok()
-        .flatten();
+        .flatten()
+        .filter(|m| m.active && !m.content.trim().is_empty())
+        .map(|m| {
+            let date = m.updated_at.get(..10).unwrap_or(&m.updated_at);
+            format!(
+                "[本记忆最后更新于 {date}；年代久远的内容可能已过时，与近期对话冲突时以对话为准]\n{}",
+                m.content
+            )
+        });
 
     let engine = AgentEngine::new(
         llm_client,

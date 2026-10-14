@@ -840,6 +840,7 @@ pub fn run() {
             commands::chat::agent_memory_set,
             commands::chat::agent_memory_set_active,
             commands::chat::agent_memory_restore,
+            commands::agent::agent_memory_review,
             // Projects
             commands::projects::projects_list,
             commands::projects::project_create,

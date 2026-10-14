@@ -839,6 +839,18 @@ export async function agentMemoryRestore(sessionId: string, versionId: string): 
   return invoke<void>('agent_memory_restore', { sessionId, versionId });
 }
 
+export interface AgentMemoryReview {
+  /** Human-readable list of the changes the reviewer proposes. */
+  notes: string;
+  /** The full revised memory document (never auto-applied). */
+  revised: string;
+}
+
+/** Ask the session's own model to review the long-term memory and propose a revision. */
+export async function agentMemoryReview(sessionId: string): Promise<AgentMemoryReview> {
+  return invoke<AgentMemoryReview>('agent_memory_review', { sessionId });
+}
+
 // ============================================================
 // Projects (Codex-style project folders)
 // ============================================================

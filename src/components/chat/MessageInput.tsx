@@ -47,6 +47,9 @@ export function MessageInput({ disabled }: Props) {
   );
   // Long-term memory button state (per agent, persisted server-side).
   const [memoryActive, setMemoryActive] = useState(false);
+  // Days since the memory was last edited, once it crosses the staleness
+  // threshold — the brain button turns amber to prompt a review.
+  const [memoryStaleDays, setMemoryStaleDays] = useState<number | null>(null);
   const [memoryOpen, setMemoryOpen] = useState(false);
   // Picked note/file contexts attached to the next message (one-shot).
   const [contexts, setContexts] = useState<ContextItem[]>([]);
@@ -56,9 +59,16 @@ export function MessageInput({ disabled }: Props) {
 
   useEffect(() => {
     setMemoryActive(false);
+    setMemoryStaleDays(null);
     if (!activeSessionId) return;
     agentMemoryGet(activeSessionId)
-      .then((m) => setMemoryActive(m?.active ?? false))
+      .then((m) => {
+        setMemoryActive(m?.active ?? false);
+        if (m?.active && m.content.trim()) {
+          const days = Math.floor((Date.now() - new Date(m.updated_at).getTime()) / 86400000);
+          setMemoryStaleDays(Number.isFinite(days) && days >= 90 ? days : null);
+        }
+      })
       .catch(() => {});
     agentGetSession(activeSessionId)
       .then((s) => setApprovalConfig(s.approval_config ?? { mode: 'auto' }))
@@ -420,11 +430,19 @@ export function MessageInput({ disabled }: Props) {
                 disabled={disabled || !activeSessionId}
                 onClick={() => setMemoryOpen(true)}
                 className={`w-7 h-7 rounded-md border-0 bg-transparent flex items-center justify-center hover:bg-surface-hover transition-colors disabled:opacity-50 ${
-                  memoryActive
-                    ? 'text-primary hover:text-primary'
-                    : 'text-text-secondary/50 hover:text-text-primary'
+                  memoryStaleDays !== null
+                    ? 'text-amber-400 hover:text-amber-300'
+                    : memoryActive
+                      ? 'text-primary hover:text-primary'
+                      : 'text-text-secondary/50 hover:text-text-primary'
                 }`}
-                title={memoryActive ? '长期记忆 · 已激活' : '长期记忆 · 已遗忘'}
+                title={
+                  memoryStaleDays !== null
+                    ? `长期记忆已 ${memoryStaleDays} 天未更新，建议点击审查`
+                    : memoryActive
+                      ? '长期记忆 · 已激活'
+                      : '长期记忆 · 已遗忘'
+                }
               >
                 <Brain size={15} />
               </button>
@@ -462,7 +480,22 @@ export function MessageInput({ disabled }: Props) {
       {memoryOpen && activeSessionId && (
         <AgentMemoryModal
           sessionId={activeSessionId}
-          onClose={() => setMemoryOpen(false)}
+          onClose={() => {
+            setMemoryOpen(false);
+            // Editing inside the modal clears staleness — refresh the brain
+            // button so the amber state disappears without a session switch.
+            agentMemoryGet(activeSessionId)
+              .then((m) => {
+                setMemoryActive(m?.active ?? false);
+                if (m?.active && m.content.trim()) {
+                  const days = Math.floor((Date.now() - new Date(m.updated_at).getTime()) / 86400000);
+                  setMemoryStaleDays(Number.isFinite(days) && days >= 90 ? days : null);
+                } else {
+                  setMemoryStaleDays(null);
+                }
+              })
+              .catch(() => {});
+          }}
           onActiveChange={setMemoryActive}
         />
       )}

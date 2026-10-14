@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Brain, X, Loader2, Check, BookOpen, Pen, MoreVertical, Code, Columns2, Rows2, History } from 'lucide-react';
+import { Brain, X, Loader2, Check, BookOpen, Pen, MoreVertical, Code, Columns2, Rows2, History, Sparkles } from 'lucide-react';
 import { MarkdownEditor } from '@/components/editor/MarkdownEditor';
 import { WikiMarkdown } from '@/components/notes/WikiMarkdown';
 import { VersionHistoryDialog } from '@/components/notes/VersionHistoryDialog';
-import { agentMemoryGet, agentMemorySet, agentMemorySetActive, agentMemoryRestore } from '@/lib/tauri';
+import { agentMemoryGet, agentMemorySet, agentMemorySetActive, agentMemoryRestore, agentMemoryReview, type AgentMemoryReview } from '@/lib/tauri';
 import type { NoteVersion } from '@/lib/types';
 
 interface Props {
@@ -27,11 +27,18 @@ const LONG_MEMORY_CHARS = 2000;
 export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) {
   const [content, setContent] = useState('');
   const [active, setActive] = useState(true);
+  const [updatedAt, setUpdatedAt] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [mode, setMode] = useState<ViewMode>('edit');
   const [menuOpen, setMenuOpen] = useState(false);
   const [versionOpen, setVersionOpen] = useState(false);
   const [saved, setSaved] = useState<'idle' | 'saving' | 'saved'>('idle');
+  // AI review: the session's own model proposes a revised document; nothing
+  // is applied until the user adopts it (adoption goes through the normal
+  // save path, so the pre-adoption content lands in the version history).
+  const [reviewing, setReviewing] = useState(false);
+  const [review, setReview] = useState<AgentMemoryReview | null>(null);
+  const [reviewError, setReviewError] = useState<string | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const latest = useRef(content);
@@ -45,6 +52,7 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
         if (m) {
           setContent(m.content);
           setActive(m.active);
+          setUpdatedAt(m.updated_at);
           onActiveChange?.(m.active);
         }
         setLoaded(true);
@@ -82,7 +90,10 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
     saveTimer.current = null;
     setSaved('saving');
     agentMemorySet(sessionId, latest.current)
-      .then(() => setSaved('saved'))
+      .then(() => {
+        setSaved('saved');
+        setUpdatedAt(new Date().toISOString());
+      })
       .catch(() => setSaved('idle'));
   }, [sessionId]);
 
@@ -109,11 +120,37 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
     setMode(m);
   };
 
+  const handleReview = async () => {
+    if (saveTimer.current) flushSave();
+    setReviewing(true);
+    setReviewError(null);
+    try {
+      setReview(await agentMemoryReview(sessionId));
+    } catch (err) {
+      setReviewError(String(err instanceof Error ? err.message : err));
+    } finally {
+      setReviewing(false);
+    }
+  };
+
+  /** Adopt the revised document: route through the normal save path so the
+   * pre-adoption content is snapshotted into the version history. */
+  const adoptReview = () => {
+    if (!review) return;
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    setContent(review.revised);
+    latest.current = review.revised;
+    setReview(null);
+    flushSave();
+  };
+
   /** Restore a version: cancel any pending autosave first so it cannot
    * overwrite the restored content, then apply and show it. The backend
    * snapshots the pre-restore content itself. */
-  const handleVersionRestore = async (version: NoteVersion) => {
-    if (saveTimer.current) {
+  const handleVersionRestore = async (version: NoteVersion) => {    if (saveTimer.current) {
       clearTimeout(saveTimer.current);
       saveTimer.current = null;
     }
@@ -132,6 +169,14 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
     if (saveTimer.current) flushSave();
     onClose();
   };
+
+  // Staleness banner: a memory untouched for 90+ days is likely outdated —
+  // it still gets injected every turn, so prompt a review.
+  const staleDays = (() => {
+    if (!updatedAt) return null;
+    const days = Math.floor((Date.now() - new Date(updatedAt).getTime()) / 86400000);
+    return Number.isFinite(days) && days >= 90 ? days : null;
+  })();
 
   const editorEl = (
     <MarkdownEditor
@@ -162,6 +207,16 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
             ) : null}
           </span>
           <div className="flex-1" />
+          {/* AI 审查：会话自己的模型提出修订稿，用户决定是否采用 */}
+          <button
+            onClick={handleReview}
+            disabled={reviewing || !content.trim()}
+            title="AI 审查：由当前会话的模型检查过时/重复/矛盾内容并提出修订稿，采用与否由你决定"
+            className="p-1.5 rounded hover:bg-surface-hover text-text-secondary hover:text-primary disabled:opacity-50 flex items-center gap-1"
+          >
+            {reviewing ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+            <span className="text-[11px]">AI 审查</span>
+          </button>
           {/* 编辑/阅读视图切换（与笔记编辑区一致） */}
           <button
             onClick={toggleReading}
@@ -243,8 +298,53 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
           </button>
         </div>
 
+        {staleDays !== null && (
+          <div className="px-4 py-1.5 text-[11px] text-amber-400/90 bg-amber-400/10 border-b border-surface-hover shrink-0">
+            这份记忆已 {staleDays} 天未更新，内容可能已过时——建议审查精简；不再适用时可点右上角开关「遗忘」（内容保留但停止注入）
+          </div>
+        )}
+        {reviewError && (
+          <div className="px-4 py-1.5 text-[11px] text-red-400/90 bg-red-400/10 border-b border-surface-hover shrink-0">
+            AI 审查失败：{reviewError}
+          </div>
+        )}
+
         <div className="flex-1 min-h-0 overflow-hidden">
-          {!loaded ? (
+          {review ? (
+            <div className="h-full flex flex-col">
+              <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                <section>
+                  <h4 className="text-xs font-medium text-text-secondary mb-1.5">审查意见</h4>
+                  <div className="text-sm text-text-primary whitespace-pre-wrap bg-surface-hover/40 rounded-lg p-3">
+                    {review.notes || '（模型未给出审查意见）'}
+                  </div>
+                </section>
+                <section>
+                  <h4 className="text-xs font-medium text-text-secondary mb-1.5">修订后文档</h4>
+                  <div className="text-sm text-text-primary whitespace-pre-wrap font-mono bg-surface-hover/40 rounded-lg p-3">
+                    {review.revised}
+                  </div>
+                </section>
+              </div>
+              <div className="flex items-center justify-end gap-2 px-4 py-2.5 border-t border-surface-hover shrink-0">
+                <span className="flex-1 text-[11px] text-text-secondary/50">
+                  采用后旧内容自动存入版本历史，可随时恢复
+                </span>
+                <button
+                  onClick={() => setReview(null)}
+                  className="px-3 py-1.5 text-xs rounded-lg border border-surface-hover text-text-secondary hover:text-text-primary hover:border-text-secondary"
+                >
+                  放弃
+                </button>
+                <button
+                  onClick={adoptReview}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-primary text-white hover:opacity-90"
+                >
+                  采用修订稿
+                </button>
+              </div>
+            </div>
+          ) : !loaded ? (
             <div className="flex items-center justify-center h-full text-sm text-text-secondary/60">加载中…</div>
           ) : mode === 'reading' ? (
             previewEl

@@ -709,6 +709,13 @@ body.in-tauri {
     orphans: 2;
     widows: 2;
   }
+  /* 段落与列表项允许西文在单词中间断行（Word「中文版式 → 允许西文在单词
+     中间换行」的对应物）：两端对齐下，长代码令牌/URL 不再被整体推到下一行
+     而把当前行的汉字间距拉散。不加连字符（hyphens: none 在根上）。 */
+  #siku-print-root p,
+  #siku-print-root li {
+    word-break: break-all;
+  }
   /* 这些场合不缩进：列表内、表格内、引用内、图注、公式、代码块内嵌段落 */
   #siku-print-root li p,
   #siku-print-root td p,

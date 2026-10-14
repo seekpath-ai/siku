@@ -853,6 +853,8 @@ body.in-tauri {
     font-weight: 700;
     margin: 0 0 14pt;
     border-bottom: none;
+    /* 覆盖通用 h1 规则的 text-align:left（元素级规则胜过 .pdf-cover 的继承居中） */
+    text-align: center;
   }
   #siku-print-root .pdf-cover-date {
     font-size: 12pt;

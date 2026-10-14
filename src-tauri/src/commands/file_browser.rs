@@ -25,6 +25,14 @@ pub async fn file_browser_reveal_in_system(path: String) -> Result<(), String> {
     crate::core::file_service::reveal_in_system(&path)
 }
 
+/// Show the Windows "Open with…" dialog for a file (Windows-only; the
+/// frontend hides the menu item on other platforms).
+#[tauri::command]
+#[instrument]
+pub async fn file_browser_open_with(path: String) -> Result<(), String> {
+    crate::core::file_service::open_with_dialog(&path)
+}
+
 /// Read a text file's content (bounded by the file-read tool limit).
 /// Used by the chat "attach file" feature to include file content as context.
 #[tauri::command]

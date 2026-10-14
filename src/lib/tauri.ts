@@ -1525,6 +1525,11 @@ export async function fileBrowserRevealInSystem(path: string): Promise<void> {
   return invoke<void>('file_browser_reveal_in_system', { path });
 }
 
+/** Windows-only: show the system "Open with…" dialog for a file. */
+export async function fileBrowserOpenWith(path: string): Promise<void> {
+  return invoke<void>('file_browser_open_with', { path });
+}
+
 /** Read a text file's content (bounded) — used by the chat attach feature. */
 export async function readTextFile(path: string): Promise<string> {
   return invoke<string>('read_text_file', { path });

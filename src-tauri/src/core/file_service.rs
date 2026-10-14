@@ -120,6 +120,31 @@ pub fn reveal_in_system(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Show the Windows "Open with…" system dialog. Windows-only: macOS and
+/// Linux have no equivalent native dialog, so the frontend hides this menu
+/// item there (the stub errors out as a safety net).
+#[cfg(target_os = "windows")]
+pub fn open_with_dialog(path: &str) -> Result<(), String> {
+    let p = std::path::Path::new(path);
+    if !p.exists() {
+        return Err(format!("路径不存在：{path}"));
+    }
+    if p.is_dir() {
+        return Err("目录不支持「打开方式」".into());
+    }
+    crate::core::process::no_window(&mut std::process::Command::new("rundll32"))
+        .args(["shell32.dll,OpenAs_RunDLL", path])
+        .spawn()
+        .map_err(|e| format!("failed to open the Open-With dialog: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn open_with_dialog(path: &str) -> Result<(), String> {
+    let _ = path;
+    Err("当前平台没有系统「打开方式」对话框".into())
+}
+
 pub fn mime_guess(name: &str) -> Option<String> {
     let ext = std::path::Path::new(name).extension()?.to_str()?;
     match ext.to_lowercase().as_str() {

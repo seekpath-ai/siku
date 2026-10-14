@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback } from 'react';
 import { createRoute } from '@tanstack/react-router';
 import { Route as RootRoute } from './__root';
-import { Folder, File, ChevronRight, Home, FileText, Image, Loader2, Database } from 'lucide-react';
+import { Folder, File, ChevronRight, Home, FileText, Image, Loader2, Database, ExternalLink, FolderOpen, AppWindow } from 'lucide-react';
 import { homeDir, desktopDir, documentDir, downloadDir, appDataDir } from '@tauri-apps/api/path';
-import { fileBrowserListDir, fileBrowserOpenInSystem } from '@/lib/tauri';
+import { fileBrowserListDir, fileBrowserOpenInSystem, fileBrowserRevealInSystem, fileBrowserOpenWith } from '@/lib/tauri';
+import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
 import type { FileEntry } from '@/lib/types';
 
 /** Last browsed directory is restored on the next visit (device-local). */
@@ -28,6 +29,7 @@ function FilesPage() {
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; entry: FileEntry } | null>(null);
 
   // Resolve well-known directories once, then pick the initial directory:
   // last browsed (if any) else the user home — never the drive root.
@@ -95,6 +97,34 @@ function FilesPage() {
   const pathParts = cwd.split(sep).filter(Boolean);
   const isWindows = sep === '\\';
 
+  /** Right-click menu for one entry. 「打开方式…」is Windows-only (no native
+   * equivalent on macOS/Linux — users reveal the file and choose there). */
+  const menuItems = (entry: FileEntry): ContextMenuItem[] => {
+    const run = (fn: (p: string) => Promise<void>) => () =>
+      fn(entry.path).catch((err) => setError(`${err}`));
+    const items: ContextMenuItem[] = [];
+    if (!entry.is_dir) {
+      items.push({
+        label: '打开',
+        icon: <ExternalLink size={14} />,
+        onClick: run(fileBrowserOpenInSystem),
+      });
+    }
+    items.push({
+      label: '打开位置',
+      icon: <FolderOpen size={14} />,
+      onClick: run(fileBrowserRevealInSystem),
+    });
+    if (!entry.is_dir && isWindows) {
+      items.push({
+        label: '打开方式…',
+        icon: <AppWindow size={14} />,
+        onClick: run(fileBrowserOpenWith),
+      });
+    }
+    return items;
+  };
+
   const buildPath = (idx: number) => {
     if (isWindows) {
       return pathParts.slice(0, idx + 1).join('\\') + (idx === 0 ? '\\' : '');
@@ -154,6 +184,10 @@ function FilesPage() {
                 key={entry.path}
                 onClick={() => handleClick(entry)}
                 onDoubleClick={() => handleOpen(entry)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setMenu({ x: e.clientX, y: e.clientY, entry });
+                }}
                 className={`flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer text-sm transition-colors ${
                   entry.is_dir ? 'hover:bg-primary/5' : 'hover:bg-surface-hover'
                 }`}
@@ -168,6 +202,15 @@ function FilesPage() {
           </div>
         )}
       </div>
+
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          items={menuItems(menu.entry)}
+          onClose={() => setMenu(null)}
+        />
+      )}
     </div>
   );
 }

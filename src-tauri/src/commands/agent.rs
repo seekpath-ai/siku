@@ -160,6 +160,48 @@ fn agent_skills_dir(
         .unwrap_or_else(|| default_skills_dir(effective_base_dir(app_data_dir, data_dir)))
 }
 
+/// Build the truncation manifest from the older (not loaded) memory records:
+/// a zero-LLM-cost map of what fell out of the window — round count, time
+/// range, and the first line of each truncated user message — plus the recall
+/// escape hatch. Every line derives from stored records, so unlike an LLM
+/// summary it cannot hallucinate content that was never said.
+fn truncated_history_note(
+    older: &[crate::ai::agent::memory_store::MemoryRecord],
+    recall_available: bool,
+) -> Option<String> {
+    let users: Vec<_> = older.iter().filter(|r| r.role == "user").collect();
+    if users.is_empty() {
+        return None;
+    }
+    const MAX_ENTRIES: usize = 30;
+    let first = older.first()?.time.format("%Y-%m-%d");
+    let last = older.last()?.time.format("%Y-%m-%d");
+    let mut note = format!(
+        "# 更早的对话（未加载进上下文）\n本会话还有 {} 轮更早的对话（{} ~ {}）未加载。以下是每条用户消息的首行，仅供定位：\n",
+        users.len(),
+        first,
+        last
+    );
+    let shown = if users.len() > MAX_ENTRIES {
+        &users[users.len() - MAX_ENTRIES..]
+    } else {
+        &users[..]
+    };
+    for r in shown {
+        let first_line: String = r.content.lines().next().unwrap_or("").chars().take(60).collect();
+        note.push_str(&format!("- [{}] {}\n", r.time.format("%m-%d %H:%M"), first_line));
+    }
+    if users.len() > MAX_ENTRIES {
+        note.push_str(&format!("（更早的 {} 轮从略）\n", users.len() - MAX_ENTRIES));
+    }
+    if recall_available {
+        note.push_str("需要完整内容或当时的工具调用详情时，用 memory_recall 工具按关键词（query）或时间范围（from/to）查询。");
+    } else {
+        note.push_str("（历史检索工具 memory_recall 未启用，无法回查这些内容。）");
+    }
+    Some(note)
+}
+
 /// Build an AgentConfig from a ChatSession row, filling defaults from app settings.
 async fn build_agent_config(
     state: &AppState,
@@ -1069,6 +1111,23 @@ pub(crate) async fn run_agent_turn(
         }
     }
 
+    // Truncation manifest: when the loaded window leaves older conversation
+    // behind, hand the model a zero-LLM-cost map of what is missing (round
+    // count, time range, first line of each truncated user message) plus the
+    // recall escape hatch. Every line is derived from stored records — no
+    // summary model, no hallucination surface.
+    let history_note = {
+        let total = memory.total_records();
+        let loaded = history.len();
+        if total > loaded {
+            let all = memory.load_all();
+            let older_len = all.len().saturating_sub(loaded);
+            truncated_history_note(&all[..older_len], registry.has_tool("memory_recall"))
+        } else {
+            None
+        }
+    };
+
     memory.append("user", &content, None, None, None, attachments_json.as_deref(), None);
 
     // Pet domain sessions: build a context hint for the system prompt so the
@@ -1094,6 +1153,11 @@ pub(crate) async fn run_agent_turn(
     // model guesses where a relative path lands, and a wrong guess is invisible
     // until a later file_read "cannot find" what the agent believes it wrote.
     let context_prompt = match (context_prompt, workspace_note) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    };
+    let context_prompt = match (context_prompt, history_note) {
         (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
         (Some(a), None) => Some(a),
         (None, b) => b,

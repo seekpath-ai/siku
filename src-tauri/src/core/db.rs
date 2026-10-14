@@ -775,6 +775,19 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.selected_skills: {}", e))?;
 
+    // Migration: sessions that opted into the memory family (memory_write in
+    // their explicit tool list) also get the history-recall tool; NULL lists
+    // already mean "all tools" and need nothing (added 2026-10-14).
+    sqlx::query(
+        "UPDATE chat_sessions SET tools_enabled = json_insert(tools_enabled, '$[#]', 'memory_recall') \
+         WHERE json_valid(tools_enabled) \
+           AND tools_enabled LIKE '%memory_write%' \
+           AND tools_enabled NOT LIKE '%memory_recall%'",
+    )
+    .execute(&db)
+    .await
+    .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions memory_recall tool: {}", e))?;
+
     // Migration: agent_steps for ReAct iterations (added 2026-08-07)
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS agent_steps (

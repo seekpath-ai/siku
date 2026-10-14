@@ -43,6 +43,7 @@ export const TOOL_CATEGORIES: AgentToolCategory[] = [
     tools: [
       { key: 'memory_read', label: 'memory_read — 读取长期记忆' },
       { key: 'memory_write', label: 'memory_write — 写入长期记忆（追加/重写）' },
+      { key: 'memory_recall', label: 'memory_recall — 检索历史对话原文（含工具调用详情）' },
     ],
   },
   {

@@ -129,6 +129,12 @@ impl MemoryStore {
         self.write_meta(current + 1);
     }
 
+    /// Total number of records in the file (meta-cached). Used to detect
+    /// that the loaded window left older conversation behind.
+    pub fn total_records(&self) -> usize {
+        self.read_meta().unwrap_or_else(|| self.rebuild_meta())
+    }
+
     /// Load the most recent `max_rounds` of conversation.
     pub fn load_recent(&self, max_rounds: usize) -> Vec<MemoryRecord> {
         let max_lines = max_rounds.saturating_mul(2).max(1);

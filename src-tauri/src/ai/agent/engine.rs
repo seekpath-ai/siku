@@ -471,6 +471,9 @@ impl AgentEngine {
         // True while the current round appends to the previous round's text, so
         // the join is verbatim instead of a new paragraph.
         let mut continuing = false;
+        // The token-budget note is appended to the system message at most once
+        // per turn — the truncation check runs every round.
+        let mut token_trunc_noted = false;
 
         // — ReAct loop with streaming —
         let mut final_content = String::new();
@@ -540,7 +543,20 @@ impl AgentEngine {
             // including the current user message.
             let context_budget = self.config.effective_context_budget();
             if ConversationMemory::estimate_messages_tokens(&messages) > context_budget {
+                let before = messages.len();
                 messages = self.memory.truncate(&messages, output_cap as usize);
+                // The round-window manifest (agent.rs) covers history dropped
+                // by max_memory_rounds; this note covers the mid-turn drops by
+                // the token budget, which the manifest cannot foresee.
+                if messages.len() < before
+                    && !token_trunc_noted
+                    && self.tool_registry.has_tool("memory_recall")
+                {
+                    token_trunc_noted = true;
+                    if let Some(sys) = messages.iter_mut().find(|m| m.role == "system") {
+                        sys.content.push_str("\n\n（注：部分较早的历史消息因上下文预算未包含在请求中；如需完整内容或当时的工具调用详情，可用 memory_recall 工具按关键词或时间范围查询。）");
+                    }
+                }
             }
             // Every request must satisfy the provider's tool-pairing rule: an
             // assistant message with tool_calls needs a response for each id,

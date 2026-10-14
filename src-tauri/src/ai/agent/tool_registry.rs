@@ -235,6 +235,10 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
     /// Create a registry with all built-in tools.
     ///
     /// `working_dir` is the default write directory for relative paths — a
@@ -291,7 +295,8 @@ impl ToolRegistry {
         // real chat sessions — not for session-less helper registries).
         if let Some(sid) = session_id.clone() {
             registry.register(crate::ai::agent::tools::memory::MemoryReadTool::new(db.clone(), sid.clone()));
-            registry.register(crate::ai::agent::tools::memory::MemoryWriteTool::new(db.clone(), sid));
+            registry.register(crate::ai::agent::tools::memory::MemoryWriteTool::new(db.clone(), sid.clone()));
+            registry.register(crate::ai::agent::tools::memory::MemoryRecallTool::new(db.clone(), sid));
         }
 
         // File tools

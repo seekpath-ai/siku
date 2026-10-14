@@ -116,14 +116,17 @@ pub async fn delete_chat_session(
 }
 
 /// Get the long-term memory for an agent (session). Returns None when the
-/// user has never written one.
+/// user has never written one. `scope`: "global" (default, synced) or
+/// "device" (this machine only).
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn agent_memory_get(
     state: State<'_, AppState>,
     session_id: String,
+    scope: Option<String>,
 ) -> Result<Option<crate::core::agent_memory_service::AgentMemory>, String> {
-    crate::core::agent_memory_service::get(&state.db, &session_id)
+    let scope = crate::core::agent_memory_service::MemoryScope::from_param(scope.as_deref());
+    crate::core::agent_memory_service::get(&state.db, scope, &session_id)
         .await
         .map_err(|e| format!("db error: {e}"))
 }
@@ -136,23 +139,27 @@ pub async fn agent_memory_set(
     state: State<'_, AppState>,
     session_id: String,
     content: String,
+    scope: Option<String>,
 ) -> Result<(), String> {
-    crate::core::agent_memory_service::set_content(&state.db, &session_id, &content)
+    let scope = crate::core::agent_memory_service::MemoryScope::from_param(scope.as_deref());
+    crate::core::agent_memory_service::set_content(&state.db, scope, &session_id, &content)
         .await
         .map_err(|e| format!("db error: {e}"))
 }
 
 /// Restore an agent's long-term memory from a version snapshot (snapshots
-/// reuse the note_versions table, keyed by session id). The current content
-/// is snapshotted first so the restore can be undone.
+/// reuse the note_versions table, keyed by the scope's versions key). The
+/// current content is snapshotted first so the restore can be undone.
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn agent_memory_restore(
     state: State<'_, AppState>,
     session_id: String,
     version_id: String,
+    scope: Option<String>,
 ) -> Result<(), String> {
-    crate::core::agent_memory_service::restore(&state.db, &session_id, &version_id)
+    let scope = crate::core::agent_memory_service::MemoryScope::from_param(scope.as_deref());
+    crate::core::agent_memory_service::restore(&state.db, scope, &session_id, &version_id)
         .await
         .map_err(|e| format!("db error: {e}"))
 }
@@ -165,8 +172,10 @@ pub async fn agent_memory_set_active(
     state: State<'_, AppState>,
     session_id: String,
     active: bool,
+    scope: Option<String>,
 ) -> Result<(), String> {
-    crate::core::agent_memory_service::set_active(&state.db, &session_id, active)
+    let scope = crate::core::agent_memory_service::MemoryScope::from_param(scope.as_deref());
+    crate::core::agent_memory_service::set_active(&state.db, scope, &session_id, active)
         .await
         .map_err(|e| format!("db error: {e}"))
 }
@@ -285,7 +294,12 @@ pub async fn chat_message_tag(
         None => {}
         Some("experience") => {
             let entry = format!("## 经验（{}）\n\n{}", &time::now_iso()[..10], msg.content.trim());
-            crate::core::agent_memory_service::append(&state.db, &msg.session_id, &entry)
+            crate::core::agent_memory_service::append(
+                &state.db,
+                crate::core::agent_memory_service::MemoryScope::Global,
+                &msg.session_id,
+                &entry,
+            )
                 .await
                 .map_err(|e| format!("memory: {e}"))?;
         }

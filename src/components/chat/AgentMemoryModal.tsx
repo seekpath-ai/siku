@@ -3,15 +3,15 @@ import { Brain, X, Loader2, Check, BookOpen, Pen, MoreVertical, Code, Columns2, 
 import { MarkdownEditor } from '@/components/editor/MarkdownEditor';
 import { WikiMarkdown } from '@/components/notes/WikiMarkdown';
 import { VersionHistoryDialog } from '@/components/notes/VersionHistoryDialog';
-import { agentMemoryGet, agentMemorySet, agentMemorySetActive, agentMemoryRestore, agentMemoryReview, type AgentMemoryReview } from '@/lib/tauri';
+import { agentMemoryGet, agentMemorySet, agentMemorySetActive, agentMemoryRestore, agentMemoryReview, type AgentMemoryReview, type MemoryScope } from '@/lib/tauri';
 import type { NoteVersion } from '@/lib/types';
 
 interface Props {
   sessionId: string;
   onClose: () => void;
-  /** Called whenever the active flag changes so the input-area brain button
-   * can update its appearance. */
-  onActiveChange?: (active: boolean) => void;
+  /** Called whenever the memory state (either scope) may have changed so the
+   * input-area brain button can re-query and update its appearance. */
+  onStateChange?: () => void;
 }
 
 type ViewMode = 'edit' | 'reading' | 'source' | 'split-h' | 'split-v';
@@ -21,10 +21,18 @@ const SAVE_DEBOUNCE_MS = 800;
  * turn while active, so long memories cost tokens on every message. */
 const LONG_MEMORY_CHARS = 2000;
 
-/** Long-term memory editor for one agent (chat session). Opens as a modal;
- * the memory lives outside the note tree and is only reachable here. The
- * view modes (edit / reading / source / split) mirror the note editor. */
-export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) {
+const SCOPE_HINT: Record<MemoryScope, string> = {
+  global: '全局记忆跨设备同步：记录用户偏好、项目约定、领域知识、经验法则',
+  device: '本机记忆仅此设备：记录本机软件环境、路径、硬件等设备相关事实',
+};
+
+/** Long-term memory editor for one agent (chat session), with two scopes:
+ * 「全局」(synced across devices) and 「本机」(this device only — for local
+ * environment facts that would be false on other machines). Opens as a
+ * modal; the memory lives outside the note tree and is only reachable here.
+ * The view modes (edit / reading / source / split) mirror the note editor. */
+export function AgentMemoryModal({ sessionId, onClose, onStateChange }: Props) {
+  const [scope, setScope] = useState<MemoryScope>('global');
   const [content, setContent] = useState('');
   const [active, setActive] = useState(true);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
@@ -43,17 +51,24 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
   const menuRef = useRef<HTMLDivElement>(null);
   const latest = useRef(content);
   latest.current = content;
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
 
   useEffect(() => {
     let cancelled = false;
-    agentMemoryGet(sessionId)
+    setLoaded(false);
+    setContent('');
+    setUpdatedAt(null);
+    setReview(null);
+    setReviewError(null);
+    agentMemoryGet(sessionId, scope)
       .then((m) => {
         if (cancelled) return;
         if (m) {
           setContent(m.content);
           setActive(m.active);
           setUpdatedAt(m.updated_at);
-          onActiveChange?.(m.active);
+          onStateChange?.();
         }
         setLoaded(true);
       })
@@ -62,7 +77,7 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId]);
+  }, [sessionId, scope]);
 
   useEffect(() => {
     const onDown = (e: KeyboardEvent) => {
@@ -85,16 +100,18 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
     return () => document.removeEventListener('mousedown', onDown);
   }, [menuOpen]);
 
-  const flushSave = useCallback(() => {
+  const flushSave = useCallback((): Promise<void> => {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = null;
     setSaved('saving');
-    agentMemorySet(sessionId, latest.current)
+    return agentMemorySet(sessionId, latest.current, scopeRef.current)
       .then(() => {
         setSaved('saved');
         setUpdatedAt(new Date().toISOString());
+        onStateChange?.();
       })
       .catch(() => setSaved('idle'));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
   const handleChange = (value: string) => {
@@ -104,11 +121,19 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
     saveTimer.current = setTimeout(flushSave, SAVE_DEBOUNCE_MS);
   };
 
+  /** Switch the 全局/本机 tab: flush pending edits of the current scope
+   * first, so a fast tab switch can never lose or cross-write content. */
+  const switchScope = (next: MemoryScope) => {
+    if (next === scope) return;
+    flushSave().finally(() => setScope(next));
+  };
+
   const toggleActive = () => {
     const next = !active;
     setActive(next);
-    onActiveChange?.(next);
-    agentMemorySetActive(sessionId, next).catch(() => {});
+    agentMemorySetActive(sessionId, next, scope)
+      .then(() => onStateChange?.())
+      .catch(() => {});
   };
 
   /** Edit/reading toggle, mirroring the note editor's header button. */
@@ -121,11 +146,11 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
   };
 
   const handleReview = async () => {
-    if (saveTimer.current) flushSave();
+    if (saveTimer.current) await flushSave();
     setReviewing(true);
     setReviewError(null);
     try {
-      setReview(await agentMemoryReview(sessionId));
+      setReview(await agentMemoryReview(sessionId, scope));
     } catch (err) {
       setReviewError(String(err instanceof Error ? err.message : err));
     } finally {
@@ -150,12 +175,13 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
   /** Restore a version: cancel any pending autosave first so it cannot
    * overwrite the restored content, then apply and show it. The backend
    * snapshots the pre-restore content itself. */
-  const handleVersionRestore = async (version: NoteVersion) => {    if (saveTimer.current) {
+  const handleVersionRestore = async (version: NoteVersion) => {
+    if (saveTimer.current) {
       clearTimeout(saveTimer.current);
       saveTimer.current = null;
     }
     try {
-      await agentMemoryRestore(sessionId, version.id);
+      await agentMemoryRestore(sessionId, version.id, scope);
       setContent(version.content);
       latest.current = version.content;
       setSaved('saved');
@@ -199,6 +225,23 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
         <div className="flex items-center gap-2 px-4 py-2.5 border-b border-surface-hover shrink-0">
           <Brain size={15} className={active ? 'text-primary' : 'text-text-secondary/50'} />
           <span className="text-sm font-medium text-text-primary">长期记忆</span>
+          {/* 全局 / 本机 作用域切换 */}
+          <div className="flex items-center rounded-lg border border-surface-hover overflow-hidden">
+            {(['global', 'device'] as const).map((s) => (
+              <button
+                key={s}
+                onClick={() => switchScope(s)}
+                title={SCOPE_HINT[s]}
+                className={`px-2.5 py-1 text-[11px] transition-colors ${
+                  scope === s
+                    ? 'bg-primary/15 text-primary'
+                    : 'text-text-secondary hover:text-text-primary hover:bg-surface-hover'
+                }`}
+              >
+                {s === 'global' ? '全局' : '本机'}
+              </button>
+            ))}
+          </div>
           <span className="text-[11px] text-text-secondary/60">
             {saved === 'saving' ? (
               <span className="inline-flex items-center gap-1"><Loader2 size={11} className="animate-spin" />保存中</span>
@@ -366,16 +409,20 @@ export function AgentMemoryModal({ sessionId, onClose, onActiveChange }: Props) 
               : `${content.length} 字`}
           </span>
           <span className="text-[11px] text-text-secondary/40">
-            记录智能体身份、职责、用户偏好、经验法则等；激活时作为系统提示词注入
+            {SCOPE_HINT[scope]}；激活时作为系统提示词注入
           </span>
         </div>
       </div>
 
       {/* Version history reuses the note dialog; snapshots are stored in
-          note_versions keyed by session id. */}
+          note_versions keyed by the scope's versions key. */}
       {versionOpen && (
         <VersionHistoryDialog
-          current={{ id: sessionId, title: '长期记忆', content }}
+          current={{
+            id: scope === 'device' ? `${sessionId}:local` : sessionId,
+            title: scope === 'device' ? '本机记忆' : '长期记忆',
+            content,
+          }}
           onRestore={handleVersionRestore}
           onClose={() => setVersionOpen(false)}
         />

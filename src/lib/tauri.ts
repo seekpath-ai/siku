@@ -815,7 +815,11 @@ export async function skillsOpenDirectory(): Promise<void> {
   return invoke<void>('skills_open_directory');
 }
 
-// Agent long-term memory (per chat session, brain button in the input area)
+// Agent long-term memory (per chat session, brain button in the input area).
+// scope: 'global' (default — synced across devices) | 'device' (this machine
+// only, never synced; for local environment facts).
+export type MemoryScope = 'global' | 'device';
+
 export interface AgentMemory {
   id: string;
   content: string;
@@ -823,20 +827,20 @@ export interface AgentMemory {
   updated_at: string;
 }
 
-export async function agentMemoryGet(sessionId: string): Promise<AgentMemory | null> {
-  return invoke<AgentMemory | null>('agent_memory_get', { sessionId });
+export async function agentMemoryGet(sessionId: string, scope?: MemoryScope): Promise<AgentMemory | null> {
+  return invoke<AgentMemory | null>('agent_memory_get', { sessionId, scope });
 }
 
-export async function agentMemorySet(sessionId: string, content: string): Promise<void> {
-  return invoke<void>('agent_memory_set', { sessionId, content });
+export async function agentMemorySet(sessionId: string, content: string, scope?: MemoryScope): Promise<void> {
+  return invoke<void>('agent_memory_set', { sessionId, content, scope });
 }
 
-export async function agentMemorySetActive(sessionId: string, active: boolean): Promise<void> {
-  return invoke<void>('agent_memory_set_active', { sessionId, active });
+export async function agentMemorySetActive(sessionId: string, active: boolean, scope?: MemoryScope): Promise<void> {
+  return invoke<void>('agent_memory_set_active', { sessionId, active, scope });
 }
 
-export async function agentMemoryRestore(sessionId: string, versionId: string): Promise<void> {
-  return invoke<void>('agent_memory_restore', { sessionId, versionId });
+export async function agentMemoryRestore(sessionId: string, versionId: string, scope?: MemoryScope): Promise<void> {
+  return invoke<void>('agent_memory_restore', { sessionId, versionId, scope });
 }
 
 export interface AgentMemoryReview {
@@ -847,8 +851,8 @@ export interface AgentMemoryReview {
 }
 
 /** Ask the session's own model to review the long-term memory and propose a revision. */
-export async function agentMemoryReview(sessionId: string): Promise<AgentMemoryReview> {
-  return invoke<AgentMemoryReview>('agent_memory_review', { sessionId });
+export async function agentMemoryReview(sessionId: string, scope?: MemoryScope): Promise<AgentMemoryReview> {
+  return invoke<AgentMemoryReview>('agent_memory_review', { sessionId, scope });
 }
 
 // ============================================================

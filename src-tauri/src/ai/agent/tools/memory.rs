@@ -1,16 +1,19 @@
 //! memory_read / memory_write: agent access to the session's long-term
-//! memory document (`agent_memories` — per-session, synced across devices,
-//! versioned via note_versions snapshots so overwrites are recoverable).
+//! memory documents. Two scopes (see agent_memory_service):
+//! - global (`agent_memories` — synced across devices),
+//! - device (`agent_memories_local` — this machine only, never synced).
+//! Both are versioned via note_versions snapshots so overwrites are
+//! recoverable.
 //!
-//! The same document is shown in the chat input's brain-button modal and
-//! injected into the system prompt when active, so agent writes take effect
-//! on the next turn automatically.
+//! The same documents are shown in the chat input's brain-button modal
+//! (「全局 / 本机」tabs) and injected into the system prompt when active, so
+//! agent writes take effect on the next turn automatically.
 
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 
 use crate::ai::agent::tool_registry::{Tool, ToolParameter};
-use crate::core::agent_memory_service;
+use crate::core::agent_memory_service::{self, MemoryScope};
 
 /// Read the session's long-term memory. Auto-approved (read-only).
 pub struct MemoryReadTool {
@@ -30,7 +33,7 @@ impl Tool for MemoryReadTool {
         "memory_read"
     }
     fn description(&self) -> &str {
-        "Read this conversation's long-term memory (a persistent markdown document that survives across turns and devices). Use it to recall user preferences, decisions and experience recorded earlier."
+        "Read this conversation's long-term memory (persistent markdown documents that survive across turns). There are two scopes: global memory syncs across devices; device memory holds facts about this machine only. Use them to recall user preferences, decisions, experience and environment facts recorded earlier."
     }
     fn parameters(&self) -> Vec<ToolParameter> {
         vec![]
@@ -40,14 +43,21 @@ impl Tool for MemoryReadTool {
     }
 
     async fn execute(&self, _args: serde_json::Value) -> Result<String, String> {
-        match agent_memory_service::get(&self.db, &self.session_id).await {
-            Ok(Some(m)) if !m.content.trim().is_empty() => {
-                let state = if m.active { "active" } else { "inactive (not injected into prompts)" };
-                Ok(format!("Long-term memory ({state}):\n\n{}", m.content))
+        let mut out = String::new();
+        for (scope, label) in [
+            (MemoryScope::Global, "Global memory (synced across devices)"),
+            (MemoryScope::Local, "Device memory (this machine only)"),
+        ] {
+            match agent_memory_service::get(&self.db, scope, &self.session_id).await {
+                Ok(Some(m)) if !m.content.trim().is_empty() => {
+                    let state = if m.active { "active" } else { "inactive (not injected into prompts)" };
+                    out.push_str(&format!("## {label} — {state}\n\n{}\n\n", m.content));
+                }
+                Ok(_) => out.push_str(&format!("## {label}\n\n(empty)\n\n")),
+                Err(e) => return Err(format!("memory read failed: {e}")),
             }
-            Ok(_) => Ok("Long-term memory is empty.".to_string()),
-            Err(e) => Err(format!("memory read failed: {e}")),
         }
+        Ok(out.trim_end().to_string())
     }
 }
 
@@ -71,7 +81,7 @@ impl Tool for MemoryWriteTool {
         "memory_write"
     }
     fn description(&self) -> &str {
-        "Write to this conversation's long-term memory. mode=append (default) adds a paragraph — use it to record experience, user preferences and decisions worth keeping; mode=overwrite replaces the whole document (the previous content is snapshotted and recoverable). Keep entries short and factual."
+        "Write to this conversation's long-term memory. mode=append (default) adds a paragraph — appends are automatically prefixed with a `## YYYY-MM-DD` date heading, so do NOT add your own date heading; mode=overwrite replaces the whole document (the previous content is snapshotted and recoverable). scope=global (default) syncs across devices — use it for user preferences, project conventions, domain knowledge and experience; scope=device stays on this machine — use it for facts about the local environment ONLY (OS, installed software and versions, absolute paths, hardware). Never record machine-specific facts in the global scope: they would be injected on other devices where they are false. Keep entries short and factual."
     }
     fn parameters(&self) -> Vec<ToolParameter> {
         vec![
@@ -87,6 +97,12 @@ impl Tool for MemoryWriteTool {
                 description: "append (default) | overwrite".into(),
                 required: false,
             },
+            ToolParameter {
+                name: "scope".into(),
+                param_type: "string".into(),
+                description: "global (default, syncs across devices) | device (this machine only)".into(),
+                required: false,
+            },
         ]
     }
 
@@ -96,18 +112,35 @@ impl Tool for MemoryWriteTool {
             return Err("content is empty".to_string());
         }
         let mode = args["mode"].as_str().unwrap_or("append");
+        let scope = MemoryScope::from_param(args["scope"].as_str());
+        let scope_label = match scope {
+            MemoryScope::Global => "全局记忆（跨设备同步）",
+            MemoryScope::Local => "本机记忆（仅此设备）",
+        };
         match mode {
             "append" => {
-                agent_memory_service::append(&self.db, &self.session_id, content)
+                // Stamp each appended paragraph with a date heading so every
+                // entry stays traceable (the document itself only carries a
+                // whole-doc updated_at). Content that already starts with a
+                // heading is left alone — e.g. the 「打标为经验」 path writes
+                // its own `## 经验（date）` header.
+                let dated = if content.starts_with('#') {
+                    content.to_string()
+                } else {
+                    let now = crate::core::time::now_iso();
+                    let date = now.get(..10).unwrap_or(&now);
+                    format!("## {date}\n\n{content}")
+                };
+                agent_memory_service::append(&self.db, scope, &self.session_id, &dated)
                     .await
                     .map_err(|e| format!("memory append failed: {e}"))?;
-                Ok("已追加到长期记忆。".to_string())
+                Ok(format!("已追加到{scope_label}。"))
             }
             "overwrite" => {
-                agent_memory_service::set_content(&self.db, &self.session_id, content)
+                agent_memory_service::set_content(&self.db, scope, &self.session_id, content)
                     .await
                     .map_err(|e| format!("memory overwrite failed: {e}"))?;
-                Ok("长期记忆已重写（旧内容已快照，可在记忆面板的历史版本中恢复）。".to_string())
+                Ok(format!("{scope_label}已重写（旧内容已快照，可在记忆面板的历史版本中恢复）。"))
             }
             other => Err(format!("unknown mode: {other} (expected append|overwrite)")),
         }

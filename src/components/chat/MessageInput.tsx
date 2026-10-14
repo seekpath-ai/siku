@@ -57,23 +57,37 @@ export function MessageInput({ disabled }: Props) {
   // Approval policy quick switch (per session, persisted; next-turn effect).
   const [approvalConfig, setApprovalConfig] = useState<ApprovalConfig>({ mode: 'auto' });
 
+  // Long-term memory has two scopes (global synced / device-local); the
+  // brain button reflects either: lit when any scope is injected, amber when
+  // any active scope has gone stale (90+ days untouched).
+  const refreshMemoryState = useCallback(() => {
+    if (!activeSessionId) return;
+    Promise.all([
+      agentMemoryGet(activeSessionId, 'global'),
+      agentMemoryGet(activeSessionId, 'device'),
+    ])
+      .then((mems) => {
+        const injected = mems.filter((m) => m?.active && m.content.trim());
+        setMemoryActive(injected.length > 0);
+        let worst: number | null = null;
+        for (const m of injected) {
+          const days = Math.floor((Date.now() - new Date(m!.updated_at).getTime()) / 86400000);
+          if (Number.isFinite(days) && days >= 90) worst = Math.max(worst ?? 0, days);
+        }
+        setMemoryStaleDays(worst);
+      })
+      .catch(() => {});
+  }, [activeSessionId]);
+
   useEffect(() => {
     setMemoryActive(false);
     setMemoryStaleDays(null);
+    refreshMemoryState();
     if (!activeSessionId) return;
-    agentMemoryGet(activeSessionId)
-      .then((m) => {
-        setMemoryActive(m?.active ?? false);
-        if (m?.active && m.content.trim()) {
-          const days = Math.floor((Date.now() - new Date(m.updated_at).getTime()) / 86400000);
-          setMemoryStaleDays(Number.isFinite(days) && days >= 90 ? days : null);
-        }
-      })
-      .catch(() => {});
     agentGetSession(activeSessionId)
       .then((s) => setApprovalConfig(s.approval_config ?? { mode: 'auto' }))
       .catch(() => {});
-  }, [activeSessionId]);
+  }, [activeSessionId, refreshMemoryState]);
 
   const pickApprovalMode = (mode: ApprovalConfig['mode']) => {
     if (!activeSessionId || mode === approvalConfig.mode) return;
@@ -484,19 +498,9 @@ export function MessageInput({ disabled }: Props) {
             setMemoryOpen(false);
             // Editing inside the modal clears staleness — refresh the brain
             // button so the amber state disappears without a session switch.
-            agentMemoryGet(activeSessionId)
-              .then((m) => {
-                setMemoryActive(m?.active ?? false);
-                if (m?.active && m.content.trim()) {
-                  const days = Math.floor((Date.now() - new Date(m.updated_at).getTime()) / 86400000);
-                  setMemoryStaleDays(Number.isFinite(days) && days >= 90 ? days : null);
-                } else {
-                  setMemoryStaleDays(null);
-                }
-              })
-              .catch(() => {});
+            refreshMemoryState();
           }}
-          onActiveChange={setMemoryActive}
+          onStateChange={refreshMemoryState}
         />
       )}
       {contextOpen && (

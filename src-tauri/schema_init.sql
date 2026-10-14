@@ -316,6 +316,18 @@ CREATE TABLE IF NOT EXISTS agent_memories (
     updated_at TEXT NOT NULL DEFAULT ''
 );
 
+-- agent_memories_local: device-scoped long-term memory, same shape as
+-- agent_memories but intentionally NOT a CRR — facts about this machine
+-- (OS, installed software, absolute paths, hardware) must never sync, or
+-- they would be injected on other devices where they are false.
+CREATE TABLE IF NOT EXISTS agent_memories_local (
+    id TEXT PRIMARY KEY NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
 -- llm_providers: unified LLM configuration pool
 CREATE TABLE IF NOT EXISTS llm_providers (
     id TEXT PRIMARY KEY,

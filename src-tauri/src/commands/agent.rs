@@ -213,8 +213,10 @@ fn truncated_history_note(
 pub async fn agent_memory_review(
     state: State<'_, AppState>,
     session_id: String,
+    scope: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let memory = crate::core::agent_memory_service::get(&state.db, &session_id)
+    let scope = crate::core::agent_memory_service::MemoryScope::from_param(scope.as_deref());
+    let memory = crate::core::agent_memory_service::get(&state.db, scope, &session_id)
         .await
         .map_err(|e| format!("db error: {e}"))?
         .filter(|m| !m.content.trim().is_empty())
@@ -248,8 +250,14 @@ pub async fn agent_memory_review(
 
     let today = crate::core::time::now_iso();
     let today = today.get(..10).unwrap_or(&today);
+    let scope_note = match scope {
+        crate::core::agent_memory_service::MemoryScope::Local =>
+            "这份是「本机记忆」：记录当前设备的软件环境、路径、硬件等事实，不跨设备同步。机器相关的条目是预期内容，不要因它们「只适用于某台设备」而删除；\n",
+        crate::core::agent_memory_service::MemoryScope::Global =>
+            "这份是「全局记忆」：会跨设备同步，并在所有设备上注入。\n",
+    };
     let sys = format!(
-        "你是记忆审查员。用户与智能体共同维护一份「长期记忆」文档，它会在每轮对话注入系统提示词。请审查并修订它：\n\
+        "你是记忆审查员。用户与智能体共同维护一份「长期记忆」文档，它会在每轮对话注入系统提示词。{scope_note}请审查并修订它：\n\
          1. 删除明显过时、重复或相互矛盾的条目（矛盾时保留较新的表述；文档开头的日期戳是最后更新时间，今天是 {today}）；\n\
          2. 合并同类条目、压缩冗长表述，但不得丢失事实细节（名称、路径、数字、偏好结论）；\n\
          3. 不得新增文档中不存在的事实；\n\
@@ -1254,22 +1262,67 @@ pub(crate) async fn run_agent_turn(
     };
 
     // Long-term memory: injected into the system prompt when the user has
-    // activated it for this agent (brain button in the chat input). The
-    // freshness stamp lets the model discount content that has gone stale —
-    // an undated "user preference" from a year ago should not override what
-    // the user said yesterday.
-    let long_term_memory = crate::core::agent_memory_service::get(&state.db, &session_id)
-        .await
-        .ok()
-        .flatten()
-        .filter(|m| m.active && !m.content.trim().is_empty())
-        .map(|m| {
-            let date = m.updated_at.get(..10).unwrap_or(&m.updated_at);
-            format!(
-                "[本记忆最后更新于 {date}；年代久远的内容可能已过时，与近期对话冲突时以对话为准]\n{}",
-                m.content
+    // activated it for this agent (brain button in the chat input). Two
+    // scopes: the global document syncs across devices; the device document
+    // holds facts about THIS machine only and is labelled with the device
+    // name so the model never applies them elsewhere. The freshness stamp
+    // lets the model discount content that has gone stale — an undated
+    // "user preference" from a year ago should not override what the user
+    // said yesterday.
+    let stamp = |m: &crate::core::agent_memory_service::AgentMemory| -> String {
+        let date = m.updated_at.get(..10).unwrap_or(&m.updated_at);
+        date.to_string()
+    };
+    let global_memory = crate::core::agent_memory_service::get(
+        &state.db,
+        crate::core::agent_memory_service::MemoryScope::Global,
+        &session_id,
+    )
+    .await
+    .ok()
+    .flatten()
+    .filter(|m| m.active && !m.content.trim().is_empty())
+    .map(|m| {
+        format!(
+            "[本记忆最后更新于 {}；年代久远的内容可能已过时，与近期对话冲突时以对话为准]\n{}",
+            stamp(&m),
+            m.content
+        )
+    });
+    let device_memory = match crate::core::agent_memory_service::get(
+        &state.db,
+        crate::core::agent_memory_service::MemoryScope::Local,
+        &session_id,
+    )
+    .await
+    .ok()
+    .flatten()
+    .filter(|m| m.active && !m.content.trim().is_empty())
+    {
+        Some(m) => {
+            let device_name = crate::core::settings_service::get_device_setting(
+                &state.db,
+                crate::commands::account::ACCOUNT_DEVICE_NAME_KEY,
             )
-        });
+            .await
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "当前设备".to_string());
+            Some(format!(
+                "## 本机记忆（仅适用于设备「{device_name}」，不要套用到其它设备；最后更新于 {}）\n{}",
+                stamp(&m),
+                m.content
+            ))
+        }
+        None => None,
+    };
+    let long_term_memory = match (global_memory, device_memory) {
+        (Some(g), Some(d)) => Some(format!("{g}\n\n{d}")),
+        (Some(g), None) => Some(g),
+        (None, Some(d)) => Some(d),
+        (None, None) => None,
+    };
 
     let engine = AgentEngine::new(
         llm_client,

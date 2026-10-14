@@ -507,29 +507,37 @@ CREATE INDEX IF NOT EXISTS idx_ki_source ON knowledge_items(source_type, source_
 CREATE INDEX IF NOT EXISTS idx_ki_created ON knowledge_items(created_at);
 
 -- research_topics
+-- CRR table (synced): PK must be NOT NULL per CRR rules; status values are
+-- enforced by the writers, not a CHECK.
 CREATE TABLE IF NOT EXISTS research_topics (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
     description TEXT,
     keywords TEXT NOT NULL DEFAULT '[]',
-    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','paused','completed','archived')),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
 );
 
 -- research_sources
+-- CRR table (synced): no FK and no CHECK constraints per CRR rules — the
+-- topic cascade is explicit in commands/research.rs::research_delete_topic,
+-- and source_type/status values are enforced by the writers.
 CREATE TABLE IF NOT EXISTS research_sources (
-    id TEXT PRIMARY KEY,
-    topic_id TEXT NOT NULL REFERENCES research_topics(id) ON DELETE CASCADE,
-    source_type TEXT NOT NULL CHECK(source_type IN ('arxiv','scholar','crossref','manual')),
+    id TEXT PRIMARY KEY NOT NULL,
+    topic_id TEXT NOT NULL DEFAULT '',
+    source_type TEXT NOT NULL DEFAULT '',
     source_id TEXT,
     title TEXT,
     authors TEXT,
     url TEXT,
     doi TEXT,
-    status TEXT NOT NULL DEFAULT 'discovered' CHECK(status IN ('discovered','downloaded','imported','read')),
+    status TEXT NOT NULL DEFAULT 'discovered',
     metadata TEXT NOT NULL DEFAULT '{}',
-    discovered_at TEXT NOT NULL,
+    -- LLM relevance assessment (NULL = not scored): 0-10 score + one-line reason.
+    relevance_score INTEGER,
+    relevance_reason TEXT,
+    discovered_at TEXT NOT NULL DEFAULT '',
     processed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_rs_topic ON research_sources(topic_id);

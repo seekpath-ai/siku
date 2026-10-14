@@ -463,6 +463,10 @@ export interface ResearchSource {
   doi: string | null;
   status: ResearchSourceStatus;
   metadata: Record<string, unknown>;
+  /** LLM relevance to the topic, 0-10; null = not scored. */
+  relevance_score?: number | null;
+  /** One-line justification from the scoring model. */
+  relevance_reason?: string | null;
   discovered_at: string;
   processed_at: string | null;
 }

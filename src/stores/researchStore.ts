@@ -9,6 +9,8 @@ interface ResearchState {
   /** Whether more pages of sources remain to be loaded. */
   hasMore: boolean;
   loadingMoreSources: boolean;
+  /** Per-topic count of 'discovered' (unread) sources. */
+  unreadCounts: Record<string, number>;
 
   setTopics: (t: ResearchTopic[]) => void;
   setActiveTopic: (id: string | null) => void;
@@ -19,6 +21,9 @@ interface ResearchState {
   setHasMore: (v: boolean) => void;
   setLoadingMoreSources: (v: boolean) => void;
   removeTopic: (id: string) => void;
+  setUnreadCounts: (c: Record<string, number>) => void;
+  /** Bump a topic's unread count (auto-discovery events). */
+  bumpUnread: (topicId: string, n: number) => void;
 }
 
 export const useResearchStore = create<ResearchState>((set) => ({
@@ -28,6 +33,7 @@ export const useResearchStore = create<ResearchState>((set) => ({
   isDiscovering: false,
   hasMore: false,
   loadingMoreSources: false,
+  unreadCounts: {},
 
   setTopics: (topics) => set({ topics }),
   setActiveTopic: (id) => set({ activeTopicId: id, sources: [], hasMore: false, loadingMoreSources: false }),
@@ -45,4 +51,9 @@ export const useResearchStore = create<ResearchState>((set) => ({
     topics: s.topics.filter((t) => t.id !== id),
     activeTopicId: s.activeTopicId === id ? null : s.activeTopicId,
   })),
+  setUnreadCounts: (unreadCounts) => set({ unreadCounts }),
+  bumpUnread: (topicId, n) =>
+    set((s) => ({
+      unreadCounts: { ...s.unreadCounts, [topicId]: (s.unreadCounts[topicId] ?? 0) + n },
+    })),
 }));

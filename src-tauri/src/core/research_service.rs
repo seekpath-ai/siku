@@ -5,9 +5,18 @@ use tracing::{info, instrument, warn};
 use crate::core::models::ResearchTopic;
 use crate::core::time::now_iso;
 
-/// Discover new sources for a topic from arXiv + Crossref and persist them.
-/// Returns the number of NEW sources added. Existing sources (matched by
-/// arXiv id or DOI, across ALL topics) are skipped — global dedup.
+/// A newly inserted source queued for LLM relevance scoring.
+struct ScoringCandidate {
+    id: String,
+    title: String,
+    abstract_text: Option<String>,
+}
+
+/// Discover new sources for a topic from arXiv + Crossref + Semantic Scholar
+/// and persist them. Returns the number of NEW sources added. Existing
+/// sources (matched by arXiv id or DOI, across ALL topics) are skipped —
+/// global dedup. New sources then get a batch LLM relevance score
+/// (best-effort: any failure leaves scores NULL).
 ///
 /// When `app` is provided, progress and per-source events are emitted for
 /// incremental display:
@@ -60,6 +69,7 @@ pub async fn discover_for_topic(
 
     let mut added = 0usize;
     let now = now_iso();
+    let mut candidates: Vec<ScoringCandidate> = Vec::new();
 
     // 1. arXiv
     emit("arxiv", 0);
@@ -87,6 +97,11 @@ pub async fn discover_for_topic(
                 .bind(&metadata).bind(&now)
                 .execute(db).await.map_err(|e| format!("db: {e}"))?;
                 added += 1;
+                candidates.push(ScoringCandidate {
+                    id: id.clone(),
+                    title: paper.title.clone(),
+                    abstract_text: Some(paper.abstract_text.clone()),
+                });
                 emit_source(app, topic_id, id, "arxiv", paper.arxiv_id.clone(), paper.title, authors_json, paper.pdf_url, paper.doi, metadata, now.clone());
             }
         }
@@ -122,15 +137,177 @@ pub async fn discover_for_topic(
                 .bind(&metadata).bind(&now)
                 .execute(db).await.map_err(|e| format!("db: {e}"))?;
                 added += 1;
+                candidates.push(ScoringCandidate {
+                    id: id.clone(),
+                    title: title.clone(),
+                    abstract_text: w.abstract_text.clone(),
+                });
                 emit_source(app, topic_id, id, "crossref", doi.clone(), title, authors_json, url, Some(doi), metadata, now.clone());
             }
         }
         Err(e) => warn!(topic_id, error = %e, "crossref search failed"),
     }
 
+    // 3. Semantic Scholar (free graph API; one request per scan).
+    emit("scholar", added);
+    match crate::ai::scraping::semanticscholar::search(&query, limit, proxy.as_deref()).await {
+        Ok(papers) => {
+            for p in papers {
+                let arxiv_id = p.arxiv_id.clone().unwrap_or_default();
+                if source_exists(db, &arxiv_id, p.doi.as_deref()).await? {
+                    continue;
+                }
+                let id = uuid::Uuid::new_v4().to_string();
+                let authors_json = serde_json::to_string(&p.authors).unwrap_or_default();
+                let metadata = serde_json::json!({
+                    "s2_id": p.s2_id,
+                    "arxiv_id": p.arxiv_id,
+                    "year": p.year,
+                    "citation_count": p.citation_count,
+                    "pdf_url": p.pdf_url,
+                })
+                .to_string();
+                // The import pipeline needs a real PDF: prefer the
+                // open-access PDF, fall back to the landing page (import will
+                // report a clear "not a PDF" error for paywalled papers).
+                let url = p.pdf_url.clone().unwrap_or_else(|| p.url.clone());
+                sqlx::query(
+                    "INSERT INTO research_sources (id, topic_id, source_type, source_id, title, authors, url, doi, status, metadata, discovered_at)
+                     VALUES (?, ?, 'scholar', ?, ?, ?, ?, ?, 'discovered', ?, ?)"
+                )
+                .bind(&id).bind(topic_id).bind(&p.s2_id).bind(&p.title)
+                .bind(&authors_json).bind(&url).bind(&p.doi)
+                .bind(&metadata).bind(&now)
+                .execute(db).await.map_err(|e| format!("db: {e}"))?;
+                added += 1;
+                candidates.push(ScoringCandidate {
+                    id: id.clone(),
+                    title: p.title.clone(),
+                    abstract_text: p.abstract_text.clone(),
+                });
+                emit_source(app, topic_id, id, "scholar", p.s2_id.clone(), p.title, authors_json, url, p.doi, metadata, now.clone());
+            }
+        }
+        Err(e) => warn!(topic_id, error = %e, "semantic scholar search failed"),
+    }
+
+    // 4. LLM relevance scoring over just-inserted sources (best-effort).
+    if !candidates.is_empty() {
+        emit("scoring", added);
+        score_candidates(db, &topic.name, &keywords, &candidates).await;
+    }
+
     emit("done", added);
     info!(topic_id, added, "research discovery completed");
     Ok(added)
+}
+
+/// Batch-score new sources against the topic with the configured LLM.
+/// One completion per scan (not per paper); any failure is swallowed so a
+/// broken/slow model never breaks discovery — scores simply stay NULL and
+/// the UI shows the sources unscored.
+async fn score_candidates(
+    db: &SqlitePool,
+    topic_name: &str,
+    keywords: &[String],
+    candidates: &[ScoringCandidate],
+) {
+    let scored = match score_candidates_llm(db, topic_name, keywords, candidates).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "relevance scoring failed; sources left unscored");
+            return;
+        }
+    };
+    for (id, score, reason) in scored {
+        if let Err(e) = sqlx::query(
+            "UPDATE research_sources SET relevance_score = ?, relevance_reason = ? WHERE id = ?",
+        )
+        .bind(score)
+        .bind(&reason)
+        .bind(&id)
+        .execute(db)
+        .await
+        {
+            warn!(error = %e, "failed to store relevance score");
+        }
+    }
+}
+
+/// The raw LLM call behind score_candidates. Returns (source_id, score, reason).
+async fn score_candidates_llm(
+    db: &SqlitePool,
+    topic_name: &str,
+    keywords: &[String],
+    candidates: &[ScoringCandidate],
+) -> Result<Vec<(String, i64, String)>, String> {
+    let llm_config = crate::core::settings_service::load_llm_config(db).await?;
+    if llm_config.api_key.is_empty() && llm_config.provider != crate::ai::llm::LlmProvider::Ollama {
+        return Err("no LLM configured".into());
+    }
+    let client = crate::ai::llm::client::create_llm_client(&llm_config)
+        .map_err(|e| format!("client: {e}"))?;
+
+    let kw = if keywords.is_empty() { topic_name.to_string() } else { keywords.join("、") };
+    let mut list = String::new();
+    for (i, c) in candidates.iter().enumerate() {
+        let abstract_preview: String = c
+            .abstract_text
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(300)
+            .collect();
+        list.push_str(&format!("{}. {}\n   摘要：{}\n", i + 1, c.title, abstract_preview));
+    }
+    let prompt = format!(
+        "课题：{topic_name}\n关键词：{kw}\n\n候选文献：\n{list}\n\
+         请逐条评估每篇文献与该课题的相关性，严格输出 JSON 数组，不要输出任何其它内容：\n\
+         [{{\"i\":1,\"score\":7,\"reason\":\"一句话理由\"}}]\n\
+         score 为 0-10 整数：9-10 直接命中课题核心；6-8 明显相关；3-5 边缘相关；0-2 基本无关。"
+    );
+    let messages = vec![
+        crate::ai::llm::ChatMessage {
+            reasoning_content: None,
+            role: "system".into(),
+            content: "你是文献相关性评估助手，只输出 JSON。".into(),
+            attachments: None, tool_calls: None, tool_call_id: None, name: None,
+        },
+        crate::ai::llm::ChatMessage {
+            reasoning_content: None,
+            role: "user".into(),
+            content: prompt,
+            attachments: None, tool_calls: None, tool_call_id: None, name: None,
+        },
+    ];
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        client.chat_completion(&messages, &[]),
+    )
+    .await
+    .map_err(|_| "scoring timeout".to_string())?
+    .map_err(|e| format!("scoring: {e}"))?;
+
+    // Tolerate prose around the JSON: take the outermost [ … ] span.
+    let text = resp.content;
+    let start = text.find('[').ok_or("no JSON array in scoring output")?;
+    let end = text.rfind(']').ok_or("no JSON array in scoring output")?;
+    #[derive(serde::Deserialize)]
+    struct ScoreRow {
+        i: usize,
+        score: i64,
+        #[serde(default)]
+        reason: String,
+    }
+    let rows: Vec<ScoreRow> =
+        serde_json::from_str(&text[start..=end]).map_err(|e| format!("parse: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let c = candidates.get(r.i.checked_sub(1)?)?;
+            Some((c.id.clone(), r.score.clamp(0, 10), r.reason))
+        })
+        .collect())
 }
 
 /// Emit a single discovered source to the frontend for incremental display.
@@ -163,6 +340,8 @@ fn emit_source(
                     "doi": doi,
                     "status": "discovered",
                     "metadata": metadata,
+                    "relevance_score": serde_json::Value::Null,
+                    "relevance_reason": serde_json::Value::Null,
                     "discovered_at": discovered_at,
                     "processed_at": serde_json::Value::Null,
                 }
@@ -193,7 +372,7 @@ async fn source_exists(db: &SqlitePool, arxiv_id: &str, doi: Option<&str>) -> Re
         .bind(d)
         .fetch_optional(db)
         .await
-        .map_err(|e| format!("db: {e}"))?;
+            .map_err(|e| format!("db: {e}"))?;
         if doi_exists.is_some() {
             return Ok(true);
         }
@@ -206,8 +385,12 @@ async fn source_exists(db: &SqlitePool, arxiv_id: &str, doi: Option<&str>) -> Re
 /// (`research_auto_discover_interval_hours`, `research_discover_max_results`)
 /// and are re-read every cycle, so changes take effect on the next scan
 /// without restarting. Interval 0 disables auto-discovery.
+///
+/// When a scan adds sources, emits `research:auto_discovered`
+/// { topic_id, topic_name, added } so the UI can toast + bump unread badges.
 pub async fn run_auto_discovery(
     db: SqlitePool,
+    app: tauri::AppHandle,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     loop {
@@ -232,8 +415,8 @@ pub async fn run_auto_discovery(
                 break;
             }
         }
-        let topics: Vec<String> = match sqlx::query_scalar(
-            "SELECT id FROM research_topics WHERE status = 'active'"
+        let topics: Vec<(String, String)> = match sqlx::query_as(
+            "SELECT id, name FROM research_topics WHERE status = 'active'"
         )
         .fetch_all(&db)
         .await
@@ -244,9 +427,16 @@ pub async fn run_auto_discovery(
                 continue;
             }
         };
-        for id in &topics {
-            if let Err(e) = discover_for_topic(&db, None, id, None).await {
-                warn!(topic_id = %id, error = %e, "auto-discovery failed");
+        for (id, name) in &topics {
+            match discover_for_topic(&db, Some(&app), id, None).await {
+                Ok(added) if added > 0 => {
+                    let _ = app.emit(
+                        "research:auto_discovered",
+                        serde_json::json!({ "topic_id": id, "topic_name": name, "added": added }),
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!(topic_id = %id, error = %e, "auto-discovery failed"),
             }
         }
     }

@@ -8,7 +8,7 @@ import { FlaskConical, Plus } from 'lucide-react';
 
 function ResearchPage() {
   const navigate = useNavigate();
-  const { topics, activeTopicId, setActiveTopic, isDiscovering, createTopic, discoverSources, updateTopic, deleteTopic } = useResearch();
+  const { topics, activeTopicId, unreadCounts, setActiveTopic, isDiscovering, createTopic, discoverSources, updateTopic, deleteTopic } = useResearch();
   const [showForm, setShowForm] = useState(false);
 
   const handleCreate = async (name: string, keywords: string[], description?: string) => {
@@ -47,6 +47,7 @@ function ResearchPage() {
             key={t.id}
             topic={t}
             isActive={activeTopicId === t.id}
+            unread={unreadCounts[t.id] ?? 0}
             onSelect={() => handleSelect(t.id)}
             onDiscover={() => discoverSources(t.id)}
             onTogglePause={() => updateTopic(t.id, t.status === 'active' ? 'paused' : 'active')}

@@ -194,6 +194,23 @@ pub async fn research_import_source(
     }))
 }
 
+/// Per-topic unread counts: sources still in 'discovered' status (found but
+/// neither imported nor marked read). Powers the topic-card badges and the
+/// auto-discovery toast.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn research_unread_counts(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, i64>, String> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT topic_id, COUNT(*) FROM research_sources WHERE status = 'discovered' GROUP BY topic_id",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| format!("db: {e}"))?;
+    Ok(rows.into_iter().collect())
+}
+
 /// Delete a research topic and its sources
 #[tauri::command]
 #[instrument(skip(state))]

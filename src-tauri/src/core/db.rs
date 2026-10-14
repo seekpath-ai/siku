@@ -30,6 +30,10 @@ pub(crate) const CORE_SYNC_TABLES: &[&str] = &[
     "saved_searches",
     "saved_items",
     "imports",
+    // Research tracking: topics + discovered sources. research_sources is
+    // FK-free (cascade is explicit in research_delete_topic).
+    "research_topics",
+    "research_sources",
     // Per-agent long-term memory (1:1 with chat_sessions, which is optional:
     // memory rows may arrive before/regardless of their session — harmless,
     // they apply once the session exists).
@@ -1129,6 +1133,84 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // Existing DBs: the history column (the exact memory records sent with the
     // turn) was added after the table first shipped.
     add_column_if_missing(&db, "turn_contexts", "history", "TEXT").await?;
+
+    // Migration: research_sources joins the CRR set — the legacy table carries
+    // an FK to research_topics and CHECK constraints, and NOT NULL columns
+    // without defaults; all three are forbidden on CRR tables. Rebuild it
+    // FK-free (gaining the relevance columns); fresh installs already have
+    // this shape from schema_init.sql. (added 2026-10-14)
+    {
+        let ddl: Option<(String,)> = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'research_sources'",
+        )
+        .fetch_optional(&db)
+        .await?;
+        if ddl.map(|(sql,)| sql.contains("REFERENCES research_topics")).unwrap_or(false) {
+            sqlx::query(
+                "CREATE TABLE research_sources_new (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    topic_id TEXT NOT NULL DEFAULT '',
+                    source_type TEXT NOT NULL DEFAULT '',
+                    source_id TEXT,
+                    title TEXT,
+                    authors TEXT,
+                    url TEXT,
+                    doi TEXT,
+                    status TEXT NOT NULL DEFAULT 'discovered',
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    relevance_score INTEGER,
+                    relevance_reason TEXT,
+                    discovered_at TEXT NOT NULL DEFAULT '',
+                    processed_at TEXT
+                )",
+            )
+            .execute(&db)
+            .await?;
+            sqlx::query(
+                "INSERT INTO research_sources_new (id, topic_id, source_type, source_id, title, authors, url, doi, status, metadata, discovered_at, processed_at)
+                 SELECT id, topic_id, source_type, source_id, title, authors, url, doi, status, metadata, discovered_at, processed_at FROM research_sources",
+            )
+            .execute(&db)
+            .await?;
+            sqlx::query("DROP TABLE research_sources").execute(&db).await?;
+            sqlx::query("ALTER TABLE research_sources_new RENAME TO research_sources").execute(&db).await?;
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_rs_topic ON research_sources(topic_id)").execute(&db).await?;
+            sqlx::query("CREATE INDEX IF NOT EXISTS idx_rs_status ON research_sources(status)").execute(&db).await?;
+        }
+    }
+    // research_topics: CRR requires a NOT NULL primary key and a DEFAULT on
+    // every NOT NULL column; the legacy table has a nullable
+    // `id TEXT PRIMARY KEY` and no defaults. Rebuild after research_sources
+    // (its legacy FK references this table).
+    {
+        let ddl: Option<(String,)> = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'research_topics'",
+        )
+        .fetch_optional(&db)
+        .await?;
+        if ddl.map(|(sql,)| !sql.contains("PRIMARY KEY NOT NULL")).unwrap_or(false) {
+            sqlx::query(
+                "CREATE TABLE research_topics_new (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    description TEXT,
+                    keywords TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )",
+            )
+            .execute(&db)
+            .await?;
+            sqlx::query("INSERT INTO research_topics_new SELECT * FROM research_topics")
+                .execute(&db)
+                .await?;
+            sqlx::query("DROP TABLE research_topics").execute(&db).await?;
+            sqlx::query("ALTER TABLE research_topics_new RENAME TO research_topics").execute(&db).await?;
+        }
+    }
+    add_column_if_missing(&db, "research_sources", "relevance_score", "INTEGER").await?;
+    add_column_if_missing(&db, "research_sources", "relevance_reason", "TEXT").await?;
 
     // Per-paper anchored paragraphs (page + bbox + text) for the reader's
     // dual-pane view. Device-local derived data: recomputed from the PDF on

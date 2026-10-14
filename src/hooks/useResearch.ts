@@ -3,7 +3,7 @@ import { useResearchStore } from '@/stores/researchStore';
 import { useDialogStore } from '@/stores/dialogStore';
 import {
   researchListTopics, researchCreateTopic, researchDiscoverSources,
-  researchListSources, researchDeleteTopic, researchUpdateTopic,
+  researchListSources, researchDeleteTopic, researchUpdateTopic, researchUnreadCounts,
 } from '@/lib/tauri';
 
 const reportError = (action: string, err: unknown) => {
@@ -20,7 +20,10 @@ export function useResearch() {
   useEffect(() => { loadTopics(); }, []);
 
   const loadTopics = async () => {
-    try { store.setTopics(await researchListTopics()); }
+    try {
+      store.setTopics(await researchListTopics());
+      store.setUnreadCounts(await researchUnreadCounts());
+    }
     catch (err) { console.error('load topics:', err); }
   };
 
@@ -78,5 +81,5 @@ export function useResearch() {
     catch (err) { reportError('删除课题', err); }
   };
 
-  return { ...store, loadSources, loadMoreSources, createTopic, discoverSources, updateTopic, deleteTopic };
+  return { ...store, loadTopics, loadSources, loadMoreSources, createTopic, discoverSources, updateTopic, deleteTopic };
 }

@@ -5,6 +5,8 @@ import { ConfirmButton } from '@/components/ui/ConfirmButton';
 interface Props {
   topic: ResearchTopic;
   isActive: boolean;
+  /** Unread ('discovered') source count — shown as a badge on the title. */
+  unread?: number;
   onSelect: () => void;
   onDiscover: () => void;
   onTogglePause: () => void;
@@ -20,7 +22,7 @@ const statusBadge: Record<string, { label: string; color: string }> = {
   archived: { label: '归档', color: 'bg-text-secondary/10 text-text-secondary' },
 };
 
-export function TopicCard({ topic, isActive, onSelect, onDiscover, onTogglePause, onArchive, onDelete, isDiscovering }: Props) {
+export function TopicCard({ topic, isActive, unread = 0, onSelect, onDiscover, onTogglePause, onArchive, onDelete, isDiscovering }: Props) {
   const badge = statusBadge[topic.status] || statusBadge.active;
   const keywords: string[] = (() => { try { return JSON.parse(topic.keywords as unknown as string) } catch { return [] } })();
 
@@ -35,6 +37,14 @@ export function TopicCard({ topic, isActive, onSelect, onDiscover, onTogglePause
         <div className="flex items-center gap-2">
           <FlaskConical size={18} className="text-primary" />
           <h3 className="font-medium text-text-primary text-sm">{topic.name}</h3>
+          {unread > 0 && (
+            <span
+              className="min-w-[18px] h-[18px] px-1 rounded-full bg-primary text-white text-[10px] flex items-center justify-center"
+              title={`${unread} 篇待读`}
+            >
+              {unread > 99 ? '99+' : unread}
+            </span>
+          )}
         </div>
         <span className={`text-xs px-2 py-0.5 rounded-full ${badge.color}`}>{badge.label}</span>
       </div>

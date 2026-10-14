@@ -20,7 +20,7 @@ function ResearchTopicPage() {
   const { open: openTab } = useTabStore();
   const {
     topics, sources, isDiscovering, hasMore, loadingMoreSources,
-    setActiveTopic, loadSources, loadMoreSources, discoverSources,
+    setActiveTopic, loadTopics, loadSources, loadMoreSources, discoverSources,
   } = useResearch();
   const [importingId, setImportingId] = useState<string | null>(null);
   const [discoverHint, setDiscoverHint] = useState<string | null>(null);
@@ -49,7 +49,11 @@ function ResearchTopicPage() {
               ? '正在搜索 arXiv…'
               : p === 'crossref'
                 ? '正在搜索 Crossref…'
-                : `发现完成，新增 ${e.payload.found} 条`
+                : p === 'scholar'
+                  ? '正在搜索 Semantic Scholar…'
+                  : p === 'scoring'
+                    ? '正在评估相关性…'
+                    : `发现完成，新增 ${e.payload.found} 条`
           );
         }
       );
@@ -83,6 +87,8 @@ function ResearchTopicPage() {
     try {
       const res = await researchImportSource(source.id);
       await loadSources(topicId);
+      // Import flips 'discovered' → 'imported': refresh the unread badge.
+      loadTopics();
       const go = await confirm(`已导入「${res.title}」到图书馆，是否打开阅读器？`, '导入成功');
       if (go) {
         openTab({

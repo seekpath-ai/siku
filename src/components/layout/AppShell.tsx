@@ -14,6 +14,7 @@ import { runFileBatch, useBatchImportStore } from '@/stores/batchImportStore';
 import { useImportPaper } from '@/hooks/useLibrary';
 import { useShellStore } from '@/stores/shellStore';
 import { useTabStore } from '@/stores/tabStore';
+import { useResearchStore } from '@/stores/researchStore';
 import { notesCreate, bookmarksCreate, settingsAppGet, settingsAppSave, screenshotHotkeySync, screenshotStart } from '@/lib/tauri';
 import { openNoteTab } from '@/lib/openNote';
 import { listen } from '@tauri-apps/api/event';
@@ -134,6 +135,22 @@ export function AppShell({ children }: AppShellProps) {
     });
     return () => unlisten?.();
   }, []);
+
+  // Research auto-discovery: toast + bump the topic's unread badge when a
+  // background scan finds new sources.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<{ topic_id: string; topic_name: string; added: number }>(
+      'research:auto_discovered',
+      (e) => {
+        showToast(`科研追踪：课题「${e.payload.topic_name}」新增 ${e.payload.added} 篇文献`);
+        useResearchStore.getState().bumpUnread(e.payload.topic_id, e.payload.added);
+      }
+    ).then((u) => {
+      unlisten = u;
+    });
+    return () => unlisten?.();
+  }, [showToast]);
 
   // Sync the pinned home tab with the user-configured homepage.
   useEffect(() => {

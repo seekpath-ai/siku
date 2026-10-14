@@ -932,6 +932,10 @@ pub struct ResearchSource {
     pub doi: Option<String>,
     pub status: String,
     pub metadata: String,
+    /// LLM relevance to the topic (0-10); NULL = not scored.
+    pub relevance_score: Option<i64>,
+    /// One-line justification from the scoring model.
+    pub relevance_reason: Option<String>,
     pub discovered_at: String,
     pub processed_at: Option<String>,
 }

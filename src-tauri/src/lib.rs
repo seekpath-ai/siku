@@ -562,9 +562,10 @@ pub fn run() {
 
                 // Background research auto-discovery (active topics).
                 let auto_db = handle2.state::<AppState>().db.clone();
+                let auto_handle = handle2.clone();
                 let auto_shutdown = shutdown_tx.subscribe();
                 tokio::spawn(async move {
-                    crate::core::research_service::run_auto_discovery(auto_db, auto_shutdown).await;
+                    crate::core::research_service::run_auto_discovery(auto_db, auto_handle, auto_shutdown).await;
                 });
 
                 // Restore account auto-sync after a restart: `auth_login`
@@ -888,6 +889,7 @@ pub fn run() {
             commands::research::research_list_sources,
             commands::research::research_import_source,
             commands::research::research_delete_topic,
+            commands::research::research_unread_counts,
             commands::research::research_update_source_status,
             // Notes
             commands::notes::notes_create,

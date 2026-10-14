@@ -1173,6 +1173,11 @@ export async function researchUpdateSourceStatus(sourceId: string, status: strin
   return invoke<void>('research_update_source_status', { sourceId, status });
 }
 
+/** Per-topic count of sources still in 'discovered' status (unread). */
+export async function researchUnreadCounts(): Promise<Record<string, number>> {
+  return invoke<Record<string, number>>('research_unread_counts');
+}
+
 // ============================================================
 // Search
 // ============================================================

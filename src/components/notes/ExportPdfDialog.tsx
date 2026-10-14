@@ -8,6 +8,8 @@ export interface PdfExportOptions {
   numberFigures: boolean;
   /** 封面页：标题 + 导出日期独占一页 */
   coverPage: boolean;
+  /** 公文风格：正文加粗降为常规字重、行内代码去灰底 */
+  officialStyle: boolean;
 }
 
 const STORAGE_KEY = 'siku.pdf-export-options';
@@ -15,9 +17,9 @@ const STORAGE_KEY = 'siku.pdf-export-options';
 function loadOptions(): PdfExportOptions {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return { numberSections: false, numberFigures: false, coverPage: false, ...JSON.parse(raw) };
+    if (raw) return { numberSections: false, numberFigures: false, coverPage: false, officialStyle: false, ...JSON.parse(raw) };
   } catch { /* corrupted value — fall through to defaults */ }
-  return { numberSections: false, numberFigures: false, coverPage: false };
+  return { numberSections: false, numberFigures: false, coverPage: false, officialStyle: false };
 }
 
 interface Props {
@@ -45,6 +47,7 @@ export function ExportPdfDialog({ noteTitle, onConfirm, onCancel }: Props) {
     { key: 'numberSections', label: '章节自动编号', hint: '正文标题前加 1 / 1.1 / 1.1.1' },
     { key: 'numberFigures', label: '图表自动编号', hint: '图片下方加「图 N」，表格加「表 N」' },
     { key: 'coverPage', label: '封面页', hint: '标题与导出日期独占首页' },
+    { key: 'officialStyle', label: '公文风格', hint: '正文加粗降为常规字重，行内代码去灰底' },
   ];
 
   return (

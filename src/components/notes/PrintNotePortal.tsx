@@ -101,6 +101,7 @@ export function PrintNotePortal({ note, content, notes, attachmentsDir, options,
   const rootClass = [
     options.numberSections ? 'pdf-number-sections' : '',
     options.numberFigures ? 'pdf-number-figures' : '',
+    options.officialStyle ? 'pdf-official-style' : '',
   ]
     .filter(Boolean)
     .join(' ');

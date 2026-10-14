@@ -766,6 +766,12 @@ body.in-tauri {
   }
   #siku-print-root th { background: #f3f4f6; font-weight: 600; }
 
+  /* ── 分割线：prose 默认上下各 3em，白底打印件上留白约为段距的 8 倍，
+        收拢到与引用块/列表一致的节奏 ─────────────────────────────── */
+  #siku-print-root hr {
+    margin: 1em 0;
+  }
+
   /* ── 链接、图片 ──────────────────────────────────────────────────── */
   #siku-print-root a {
     color: #111;
@@ -913,6 +919,20 @@ body.in-tauri {
   /* 代码块右上角的语言标签与复制/折行按钮是交互控件，不上纸 */
   #siku-print-root .not-prose .absolute {
     display: none !important;
+  }
+
+  /* ── 公文风格（导出选项开启时）：正文不用加粗强调、行内代码去灰底。
+        标题的字重不动——公文标题本就用黑体；标题内的 strong 继承标题字重，
+        避免出现「半截不加粗的标题」 ────────────────────────────────── */
+  #siku-print-root.pdf-official-style strong,
+  #siku-print-root.pdf-official-style b {
+    font-weight: normal;
+  }
+  #siku-print-root.pdf-official-style :is(h1, h2, h3, h4, h5, h6) :is(strong, b) {
+    font-weight: inherit;
+  }
+  #siku-print-root.pdf-official-style code {
+    background: none !important;
   }
 }
 @page {

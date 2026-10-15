@@ -954,13 +954,20 @@ mod tests {
             .await?;
         assert_ne!(site_a, site_b);
 
-        // B has authored nothing yet: the own-site export is empty (the echo
-        // is suppressed), but the watermark still covers the applied rows.
+        // B has authored nothing yet beyond the schema seeds (the built-in
+        // knowledge domains joined the CRR set on 2026-10-15 and are locally
+        // authored on every device): the echo of A's rows is suppressed, but
+        // the watermark still covers the applied rows.
         let own = export_own_changes_since(&db_b, 0).await?;
         let full = export_changes_since(&db_b, 0).await?;
-        assert!(own.changes.is_empty(), "echo rows must not be re-exported");
-        assert!(!full.changes.is_empty(), "all-sites export keeps foreign rows");
-        assert!(full.changes.iter().all(|c| c.site_id == site_a));
+        assert!(
+            own.changes.iter().all(|c| c.site_id == site_b),
+            "echo rows must not be re-exported"
+        );
+        assert!(
+            full.changes.iter().any(|c| c.site_id == site_a),
+            "all-sites export keeps foreign rows"
+        );
         assert_eq!(
             own.to_db_version, full.to_db_version,
             "filtered echo rows must still advance the watermark"
@@ -1277,8 +1284,12 @@ mod tests {
             .await?;
 
         let changes = export_changes_since(&db_a, 0).await?;
+        // The export may legitimately carry other syncable rows (e.g. the
+        // seeded knowledge domains, which joined the CRR set on 2026-10-15);
+        // the point is that the `app_settings` row (which embeds API keys)
+        // is never among them.
         assert!(
-            changes.changes.is_empty(),
+            changes.changes.iter().all(|c| c.table != "settings"),
             "non-syncable settings row must be filtered out"
         );
         assert!(

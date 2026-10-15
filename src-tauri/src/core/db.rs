@@ -34,6 +34,11 @@ pub(crate) const CORE_SYNC_TABLES: &[&str] = &[
     // FK-free (cascade is explicit in research_delete_topic).
     "research_topics",
     "research_sources",
+    // Knowledge base: domains + items. knowledge_items is FK-free (cascade is
+    // explicit in knowledge_delete_domain). knowledge_items_fts is a
+    // device-local derived index and stays unsynced.
+    "knowledge_domains",
+    "knowledge_items",
     // Per-agent long-term memory (1:1 with chat_sessions, which is optional:
     // memory rows may arrive before/regardless of their session — harmless,
     // they apply once the session exists).
@@ -1138,6 +1143,10 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // legacy shapes are CRR-incompatible. Rebuild + crash recovery lives in
     // migrate_research_crr_tables. (added 2026-10-14)
     migrate_research_crr_tables(&db).await?;
+    // Migration: knowledge_domains/knowledge_items join the CRR set (same
+    // treatment; also repairs the knowledge_items FTS triggers/index after a
+    // rebuild). (added 2026-10-15)
+    migrate_knowledge_crr_tables(&db).await?;
     add_column_if_missing(&db, "research_sources", "relevance_score", "INTEGER").await?;
     add_column_if_missing(&db, "research_sources", "relevance_reason", "TEXT").await?;
 
@@ -1445,14 +1454,10 @@ async fn table_definition_sql(
     Ok(sql.unwrap_or_default())
 }
 
-/// Rebuild the research-tracking tables into CRR-compatible shapes and
-/// recover from interrupted earlier attempts. (added 2026-10-14, hardened
-/// the same day after a startup crash on a stranded `research_sources_new`)
-///
-/// Legacy shapes are CRR-incompatible: `research_sources` carries an FK to
-/// research_topics plus CHECK constraints, `research_topics` has a nullable
-/// `TEXT PRIMARY KEY` and NOT NULL columns without defaults. Fresh installs
-/// get the compliant shapes from schema_init.sql directly.
+/// One table rebuild into a CRR-compatible shape, with recovery from
+/// interrupted earlier attempts. (introduced 2026-10-14 for the research
+/// tables after a startup crash on a stranded `research_sources_new`;
+/// generalized 2026-10-15 for the knowledge tables)
 ///
 /// Every rebuild runs in a single transaction, so a crash leaves no partial
 /// state; a crash *outside* the transaction window (or a broken intermediate
@@ -1464,184 +1469,272 @@ async fn table_definition_sql(
 /// - main table already new-shaped (schema_init recreated it empty, or the
 ///   user added rows after the crash) → merge the stranded rows in
 ///   (OR IGNORE dedups by id) and drop the copy.
-async fn migrate_research_crr_tables(db: &Db) -> anyhow::Result<()> {
-    // Single connection: the PRAGMAs below are per-connection.
+struct CrrRebuildSpec {
+    /// Base table name; the rebuild copy is `<table>_new`.
+    table: &'static str,
+    /// CREATE TABLE statement for `<table>_new` (the compliant shape).
+    new_ddl: &'static str,
+    /// Full column list of the new shape (merge direction).
+    cols: &'static str,
+    /// Columns present in the legacy shape (copy direction).
+    cols_legacy: &'static str,
+    /// Decide from the sqlite_master DDL whether the table is legacy.
+    is_legacy: fn(&str) -> bool,
+    /// Indexes to recreate afterwards (must be IF NOT EXISTS).
+    indexes: &'static [&'static str],
+}
+
+/// Run rebuild specs on ONE connection with FK enforcement off (the PRAGMAs
+/// are per-connection). Returns per-spec whether the table was dropped and
+/// recreated — callers must then recreate dependent objects whose lifetime
+/// is tied to the table (e.g. FTS sync triggers).
+async fn run_crr_rebuilds(db: &Db, specs: &[CrrRebuildSpec]) -> anyhow::Result<Vec<bool>> {
     let mut conn = db.acquire().await?;
     sqlx::query("PRAGMA foreign_keys = OFF").execute(&mut *conn).await?;
     // legacy_alter_table: renames must NOT rewrite REFERENCES in dependents.
     sqlx::query("PRAGMA legacy_alter_table = ON").execute(&mut *conn).await?;
 
-    let result = migrate_research_crr_tables_inner(&mut *conn).await;
+    let mut replaced = Vec::with_capacity(specs.len());
+    let mut result = Ok(());
+    for spec in specs {
+        match rebuild_table_for_crr(&mut conn, spec).await {
+            Ok(r) => replaced.push(r),
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
+    }
 
     sqlx::query("PRAGMA legacy_alter_table = OFF").execute(&mut *conn).await?;
     sqlx::query("PRAGMA foreign_keys = ON").execute(&mut *conn).await?;
-    result
+    result.map(|_| replaced)
 }
 
-async fn migrate_research_crr_tables_inner(conn: &mut sqlx::SqliteConnection) -> anyhow::Result<()> {
-    const SOURCES_NEW_DDL: &str =
-        "CREATE TABLE research_sources_new (
-            id TEXT PRIMARY KEY NOT NULL,
-            topic_id TEXT NOT NULL DEFAULT '',
-            source_type TEXT NOT NULL DEFAULT '',
-            source_id TEXT,
-            title TEXT,
-            authors TEXT,
-            url TEXT,
-            doi TEXT,
-            status TEXT NOT NULL DEFAULT 'discovered',
-            metadata TEXT NOT NULL DEFAULT '{}',
-            relevance_score INTEGER,
-            relevance_reason TEXT,
-            discovered_at TEXT NOT NULL DEFAULT '',
-            processed_at TEXT
-        )";
+async fn rebuild_table_for_crr(
+    conn: &mut sqlx::SqliteConnection,
+    spec: &CrrRebuildSpec,
+) -> anyhow::Result<bool> {
+    let table = spec.table;
+    let new_table = format!("{table}_new");
+    let main_sql = table_definition_sql(&mut *conn, table).await?;
+    let mut legacy = !main_sql.is_empty() && (spec.is_legacy)(&main_sql);
+    let stranded = !table_definition_sql(&mut *conn, &new_table).await?.is_empty();
+    let mut replaced = false;
+
+    if stranded {
+        if legacy {
+            sqlx::query(&format!("DROP TABLE \"{new_table}\""))
+                .execute(&mut *conn)
+                .await
+                .with_context(|| format!("{table}: drop stranded partial copy over legacy table"))?;
+        } else if main_sql.is_empty() {
+            sqlx::query(&format!("ALTER TABLE \"{new_table}\" RENAME TO \"{table}\""))
+                .execute(&mut *conn)
+                .await
+                .with_context(|| format!("{table}: adopt stranded rebuild copy"))?;
+            info!("{}: adopted stranded {}", table, new_table);
+            legacy = false;
+            replaced = true;
+        } else {
+            sqlx::query(&format!(
+                "INSERT OR IGNORE INTO \"{table}\" ({cols}) SELECT {cols} FROM \"{new_table}\"",
+                cols = spec.cols
+            ))
+            .execute(&mut *conn)
+            .await
+            .with_context(|| format!("{table}: merge stranded rebuild copy"))?;
+            sqlx::query(&format!("DROP TABLE \"{new_table}\""))
+                .execute(&mut *conn)
+                .await
+                .with_context(|| format!("{table}: drop merged rebuild copy"))?;
+            info!("{}: merged stranded {} back", table, new_table);
+            legacy = false;
+            // The main table object survived — its triggers are intact.
+        }
+    }
+
+    if legacy {
+        let mut tx = conn.begin().await?;
+        sqlx::query(spec.new_ddl)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("{table}: create rebuild table"))?;
+        sqlx::query(&format!(
+            "INSERT INTO \"{new_table}\" ({cols}) SELECT {cols} FROM \"{table}\"",
+            cols = spec.cols_legacy
+        ))
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("{table}: copy legacy rows"))?;
+        sqlx::query(&format!("DROP TABLE \"{table}\""))
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("{table}: drop legacy table"))?;
+        sqlx::query(&format!("ALTER TABLE \"{new_table}\" RENAME TO \"{table}\""))
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("{table}: rename rebuild table"))?;
+        tx.commit()
+            .await
+            .with_context(|| format!("{table}: commit rebuild"))?;
+        info!("{}: rebuilt legacy table for CRR compatibility", table);
+        replaced = true;
+    }
+    for index_sql in spec.indexes {
+        sqlx::query(index_sql).execute(&mut *conn).await?;
+    }
+    Ok(replaced)
+}
+
+/// Rebuild the research-tracking tables into CRR-compatible shapes (added
+/// 2026-10-14; see CrrRebuildSpec for the crash-recovery semantics). Legacy
+/// shapes are CRR-incompatible: `research_sources` carries an FK to
+/// research_topics plus CHECK constraints, `research_topics` has a nullable
+/// `TEXT PRIMARY KEY` and NOT NULL columns without defaults. Fresh installs
+/// get the compliant shapes from schema_init.sql directly.
+async fn migrate_research_crr_tables(db: &Db) -> anyhow::Result<()> {
     const SOURCES_COLS: &str = "id, topic_id, source_type, source_id, title, authors, url, doi, status, metadata, relevance_score, relevance_reason, discovered_at, processed_at";
     const SOURCES_COLS_LEGACY: &str = "id, topic_id, source_type, source_id, title, authors, url, doi, status, metadata, discovered_at, processed_at";
-    const TOPICS_NEW_DDL: &str =
-        "CREATE TABLE research_topics_new (
-            id TEXT PRIMARY KEY NOT NULL,
-            name TEXT NOT NULL DEFAULT '',
-            description TEXT,
-            keywords TEXT NOT NULL DEFAULT '[]',
-            status TEXT NOT NULL DEFAULT 'active',
-            created_at TEXT NOT NULL DEFAULT '',
-            updated_at TEXT NOT NULL DEFAULT ''
-        )";
     const TOPICS_COLS: &str = "id, name, description, keywords, status, created_at, updated_at";
+    // sources first: its legacy FK targets research_topics.
+    run_crr_rebuilds(db, &[
+        CrrRebuildSpec {
+            table: "research_sources",
+            new_ddl:
+                "CREATE TABLE research_sources_new (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    topic_id TEXT NOT NULL DEFAULT '',
+                    source_type TEXT NOT NULL DEFAULT '',
+                    source_id TEXT,
+                    title TEXT,
+                    authors TEXT,
+                    url TEXT,
+                    doi TEXT,
+                    status TEXT NOT NULL DEFAULT 'discovered',
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    relevance_score INTEGER,
+                    relevance_reason TEXT,
+                    discovered_at TEXT NOT NULL DEFAULT '',
+                    processed_at TEXT
+                )",
+            cols: SOURCES_COLS,
+            cols_legacy: SOURCES_COLS_LEGACY,
+            is_legacy: |sql| sql.contains("REFERENCES research_topics"),
+            indexes: &[
+                "CREATE INDEX IF NOT EXISTS idx_rs_topic ON research_sources(topic_id)",
+                "CREATE INDEX IF NOT EXISTS idx_rs_status ON research_sources(status)",
+            ],
+        },
+        CrrRebuildSpec {
+            table: "research_topics",
+            new_ddl:
+                "CREATE TABLE research_topics_new (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    description TEXT,
+                    keywords TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )",
+            cols: TOPICS_COLS,
+            cols_legacy: TOPICS_COLS,
+            is_legacy: |sql| !sql.contains("PRIMARY KEY NOT NULL"),
+            indexes: &[],
+        },
+    ])
+    .await
+    .map(|_| ())
+}
 
-    // ── research_sources (rebuilt first: its legacy FK targets topics) ──
-    {
-        let mut legacy = table_definition_sql(&mut *conn, "research_sources")
-            .await?
-            .contains("REFERENCES research_topics");
-        let new_sql = table_definition_sql(&mut *conn, "research_sources_new").await?;
-        if !new_sql.is_empty() {
-            if legacy {
-                sqlx::query("DROP TABLE research_sources_new")
-                    .execute(&mut *conn)
-                    .await
-                    .context("research_sources: drop stranded partial copy over legacy table")?;
-            } else if table_definition_sql(&mut *conn, "research_sources").await?.is_empty() {
-                sqlx::query("ALTER TABLE research_sources_new RENAME TO research_sources")
-                    .execute(&mut *conn)
-                    .await
-                    .context("research_sources: adopt stranded rebuild copy")?;
-                info!("research_sources: adopted stranded research_sources_new");
-                legacy = false;
-            } else {
-                sqlx::query(&format!(
-                    "INSERT OR IGNORE INTO research_sources ({SOURCES_COLS}) SELECT {SOURCES_COLS} FROM research_sources_new"
-                ))
-                .execute(&mut *conn)
+/// Rebuild the knowledge-base tables into CRR-compatible shapes (added
+/// 2026-10-15). Legacy shapes: `knowledge_items` carries an FK to
+/// knowledge_domains, `knowledge_domains` has a CHECK on domain_type, and
+/// both have nullable TEXT PKs plus NOT NULL columns without defaults.
+///
+/// When knowledge_items is replaced, its FTS sync triggers die with the drop
+/// and the external-content index still maps the OLD rowids — recreate the
+/// triggers and rebuild the index (statements mirror schema_init.sql; keep
+/// in sync).
+async fn migrate_knowledge_crr_tables(db: &Db) -> anyhow::Result<()> {
+    const ITEMS_COLS: &str = "id, domain_id, title, content_type, content, source_type, source_id, metadata, tags, created_at, updated_at";
+    const DOMAINS_COLS: &str = "id, name, domain_type, icon, color, sort_order, created_at, updated_at";
+    // items first: its legacy FK targets knowledge_domains.
+    let replaced = run_crr_rebuilds(db, &[
+        CrrRebuildSpec {
+            table: "knowledge_items",
+            new_ddl:
+                "CREATE TABLE knowledge_items_new (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    domain_id TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '',
+                    content_type TEXT NOT NULL DEFAULT 'note',
+                    content TEXT,
+                    source_type TEXT,
+                    source_id TEXT,
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )",
+            cols: ITEMS_COLS,
+            cols_legacy: ITEMS_COLS,
+            is_legacy: |sql| sql.contains("REFERENCES knowledge_domains"),
+            indexes: &[
+                "CREATE INDEX IF NOT EXISTS idx_ki_domain ON knowledge_items(domain_id)",
+                "CREATE INDEX IF NOT EXISTS idx_ki_source ON knowledge_items(source_type, source_id)",
+                "CREATE INDEX IF NOT EXISTS idx_ki_created ON knowledge_items(created_at)",
+            ],
+        },
+        CrrRebuildSpec {
+            table: "knowledge_domains",
+            new_ddl:
+                "CREATE TABLE knowledge_domains_new (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    domain_type TEXT NOT NULL DEFAULT '',
+                    icon TEXT,
+                    color TEXT DEFAULT '#3b82f6',
+                    sort_order INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )",
+            cols: DOMAINS_COLS,
+            cols_legacy: DOMAINS_COLS,
+            is_legacy: |sql| !sql.contains("PRIMARY KEY NOT NULL"),
+            indexes: &[],
+        },
+    ])
+    .await?;
+
+    if replaced.first().copied().unwrap_or(false) {
+        for trigger_sql in [
+            "CREATE TRIGGER IF NOT EXISTS knowledge_items_fts_ai AFTER INSERT ON knowledge_items BEGIN
+               INSERT INTO knowledge_items_fts(rowid, title, content) VALUES (new.rowid, new.title, new.content);
+             END",
+            "CREATE TRIGGER IF NOT EXISTS knowledge_items_fts_ad AFTER DELETE ON knowledge_items BEGIN
+               INSERT INTO knowledge_items_fts(knowledge_items_fts, rowid, title, content) VALUES('delete', old.rowid, old.title, old.content);
+             END",
+            "CREATE TRIGGER IF NOT EXISTS knowledge_items_fts_au AFTER UPDATE ON knowledge_items BEGIN
+               INSERT INTO knowledge_items_fts(knowledge_items_fts, rowid, title, content) VALUES('delete', old.rowid, old.title, old.content);
+               INSERT INTO knowledge_items_fts(rowid, title, content) VALUES (new.rowid, new.title, new.content);
+             END",
+        ] {
+            sqlx::query(trigger_sql)
+                .execute(db)
                 .await
-                .context("research_sources: merge stranded rebuild copy")?;
-                sqlx::query("DROP TABLE research_sources_new")
-                    .execute(&mut *conn)
-                    .await
-                    .context("research_sources: drop merged rebuild copy")?;
-                info!("research_sources: merged stranded research_sources_new back");
-                legacy = false;
-            }
+                .context("knowledge_items: recreate FTS sync trigger")?;
         }
-
-        if legacy {
-            let mut tx = conn.begin().await?;
-            sqlx::query(SOURCES_NEW_DDL)
-                .execute(&mut *tx)
-                .await
-                .context("research_sources: create rebuild table")?;
-            sqlx::query(&format!(
-                "INSERT INTO research_sources_new ({SOURCES_COLS_LEGACY}) SELECT {SOURCES_COLS_LEGACY} FROM research_sources"
-            ))
-            .execute(&mut *tx)
+        sqlx::query("INSERT INTO knowledge_items_fts(knowledge_items_fts) VALUES('rebuild')")
+            .execute(db)
             .await
-            .context("research_sources: copy legacy rows")?;
-            sqlx::query("DROP TABLE research_sources")
-                .execute(&mut *tx)
-                .await
-                .context("research_sources: drop legacy table")?;
-            sqlx::query("ALTER TABLE research_sources_new RENAME TO research_sources")
-                .execute(&mut *tx)
-                .await
-                .context("research_sources: rename rebuild table")?;
-            tx.commit()
-                .await
-                .context("research_sources: commit rebuild")?;
-            info!("research_sources: rebuilt legacy table for CRR compatibility");
-        }
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_rs_topic ON research_sources(topic_id)")
-            .execute(&mut *conn)
-            .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_rs_status ON research_sources(status)")
-            .execute(&mut *conn)
-            .await?;
+            .context("knowledge_items: rebuild FTS index")?;
+        info!("knowledge_items: recreated FTS triggers and rebuilt the index");
     }
-
-    // ── research_topics ──
-    {
-        let mut legacy = !table_definition_sql(&mut *conn, "research_topics")
-            .await?
-            .contains("PRIMARY KEY NOT NULL");
-        let new_sql = table_definition_sql(&mut *conn, "research_topics_new").await?;
-        if !new_sql.is_empty() {
-            if legacy {
-                sqlx::query("DROP TABLE research_topics_new")
-                    .execute(&mut *conn)
-                    .await
-                    .context("research_topics: drop stranded partial copy over legacy table")?;
-            } else if table_definition_sql(&mut *conn, "research_topics").await?.is_empty() {
-                sqlx::query("ALTER TABLE research_topics_new RENAME TO research_topics")
-                    .execute(&mut *conn)
-                    .await
-                    .context("research_topics: adopt stranded rebuild copy")?;
-                info!("research_topics: adopted stranded research_topics_new");
-                legacy = false;
-            } else {
-                sqlx::query(&format!(
-                    "INSERT OR IGNORE INTO research_topics ({TOPICS_COLS}) SELECT {TOPICS_COLS} FROM research_topics_new"
-                ))
-                .execute(&mut *conn)
-                .await
-                .context("research_topics: merge stranded rebuild copy")?;
-                sqlx::query("DROP TABLE research_topics_new")
-                    .execute(&mut *conn)
-                    .await
-                    .context("research_topics: drop merged rebuild copy")?;
-                info!("research_topics: merged stranded research_topics_new back");
-                legacy = false;
-            }
-        }
-
-        if legacy {
-            let mut tx = conn.begin().await?;
-            sqlx::query(TOPICS_NEW_DDL)
-                .execute(&mut *tx)
-                .await
-                .context("research_topics: create rebuild table")?;
-            sqlx::query(&format!(
-                "INSERT INTO research_topics_new ({TOPICS_COLS}) SELECT {TOPICS_COLS} FROM research_topics"
-            ))
-            .execute(&mut *tx)
-            .await
-            .context("research_topics: copy legacy rows")?;
-            sqlx::query("DROP TABLE research_topics")
-                .execute(&mut *tx)
-                .await
-                .context("research_topics: drop legacy table")?;
-            sqlx::query("ALTER TABLE research_topics_new RENAME TO research_topics")
-                .execute(&mut *tx)
-                .await
-                .context("research_topics: rename rebuild table")?;
-            tx.commit()
-                .await
-                .context("research_topics: commit rebuild")?;
-            info!("research_topics: rebuilt legacy table for CRR compatibility");
-        }
-    }
-
     Ok(())
 }
+
 
 
 /// Rebuild pre-sync tables whose schemas are incompatible with CRDT sync:
@@ -3206,6 +3299,136 @@ pub(crate) mod tests {
             .await?;
         assert_eq!(count, 1);
         register_crr_tables(&db, &["research_topics", "research_sources"]).await?;
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Rows written BEFORE crsql_as_crr are backfilled into crsql_changes on
+    /// registration, so they reach peers through the normal full-history
+    /// changeset (db_version 0 export). We rely on this when a table newly
+    /// joins the CRR set (attachments 2026-08, research_* 2026-10-14,
+    /// knowledge_* 2026-10-15): pre-existing rows sync without a snapshot.
+    #[tokio::test]
+    async fn pre_crr_rows_propagate_after_registration() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-precrr-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = connect_with_crsqlite(&dir.join("p.db")).await?;
+
+        sqlx::query("CREATE TABLE probe_t (id TEXT PRIMARY KEY NOT NULL, v TEXT NOT NULL DEFAULT '')")
+            .execute(&db)
+            .await?;
+        sqlx::query("INSERT INTO probe_t VALUES ('r1', 'before-registration')")
+            .execute(&db)
+            .await?;
+        register_crr_tables(&db, &["probe_t"]).await?;
+
+        let (in_changes,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM crsql_changes WHERE \"table\" = 'probe_t'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(in_changes, 1, "crsql_as_crr must backfill pre-existing rows into crsql_changes");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Legacy knowledge tables (nullable PK + CHECK + FK) are rebuilt into
+    /// CRR-compatible shapes, rows survive, and — because the rebuild drops
+    /// and recreates knowledge_items — the FTS sync triggers are recreated
+    /// and the external-content index remapped to the new rowids.
+    #[tokio::test]
+    async fn knowledge_rebuild_migrates_legacy_tables_and_repairs_fts() -> anyhow::Result<()> {
+        let (_dir, db) = research_repro_db("knowledge").await?;
+
+        // Legacy shapes.
+        sqlx::query("CREATE TABLE knowledge_domains (id TEXT PRIMARY KEY, name TEXT NOT NULL, domain_type TEXT NOT NULL CHECK(domain_type IN ('research','learning','life','reading','notes')), icon TEXT, color TEXT DEFAULT '#3b82f6', sort_order INTEGER DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+            .execute(&db)
+            .await?;
+        sqlx::query("CREATE TABLE knowledge_items (id TEXT PRIMARY KEY, domain_id TEXT NOT NULL REFERENCES knowledge_domains(id) ON DELETE CASCADE, title TEXT NOT NULL, content_type TEXT NOT NULL DEFAULT 'note', content TEXT, source_type TEXT, source_id TEXT, metadata TEXT NOT NULL DEFAULT '{}', tags TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+            .execute(&db)
+            .await?;
+        sqlx::query("INSERT INTO knowledge_domains VALUES ('dom-notes','个人笔记','notes','sticky-note','#95a5a6',4,'2026-01-01','2026-01-01')")
+            .execute(&db)
+            .await?;
+        sqlx::query("INSERT INTO knowledge_items (id, domain_id, title, content, created_at, updated_at) VALUES ('k1','dom-notes','私域知识','legacy-body-xyz','2026-01-01','2026-01-01')")
+            .execute(&db)
+            .await?;
+
+        // The FTS index + one sync trigger, as schema_init creates them.
+        sqlx::query("CREATE VIRTUAL TABLE knowledge_items_fts USING fts5(title, content, content='knowledge_items', content_rowid='rowid')")
+            .execute(&db)
+            .await?;
+        sqlx::query("CREATE TRIGGER knowledge_items_fts_ai AFTER INSERT ON knowledge_items BEGIN INSERT INTO knowledge_items_fts(rowid, title, content) VALUES (new.rowid, new.title, new.content); END")
+            .execute(&db)
+            .await?;
+        sqlx::query("INSERT INTO knowledge_items_fts(knowledge_items_fts) VALUES('rebuild')")
+            .execute(&db)
+            .await?;
+
+        super::migrate_knowledge_crr_tables(&db).await?;
+
+        // Data survives; DDL is CRR-compliant.
+        let (title,): (String,) =
+            sqlx::query_as("SELECT title FROM knowledge_items WHERE id = 'k1'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(title, "私域知识", "knowledge rows must survive the rebuild");
+        let items_ddl: (String,) = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='knowledge_items'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert!(!items_ddl.0.contains("REFERENCES"), "FK must be gone");
+        let domains_ddl: (String,) = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='knowledge_domains'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert!(domains_ddl.0.contains("PRIMARY KEY NOT NULL"));
+
+        // The FTS trigger was recreated: a post-migration insert is indexed…
+        sqlx::query("INSERT INTO knowledge_items (id, domain_id, title, content, created_at, updated_at) VALUES ('k2','dom-notes','新条目','fresh-abc','2026-01-02','2026-01-02')")
+            .execute(&db)
+            .await?;
+        let (hit,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM knowledge_items_fts WHERE knowledge_items_fts MATCH 'abc'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(hit, 1, "FTS trigger must be recreated after the rebuild");
+        // …and the index was rebuilt: the migrated row maps its NEW rowid.
+        let (fts_rowid,): (i64,) = sqlx::query_as(
+            "SELECT rowid FROM knowledge_items_fts WHERE knowledge_items_fts MATCH 'body'",
+        )
+        .fetch_one(&db)
+        .await?;
+        let (real_rowid,): (i64,) =
+            sqlx::query_as("SELECT rowid FROM knowledge_items WHERE id = 'k1'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(fts_rowid, real_rowid, "FTS must map the post-rebuild rowid");
+
+        // Rebuilt tables register as CRRs (legacy shapes were rejected).
+        register_crr_tables(&db, &["knowledge_domains", "knowledge_items"]).await?;
+
+        // Idempotent: a second run is a no-op and keeps the data.
+        super::migrate_knowledge_crr_tables(&db).await?;
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM knowledge_items")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(count, 2);
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;

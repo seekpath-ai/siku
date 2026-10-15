@@ -471,15 +471,17 @@ CREATE INDEX IF NOT EXISTS idx_te_session ON tool_executions(session_id);
 CREATE INDEX IF NOT EXISTS idx_te_created ON tool_executions(created_at);
 
 -- knowledge_domains
+-- CRR table (synced): PK must be NOT NULL per CRR rules; the five built-in
+-- domains use fixed ids so every device seeds and converges on the same rows.
 CREATE TABLE IF NOT EXISTS knowledge_domains (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    domain_type TEXT NOT NULL CHECK(domain_type IN ('research','learning','life','reading','notes')),
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    domain_type TEXT NOT NULL DEFAULT '',
     icon TEXT,
     color TEXT DEFAULT '#3b82f6',
     sort_order INTEGER DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
 );
 INSERT OR IGNORE INTO knowledge_domains (id, name, domain_type, icon, color, sort_order, created_at, updated_at) VALUES
     ('dom-research', '学术研究', 'research', 'graduation-cap', '#3b82f6', 0, '2026-06-17T00:00:00Z', '2026-06-17T00:00:00Z'),
@@ -489,18 +491,23 @@ INSERT OR IGNORE INTO knowledge_domains (id, name, domain_type, icon, color, sor
     ('dom-notes',     '个人笔记', 'notes', 'sticky-note', '#95a5a6', 4, '2026-06-17T00:00:00Z', '2026-06-17T00:00:00Z');
 
 -- knowledge_items
+-- knowledge_items
+-- CRR table (synced): no FK and no CHECK constraints per CRR rules — the
+-- domain cascade is explicit in commands/knowledge.rs::knowledge_delete_domain,
+-- and domain_type/content_type values are enforced by the writers.
+-- knowledge_items_fts stays device-local (rebuilt from this table).
 CREATE TABLE IF NOT EXISTS knowledge_items (
-    id TEXT PRIMARY KEY,
-    domain_id TEXT NOT NULL REFERENCES knowledge_domains(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
+    id TEXT PRIMARY KEY NOT NULL,
+    domain_id TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
     content_type TEXT NOT NULL DEFAULT 'note',
     content TEXT,
     source_type TEXT,
     source_id TEXT,
     metadata TEXT NOT NULL DEFAULT '{}',
     tags TEXT NOT NULL DEFAULT '[]',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_ki_domain ON knowledge_items(domain_id);
 CREATE INDEX IF NOT EXISTS idx_ki_source ON knowledge_items(source_type, source_id);

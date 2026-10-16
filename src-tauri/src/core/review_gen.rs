@@ -50,6 +50,11 @@ pub struct ReviewProgress {
     /// dialog accumulates these into its live preview panel.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<String>,
+    /// Reasoning fragment (thinking models burn reasoning tokens before any
+    /// visible text — without this the preview sits on "等待模型输出" the
+    /// whole time). Shown dimmed above the content in the drawer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 pub fn request_cancel() {
@@ -76,6 +81,21 @@ fn emit(app: &AppHandle, p: &ReviewProgress) {
     if let Err(e) = app.emit(PROGRESS_EVENT, p) {
         tracing::warn!(error = %e, "failed to emit review progress");
     }
+}
+
+/// Streaming beats from the drain tasks: a content delta OR a reasoning
+/// fragment of the section/outline currently being generated.
+fn emit_stream(app: &AppHandle, stage: &str, section_index: usize, total_sections: usize, delta: Option<String>, reasoning: Option<String>) {
+    emit(app, &ReviewProgress {
+        stage: stage.into(),
+        section_index,
+        total_sections,
+        section_title: String::new(),
+        note_id: None,
+        message: None,
+        delta,
+        reasoning,
+    });
 }
 
 fn chat_msg(role: &str, content: String) -> ChatMessage {
@@ -208,15 +228,11 @@ pub async fn generate_outline(
             if ev.event_type == "delta" {
                 if let Some(content) = ev.content {
                     text.push_str(&content);
-                    emit(&app2, &ReviewProgress {
-                        stage: "outline".into(),
-                        section_index: 0,
-                        total_sections: 0,
-                        section_title: String::new(),
-                        note_id: None,
-                        message: None,
-                        delta: Some(content),
-                    });
+                    emit_stream(&app2, "outline", 0, 0, Some(content), None);
+                }
+            } else if ev.event_type == "reasoning" {
+                if let Some(content) = ev.content {
+                    emit_stream(&app2, "outline", 0, 0, None, Some(content));
                 }
             }
         }
@@ -244,12 +260,12 @@ pub async fn run_review(
     let _guard = match RunGuard::try_acquire() {
         Ok(g) => g,
         Err(e) => {
-            emit(&app, &ReviewProgress { stage: "error".into(), section_index: 0, total_sections: 0, section_title: String::new(), note_id: None, message: Some(e), delta: None });
+            emit(&app, &ReviewProgress { stage: "error".into(), section_index: 0, total_sections: 0, section_title: String::new(), note_id: None, message: Some(e), delta: None, reasoning: None });
             return;
         }
     };
     let fail = |app: &AppHandle, msg: String| {
-        emit(app, &ReviewProgress { stage: "error".into(), section_index: 0, total_sections: 0, section_title: String::new(), note_id: None, message: Some(msg), delta: None });
+        emit(app, &ReviewProgress { stage: "error".into(), section_index: 0, total_sections: 0, section_title: String::new(), note_id: None, message: Some(msg), delta: None, reasoning: None });
     };
 
     let sources = match load_sources(&db, &paper_ids).await {
@@ -268,10 +284,10 @@ pub async fn run_review(
 
     for (idx, section) in outline.iter().enumerate() {
         if CANCEL.load(Ordering::SeqCst) {
-            emit(&app, &ReviewProgress { stage: "cancelled".into(), section_index: idx, total_sections: total, section_title: section.title.clone(), note_id: None, message: None, delta: None });
+            emit(&app, &ReviewProgress { stage: "cancelled".into(), section_index: idx, total_sections: total, section_title: section.title.clone(), note_id: None, message: None, delta: None, reasoning: None });
             return;
         }
-        emit(&app, &ReviewProgress { stage: "section".into(), section_index: idx + 1, total_sections: total, section_title: section.title.clone(), note_id: None, message: None, delta: None });
+        emit(&app, &ReviewProgress { stage: "section".into(), section_index: idx + 1, total_sections: total, section_title: section.title.clone(), note_id: None, message: None, delta: None, reasoning: None });
 
         match write_section(&app, idx + 1, total, &db, llm.as_ref(), &sources, &question, &language, per_section_words, section).await {
             Ok(md) => section_md.push((section.title.clone(), md)),
@@ -281,7 +297,7 @@ pub async fn run_review(
 
     // Assemble the note: title from the research question, sections, then
     // the numbered reference list matching the [n] markers.
-    emit(&app, &ReviewProgress { stage: "assemble".into(), section_index: total, total_sections: total, section_title: String::new(), note_id: None, message: None, delta: None });
+    emit(&app, &ReviewProgress { stage: "assemble".into(), section_index: total, total_sections: total, section_title: String::new(), note_id: None, message: None, delta: None, reasoning: None });
     let note_title = format!("综述：{}", question.chars().take(40).collect::<String>());
     let mut md = format!("# {note_title}\n\n> 研究问题：{question}\n> 基于 {} 篇文献由 AI 生成，引用编号可点击溯源到原文。\n\n", sources.len());
     for (title, body) in &section_md {
@@ -299,7 +315,7 @@ pub async fn run_review(
     };
     match crate::core::note_service::create_note(&db, &note_title, &md, None, None, &vault_id, false).await {
         Ok(note) => {
-            emit(&app, &ReviewProgress { stage: "done".into(), section_index: total, total_sections: total, section_title: String::new(), note_id: Some(note.id), message: None, delta: None });
+            emit(&app, &ReviewProgress { stage: "done".into(), section_index: total, total_sections: total, section_title: String::new(), note_id: Some(note.id), message: None, delta: None, reasoning: None });
         }
         Err(e) => fail(&app, format!("保存笔记失败：{e}")),
     }
@@ -357,15 +373,11 @@ async fn write_section(
             if ev.event_type == "delta" {
                 if let Some(content) = ev.content {
                     text.push_str(&content);
-                    emit(&app2, &ReviewProgress {
-                        stage: "section".into(),
-                        section_index,
-                        total_sections,
-                        section_title: String::new(),
-                        note_id: None,
-                        message: None,
-                        delta: Some(content),
-                    });
+                    emit_stream(&app2, "section", section_index, total_sections, Some(content), None);
+                }
+            } else if ev.event_type == "reasoning" {
+                if let Some(content) = ev.content {
+                    emit_stream(&app2, "section", section_index, total_sections, None, Some(content));
                 }
             }
         }

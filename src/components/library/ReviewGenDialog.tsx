@@ -27,11 +27,14 @@ function ProcessDrawer({
   show,
   busy,
   text,
+  reasoning,
   previewRef,
 }: {
   show: boolean;
   busy: boolean;
   text: string;
+  /** Thinking-model reasoning stream, rendered dimmed above the content. */
+  reasoning: string;
   previewRef: React.RefObject<HTMLDivElement | null>;
 }) {
   return (
@@ -49,7 +52,12 @@ function ProcessDrawer({
           ref={previewRef}
           className="flex-1 overflow-y-auto px-3 py-2 whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-text-secondary/85"
         >
-          {text || '（等待模型输出…）'}
+          {reasoning && (
+            <div className="italic text-text-secondary/45 border-b border-dashed border-surface-hover/50 pb-1.5 mb-1.5">
+              {reasoning}
+            </div>
+          )}
+          {text || (reasoning ? '' : '（等待模型输出…）')}
         </div>
       </div>
     </aside>
@@ -75,13 +83,14 @@ export function ReviewGenDialog() {
   const [error, setError] = useState<string | null>(null);
   const [providerId, setProviderId] = useState('');
   const [streamText, setStreamText] = useState('');
+  const [reasoningText, setReasoningText] = useState('');
   const [showPreview, setShowPreview] = useState(true);
   const previewRef = useRef<HTMLDivElement>(null);
 
   // Keep the live preview pinned to its newest output.
   useEffect(() => {
     previewRef.current?.scrollTo({ top: previewRef.current.scrollHeight });
-  }, [streamText]);
+  }, [streamText, reasoningText]);
 
   // Reset whenever the dialog is (re)opened with a paper set.
   useEffect(() => {
@@ -100,12 +109,16 @@ export function ReviewGenDialog() {
     const un = listen<ReviewProgress>('library:review-progress', (e) => {
       const p = e.payload;
       setProgress(p);
-      if (p.stage === 'section' && !p.delta) {
+      if (p.stage === 'section' && !p.delta && !p.reasoning) {
         // New section starting: reset the live preview.
         setStreamText('');
+        setReasoningText('');
       }
       if (p.delta) {
         setStreamText((t) => t + p.delta);
+      }
+      if (p.reasoning) {
+        setReasoningText((t) => t + p.reasoning);
       }
       if (p.stage === 'done') {
         setNoteId(p.noteId);
@@ -132,6 +145,7 @@ export function ReviewGenDialog() {
     setBusy(true);
     setError(null);
     setStreamText('');
+    setReasoningText('');
     try {
       const result = await reviewGenerateOutline(paperIds, question.trim(), scope.trim(), language, targetWords, providerId || null);
       setOutline(result);
@@ -158,6 +172,7 @@ export function ReviewGenDialog() {
     setError(null);
     setNoteId(null);
     setStreamText('');
+    setReasoningText('');
     try {
       await reviewGenerateStart(paperIds, question.trim(), language, targetWords, cleaned, providerId || null);
     } catch (err) {
@@ -267,8 +282,8 @@ export function ReviewGenDialog() {
                 <ModelOverrideSelect value={providerId} onChange={setProviderId} disabled={busy} className="w-full" />
               </div>
               </div>
-              {(busy || streamText) && (
-                <ProcessDrawer show={showPreview} busy={busy} text={streamText} previewRef={previewRef} />
+              {(busy || streamText || reasoningText) && (
+                <ProcessDrawer show={showPreview} busy={busy} text={streamText} reasoning={reasoningText} previewRef={previewRef} />
               )}
             </div>
           )}
@@ -362,7 +377,7 @@ export function ReviewGenDialog() {
 
               {/* Right drawer: live stream of the section being written — a
                   long generation no longer looks like a stuck spinner. */}
-              <ProcessDrawer show={showPreview} busy={busy} text={streamText} previewRef={previewRef} />
+              <ProcessDrawer show={showPreview} busy={busy} text={streamText} reasoning={reasoningText} previewRef={previewRef} />
             </div>
           )}
         </div>

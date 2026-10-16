@@ -2098,6 +2098,8 @@ export interface ReviewProgress {
   message: string | null;
   /** Streaming text fragment of the section being written. */
   delta?: string;
+  /** Reasoning fragment (thinking models), shown dimmed above the content. */
+  reasoning?: string;
 }
 
 export async function reviewGenerateOutline(

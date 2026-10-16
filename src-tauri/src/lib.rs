@@ -814,6 +814,7 @@ pub fn run() {
             commands::agent::settings_get_data_dir,
             commands::agent::settings_set_data_dir,
             commands::agent::settings_get_memory_dir,
+            commands::agent::settings_get_skills_dir,
             commands::agent::settings_ensure_directories,
             commands::agent::settings_validate_llm,
             commands::agent::settings_list_models,

@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react';
-import { X, Bot, FolderOpen, Copy, Trash2 } from 'lucide-react';
-import { open } from '@tauri-apps/plugin-shell';
+import { X, Bot, FolderOpen, Copy, Check, Trash2 } from 'lucide-react';
 import type { AgentSession, ApprovalConfig, LlmConfigBlock, LlmProvider } from '@/lib/types';
 import { LlmConfigFields } from './LlmConfigFields';
 import { ToolPicker } from './ToolPicker';
@@ -9,6 +8,9 @@ import {
   agentSessionWorkspace,
   agentSessionWorkspaceClear,
   llmProviderList,
+  revealInFileManager,
+  settingsGetMemoryDir,
+  settingsGetSkillsDir,
   skillsList,
   type SkillInfo,
 } from '@/lib/tauri';
@@ -81,10 +83,19 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
   const [maxMemoryRounds, setMaxMemoryRounds] = useState(agent.max_memory_rounds ?? 10);
   const [memoryDir, setMemoryDir] = useState(agent.memory_dir ?? '');
   const [skillsDir, setSkillsDir] = useState(agent.skills_dir ?? '');
+  // Device-level effective paths, shown in the fields when the session has no
+  // custom override so the user can see (and copy) where files actually live.
+  const [defaultMemoryDir, setDefaultMemoryDir] = useState('');
+  const [defaultSkillsDir, setDefaultSkillsDir] = useState('');
+  useEffect(() => {
+    settingsGetMemoryDir().then(setDefaultMemoryDir).catch(() => {});
+    settingsGetSkillsDir().then(setDefaultSkillsDir).catch(() => {});
+  }, []);
   /** Absolute path of the automatic per-session workspace, resolved on demand
    *  (only while the "不指定" mode is selected). null = not fetched yet or the
    *  backend could not provide it. */
   const [workspacePath, setWorkspacePath] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   /** Skills mounted on this session (per-session plugins). */
   const [selectedSkills, setSelectedSkills] = useState<string[]>(agent.selected_skills ?? []);
@@ -171,17 +182,22 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
 
   const handleOpenWorkspace = () => {
     if (!workspacePath) return;
-    // Failure (e.g. outside Tauri) is not worth interrupting the user for.
-    open(workspacePath).catch(() => {});
+    revealInFileManager(workspacePath).catch((err) => {
+      setWorkspaceError(`打开工作区失败: ${err}`);
+    });
   };
 
   const handleCopyWorkspace = () => {
     if (!workspacePath) return;
-    try {
-      navigator.clipboard.writeText(workspacePath).catch(() => {});
-    } catch {
-      /* clipboard unavailable (no permission / insecure context) — silent */
-    }
+    navigator.clipboard
+      .writeText(workspacePath)
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      })
+      .catch(() => {
+        setWorkspaceError('复制失败：剪贴板不可用');
+      });
   };
 
   const handleClearWorkspace = async () => {
@@ -231,8 +247,8 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
         maxTokens: maxTokens.trim() ? parseInt(maxTokens, 10) : undefined,
         contextBudget,
         maxMemoryRounds,
-        memoryDir: memoryDir.trim() || undefined,
-        skillsDir: skillsDir.trim() || undefined,
+        memoryDir: dirOverrideForSave(memoryDir, defaultMemoryDir),
+        skillsDir: dirOverrideForSave(skillsDir, defaultSkillsDir),
         selectedSkills,
       });
       onClose();
@@ -388,8 +404,8 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
                       title="复制绝对路径"
                       className="flex items-center gap-1 px-2 py-1 rounded-md border border-codex-border text-[11px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary transition-colors disabled:opacity-50 disabled:hover:bg-transparent"
                     >
-                      <Copy size={11} />
-                      复制
+                      {copied ? <Check size={11} className="text-codex-accent" /> : <Copy size={11} />}
+                      {copied ? '已复制' : '复制'}
                     </button>
                     <button
                       type="button"
@@ -563,13 +579,13 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
             <h4 className="text-xs font-semibold text-codex-muted uppercase tracking-wide">存储路径</h4>
             <DirField
               label="记忆目录"
-              value={memoryDir}
+              value={memoryDir || defaultMemoryDir}
               onChange={setMemoryDir}
               placeholder="留空使用智能体默认值"
             />
             <DirField
               label="技能目录"
-              value={skillsDir}
+              value={skillsDir || defaultSkillsDir}
               onChange={setSkillsDir}
               placeholder="留空使用智能体默认值"
             />
@@ -594,6 +610,18 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
       </div>
     </div>
   );
+}
+
+/** The directory fields show the device-level effective path when the
+ *  session has no override. Saving that same path back must stay "no
+ *  override" (undefined) so the session keeps following the device setting;
+ *  only a genuinely different path is stored. */
+function dirOverrideForSave(value: string, effectiveDefault: string): string | undefined {
+  const v = value.trim();
+  if (!v) return undefined;
+  const norm = (p: string) => p.trim().replace(/[\\/]+$/, '');
+  if (effectiveDefault && norm(v) === norm(effectiveDefault)) return undefined;
+  return v;
 }
 
 function DirField({

@@ -2189,6 +2189,19 @@ pub async fn settings_get_memory_dir(
 }
 
 #[tauri::command]
+pub async fn settings_get_skills_dir(
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let device_settings = settings_service::load_device_settings(&state.db).await?;
+    let base = device_settings
+        .data_dir
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| state.app_data_dir.clone());
+    Ok(device_settings.skills_dir.unwrap_or_else(|| default_skills_dir(&base).to_string_lossy().to_string()))
+}
+
+#[tauri::command]
 pub async fn settings_ensure_directories(
     state: State<'_, AppState>,
 ) -> Result<(), String> {

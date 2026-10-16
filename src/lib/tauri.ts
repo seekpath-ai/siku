@@ -636,6 +636,10 @@ export async function settingsGetMemoryDir(): Promise<string> {
   return invoke<string>('settings_get_memory_dir');
 }
 
+export async function settingsGetSkillsDir(): Promise<string> {
+  return invoke<string>('settings_get_skills_dir');
+}
+
 export async function settingsEnsureDirectories(): Promise<void> {
   return invoke<void>('settings_ensure_directories');
 }

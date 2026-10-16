@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
+import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle, PanelRight } from 'lucide-react';
 import { useAiTableStore } from '@/stores/aiTableStore';
 import { useDialog } from '@/hooks/useDialog';
 import { ModelOverrideSelect } from './ModelOverrideSelect';
@@ -362,6 +362,13 @@ export function AiTableDialog() {
                 Markdown
               </button>
               <button
+                onClick={() => setShowLog((v) => !v)}
+                title="过程日志"
+                className={`p-1.5 rounded hover:bg-surface-hover ${showLog ? 'text-primary bg-primary/10' : 'text-text-secondary/60'}`}
+              >
+                <PanelRight size={14} />
+              </button>
+              <button
                 onClick={close}
                 disabled={running}
                 className="p-1.5 rounded text-text-secondary/60 hover:text-text-primary hover:bg-surface-hover disabled:opacity-40"
@@ -374,25 +381,6 @@ export function AiTableDialog() {
           <p className="px-4 py-1.5 text-[11px] text-text-secondary/50 border-b border-surface-hover/60">
             每篇文献一次调用返回所有列；已完成和手动编辑的单元格不会被覆盖。点击单元格可编辑。
           </p>
-
-          {/* Process log: per-paper outcomes, so a long run never looks stuck */}
-          <div className="border-b border-surface-hover/60">
-            <button
-              onClick={() => setShowLog((v) => !v)}
-              className="w-full flex items-center gap-1 px-4 py-1 text-[11px] text-text-secondary/60 hover:bg-surface-hover/40"
-            >
-              {showLog ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-              过程日志{logs.length > 0 ? `（${logs.length}）` : ''}
-              {running && <Loader2 size={10} className="animate-spin" />}
-            </button>
-            {showLog && logs.length > 0 && (
-              <div ref={logRef} className="max-h-28 overflow-y-auto px-4 pb-2 font-mono text-[11px] leading-relaxed text-text-secondary/80">
-                {logs.map((l, i) => (
-                  <div key={i}>{l}</div>
-                ))}
-              </div>
-            )}
-          </div>
 
           <div className="flex-1 overflow-auto">
             <table className="w-full border-collapse text-[12px]">
@@ -489,6 +477,33 @@ export function AiTableDialog() {
             </table>
           </div>
         </div>
+
+        {/* Right drawer: process log — per-paper outcomes, so a long run
+            never looks stuck. Inline (flex) rather than overlay: the grid
+            stays visible next to it. */}
+        <aside
+          className={`shrink-0 flex flex-col overflow-hidden transition-all duration-200 ${
+            showLog ? 'w-[280px] border-l border-surface-hover' : 'w-0'
+          }`}
+        >
+          <div className="w-[280px] flex flex-col h-full">
+            <div className="flex items-center gap-1.5 px-3 py-2.5 border-b border-surface-hover text-[12px] text-text-secondary">
+              过程日志
+              {running && <Loader2 size={11} className="animate-spin" />}
+              {logs.length > 0 && <span className="text-text-secondary/40">（{logs.length}）</span>}
+            </div>
+            <div
+              ref={logRef}
+              className="flex-1 overflow-y-auto px-3 py-2 font-mono text-[11px] leading-relaxed text-text-secondary/80 space-y-1"
+            >
+              {logs.length === 0 ? (
+                <span className="text-text-secondary/40">运行后此处逐篇显示抽取结果。</span>
+              ) : (
+                logs.map((l, i) => <div key={i}>{l}</div>)
+              )}
+            </div>
+          </div>
+        </aside>
       </div>
     </div>
   );

@@ -166,7 +166,9 @@ fn parse_outline(content: &str) -> Result<Vec<ReviewSection>, String> {
 }
 
 /// Step 1: design the section outline (user-editable before generation).
+/// Streams like the section calls: deltas go to the dialog's live drawer.
 pub async fn generate_outline(
+    app: &AppHandle,
     db: &SqlitePool,
     paper_ids: &[String],
     question: &str,
@@ -196,10 +198,34 @@ pub async fn generate_outline(
         请设计 {section_count} 个章节（含引言与总结/展望）。\n\n可用文献（编号即引用编号）：\n{}",
         source_listing(&sources)
     );
-    let resp = llm
-        .chat_completion(&[chat_msg("system", system), chat_msg("user", user)], &[])
-        .await?;
-    let mut outline = parse_outline(&resp.content)?;
+    let messages = vec![chat_msg("system", system), chat_msg("user", user)];
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ai::llm::StreamEvent>();
+    let app2 = app.clone();
+    let drain = tokio::spawn(async move {
+        let mut text = String::new();
+        while let Some(ev) = rx.recv().await {
+            if ev.event_type == "delta" {
+                if let Some(content) = ev.content {
+                    text.push_str(&content);
+                    emit(&app2, &ReviewProgress {
+                        stage: "outline".into(),
+                        section_index: 0,
+                        total_sections: 0,
+                        section_title: String::new(),
+                        note_id: None,
+                        message: None,
+                        delta: Some(content),
+                    });
+                }
+            }
+        }
+        text
+    });
+    let call = llm.chat_completion_stream(&messages, &[], tx).await;
+    let text = drain.await.map_err(|e| format!("stream drain: {e}"))?;
+    call?;
+    let mut outline = parse_outline(&text)?;
     outline.truncate(10);
     Ok(outline)
 }

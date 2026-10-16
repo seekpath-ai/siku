@@ -9,6 +9,7 @@ use crate::AppState;
 /// lets the user edit it before calling review_generate_start.
 #[tauri::command]
 pub async fn review_generate_outline(
+    app: AppHandle,
     state: State<'_, AppState>,
     paper_ids: Vec<String>,
     question: String,
@@ -24,6 +25,7 @@ pub async fn review_generate_outline(
         return Err("请填写研究问题".to_string());
     }
     review_gen::generate_outline(
+        &app,
         &state.db,
         &paper_ids,
         question.trim(),

@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { useNavigate } from '@tanstack/react-router';
 import {
   X, Loader2, Sparkles, ArrowLeft, ArrowUp, ArrowDown, Plus, Trash2, Check, Square, BookOpen,
-  ChevronDown, ChevronRight,
+  PanelRight,
 } from 'lucide-react';
 import { useReviewStore } from '@/stores/reviewStore';
 import { useDialog } from '@/hooks/useDialog';
@@ -20,6 +20,41 @@ import {
 type Step = 'form' | 'outline' | 'run';
 
 const WORD_OPTIONS = [3000, 5000, 8000, 10000];
+
+/** Right drawer showing the model's live output (outline JSON or the section
+ *  being written) — a long call never looks like a stuck spinner. */
+function ProcessDrawer({
+  show,
+  busy,
+  text,
+  previewRef,
+}: {
+  show: boolean;
+  busy: boolean;
+  text: string;
+  previewRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  return (
+    <aside
+      className={`shrink-0 rounded-lg flex flex-col overflow-hidden transition-all duration-200 ${
+        show ? 'w-[300px] border border-surface-hover/70' : 'w-0'
+      }`}
+    >
+      <div className="w-[300px] flex flex-col h-full max-h-full">
+        <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-surface-hover/60 text-[11px] text-text-secondary/60">
+          生成过程
+          {busy && <Loader2 size={10} className="animate-spin" />}
+        </div>
+        <div
+          ref={previewRef}
+          className="flex-1 overflow-y-auto px-3 py-2 whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-text-secondary/85"
+        >
+          {text || '（等待模型输出…）'}
+        </div>
+      </div>
+    </aside>
+  );
+}
 
 /** AI 综述: form → editable outline → section-by-section generation with
  *  clickable citation traceability, saved as a note. */
@@ -96,6 +131,7 @@ export function ReviewGenDialog() {
     }
     setBusy(true);
     setError(null);
+    setStreamText('');
     try {
       const result = await reviewGenerateOutline(paperIds, question.trim(), scope.trim(), language, targetWords, providerId || null);
       setOutline(result);
@@ -121,6 +157,7 @@ export function ReviewGenDialog() {
     setProgress(null);
     setError(null);
     setNoteId(null);
+    setStreamText('');
     try {
       await reviewGenerateStart(paperIds, question.trim(), language, targetWords, cleaned, providerId || null);
     } catch (err) {
@@ -155,18 +192,30 @@ export function ReviewGenDialog() {
           <Sparkles size={15} className="text-primary" />
           <span className="text-sm font-medium text-text-primary">AI 综述</span>
           <span className="text-[11px] text-text-secondary/60">{paperIds.length} 篇文献</span>
-          <button
-            onClick={close}
-            disabled={busy && step === 'run'}
-            className="ml-auto p-1 rounded text-text-secondary/60 hover:text-text-primary hover:bg-surface-hover disabled:opacity-40"
-          >
-            <X size={14} />
-          </button>
+          <div className="ml-auto flex items-center gap-1">
+            {(step === 'run' || (step === 'form' && busy)) && (
+              <button
+                onClick={() => setShowPreview((v) => !v)}
+                title="生成过程"
+                className={`p-1 rounded hover:bg-surface-hover ${showPreview ? 'text-primary bg-primary/10' : 'text-text-secondary/60'}`}
+              >
+                <PanelRight size={14} />
+              </button>
+            )}
+            <button
+              onClick={close}
+              disabled={busy && step === 'run'}
+              className="p-1 rounded text-text-secondary/60 hover:text-text-primary hover:bg-surface-hover disabled:opacity-40"
+            >
+              <X size={14} />
+            </button>
+          </div>
         </div>
 
         <div className="flex-1 overflow-y-auto px-4 py-3">
           {step === 'form' && (
-            <div className="space-y-3">
+            <div className="flex gap-3 h-full">
+              <div className="flex-1 min-w-0 space-y-3">
               <div className="space-y-1.5">
                 <label className="text-xs text-text-secondary">研究问题</label>
                 <textarea
@@ -217,6 +266,10 @@ export function ReviewGenDialog() {
                 <label className="text-xs text-text-secondary">模型</label>
                 <ModelOverrideSelect value={providerId} onChange={setProviderId} disabled={busy} className="w-full" />
               </div>
+              </div>
+              {(busy || streamText) && (
+                <ProcessDrawer show={showPreview} busy={busy} text={streamText} previewRef={previewRef} />
+              )}
             </div>
           )}
 
@@ -273,59 +326,43 @@ export function ReviewGenDialog() {
           )}
 
           {step === 'run' && (
-            <div className="space-y-3">
-              <ul className="space-y-1.5">
-                {outline.map((s, i) => {
-                  const current = progress?.stage === 'section' && progress.sectionIndex === i + 1;
-                  const done =
-                    noteId != null ||
-                    (progress != null &&
-                      (progress.sectionIndex > i + 1 || ['assemble', 'done'].includes(progress.stage)));
-                  return (
-                    <li key={i} className="flex items-center gap-2 text-[13px]">
-                      {done ? (
-                        <Check size={13} className="text-emerald-400 shrink-0" />
-                      ) : current ? (
-                        <Loader2 size={13} className="animate-spin text-primary shrink-0" />
-                      ) : (
-                        <span className="w-[13px] h-[13px] rounded-full border border-surface-hover shrink-0" />
-                      )}
-                      <span className={done || current ? 'text-text-primary' : 'text-text-secondary/50'}>
-                        {s.title}
-                      </span>
-                    </li>
-                  );
-                })}
-              </ul>
-
-              {/* Live stream of the section being written — a long generation
-                  no longer looks like a stuck spinner. */}
-              <div className="rounded-lg border border-surface-hover/70 overflow-hidden">
-                <button
-                  onClick={() => setShowPreview((v) => !v)}
-                  className="w-full flex items-center gap-1 px-3 py-1.5 text-[11px] text-text-secondary/60 hover:bg-surface-hover/40"
-                >
-                  {showPreview ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-                  生成过程
-                  {busy && <Loader2 size={10} className="animate-spin" />}
-                </button>
-                {showPreview && (
-                  <div
-                    ref={previewRef}
-                    className="max-h-44 overflow-y-auto px-3 pb-2 whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-text-secondary/85"
-                  >
-                    {streamText || '（等待模型输出…）'}
-                  </div>
+            <div className="flex gap-3 h-full">
+              <div className="flex-1 min-w-0 space-y-3">
+                <ul className="space-y-1.5">
+                  {outline.map((s, i) => {
+                    const current = progress?.stage === 'section' && progress.sectionIndex === i + 1;
+                    const done =
+                      noteId != null ||
+                      (progress != null &&
+                        (progress.sectionIndex > i + 1 || ['assemble', 'done'].includes(progress.stage)));
+                    return (
+                      <li key={i} className="flex items-center gap-2 text-[13px]">
+                        {done ? (
+                          <Check size={13} className="text-emerald-400 shrink-0" />
+                        ) : current ? (
+                          <Loader2 size={13} className="animate-spin text-primary shrink-0" />
+                        ) : (
+                          <span className="w-[13px] h-[13px] rounded-full border border-surface-hover shrink-0" />
+                        )}
+                        <span className={done || current ? 'text-text-primary' : 'text-text-secondary/50'}>
+                          {s.title}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+                {progress?.stage === 'assemble' && (
+                  <p className="text-[12px] text-text-secondary">正在汇总并保存笔记…</p>
                 )}
+                {noteId && (
+                  <p className="text-[12px] text-emerald-400">综述已生成并保存为笔记，引用编号可点击溯源。</p>
+                )}
+                {error && <p className="text-[12px] text-red-400">{error}</p>}
               </div>
 
-              {progress?.stage === 'assemble' && (
-                <p className="text-[12px] text-text-secondary">正在汇总并保存笔记…</p>
-              )}
-              {noteId && (
-                <p className="text-[12px] text-emerald-400">综述已生成并保存为笔记，引用编号可点击溯源。</p>
-              )}
-              {error && <p className="text-[12px] text-red-400">{error}</p>}
+              {/* Right drawer: live stream of the section being written — a
+                  long generation no longer looks like a stuck spinner. */}
+              <ProcessDrawer show={showPreview} busy={busy} text={streamText} previewRef={previewRef} />
             </div>
           )}
         </div>

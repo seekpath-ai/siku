@@ -27,7 +27,9 @@ import {
   agentDeleteSession,
   agentPinSession,
   agentArchiveSession,
+  agentSessionWorkspace,
   fileBrowserRevealInSystem,
+  revealInFileManager,
 } from '@/lib/tauri';
 import { useDialog } from '@/hooks/useDialog';
 import { ConfirmButton } from '@/components/ui/ConfirmButton';
@@ -303,6 +305,20 @@ export function AgentList() {
     e.preventDefault();
     e.stopPropagation();
     setProjectMenu({ visible: true, x: e.clientX, y: e.clientY, projectId });
+  };
+
+  // Open the session's effective write directory: the bound working_dir when
+  // set, otherwise its auto per-session workspace (created on demand).
+  const handleOpenWorkspace = async (agent: AgentSession) => {
+    try {
+      const path = agent.working_dir?.trim()
+        ? agent.working_dir
+        : await agentSessionWorkspace(agent.id);
+      await revealInFileManager(path);
+    } catch (err) {
+      console.error('open workspace:', err);
+      await alert(`打开工作区失败: ${err}`);
+    }
   };
 
   const handleArchiveSession = async (id: string, archived: boolean) => {
@@ -729,6 +745,16 @@ export function AgentList() {
                 >
                   <Settings size={14} />
                   个性设置
+                </button>
+                <button
+                  onClick={() => {
+                    void handleOpenWorkspace(agent);
+                    setContextMenu({ visible: false, x: 0, y: 0, agentId: '' });
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
+                >
+                  <FolderOpen size={14} />
+                  打开工作区
                 </button>
                 <button
                   onClick={() => {

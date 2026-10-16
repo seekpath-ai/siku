@@ -10,10 +10,13 @@ import {
   Edit3,
   Palette,
   Clock,
+  Table2,
 } from 'lucide-react';
 import { useCollections, useCreateCollection, useUpdateCollection, useDeleteCollection, useAddPapersToCollection, useTags, useCreateTag, useDeleteTag, useUpdateTag } from '@/hooks/useLibrary';
 import { useLibraryStore } from '@/stores/libraryStore';
+import { useAiTableStore } from '@/stores/aiTableStore';
 import { useDialog } from '@/hooks/useDialog';
+import { listPapers } from '@/lib/tauri';
 import type { Collection, Tag as TagType } from '@/lib/types';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
 import { ResizeHandle } from './ResizeHandle';
@@ -112,7 +115,7 @@ function CollectionTreeItem({
   const updateMutation = useUpdateCollection();
   const deleteMutation = useDeleteCollection();
   const createMutation = useCreateCollection();
-  const { prompt, confirm } = useDialog();
+  const { prompt, confirm, alert } = useDialog();
   const isExpanded = expanded.has(node.collection.id);
   const isActive = activeCollectionId === node.collection.id;
 
@@ -138,6 +141,22 @@ function CollectionTreeItem({
       onClick: () => {
         setEditName(node.collection.name);
         setEditing(true);
+      },
+    },
+    {
+      label: 'AI 表格列',
+      icon: <Table2 size={14} />,
+      onClick: async () => {
+        try {
+          const papers = await listPapers({ collection_id: node.collection.id, limit: 10000 });
+          if (papers.length === 0) {
+            await alert('该集合下没有文献');
+            return;
+          }
+          useAiTableStore.getState().openWith(papers.map((p) => p.id));
+        } catch (err) {
+          await alert(`获取集合文献失败: ${err}`);
+        }
       },
     },
     {

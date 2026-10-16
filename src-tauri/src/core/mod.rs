@@ -1,4 +1,5 @@
 pub mod agent_memory_service;
+pub mod ai_table;
 pub mod annotation_service;
 pub mod batch_import;
 pub mod bibtex;

@@ -1167,6 +1167,35 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // extractor upgrades (geometry fixes change the paragraph output).
     add_column_if_missing(&db, "paper_paragraphs", "version", "INTEGER NOT NULL DEFAULT 1").await?;
 
+    // AI 表格列: per-(paper, column) extraction cells + reusable column
+    // presets. Device-local like paper_paragraphs: cells are cheap to
+    // recompute from the index, and syncing them would be pure weight.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ai_table_cells (
+            paper_id TEXT NOT NULL,
+            column_key TEXT NOT NULL,
+            value TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'done',
+            edited INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (paper_id, column_key)
+        )"
+    )
+    .execute(&db)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ai_table_presets (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            columns_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )"
+    )
+    .execute(&db)
+    .await?;
+
     // Per-paper figure/table metadata (page, label, caption, image bbox) for
     // the agent's paper_snapshot tool. Device-local derived data like
     // paper_paragraphs: rebuilt from the PDF when the paper is indexed, so no

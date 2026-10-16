@@ -37,6 +37,7 @@ import {
   Check,
   FolderInput,
   BookCopy,
+  Table2,
 } from 'lucide-react';
 import {
   usePapers,
@@ -51,6 +52,7 @@ import {
   useRemovePapersFromCollection,
 } from '@/hooks/useLibrary';
 import { useLibraryStore } from '@/stores/libraryStore';
+import { useAiTableStore } from '@/stores/aiTableStore';
 import { useTabStore } from '@/stores/tabStore';
 import { openNoteTab } from '@/lib/openNote';
 import { useDialog } from '@/hooks/useDialog';
@@ -570,6 +572,11 @@ function PaperRow({
       icon: reprocessing ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />,
       disabled: reprocessing || !hasAttachment,
       onClick: handleReprocessIndex,
+    },
+    {
+      label: `AI 表格列${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
+      icon: <Table2 size={14} />,
+      onClick: () => useAiTableStore.getState().openWith(targetPaperIds),
     },
     {
       label: `添加到分类${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,

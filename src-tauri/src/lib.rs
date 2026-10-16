@@ -756,6 +756,15 @@ pub fn run() {
             commands::library::paper_reprocess_index,
             commands::library::paper_get_paragraphs,
             commands::library::paper_enrich_metadata,
+            // AI 表格列
+            commands::ai_table::ai_table_extract_start,
+            commands::ai_table::ai_table_extract_cancel,
+            commands::ai_table::ai_table_cells_list,
+            commands::ai_table::ai_table_cell_set,
+            commands::ai_table::ai_table_presets_list,
+            commands::ai_table::ai_table_preset_save,
+            commands::ai_table::ai_table_preset_delete,
+            commands::ai_table::ai_table_papers_info,
             // Collections
             commands::collections::collections_list,
             commands::collections::collections_get,

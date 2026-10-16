@@ -1989,3 +1989,89 @@ export async function timelineList(
 ): Promise<TimelineItem[]> {
   return invoke<TimelineItem[]>('timeline_list', { limit, offset, module });
 }
+
+// ============================================================
+// AI 表格列
+// ============================================================
+
+export interface AiTableColumn {
+  key: string;
+  prompt: string;
+}
+
+export interface AiTableCell {
+  paperId: string;
+  columnKey: string;
+  value: string;
+  /** done | failed | edited */
+  status: string;
+  edited: boolean;
+}
+
+export interface AiTableProgress {
+  total: number;
+  done: number;
+  failed: number;
+  currentTitle: string;
+  /** "done" | "cancelled" once the run ends; null while running. */
+  finished: string | null;
+}
+
+export interface AiTablePreset {
+  id: string;
+  name: string;
+  columns: AiTableColumn[];
+  updatedAt: string;
+}
+
+export interface AiTablePaperBrief {
+  id: string;
+  title: string;
+  year: number | null;
+}
+
+export async function aiTableExtractStart(
+  paperIds: string[],
+  columns: AiTableColumn[]
+): Promise<void> {
+  return invoke<void>('ai_table_extract_start', { paperIds, columns });
+}
+
+export async function aiTableExtractCancel(): Promise<void> {
+  return invoke<void>('ai_table_extract_cancel');
+}
+
+export async function aiTableCellsList(
+  paperIds: string[],
+  columnKeys: string[]
+): Promise<AiTableCell[]> {
+  return invoke<AiTableCell[]>('ai_table_cells_list', { paperIds, columnKeys });
+}
+
+export async function aiTableCellSet(
+  paperId: string,
+  columnKey: string,
+  value: string
+): Promise<void> {
+  return invoke<void>('ai_table_cell_set', { paperId, columnKey, value });
+}
+
+export async function aiTablePresetsList(): Promise<AiTablePreset[]> {
+  return invoke<AiTablePreset[]>('ai_table_presets_list');
+}
+
+export async function aiTablePresetSave(
+  id: string | null,
+  name: string,
+  columns: AiTableColumn[]
+): Promise<AiTablePreset> {
+  return invoke<AiTablePreset>('ai_table_preset_save', { id, name, columns });
+}
+
+export async function aiTablePresetDelete(id: string): Promise<void> {
+  return invoke<void>('ai_table_preset_delete', { id });
+}
+
+export async function aiTablePapersInfo(paperIds: string[]): Promise<AiTablePaperBrief[]> {
+  return invoke<AiTablePaperBrief[]>('ai_table_papers_info', { paperIds });
+}

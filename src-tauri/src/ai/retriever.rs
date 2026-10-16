@@ -54,26 +54,41 @@ pub async fn hybrid_search_with(
     top_k: usize,
     include_tail: bool,
 ) -> Result<Vec<SearchResult>, String> {
+    hybrid_search_scoped(db, query, top_k, include_tail, None).await
+}
+
+/// As [`hybrid_search_with`], optionally restricted to a set of papers
+/// (`paper_ids`). The AI table / review pipelines scope retrieval to the
+/// selected paper set this way; `None` keeps the whole-library behaviour.
+/// The vector cache is scope-agnostic — filtering happens at scoring time.
+pub async fn hybrid_search_scoped(
+    db: &SqlitePool,
+    query: &str,
+    top_k: usize,
+    include_tail: bool,
+    paper_ids: Option<&[String]>,
+) -> Result<Vec<SearchResult>, String> {
+    let scope = paper_ids.filter(|ids| !ids.is_empty());
     let terms = crate::ai::query::analyze_query(query);
     let limit = top_k * 2;
 
     let mut legs: Vec<Vec<SearchResult>> = Vec::new();
     if let Some(expr) = crate::ai::query::trigram_match_expr(&terms.ascii) {
         legs.push(
-            keyword_search(db, "chunks_fts", "content", &expr, limit, include_tail)
+            keyword_search(db, "chunks_fts", "content", &expr, limit, include_tail, scope)
                 .await
                 .unwrap_or_default(),
         );
     }
     if let Some(expr) = crate::ai::query::bigram_match_expr(&terms.cjk) {
         legs.push(
-            keyword_search(db, "chunks_fts_bi", "search_text", &expr, limit, include_tail)
+            keyword_search(db, "chunks_fts_bi", "search_text", &expr, limit, include_tail, scope)
                 .await
                 .unwrap_or_default(),
         );
     }
     if vector_leg_enabled() {
-        legs.push(vector_search(db, query, limit, include_tail).await.unwrap_or_default());
+        legs.push(vector_search(db, query, limit, include_tail, scope).await.unwrap_or_default());
     }
 
     Ok(rrf_fuse(&legs, top_k))
@@ -99,7 +114,12 @@ async fn keyword_search(
     query: &str,
     limit: usize,
     include_tail: bool,
+    paper_ids: Option<&[String]>,
 ) -> Result<Vec<SearchResult>, String> {
+    let scope_sql = match paper_ids {
+        Some(ids) => format!("AND c.paper_id IN ({})", ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")),
+        None => String::new(),
+    };
     let sql = format!(
         "SELECT c.id, c.content, c.paper_id, c.chunk_index, c.page_start, c.page_end, c.section,
                 c.section_path, c.block_type, c.is_tail, p.title, rank
@@ -107,14 +127,21 @@ async fn keyword_search(
          JOIN chunks c ON fts.rowid = c.rowid
          JOIN papers p ON c.paper_id = p.id
          WHERE {table} MATCH ? AND (? = 1 OR c.is_tail = 0) AND p.deleted_at IS NULL
+         {scope_sql}
          ORDER BY rank
          LIMIT ?"
     );
-    let rows = sqlx::query_as::<_, (String, String, String, i32, Option<i32>, Option<i32>, Option<String>, Option<String>, String, i64, String, f64)>(
+    let mut q = sqlx::query_as::<_, (String, String, String, i32, Option<i32>, Option<i32>, Option<String>, Option<String>, String, i64, String, f64)>(
         &sql,
     )
     .bind(query)
-    .bind(if include_tail { 1 } else { 0 })
+    .bind(if include_tail { 1 } else { 0 });
+    if let Some(ids) = paper_ids {
+        for id in ids {
+            q = q.bind(id);
+        }
+    }
+    let rows = q
     .bind(limit as i64)
     .fetch_all(db)
     .await
@@ -210,12 +237,15 @@ async fn vector_search(
     query: &str,
     limit: usize,
     include_tail: bool,
+    paper_ids: Option<&[String]>,
 ) -> Result<Vec<SearchResult>, String> {
     // No query vector means no vector leg: the endpoint is unreachable or
     // returned nothing usable. Dropping the leg keeps keyword results intact.
     let Some(query_vec) = embedder::embed_query(db, query).await else {
         return Ok(Vec::new());
     };
+    let scope: Option<std::collections::HashSet<&str>> =
+        paper_ids.map(|ids| ids.iter().map(|s| s.as_str()).collect());
     let model = embedder::embedding_model_label();
     let stamp = vector_cache_stamp(db).await?;
 
@@ -224,7 +254,7 @@ async fn vector_search(
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = guard.as_ref() {
             if cached.model == model && cached.stamp == stamp {
-                return Ok(score_vectors(&cached.entries, &query_vec, include_tail, limit));
+                return Ok(score_vectors(&cached.entries, &query_vec, include_tail, scope.as_ref(), limit));
             }
         }
     }
@@ -269,13 +299,13 @@ async fn vector_search(
         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(VectorCache { model, stamp, entries });
         let cached = guard.as_ref().expect("just stored");
-        return Ok(score_vectors(&cached.entries, &query_vec, include_tail, limit));
+        return Ok(score_vectors(&cached.entries, &query_vec, include_tail, scope.as_ref(), limit));
     }
     tracing::debug!(
         vectors = entries.len(),
         "embedding table too large to cache; scoring straight from the table"
     );
-    Ok(score_vectors(&entries, &query_vec, include_tail, limit))
+    Ok(score_vectors(&entries, &query_vec, include_tail, scope.as_ref(), limit))
 }
 
 /// Score cached vectors against a query vector. Synchronous on purpose: it runs
@@ -284,11 +314,13 @@ fn score_vectors(
     entries: &[CachedVector],
     query_vec: &[f32],
     include_tail: bool,
+    paper_ids: Option<&std::collections::HashSet<&str>>,
     limit: usize,
 ) -> Vec<SearchResult> {
     let mut scored: Vec<(SearchResult, f32)> = entries
         .iter()
         .filter(|e| include_tail || !e.is_tail)
+        .filter(|e| paper_ids.is_none_or(|ids| ids.contains(e.paper_id.as_str())))
         .map(|e| {
             let sim = embedder::cosine_similarity(query_vec, &e.vector);
             (
@@ -537,6 +569,42 @@ mod tests {
         assert_eq!(chunks.0, 0, "永久删除应级联删除分块");
         let hits = hybrid_search_with(&db, "方法", 10, false).await.unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scoped_search_returns_only_the_selected_papers() {
+        let db = test_db().await;
+        // A second paper whose chunk also matches the query.
+        sqlx::query(
+            "INSERT INTO papers (id, title, created_at, updated_at) VALUES ('p2', '另一篇文献', 't', 't')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chunks (id, paper_id, content, search_text, block_type, is_tail, chunk_index, created_at)
+             VALUES ('c9', 'p2', '本方法采用图神经网络进行节点分类。', ?, 'prose', 0, 0, 't')",
+        )
+        .bind(crate::ai::query::bigram_index_text("本方法采用图神经网络进行节点分类。"))
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let all = hybrid_search_with(&db, "方法", 10, false).await.unwrap();
+        assert!(all.iter().any(|h| h.paper_id == "p2"), "全库检索应包含 p2: {:?}",
+            all.iter().map(|h| h.chunk_id.as_str()).collect::<Vec<_>>());
+
+        let scoped = hybrid_search_scoped(&db, "方法", 10, false, Some(&["p1".to_string()]))
+            .await
+            .unwrap();
+        assert!(!scoped.is_empty());
+        assert!(scoped.iter().all(|h| h.paper_id == "p1"), "作用域检索不得越界: {:?}",
+            scoped.iter().map(|h| h.paper_id.as_str()).collect::<Vec<_>>());
+
+        let empty = hybrid_search_scoped(&db, "方法", 10, false, Some(&["nope".to_string()]))
+            .await
+            .unwrap();
+        assert!(empty.is_empty(), "不存在的 paper 作用域应返回空");
     }
 
     #[tokio::test]

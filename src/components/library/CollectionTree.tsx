@@ -11,10 +11,12 @@ import {
   Palette,
   Clock,
   Table2,
+  Sparkles,
 } from 'lucide-react';
 import { useCollections, useCreateCollection, useUpdateCollection, useDeleteCollection, useAddPapersToCollection, useTags, useCreateTag, useDeleteTag, useUpdateTag } from '@/hooks/useLibrary';
 import { useLibraryStore } from '@/stores/libraryStore';
 import { useAiTableStore } from '@/stores/aiTableStore';
+import { useReviewStore } from '@/stores/reviewStore';
 import { useDialog } from '@/hooks/useDialog';
 import { listPapers } from '@/lib/tauri';
 import type { Collection, Tag as TagType } from '@/lib/types';
@@ -154,6 +156,22 @@ function CollectionTreeItem({
             return;
           }
           useAiTableStore.getState().openWith(papers.map((p) => p.id));
+        } catch (err) {
+          await alert(`获取集合文献失败: ${err}`);
+        }
+      },
+    },
+    {
+      label: 'AI 综述',
+      icon: <Sparkles size={14} />,
+      onClick: async () => {
+        try {
+          const papers = await listPapers({ collection_id: node.collection.id, limit: 10000 });
+          if (papers.length === 0) {
+            await alert('该集合下没有文献');
+            return;
+          }
+          useReviewStore.getState().openWith(papers.map((p) => p.id));
         } catch (err) {
           await alert(`获取集合文献失败: ${err}`);
         }

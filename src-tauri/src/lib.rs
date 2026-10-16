@@ -765,6 +765,10 @@ pub fn run() {
             commands::ai_table::ai_table_preset_save,
             commands::ai_table::ai_table_preset_delete,
             commands::ai_table::ai_table_papers_info,
+            // AI 综述
+            commands::review::review_generate_outline,
+            commands::review::review_generate_start,
+            commands::review::review_generate_cancel,
             // Collections
             commands::collections::collections_list,
             commands::collections::collections_get,

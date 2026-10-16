@@ -2075,3 +2075,52 @@ export async function aiTablePresetDelete(id: string): Promise<void> {
 export async function aiTablePapersInfo(paperIds: string[]): Promise<AiTablePaperBrief[]> {
   return invoke<AiTablePaperBrief[]>('ai_table_papers_info', { paperIds });
 }
+
+// ============================================================
+// AI 综述生成
+// ============================================================
+
+export interface ReviewSection {
+  title: string;
+  points: string;
+}
+
+export interface ReviewProgress {
+  /** "outline" | "section" | "assemble" | "done" | "cancelled" | "error" */
+  stage: string;
+  sectionIndex: number;
+  totalSections: number;
+  sectionTitle: string;
+  noteId: string | null;
+  message: string | null;
+}
+
+export async function reviewGenerateOutline(
+  paperIds: string[],
+  question: string,
+  scope: string,
+  language: string,
+  targetWords: number
+): Promise<ReviewSection[]> {
+  return invoke<ReviewSection[]>('review_generate_outline', {
+    paperIds,
+    question,
+    scope,
+    language,
+    targetWords,
+  });
+}
+
+export async function reviewGenerateStart(
+  paperIds: string[],
+  question: string,
+  language: string,
+  targetWords: number,
+  outline: ReviewSection[]
+): Promise<void> {
+  return invoke<void>('review_generate_start', { paperIds, question, language, targetWords, outline });
+}
+
+export async function reviewGenerateCancel(): Promise<void> {
+  return invoke<void>('review_generate_cancel');
+}

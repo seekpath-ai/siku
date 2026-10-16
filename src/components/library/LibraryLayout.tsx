@@ -7,6 +7,7 @@ import { CollectionTree } from './CollectionTree';
 import { PaperList } from './PaperList';
 import { PaperDetailPanel } from './PaperDetailPanel';
 import { AiTableDialog } from './AiTableDialog';
+import { ReviewGenDialog } from './ReviewGenDialog';
 import { ResizeHandle } from './ResizeHandle';
 
 const RIGHT_PANEL_COLLAPSE_THRESHOLD = 140;
@@ -160,6 +161,7 @@ export function LibraryLayout() {
       </aside>
 
       <AiTableDialog />
+      <ReviewGenDialog />
     </div>
   );
 }

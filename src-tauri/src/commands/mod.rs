@@ -20,6 +20,7 @@ pub mod projects;
 pub mod reader;
 pub mod region;
 pub mod research;
+pub mod review;
 pub mod search;
 pub mod skills;
 pub mod sync;

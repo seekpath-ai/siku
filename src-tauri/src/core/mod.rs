@@ -27,6 +27,7 @@ pub mod project_service;
 pub mod process;
 pub mod redact;
 pub mod research_service;
+pub mod review_gen;
 pub mod search_service;
 pub mod settings_service;
 pub mod skill_review;

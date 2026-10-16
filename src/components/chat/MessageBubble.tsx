@@ -1,11 +1,12 @@
 import ReactMarkdown from 'react-markdown';
-import { User, Copy, Check, Paperclip, ChevronDown, ChevronUp, Tag } from 'lucide-react';
+import { User, Copy, Check, Paperclip, ChevronDown, ChevronUp, Tag, Download } from 'lucide-react';
 import { memo, useEffect, useMemo, useState } from 'react';
 import type { AgentStep, ChatMessage } from '@/lib/types';
 import { parseToolCalls, stepsToPhases } from '@/lib/agentPhases';
 import { parseAttachments } from '@/lib/attachments';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
-import { chatMessageTag } from '@/lib/tauri';
+import { chatMessageTag, saveTextFile } from '@/lib/tauri';
+import { buildTurnMarkdown, turnExportFileName } from '@/lib/exportTurn';
 import { useChatStore } from '@/stores/chatStore';
 import { AttachmentImage } from '@/components/ui/AttachmentImage';
 import { ToolCallCard } from './ToolCallCard';
@@ -23,6 +24,8 @@ import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
 interface Props {
   message: ChatMessage;
   agentSteps?: AgentStep[];
+  /** Nearest user message before this one — exported together for context. */
+  prevUserMessage?: ChatMessage;
 }
 
 function formatTime(iso: string): string {
@@ -111,9 +114,10 @@ function UserText({ content }: { content: string }) {
 // and each history bubble re-parses ReactMarkdown/KaTeX on re-render. Props
 // (message object, steps array from the memoized map) are referentially
 // stable, so history bubbles skip those renders entirely.
-function MessageBubbleInner({ message, agentSteps = [] }: Props) {
+function MessageBubbleInner({ message, agentSteps = [], prevUserMessage }: Props) {
   const agentName = useActiveAgentName();
   const [copied, setCopied] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
   const isTool = message.role === 'tool';
@@ -193,6 +197,31 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch { /* ignore */ }
+  };
+
+  // Export this turn (user message + reasoning chain + reply) as a markdown
+  // file for troubleshooting/sharing. All data is already local.
+  const handleExport = async () => {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const md = buildTurnMarkdown({
+        agentName,
+        userMessage: prevUserMessage,
+        assistantMessage: message,
+        steps: agentSteps,
+      });
+      const { save } = await import('@tauri-apps/plugin-dialog');
+      const target = await save({
+        defaultPath: turnExportFileName(agentName),
+        filters: [{ name: 'Markdown', extensions: ['md'] }],
+      });
+      if (target) await saveTextFile(target, md);
+    } catch (err) {
+      console.error('export turn:', err);
+    } finally {
+      setExporting(false);
+    }
   };
 
   const avatar = (
@@ -308,7 +337,7 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
         )}
       </div>
 
-      {/* Copy + tag buttons under the assistant's bubble */}
+      {/* Copy + export + tag buttons under the assistant's bubble */}
       {!isUser && (
         <div className="flex items-center gap-1 mt-1 opacity-0 group-hover/bubble:opacity-100 transition-opacity">
           <button
@@ -317,6 +346,14 @@ function MessageBubbleInner({ message, agentSteps = [] }: Props) {
             title="复制"
           >
             {copied ? <Check size={11} className="text-codex-accent" /> : <Copy size={11} />}
+          </button>
+          <button
+            onClick={handleExport}
+            disabled={exporting}
+            className="p-0.5 rounded hover:bg-codex-hover text-codex-muted hover:text-codex-primary disabled:opacity-40"
+            title="导出本轮（用户消息 + 推理过程 + 回复）为 Markdown"
+          >
+            <Download size={11} />
           </button>
           <div className="relative" onMouseDown={(e) => e.stopPropagation()}>
             <button

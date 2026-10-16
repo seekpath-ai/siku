@@ -25,6 +25,18 @@ const HistoryMessages = memo(function HistoryMessages({
   messages: ChatMessage[];
   stepsByMessageId: Map<string, AgentStep[]>;
 }) {
+  // Each assistant message gets the nearest preceding user message — the
+  // bubble's turn export includes it for context.
+  const prevUserById = useMemo(() => {
+    const map = new Map<string, ChatMessage>();
+    let lastUser: ChatMessage | undefined;
+    for (const m of messages) {
+      if (m.role === 'user') lastUser = m;
+      else if (m.role === 'assistant' && lastUser) map.set(m.id, lastUser);
+    }
+    return map;
+  }, [messages]);
+
   return (
     <>
       {messages.map((msg) => (
@@ -32,6 +44,7 @@ const HistoryMessages = memo(function HistoryMessages({
           key={msg.id}
           message={msg}
           agentSteps={msg.role === 'assistant' ? stepsByMessageId.get(msg.id) : undefined}
+          prevUserMessage={msg.role === 'assistant' ? prevUserById.get(msg.id) : undefined}
         />
       ))}
     </>

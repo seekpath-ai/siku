@@ -31,7 +31,9 @@ impl Tool for PaperImportTool {
 
     async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
         let file_path = args["file_path"].as_str().ok_or("file_path required")?;
-        let path = std::path::Path::new(file_path);
+        // The model may quote a Git Bash path (`/c/…`) back verbatim.
+        let normalized = super::path::normalize_msys_drive(file_path);
+        let path = std::path::Path::new(normalized.as_ref());
 
         if !path.exists() {
             return Ok(format!("File not found: {file_path}"));

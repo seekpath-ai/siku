@@ -131,8 +131,29 @@ pub fn resolve_existing_path(candidate: String) -> Result<Option<String>, String
     Ok(resolve_existing(&candidate))
 }
 
+/// Git Bash (the agent's preferred shell on Windows) prints MSYS-style
+/// paths like `/c/Users/…`, and the model quotes them back verbatim in prose
+/// and markdown images. Map the drive prefix back to `C:/…` so existence
+/// checks work; a no-op elsewhere, where `/c/…` can be a real path.
+fn normalize_candidate(s: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(target_os = "windows")]
+    {
+        let b = s.as_bytes();
+        if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && (b[2] == b'/' || b[2] == b'\\') {
+            return std::borrow::Cow::Owned(format!(
+                "{}:{}",
+                (b[1] as char).to_ascii_uppercase(),
+                &s[2..]
+            ));
+        }
+    }
+    std::borrow::Cow::Borrowed(s)
+}
+
 fn resolve_existing(candidate: &str) -> Option<String> {
     let trimmed = candidate.trim().trim_matches(|c| c == '"' || c == '\'');
+    let normalized = normalize_candidate(trimmed);
+    let trimmed: &str = &normalized;
     if trimmed.len() < 4 {
         return None;
     }
@@ -505,5 +526,17 @@ mod tests {
         assert_eq!(resolve_existing(&s), None);
         assert_eq!(resolve_existing(&format!("{s} 备注")), None);
         assert_eq!(resolve_existing("/flag"), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolve_existing_normalizes_msys_drive_paths() {
+        // Git Bash prints `C:\…` as `/c/…`; the model quotes that form back.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("vis.png");
+        std::fs::write(&f, b"x").unwrap();
+        let win = f.to_str().unwrap().replace('\\', "/"); // C:/…
+        let msys = format!("/{}{}", win[..1].to_lowercase(), &win[2..]); // /c/…
+        assert_eq!(resolve_existing(&msys), Some(win));
     }
 }

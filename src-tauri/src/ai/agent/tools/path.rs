@@ -26,8 +26,35 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+/// Git Bash (the preferred agent shell on Windows) prints MSYS-style paths
+/// like `/c/Users/…`, and the model passes them back verbatim. Rust's
+/// Windows `Path` treats `/c/…` as *relative* (a root with no drive prefix),
+/// which would silently join it onto the write directory and produce a
+/// nonsense "not found". Map the drive prefix back to `C:/…`; a no-op
+/// elsewhere, where `/c/…` can be a real path.
+pub fn normalize_msys_drive(path: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(target_os = "windows")]
+    {
+        let b = path.as_bytes();
+        if b.len() >= 2
+            && b[0] == b'/'
+            && b[1].is_ascii_alphabetic()
+            && (b.len() == 2 || b[2] == b'/' || b[2] == b'\\')
+        {
+            let rest = if b.len() == 2 { "/" } else { &path[2..] };
+            return std::borrow::Cow::Owned(format!(
+                "{}:{}",
+                (b[1] as char).to_ascii_uppercase(),
+                rest
+            ));
+        }
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
 pub fn resolve_path(base: Option<&str>, path: &str) -> Result<PathBuf, String> {
-    let raw = Path::new(path);
+    let normalized = normalize_msys_drive(path);
+    let raw = Path::new(normalized.as_ref());
     let joined = match base.filter(|b| !b.trim().is_empty()) {
         Some(base) if !raw.is_absolute() => Path::new(base).join(raw),
         Some(_) => raw.to_path_buf(),
@@ -190,5 +217,25 @@ mod tests {
         let resolved = resolve_path(Some(missing.to_str().unwrap()), "x.txt").unwrap();
         assert!(resolved.is_absolute());
         assert!(resolved.ends_with("gone/sub/x.txt"), "{resolved:?}");
+    }
+
+    /// `/c/…` is Git Bash's spelling of `C:\…`; on Windows it must NOT be
+    /// joined onto the write directory as if it were relative.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn msys_drive_paths_resolve_as_absolute() {
+        assert_eq!(
+            resolve_path(Some(r"C:\base"), "/c/Users/x/a.png").unwrap(),
+            std::path::PathBuf::from("C:/Users/x/a.png")
+        );
+        assert_eq!(
+            super::normalize_msys_drive("/d").as_ref(),
+            "D:/",
+            "bare drive root"
+        );
+        // Not MSYS forms: multi-letter first segment, relative, plain POSIX.
+        for untouched in ["/tmp/x", "/cc/foo", "relative/x", "C:/x"] {
+            assert_eq!(super::normalize_msys_drive(untouched).as_ref(), untouched);
+        }
     }
 }

@@ -2,15 +2,25 @@ import { useEffect, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { ImageOff } from 'lucide-react';
 
+/** Git Bash (the agent's preferred shell on Windows) prints MSYS-style
+ * paths like `/c/Users/…` and the model quotes them back verbatim in
+ * `![](…)`. Map the drive prefix back to `C:/…`; elsewhere `/c/…` can be a
+ * real POSIX path, so leave it alone. */
+function normalizeMsysPath(src: string): string {
+  if (typeof navigator !== 'undefined' && !navigator.userAgent.includes('Windows')) return src;
+  return src.replace(/^\/([A-Za-z])(?=[\\/])/, '$1:');
+}
+
 /** markdown img src → renderable URL: http(s)/data/blob pass through, a
  * local absolute path goes through the asset protocol (scope `**`). Windows
  * paths arrive with backslashes percent-encoded (hast normalizeUri turns
  * `C:\…` into `C:%5C…`) — decode before convertFileSrc. */
 function resolveImageSrc(src: string): string {
-  if (/^(https?|data|blob|asset):/i.test(src)) return src;
-  if (/^[A-Za-z]:%5C/i.test(src)) return convertFileSrc(decodeURIComponent(src));
-  if (/^([A-Za-z]:[\\/]|\\\\|\/)/.test(src)) return convertFileSrc(src);
-  return src;
+  const s = normalizeMsysPath(src);
+  if (/^(https?|data|blob|asset):/i.test(s)) return s;
+  if (/^[A-Za-z]:%5C/i.test(s)) return convertFileSrc(decodeURIComponent(s));
+  if (/^([A-Za-z]:[\\/]|\\\\|\/)/.test(s)) return convertFileSrc(s);
+  return s;
 }
 
 /** Assistant-bubble image: thumbnail with the same click-to-zoom lightbox as

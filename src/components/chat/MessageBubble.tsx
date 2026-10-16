@@ -7,7 +7,7 @@ import { parseAttachments } from '@/lib/attachments';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
 import { chatMessageTag, saveTextFile, agentGetTurnContext } from '@/lib/tauri';
 import { buildTurnMarkdown, turnExportFileName, type TurnContextSnapshot } from '@/lib/exportTurn';
-import { useDialog } from '@/hooks/useDialog';
+import { ExportTurnDialog } from './ExportTurnDialog';
 import { useChatStore } from '@/stores/chatStore';
 import { AttachmentImage } from '@/components/ui/AttachmentImage';
 import { ToolCallCard } from './ToolCallCard';
@@ -119,7 +119,7 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage }: Props
   const agentName = useActiveAgentName();
   const [copied, setCopied] = useState(false);
   const [exporting, setExporting] = useState(false);
-  const { confirm } = useDialog();
+  const [exportDialogOpen, setExportDialogOpen] = useState(false);
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
   const isTool = message.role === 'tool';
@@ -202,21 +202,22 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage }: Props
   };
 
   // Export this turn (user message + reasoning chain + reply) as a markdown
-  // file for troubleshooting/sharing. All data is already local.
-  const handleExport = async () => {
+  // file for troubleshooting/sharing. All data is already local. The options
+  // dialog (snapshot checkbox) is skipped when there is no user message to
+  // take a snapshot from.
+  const handleExportClick = () => {
+    if (exporting) return;
+    if (prevUserMessage) setExportDialogOpen(true);
+    else void doExport(false);
+  };
+
+  const doExport = async (includeContext: boolean) => {
+    setExportDialogOpen(false);
     if (exporting) return;
     setExporting(true);
     try {
-      // The snapshot holds the system prompt + history — sensitive and only
-      // useful for troubleshooting, so it is opt-in per export.
       let turnContext: TurnContextSnapshot | null = null;
-      if (
-        prevUserMessage &&
-        (await confirm(
-          '是否附带本轮上下文快照（系统提示词 + 历史消息，可能包含敏感信息）？',
-          '导出本轮'
-        ))
-      ) {
+      if (includeContext && prevUserMessage) {
         turnContext = await agentGetTurnContext(prevUserMessage.id).catch(() => null);
       }
       const md = buildTurnMarkdown({
@@ -363,7 +364,7 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage }: Props
             {copied ? <Check size={11} className="text-codex-accent" /> : <Copy size={11} />}
           </button>
           <button
-            onClick={handleExport}
+            onClick={handleExportClick}
             disabled={exporting}
             className="p-0.5 rounded hover:bg-codex-hover text-codex-muted hover:text-codex-primary disabled:opacity-40"
             title="导出本轮（用户消息 + 推理过程 + 回复）为 Markdown"
@@ -455,6 +456,9 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage }: Props
       )}
 
       {ctxOpen && <TurnContextDialog message={message} onClose={() => setCtxOpen(false)} />}
+      {exportDialogOpen && (
+        <ExportTurnDialog onConfirm={(include) => void doExport(include)} onClose={() => setExportDialogOpen(false)} />
+      )}
     </div>
   );
 }

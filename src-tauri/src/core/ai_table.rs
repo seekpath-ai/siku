@@ -44,6 +44,10 @@ pub struct ExtractProgress {
     pub failed: usize,
     /// Title of the paper currently being processed ("" between/after runs).
     pub current_title: String,
+    /// One log line for the dialog's process panel (paper finished/failed/
+    /// skipped); None on the "starting paper X" beats.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log: Option<String>,
     /// Set when the run ends: "done" | "cancelled".
     pub finished: Option<String>,
 }
@@ -92,12 +96,14 @@ const EVIDENCE_CHAR_CAP: usize = 6000;
 const CHUNKS_PER_COLUMN: usize = 3;
 
 /// Run the batch. `paper_ids` is the selected set, `columns` the column
-/// defs. Spawning/cancellation is the command layer's job.
+/// defs, `provider_id` overrides the default (starred) model when set.
+/// Spawning/cancellation is the command layer's job.
 pub async fn run_extraction(
     app: AppHandle,
     db: SqlitePool,
     paper_ids: Vec<String>,
     columns: Vec<TableColumn>,
+    provider_id: Option<String>,
 ) {
     let _guard = match RunGuard::try_acquire() {
         Ok(g) => g,
@@ -107,16 +113,16 @@ pub async fn run_extraction(
         }
     };
 
-    let llm = match crate::core::llm_provider_service::load_default_llm_config(&db).await {
+    let llm = match crate::core::llm_provider_service::load_llm_config_for(&db, provider_id.as_deref()).await {
         Ok(cfg) => match crate::ai::llm::client::create_llm_client(&cfg) {
             Ok(c) => c,
             Err(e) => {
-                emit(&app, &ExtractProgress { total: 0, done: 0, failed: 0, current_title: e, finished: Some("done".into()) });
+                emit(&app, &ExtractProgress { total: 0, done: 0, failed: 0, current_title: String::new(), log: Some(format!("创建模型客户端失败：{e}")), finished: Some("done".into()) });
                 return;
             }
         },
         Err(e) => {
-            emit(&app, &ExtractProgress { total: 0, done: 0, failed: 0, current_title: e, finished: Some("done".into()) });
+            emit(&app, &ExtractProgress { total: 0, done: 0, failed: 0, current_title: String::new(), log: Some(format!("加载模型配置失败：{e}")), finished: Some("done".into()) });
             return;
         }
     };
@@ -132,19 +138,29 @@ pub async fn run_extraction(
             break;
         }
         let title = paper_title(&db, paper_id).await;
-        emit(&app, &ExtractProgress { total, done, failed, current_title: title.clone(), finished: None });
+        emit(&app, &ExtractProgress { total, done, failed, current_title: title.clone(), log: None, finished: None });
 
+        let started = std::time::Instant::now();
         match extract_one(&db, llm.as_ref(), paper_id, &columns).await {
-            Ok(()) => done += 1,
+            Ok(did_work) => {
+                done += 1;
+                let log = if did_work {
+                    format!("✓ 《{title}》抽取完成（{:.1}s）", started.elapsed().as_secs_f64())
+                } else {
+                    format!("— 《{title}》全部单元格已存在，跳过")
+                };
+                emit(&app, &ExtractProgress { total, done, failed, current_title: title, log: Some(log), finished: None });
+            }
             Err(e) => {
                 tracing::warn!(paper_id, error = %e, "ai-table extract failed for paper");
                 // Mark every missing cell as failed so the UI can offer a
                 // per-cell retry instead of a silently blank grid.
                 let _ = mark_failed(&db, paper_id, &columns).await;
                 failed += 1;
+                let log = format!("✗ 《{title}》：{e}");
+                emit(&app, &ExtractProgress { total, done, failed, current_title: title, log: Some(log), finished: None });
             }
         }
-        emit(&app, &ExtractProgress { total, done, failed, current_title: title, finished: None });
     }
 
     emit(&app, &ExtractProgress {
@@ -152,6 +168,7 @@ pub async fn run_extraction(
         done,
         failed,
         current_title: String::new(),
+        log: None,
         finished: Some(if cancelled { "cancelled".into() } else { "done".into() }),
     });
 }
@@ -169,16 +186,17 @@ async fn paper_title(db: &SqlitePool, paper_id: &str) -> String {
 
 /// Extract every column for one paper and upsert the cells. Cells that are
 /// already `done` or were manually `edited` are left untouched (the LLM call
-/// still returns all columns — upsert is selective).
+/// still returns all columns — upsert is selective). Returns false when no
+/// LLM call was needed (all cells already present).
 async fn extract_one(
     db: &SqlitePool,
     llm: &dyn crate::ai::llm::LlmClient,
     paper_id: &str,
     columns: &[TableColumn],
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let pending = pending_columns(db, paper_id, columns).await?;
     if pending.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let meta = paper_metadata(db, paper_id).await?;
@@ -221,7 +239,7 @@ async fn extract_one(
             .to_string();
         upsert_cell(db, paper_id, &col.key, &value, "done", false, &now).await?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Columns whose cell is missing or failed — the ones a run must produce.

@@ -1,12 +1,14 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { useNavigate } from '@tanstack/react-router';
 import {
   X, Loader2, Sparkles, ArrowLeft, ArrowUp, ArrowDown, Plus, Trash2, Check, Square, BookOpen,
+  ChevronDown, ChevronRight,
 } from 'lucide-react';
 import { useReviewStore } from '@/stores/reviewStore';
 import { useDialog } from '@/hooks/useDialog';
 import { openNoteTab } from '@/lib/openNote';
+import { ModelOverrideSelect } from './ModelOverrideSelect';
 import {
   reviewGenerateOutline,
   reviewGenerateStart,
@@ -36,6 +38,15 @@ export function ReviewGenDialog() {
   const [progress, setProgress] = useState<ReviewProgress | null>(null);
   const [noteId, setNoteId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [providerId, setProviderId] = useState('');
+  const [streamText, setStreamText] = useState('');
+  const [showPreview, setShowPreview] = useState(true);
+  const previewRef = useRef<HTMLDivElement>(null);
+
+  // Keep the live preview pinned to its newest output.
+  useEffect(() => {
+    previewRef.current?.scrollTo({ top: previewRef.current.scrollHeight });
+  }, [streamText]);
 
   // Reset whenever the dialog is (re)opened with a paper set.
   useEffect(() => {
@@ -54,6 +65,13 @@ export function ReviewGenDialog() {
     const un = listen<ReviewProgress>('library:review-progress', (e) => {
       const p = e.payload;
       setProgress(p);
+      if (p.stage === 'section' && !p.delta) {
+        // New section starting: reset the live preview.
+        setStreamText('');
+      }
+      if (p.delta) {
+        setStreamText((t) => t + p.delta);
+      }
       if (p.stage === 'done') {
         setNoteId(p.noteId);
         setBusy(false);
@@ -79,7 +97,7 @@ export function ReviewGenDialog() {
     setBusy(true);
     setError(null);
     try {
-      const result = await reviewGenerateOutline(paperIds, question.trim(), scope.trim(), language, targetWords);
+      const result = await reviewGenerateOutline(paperIds, question.trim(), scope.trim(), language, targetWords, providerId || null);
       setOutline(result);
       setStep('outline');
     } catch (err) {
@@ -104,7 +122,7 @@ export function ReviewGenDialog() {
     setError(null);
     setNoteId(null);
     try {
-      await reviewGenerateStart(paperIds, question.trim(), language, targetWords, cleaned);
+      await reviewGenerateStart(paperIds, question.trim(), language, targetWords, cleaned, providerId || null);
     } catch (err) {
       setBusy(false);
       setError(`启动失败: ${err}`);
@@ -195,6 +213,10 @@ export function ReviewGenDialog() {
                   </select>
                 </div>
               </div>
+              <div className="space-y-1.5">
+                <label className="text-xs text-text-secondary">模型</label>
+                <ModelOverrideSelect value={providerId} onChange={setProviderId} disabled={busy} className="w-full" />
+              </div>
             </div>
           )}
 
@@ -203,6 +225,7 @@ export function ReviewGenDialog() {
               <p className="text-[11px] text-text-secondary/60">
                 调整目录后再开始：可改标题与要点、增删章节、调整顺序。
               </p>
+              <ModelOverrideSelect value={providerId} onChange={setProviderId} className="w-full" />
               {outline.map((s, i) => (
                 <div key={i} className="rounded-lg border border-surface-hover/70 p-2.5 space-y-1.5">
                   <div className="flex items-center gap-1.5">
@@ -274,6 +297,28 @@ export function ReviewGenDialog() {
                   );
                 })}
               </ul>
+
+              {/* Live stream of the section being written — a long generation
+                  no longer looks like a stuck spinner. */}
+              <div className="rounded-lg border border-surface-hover/70 overflow-hidden">
+                <button
+                  onClick={() => setShowPreview((v) => !v)}
+                  className="w-full flex items-center gap-1 px-3 py-1.5 text-[11px] text-text-secondary/60 hover:bg-surface-hover/40"
+                >
+                  {showPreview ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                  生成过程
+                  {busy && <Loader2 size={10} className="animate-spin" />}
+                </button>
+                {showPreview && (
+                  <div
+                    ref={previewRef}
+                    className="max-h-44 overflow-y-auto px-3 pb-2 whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-text-secondary/85"
+                  >
+                    {streamText || '（等待模型输出…）'}
+                  </div>
+                )}
+              </div>
+
               {progress?.stage === 'assemble' && (
                 <p className="text-[12px] text-text-secondary">正在汇总并保存笔记…</p>
               )}

@@ -15,6 +15,7 @@ pub async fn review_generate_outline(
     scope: String,
     language: String,
     target_words: u32,
+    provider_id: Option<String>,
 ) -> Result<Vec<ReviewSection>, String> {
     if paper_ids.is_empty() {
         return Err("未选择文献".to_string());
@@ -29,6 +30,7 @@ pub async fn review_generate_outline(
         scope.trim(),
         &language,
         target_words,
+        provider_id.as_deref(),
     )
     .await
 }
@@ -44,6 +46,7 @@ pub async fn review_generate_start(
     language: String,
     target_words: u32,
     outline: Vec<ReviewSection>,
+    provider_id: Option<String>,
 ) -> Result<(), String> {
     if paper_ids.is_empty() {
         return Err("未选择文献".to_string());
@@ -53,7 +56,7 @@ pub async fn review_generate_start(
     }
     let db = state.db.clone();
     tauri::async_runtime::spawn(async move {
-        review_gen::run_review(app, db, paper_ids, question, language, target_words, outline).await;
+        review_gen::run_review(app, db, paper_ids, question, language, target_words, outline, provider_id).await;
     });
     Ok(())
 }

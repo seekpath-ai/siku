@@ -2013,6 +2013,8 @@ export interface AiTableProgress {
   done: number;
   failed: number;
   currentTitle: string;
+  /** One process-panel log line (paper finished/failed/skipped). */
+  log?: string;
   /** "done" | "cancelled" once the run ends; null while running. */
   finished: string | null;
 }
@@ -2032,9 +2034,10 @@ export interface AiTablePaperBrief {
 
 export async function aiTableExtractStart(
   paperIds: string[],
-  columns: AiTableColumn[]
+  columns: AiTableColumn[],
+  providerId?: string | null
 ): Promise<void> {
-  return invoke<void>('ai_table_extract_start', { paperIds, columns });
+  return invoke<void>('ai_table_extract_start', { paperIds, columns, providerId: providerId ?? null });
 }
 
 export async function aiTableExtractCancel(): Promise<void> {
@@ -2093,6 +2096,8 @@ export interface ReviewProgress {
   sectionTitle: string;
   noteId: string | null;
   message: string | null;
+  /** Streaming text fragment of the section being written. */
+  delta?: string;
 }
 
 export async function reviewGenerateOutline(
@@ -2100,7 +2105,8 @@ export async function reviewGenerateOutline(
   question: string,
   scope: string,
   language: string,
-  targetWords: number
+  targetWords: number,
+  providerId?: string | null
 ): Promise<ReviewSection[]> {
   return invoke<ReviewSection[]>('review_generate_outline', {
     paperIds,
@@ -2108,6 +2114,7 @@ export async function reviewGenerateOutline(
     scope,
     language,
     targetWords,
+    providerId: providerId ?? null,
   });
 }
 
@@ -2116,9 +2123,17 @@ export async function reviewGenerateStart(
   question: string,
   language: string,
   targetWords: number,
-  outline: ReviewSection[]
+  outline: ReviewSection[],
+  providerId?: string | null
 ): Promise<void> {
-  return invoke<void>('review_generate_start', { paperIds, question, language, targetWords, outline });
+  return invoke<void>('review_generate_start', {
+    paperIds,
+    question,
+    language,
+    targetWords,
+    outline,
+    providerId: providerId ?? null,
+  });
 }
 
 export async function reviewGenerateCancel(): Promise<void> {

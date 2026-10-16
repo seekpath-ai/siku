@@ -219,6 +219,19 @@ pub async fn load_default_llm_config(db: &SqlitePool) -> Result<crate::ai::llm::
     Ok(provider_to_block(&provider).to_llm_config())
 }
 
+/// Load the LLM config for a specific provider id; `None`/empty means the
+/// default (starred) provider — the "跟随默认" behaviour of the batch
+/// features (AI 表格列 / AI 综述).
+pub async fn load_llm_config_for(
+    db: &SqlitePool,
+    provider_id: Option<&str>,
+) -> Result<crate::ai::llm::LlmConfig, String> {
+    match provider_id.filter(|s| !s.trim().is_empty()) {
+        Some(id) => Ok(provider_to_block(&get_provider(db, id).await?).to_llm_config()),
+        None => load_default_llm_config(db).await,
+    }
+}
+
 async fn clear_default(db: &SqlitePool) -> Result<(), String> {
     sqlx::query("UPDATE llm_providers SET is_default = 0")
         .execute(db)

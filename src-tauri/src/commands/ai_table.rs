@@ -17,13 +17,15 @@ pub struct TablePreset {
 }
 
 /// Start a batch extraction run (spawned; progress on
-/// `library:ai-table-progress`). One run at a time.
+/// `library:ai-table-progress`). One run at a time. `provider_id` overrides
+/// the default (starred) model when set.
 #[tauri::command]
 pub async fn ai_table_extract_start(
     app: AppHandle,
     state: State<'_, AppState>,
     paper_ids: Vec<String>,
     columns: Vec<TableColumn>,
+    provider_id: Option<String>,
 ) -> Result<(), String> {
     if paper_ids.is_empty() {
         return Err("未选择文献".to_string());
@@ -33,7 +35,7 @@ pub async fn ai_table_extract_start(
     }
     let db = state.db.clone();
     tauri::async_runtime::spawn(async move {
-        ai_table::run_extraction(app, db, paper_ids, columns).await;
+        ai_table::run_extraction(app, db, paper_ids, columns, provider_id).await;
     });
     Ok(())
 }

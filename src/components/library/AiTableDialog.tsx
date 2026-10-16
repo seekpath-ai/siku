@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle } from 'lucide-react';
+import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
 import { useAiTableStore } from '@/stores/aiTableStore';
 import { useDialog } from '@/hooks/useDialog';
+import { ModelOverrideSelect } from './ModelOverrideSelect';
 import {
   aiTableExtractStart,
   aiTableExtractCancel,
@@ -44,6 +45,15 @@ export function AiTableDialog() {
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<AiTableProgress | null>(null);
   const [editing, setEditing] = useState<{ paperId: string; columnKey: string; value: string } | null>(null);
+  const [providerId, setProviderId] = useState('');
+  const [logs, setLogs] = useState<string[]>([]);
+  const [showLog, setShowLog] = useState(true);
+  const logRef = useRef<HTMLDivElement>(null);
+
+  // Keep the process log pinned to its newest line.
+  useEffect(() => {
+    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+  }, [logs]);
 
   const reloadCells = useCallback(
     async (cols: AiTableColumn[]) => {
@@ -83,6 +93,9 @@ export function AiTableDialog() {
     if (!open) return;
     const un = listen<AiTableProgress>('library:ai-table-progress', (e) => {
       setProgress(e.payload);
+      if (e.payload.log) {
+        setLogs((prev) => [...prev.slice(-99), e.payload.log!]);
+      }
       if (e.payload.finished) {
         setRunning(false);
         void reloadCells(columns);
@@ -115,8 +128,9 @@ export function AiTableDialog() {
     setColumns(cols);
     setRunning(true);
     setProgress(null);
+    setLogs([]);
     try {
-      await aiTableExtractStart(ids ?? paperIds, cols);
+      await aiTableExtractStart(ids ?? paperIds, cols, providerId || null);
     } catch (err) {
       setRunning(false);
       await alert(`启动抽取失败: ${err}`);
@@ -293,6 +307,10 @@ export function AiTableDialog() {
               </button>
             </div>
           </div>
+          <div className="p-2.5 border-t border-surface-hover space-y-1.5">
+            <label className="block text-[11px] text-text-secondary/60">模型</label>
+            <ModelOverrideSelect value={providerId} onChange={setProviderId} disabled={running} className="w-full" />
+          </div>
         </aside>
 
         {/* Right: toolbar + grid */}
@@ -356,6 +374,25 @@ export function AiTableDialog() {
           <p className="px-4 py-1.5 text-[11px] text-text-secondary/50 border-b border-surface-hover/60">
             每篇文献一次调用返回所有列；已完成和手动编辑的单元格不会被覆盖。点击单元格可编辑。
           </p>
+
+          {/* Process log: per-paper outcomes, so a long run never looks stuck */}
+          <div className="border-b border-surface-hover/60">
+            <button
+              onClick={() => setShowLog((v) => !v)}
+              className="w-full flex items-center gap-1 px-4 py-1 text-[11px] text-text-secondary/60 hover:bg-surface-hover/40"
+            >
+              {showLog ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+              过程日志{logs.length > 0 ? `（${logs.length}）` : ''}
+              {running && <Loader2 size={10} className="animate-spin" />}
+            </button>
+            {showLog && logs.length > 0 && (
+              <div ref={logRef} className="max-h-28 overflow-y-auto px-4 pb-2 font-mono text-[11px] leading-relaxed text-text-secondary/80">
+                {logs.map((l, i) => (
+                  <div key={i}>{l}</div>
+                ))}
+              </div>
+            )}
+          </div>
 
           <div className="flex-1 overflow-auto">
             <table className="w-full border-collapse text-[12px]">

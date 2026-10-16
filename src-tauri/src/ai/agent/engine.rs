@@ -542,9 +542,19 @@ impl AgentEngine {
             // budget zeroed the inner budget and dropped the entire history,
             // including the current user message.
             let context_budget = self.config.effective_context_budget();
-            if ConversationMemory::estimate_messages_tokens(&messages) > context_budget {
+            let est_before = ConversationMemory::estimate_messages_tokens(&messages);
+            if est_before > context_budget {
                 let before = messages.len();
                 messages = self.memory.truncate(&messages, output_cap as usize);
+                info!(
+                    round,
+                    before,
+                    after = messages.len(),
+                    est_tokens = est_before,
+                    budget = context_budget,
+                    user_msgs_after = messages.iter().filter(|m| m.role == "user").count(),
+                    "context budget exceeded mid-turn; history truncated (task message pinned)"
+                );
                 // The round-window manifest (agent.rs) covers history dropped
                 // by max_memory_rounds; this note covers the mid-turn drops by
                 // the token budget, which the manifest cannot foresee.

@@ -69,7 +69,8 @@ impl ConversationMemory {
     }
 
     /// Truncate messages to fit within the token budget.
-    /// Keeps system prompt + most recent messages.
+    /// Keeps system prompt + most recent messages, and always pins the
+    /// newest user message (the task the model is currently working on).
     /// Returns the truncated list.
     /// `max_tokens == 0` means no truncation.
     /// `reserved_tokens` is the headroom kept free for the model's OUTPUT
@@ -119,6 +120,15 @@ impl ConversationMemory {
             .filter(|m| m.role != "system")
             .collect();
 
+        // The newest user message is the task the model is currently working
+        // on (mid-turn, everything after it is the assistant/tool run it
+        // triggered). The backward walk below drops it FIRST — it is the
+        // oldest message once older history is gone — and a model that can
+        // no longer see the task confabulates one from its training prior
+        // ("The user says hello" → greeting instead of an answer). Like the
+        // system prompt, it must survive regardless of budget.
+        let pinned = recent.iter().rposition(|m| m.role == "user");
+
         let mut kept: Vec<&[&crate::ai::llm::ChatMessage]> = Vec::new();
         let mut end = recent.len();
         while end > 0 {
@@ -136,18 +146,32 @@ impl ConversationMemory {
             }
         }
 
+        let pinned_kept = pinned.is_some_and(|pi| {
+            kept.iter()
+                .any(|block| block.iter().any(|m| std::ptr::eq(*m, recent[pi])))
+        });
+
         // Safety net: something has to survive even when the budget is already
         // blown, and it must be a message that can stand on its own. Dropping
         // everything leaves the model staring at a bare system prompt (it then
         // hallucinates from that instead of answering); keeping a lone tool
-        // response is worse still, since it is unsendable by definition.
-        if kept.is_empty() {
+        // response is worse still, since it is unsendable by definition. The
+        // pinned user message is itself the net when one exists.
+        if kept.is_empty() && pinned.is_none() {
             if let Some(idx) = recent.iter().rposition(|m| m.role != "tool") {
                 kept.push(std::slice::from_ref(&recent[idx]));
             }
         }
 
-        // Add back in original order.
+        // Add back in original order. A pinned task that fell out of the
+        // window is re-inserted right after the system message, so the
+        // request still reads as a normal conversation: task first, then the
+        // recent work.
+        if !pinned_kept {
+            if let Some(pi) = pinned {
+                result.push(recent[pi].clone());
+            }
+        }
         for block in kept.iter().rev() {
             for msg in block.iter() {
                 result.push((*msg).clone());
@@ -251,6 +275,35 @@ impl Default for ConversationMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_truncate_pins_current_task_message() {
+        // Mid-turn shape: user(task) followed by a long assistant/tool run.
+        // The backward walk drops the task FIRST — it is the oldest message —
+        // and a model that can no longer see the task confabulates one from
+        // its training prior ("The user says hello" → greeting). The task
+        // must be re-inserted right after the system prompt.
+        let memory = ConversationMemory::new(1000, Some("sys".into()));
+        let big = "y".repeat(1200); // ~300 tokens each
+        let messages = vec![
+            msg("user", "国务院人工智能政策查查"),
+            assistant_with_calls(&["call_a"], 1200),
+            tool_result("call_a", &big),
+            assistant_with_calls(&["call_b"], 1200),
+            tool_result("call_b", &big),
+        ];
+
+        let out = memory.truncate(&messages, 200);
+
+        assert_sendable(&out);
+        assert_eq!(out[0].role, "system");
+        assert_eq!(out[1].role, "user");
+        assert_eq!(out[1].content, "国务院人工智能政策查查");
+        // The newest tool block still fits after the pinned task.
+        assert!(out.iter().any(|m| m.role == "tool"));
+        // No duplication: the task appears exactly once.
+        assert_eq!(out.iter().filter(|m| m.role == "user").count(), 1);
+    }
 
     #[test]
     fn test_estimate_tokens() {

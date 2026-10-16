@@ -114,13 +114,21 @@ pub async fn run_extraction(
     };
 
     let llm = match crate::core::llm_provider_service::load_llm_config_for(&db, provider_id.as_deref()).await {
-        Ok(cfg) => match crate::ai::llm::client::create_llm_client(&cfg) {
-            Ok(c) => c,
-            Err(e) => {
-                emit(&app, &ExtractProgress { total: 0, done: 0, failed: 0, current_title: String::new(), log: Some(format!("创建模型客户端失败：{e}")), finished: Some("done".into()) });
-                return;
+        Ok(cfg) => {
+            // Thinking models count reasoning toward max_tokens: a tiny
+            // provider cap can be exhausted before any JSON is emitted.
+            let mut cfg = cfg;
+            if cfg.max_tokens < 6000 {
+                cfg.max_tokens = 6000;
             }
-        },
+            match crate::ai::llm::client::create_llm_client(&cfg) {
+                Ok(c) => c,
+                Err(e) => {
+                    emit(&app, &ExtractProgress { total: 0, done: 0, failed: 0, current_title: String::new(), log: Some(format!("创建模型客户端失败：{e}")), finished: Some("done".into()) });
+                    return;
+                }
+            }
+        }
         Err(e) => {
             emit(&app, &ExtractProgress { total: 0, done: 0, failed: 0, current_title: String::new(), log: Some(format!("加载模型配置失败：{e}")), finished: Some("done".into()) });
             return;

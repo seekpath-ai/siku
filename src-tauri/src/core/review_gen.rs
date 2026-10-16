@@ -113,8 +113,18 @@ fn chat_msg(role: &str, content: String) -> ChatMessage {
 async fn default_llm(
     db: &SqlitePool,
     provider_id: Option<&str>,
+    min_max_tokens: u32,
 ) -> Result<Box<dyn crate::ai::llm::LlmClient>, String> {
-    let cfg = crate::core::llm_provider_service::load_llm_config_for(db, provider_id).await?;
+    let mut cfg = crate::core::llm_provider_service::load_llm_config_for(db, provider_id).await?;
+    // Thinking models count reasoning toward max_tokens: a section needs its
+    // prose budget PLUS reasoning headroom, or the call ends on
+    // finish_reason=length with zero visible content — which is exactly how
+    // a note of headings-with-empty-bodies is produced. Bump the cap (the
+    // provider row stays untouched).
+    let need = (min_max_tokens.saturating_mul(2).saturating_add(4000)).min(32768);
+    if cfg.max_tokens < need {
+        cfg.max_tokens = need;
+    }
     crate::ai::llm::client::create_llm_client(&cfg)
 }
 
@@ -201,7 +211,7 @@ pub async fn generate_outline(
     if sources.is_empty() {
         return Err("文献集为空（文献不存在或已删除）".to_string());
     }
-    let llm = default_llm(db, provider_id).await?;
+    let llm = default_llm(db, provider_id, 1500).await?;
 
     let section_count = ((target_words / 800) as usize).clamp(3, 8);
     let system = "你是学术写作助手，擅长设计文献综述的目录框架。只输出 JSON 数组，\
@@ -273,13 +283,12 @@ pub async fn run_review(
         Ok(_) => return fail(&app, "文献集为空（文献不存在或已删除）".into()),
         Err(e) => return fail(&app, e),
     };
-    let llm = match default_llm(&db, provider_id.as_deref()).await {
+    let total = outline.len();
+    let per_section_words = (target_words as usize / total.max(1)).max(300);
+    let llm = match default_llm(&db, provider_id.as_deref(), per_section_words as u32).await {
         Ok(c) => c,
         Err(e) => return fail(&app, e),
     };
-
-    let total = outline.len();
-    let per_section_words = (target_words as usize / total.max(1)).max(300);
     let mut section_md: Vec<(String, String)> = Vec::new();
 
     for (idx, section) in outline.iter().enumerate() {
@@ -369,23 +378,39 @@ async fn write_section(
     let app2 = app.clone();
     let drain = tokio::spawn(async move {
         let mut text = String::new();
+        let mut finish: Option<String> = None;
         while let Some(ev) = rx.recv().await {
-            if ev.event_type == "delta" {
-                if let Some(content) = ev.content {
-                    text.push_str(&content);
-                    emit_stream(&app2, "section", section_index, total_sections, Some(content), None);
+            match ev.event_type.as_str() {
+                "delta" => {
+                    if let Some(content) = ev.content {
+                        text.push_str(&content);
+                        emit_stream(&app2, "section", section_index, total_sections, Some(content), None);
+                    }
                 }
-            } else if ev.event_type == "reasoning" {
-                if let Some(content) = ev.content {
-                    emit_stream(&app2, "section", section_index, total_sections, None, Some(content));
+                "reasoning" => {
+                    if let Some(content) = ev.content {
+                        emit_stream(&app2, "section", section_index, total_sections, None, Some(content));
+                    }
                 }
+                "finish" => finish = ev.content,
+                _ => {}
             }
         }
-        text
+        (text, finish)
     });
     let call = llm.chat_completion_stream(&messages, &[], tx).await;
-    let text = drain.await.map_err(|e| format!("stream drain: {e}"))?;
+    let (text, finish) = drain.await.map_err(|e| format!("stream drain: {e}"))?;
     call?;
+    if text.trim().is_empty() {
+        // The classic failure is a thinking model exhausting max_tokens on
+        // reasoning (finish=length) — say so plainly instead of letting the
+        // pipeline assemble a note of empty sections.
+        tracing::warn!(section_index, finish_reason = finish.as_deref().unwrap_or("?"), "section produced no visible content");
+        return Err(match finish.as_deref() {
+            Some("length") => "模型的思考占满了输出额度（max_tokens），未产生正文。请调大该模型的 max_tokens（设置 → 模型）后重试。".to_string(),
+            other => format!("模型未产生正文（finish_reason={}）。", other.unwrap_or("未知")),
+        });
+    }
     Ok(linkify_citations(text.trim(), sources, &hits))
 }
 

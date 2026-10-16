@@ -5,8 +5,9 @@ import type { AgentStep, ChatMessage } from '@/lib/types';
 import { parseToolCalls, stepsToPhases } from '@/lib/agentPhases';
 import { parseAttachments } from '@/lib/attachments';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
-import { chatMessageTag, saveTextFile } from '@/lib/tauri';
-import { buildTurnMarkdown, turnExportFileName } from '@/lib/exportTurn';
+import { chatMessageTag, saveTextFile, agentGetTurnContext } from '@/lib/tauri';
+import { buildTurnMarkdown, turnExportFileName, type TurnContextSnapshot } from '@/lib/exportTurn';
+import { useDialog } from '@/hooks/useDialog';
 import { useChatStore } from '@/stores/chatStore';
 import { AttachmentImage } from '@/components/ui/AttachmentImage';
 import { ToolCallCard } from './ToolCallCard';
@@ -118,6 +119,7 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage }: Props
   const agentName = useActiveAgentName();
   const [copied, setCopied] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const { confirm } = useDialog();
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
   const isTool = message.role === 'tool';
@@ -205,11 +207,24 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage }: Props
     if (exporting) return;
     setExporting(true);
     try {
+      // The snapshot holds the system prompt + history — sensitive and only
+      // useful for troubleshooting, so it is opt-in per export.
+      let turnContext: TurnContextSnapshot | null = null;
+      if (
+        prevUserMessage &&
+        (await confirm(
+          '是否附带本轮上下文快照（系统提示词 + 历史消息，可能包含敏感信息）？',
+          '导出本轮'
+        ))
+      ) {
+        turnContext = await agentGetTurnContext(prevUserMessage.id).catch(() => null);
+      }
       const md = buildTurnMarkdown({
         agentName,
         userMessage: prevUserMessage,
         assistantMessage: message,
         steps: agentSteps,
+        turnContext,
       });
       const { save } = await import('@tauri-apps/plugin-dialog');
       const target = await save({

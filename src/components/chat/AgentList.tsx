@@ -15,6 +15,7 @@ import {
   Archive,
   ArchiveRestore,
   Pencil,
+  Download,
   ChevronDown,
   ChevronRight,
 } from 'lucide-react';
@@ -29,8 +30,12 @@ import {
   agentArchiveSession,
   agentSessionWorkspace,
   fileBrowserRevealInSystem,
+  getAgentSteps,
+  getChatMessages,
   revealInFileManager,
+  saveTextFile,
 } from '@/lib/tauri';
+import { buildSessionMarkdown, sessionExportFileName } from '@/lib/exportTurn';
 import { useDialog } from '@/hooks/useDialog';
 import { ConfirmButton } from '@/components/ui/ConfirmButton';
 import { AgentAvatar } from './AgentAvatar';
@@ -318,6 +323,35 @@ export function AgentList() {
     } catch (err) {
       console.error('open workspace:', err);
       await alert(`打开工作区失败: ${err}`);
+    }
+  };
+
+  // Export the whole session (every turn: user → reasoning → reply) as one
+  // markdown file. No pagination: getChatMessages without opts returns all.
+  const handleExportSession = async (agent: AgentSession) => {
+    try {
+      const [page, steps] = await Promise.all([
+        getChatMessages(agent.id),
+        getAgentSteps(agent.id),
+      ]);
+      if (page.messages.length === 0) {
+        await alert('该会话还没有消息，无可导出内容');
+        return;
+      }
+      const md = buildSessionMarkdown({
+        sessionTitle: agent.title,
+        messages: page.messages,
+        steps,
+      });
+      const { save } = await import('@tauri-apps/plugin-dialog');
+      const target = await save({
+        defaultPath: sessionExportFileName(agent.title),
+        filters: [{ name: 'Markdown', extensions: ['md'] }],
+      });
+      if (target) await saveTextFile(target, md);
+    } catch (err) {
+      console.error('export session:', err);
+      await alert(`导出会话失败: ${err}`);
     }
   };
 
@@ -755,6 +789,16 @@ export function AgentList() {
                 >
                   <FolderOpen size={14} />
                   打开工作区
+                </button>
+                <button
+                  onClick={() => {
+                    void handleExportSession(agent);
+                    setContextMenu({ visible: false, x: 0, y: 0, agentId: '' });
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
+                >
+                  <Download size={14} />
+                  导出会话
                 </button>
                 <button
                   onClick={() => {

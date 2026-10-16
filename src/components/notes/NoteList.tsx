@@ -4,7 +4,7 @@ import {
   MoreHorizontal, FolderPlus, FilePlus, ArrowUpToLine, X, Crosshair,
   Settings, HelpCircle, Database, Move, Bookmark, Copy, BookOpen,
   File as FileIcon, Image as ImageIcon, FileSpreadsheet, ExternalLink,
-  Lock, LockOpen,
+  Lock, LockOpen, Star,
 } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import type { Note, FileItem } from '@/lib/types';
@@ -1145,10 +1145,19 @@ export function NoteList({
             (hasChildren ? (
               <Folder size={14} className="shrink-0 text-text-secondary/70" />
             ) : (
-              <FileText
-                size={14}
-                className={`shrink-0 ${note!.is_excerpt === 1 ? 'text-primary' : 'text-text-secondary/60'}`}
-              />
+              <span className="relative shrink-0">
+                <FileText
+                  size={14}
+                  className={`${note!.is_excerpt === 1 ? 'text-primary' : 'text-text-secondary/60'}`}
+                />
+                {note!.is_favorite === 1 && (
+                  <Star
+                    size={9}
+                    fill="currentColor"
+                    className="absolute -bottom-1 -right-1 text-yellow-400 drop-shadow-sm"
+                  />
+                )}
+              </span>
             ))
           )}
 

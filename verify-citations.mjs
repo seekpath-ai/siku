@@ -39,11 +39,18 @@ const sample = [
   '[13] Wang. Agentic SE. ICSE, 2025.',
 ].join('\n');
 
+// Mirror WikiMarkdown's preprocessing: `[[title]]` becomes a note link, but a
+// bracket-wrapped markdown link (`[[9]](url)`) must survive untouched — that
+// guard is exactly what a real note render needs.
+const WIKI_LINK_RE = /\[\[([^\]]+?)\]\](?!\()/g;
+const preprocessWiki = (md) =>
+  md.replace(WIKI_LINK_RE, (_m, raw) => `[${raw.trim()}](note-create://${encodeURIComponent(raw.trim())})`);
+
 const html = renderToStaticMarkup(
   React.createElement(ReactMarkdown, {
     remarkPlugins: [remarkGfm],
     rehypePlugins: [[await import('rehype-katex').then((m) => m.default), { throwOnError: false }], rehypeReferenceAnchors],
-  }, toReferenceCitations(sample))
+  }, preprocessWiki(toReferenceCitations(sample)))
 );
 
 const checks = [
@@ -55,6 +62,7 @@ const checks = [
   [`参考文献带 .${REF_ENTRY_CLASS}（打印不缩进）`, html.includes(REF_ENTRY_CLASS)],
   ['深链未残留', !html.includes('siku-reader://')],
   ['同篇两处引用指向同一锚点', (html.match(/href="#siku-ref-9"/g) || []).length === 2],
+  ['引用渲染为链接而非原文（wiki 预处理不吃掉）', !html.includes('note-create://9') && !html.includes('](siku-ref')],
   // Attribute order is not guaranteed (class may precede id) — count <p> tags
   // that carry a reference id at all.
   ['每条参考文献独占一段', (html.match(/<p[^>]*id="siku-ref-/g) || []).length === 3],

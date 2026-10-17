@@ -38,7 +38,13 @@ interface Props {
   citations?: 'reader' | 'reference';
 }
 
-const WIKI_LINK_RE = /\[\[([^\]]+?)\]\]/g;
+// A wiki link is `[[title]]`. The negative lookahead keeps markdown links whose
+// TEXT is bracketed alone: a citation is written `[[9]](siku-reader://…)` (so it
+// renders as `[9]`, see core/review_gen::linkify_citations + lib/noteCitations),
+// and without this guard the `[[9]]` was eaten as a wiki link to a note titled
+// "9" — every citation in every AI 综述 / 文献分析 note turned into
+// `[9](note-create://9)(siku-reader://…)` raw text.
+const WIKI_LINK_RE = /\[\[([^\]]+?)\]\](?!\()/g;
 const EMBED_RE = /!\[\[([^\]]+?)\]\]/g;
 
 // ReactMarkdown v9 strips unknown protocols by default. We need `note://`,

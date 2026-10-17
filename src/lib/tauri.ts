@@ -2086,6 +2086,8 @@ export async function aiTablePapersInfo(paperIds: string[]): Promise<AiTablePape
 export interface ReviewSection {
   title: string;
   points: string;
+  /** Subsection headings; empty = the section is written as one block. */
+  subsections: string[];
 }
 
 export interface ReviewProgress {

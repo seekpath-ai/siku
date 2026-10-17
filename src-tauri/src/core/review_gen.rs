@@ -33,6 +33,9 @@ pub struct ReviewSection {
     /// What this section should cover (editable before generation).
     #[serde(default)]
     pub points: String,
+    /// Subsection headings; empty = the section is written as one block.
+    #[serde(default)]
+    pub subsections: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -170,8 +173,8 @@ fn source_listing(sources: &[SourcePaper]) -> String {
         .join("\n")
 }
 
-/// Parse a JSON array of {title, points} out of the model's reply, tolerating
-/// fences and surrounding prose.
+/// Parse a JSON array of {title, points, subsections?} out of the model's
+/// reply, tolerating fences and surrounding prose.
 fn parse_outline(content: &str) -> Result<Vec<ReviewSection>, String> {
     let trimmed = content.trim();
     let start = trimmed.find('[');
@@ -184,12 +187,23 @@ fn parse_outline(content: &str) -> Result<Vec<ReviewSection>, String> {
         title: String,
         #[serde(default)]
         points: String,
+        #[serde(default)]
+        subsections: Vec<String>,
     }
     match serde_json::from_str::<Vec<RawSection>>(&trimmed[s..=e]) {
         Ok(v) if !v.is_empty() => Ok(v
             .into_iter()
             .filter(|s| !s.title.trim().is_empty())
-            .map(|s| ReviewSection { title: s.title.trim().to_string(), points: s.points.trim().to_string() })
+            .map(|s| ReviewSection {
+                title: s.title.trim().to_string(),
+                points: s.points.trim().to_string(),
+                subsections: s
+                    .subsections
+                    .into_iter()
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect(),
+            })
             .collect()),
         _ => Err("模型未返回有效大纲".to_string()),
     }
@@ -215,8 +229,9 @@ pub async fn generate_outline(
 
     let section_count = ((target_words / 800) as usize).clamp(3, 8);
     let system = "你是学术写作助手，擅长设计文献综述的目录框架。只输出 JSON 数组，\
-        每个元素为 {\"title\": \"章节标题\", \"points\": \"该节应覆盖的要点（一句话）\"}，\
-        不要输出 JSON 以外的内容。"
+        每个元素为 {\"title\": \"章节标题\", \"points\": \"该节应覆盖的要点（一句话）\", \
+        \"subsections\": [\"小节标题\", ...]}；内容较多的章节设计 2-4 个小节，\
+        引言、总结/展望等简短章节的小节数组可为空。不要输出 JSON 以外的内容。"
         .to_string();
     let scope_line = if scope.trim().is_empty() {
         String::new()
@@ -284,8 +299,17 @@ pub async fn run_review(
         Err(e) => return fail(&app, e),
     };
     let total = outline.len();
-    let per_section_words = (target_words as usize / total.max(1)).max(300);
-    let llm = match default_llm(&db, provider_id.as_deref(), per_section_words as u32).await {
+    // Sections with subsections carry more prose: weight the word budget by
+    // subsection count so a 4-subsection section is not squeezed into the
+    // same length as a one-block introduction.
+    let weights: Vec<usize> = outline.iter().map(|s| 1 + s.subsections.len()).collect();
+    let weight_sum: usize = weights.iter().sum();
+    let section_words: Vec<usize> = weights
+        .iter()
+        .map(|w| (target_words as usize * w / weight_sum.max(1)).max(300))
+        .collect();
+    let max_section_words = section_words.iter().copied().max().unwrap_or(300);
+    let llm = match default_llm(&db, provider_id.as_deref(), max_section_words as u32).await {
         Ok(c) => c,
         Err(e) => return fail(&app, e),
     };
@@ -298,7 +322,7 @@ pub async fn run_review(
         }
         emit(&app, &ReviewProgress { stage: "section".into(), section_index: idx + 1, total_sections: total, section_title: section.title.clone(), note_id: None, message: None, delta: None, reasoning: None });
 
-        match write_section(&app, idx + 1, total, &db, llm.as_ref(), &sources, &question, &language, per_section_words, section).await {
+        match write_section(&app, idx + 1, total, &db, llm.as_ref(), &sources, &question, &language, section_words[idx], section).await {
             Ok(md) => section_md.push((section.title.clone(), md)),
             Err(e) => return fail(&app, format!("第 {} 节「{}」生成失败：{e}", idx + 1, section.title)),
         }
@@ -361,14 +385,22 @@ async fn write_section(
     } else {
         format!("\n本节要点：{}", section.points)
     };
+    let (subsection_rule, subsection_line) = if section.subsections.is_empty() {
+        (String::new(), String::new())
+    } else {
+        (
+            "\n5. 按以下小节组织本节内容，每个小节以 `### 小节标题` 开头；不要新增或删除小节。".to_string(),
+            format!("\n本节小节：{}", section.subsections.join("；")),
+        )
+    };
     let system = format!(
         "你是学术写作助手，正在撰写文献综述的一节。规则：\n\
         1. 只依据「参考段落」写作，不得编造文献中没有的事实；\n\
         2. 引用事实必须在句末标注来源编号 [n]（n 为段落前的编号），一处事实可引多篇如 [1][3]；\n\
         3. 使用{language}写作，学术语体，本节约 {target_words} 字；\n\
-        4. 直接输出本节正文，不要输出章节标题，不要解释。"
+        4. 直接输出本节正文，不要输出章节标题，不要解释。{subsection_rule}"
     );
-    let user = format!("研究问题：{question}\n本节主题：{}{points_line}\n\n参考段落：\n{evidence}", section.title);
+    let user = format!("研究问题：{question}\n本节主题：{}{points_line}{subsection_line}\n\n参考段落：\n{evidence}", section.title);
     let messages = vec![chat_msg("system", system), chat_msg("user", user)];
 
     // Stream the section: the drain task accumulates the text and forwards
@@ -556,6 +588,17 @@ mod tests {
         let v = parse_outline("```json\n[{\"title\":\"引言\",\"points\":\"背景\"}]\n```").unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].title, "引言");
+        assert!(v[0].subsections.is_empty());
         assert!(parse_outline("没有 JSON").is_err());
+    }
+
+    #[test]
+    fn parse_outline_reads_subsections_and_tolerates_missing_field() {
+        let v = parse_outline(
+            r#"[{"title":"方法","points":"对比","subsections":[" 监督方法 ","无监督方法",""]},{"title":"总结"}]"#,
+        )
+        .unwrap();
+        assert_eq!(v[0].subsections, vec!["监督方法", "无监督方法"]);
+        assert!(v[1].subsections.is_empty());
     }
 }

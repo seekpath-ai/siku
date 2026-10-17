@@ -159,7 +159,11 @@ export function ReviewGenDialog() {
 
   const startGeneration = async () => {
     const cleaned = outline
-      .map((s) => ({ title: s.title.trim(), points: s.points.trim() }))
+      .map((s) => ({
+        title: s.title.trim(),
+        points: s.points.trim(),
+        subsections: s.subsections.map((x) => x.trim()).filter(Boolean),
+      }))
       .filter((s) => s.title);
     if (cleaned.length === 0) {
       await alert('大纲为空，请至少保留一节');
@@ -328,10 +332,47 @@ export function ReviewGenDialog() {
                     placeholder="本节要点"
                     className="w-full bg-background border border-surface-hover rounded px-2 py-1 text-[11px] text-text-primary outline-none focus:border-primary/50 resize-none"
                   />
+                  {s.subsections.map((sub, k) => (
+                    <div key={k} className="flex items-center gap-1.5 pl-5">
+                      <span className="text-[11px] text-text-secondary/40">{i + 1}.{k + 1}</span>
+                      <input
+                        value={sub}
+                        onChange={(e) =>
+                          setOutline((prev) =>
+                            prev.map((x, j) =>
+                              j === i ? { ...x, subsections: x.subsections.map((y, m) => (m === k ? e.target.value : y)) } : x
+                            )
+                          )
+                        }
+                        placeholder="小节标题"
+                        className="flex-1 min-w-0 bg-background border border-surface-hover rounded px-2 py-0.5 text-[11px] text-text-primary outline-none focus:border-primary/50"
+                      />
+                      <button
+                        onClick={() =>
+                          setOutline((prev) =>
+                            prev.map((x, j) => (j === i ? { ...x, subsections: x.subsections.filter((_, m) => m !== k) } : x))
+                          )
+                        }
+                        className="p-0.5 rounded text-text-secondary/50 hover:text-red-400 hover:bg-surface-hover"
+                        title="删除小节"
+                      >
+                        <Trash2 size={11} />
+                      </button>
+                    </div>
+                  ))}
+                  <button
+                    onClick={() =>
+                      setOutline((prev) => prev.map((x, j) => (j === i ? { ...x, subsections: [...x.subsections, ''] } : x)))
+                    }
+                    className="ml-5 flex items-center gap-1 px-1.5 py-0.5 rounded border border-dashed border-surface-hover text-[11px] text-text-secondary/70 hover:bg-surface-hover"
+                  >
+                    <Plus size={10} />
+                    添加小节
+                  </button>
                 </div>
               ))}
               <button
-                onClick={() => setOutline((prev) => [...prev, { title: '', points: '' }])}
+                onClick={() => setOutline((prev) => [...prev, { title: '', points: '', subsections: [] }])}
                 className="w-full flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg border border-dashed border-surface-hover text-[12px] text-text-secondary hover:bg-surface-hover"
               >
                 <Plus size={12} />

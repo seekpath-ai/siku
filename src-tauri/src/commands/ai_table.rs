@@ -19,6 +19,11 @@ pub struct TablePreset {
 /// Start a batch extraction run (spawned; progress on
 /// `library:ai-table-progress`). One run at a time. `provider_id` overrides
 /// the default (starred) model when set.
+/// Start a batch extraction run (spawned; progress on
+/// `library:ai-table-progress`). One run at a time. `provider_id` overrides
+/// the default (starred) model when set; `detail` scales how verbose each cell
+/// is (brief | normal | rich); `force` re-extracts cells that already have a
+/// value (manual edits are still kept).
 #[tauri::command]
 pub async fn ai_table_extract_start(
     app: AppHandle,
@@ -26,6 +31,8 @@ pub async fn ai_table_extract_start(
     paper_ids: Vec<String>,
     columns: Vec<TableColumn>,
     provider_id: Option<String>,
+    detail: Option<String>,
+    force: Option<bool>,
 ) -> Result<(), String> {
     if paper_ids.is_empty() {
         return Err("未选择文献".to_string());
@@ -34,16 +41,41 @@ pub async fn ai_table_extract_start(
         return Err("请先添加至少一列".to_string());
     }
     let db = state.db.clone();
+    let detail = crate::core::ai_table::Detail::parse(detail.as_deref());
+    let force = force.unwrap_or(false);
     tauri::async_runtime::spawn(async move {
-        ai_table::run_extraction(app, db, paper_ids, columns, provider_id).await;
+        ai_table::run_extraction(app, db, paper_ids, columns, provider_id, detail, force).await;
     });
     Ok(())
+}
+
+/// Built-in column presets (read-only starting points, see
+/// `core::ai_table_builtin`). Not stored in `ai_table_presets`: picking one only
+/// fills the column editor.
+#[tauri::command]
+pub async fn ai_table_builtin_presets() -> Result<Vec<crate::core::ai_table_builtin::BuiltinPreset>, String> {
+    Ok(crate::core::ai_table_builtin::builtins())
 }
 
 #[tauri::command]
 pub async fn ai_table_extract_cancel() -> Result<(), String> {
     ai_table::request_cancel();
     Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractStatus {
+    pub running: bool,
+    pub progress: Option<crate::core::ai_table::ExtractProgress>,
+}
+
+/// Whether a run is in flight, plus its last beat. The dialog asks on open so
+/// closing it (or a webview reload) never strands a run without a viewer.
+#[tauri::command]
+pub async fn ai_table_extract_status() -> Result<ExtractStatus, String> {
+    let (running, progress) = ai_table::status();
+    Ok(ExtractStatus { running, progress })
 }
 
 #[tauri::command]

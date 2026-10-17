@@ -28,6 +28,7 @@ import {
   Loader2,
   FileWarning,
   Inbox,
+  Tags,
   Paperclip,
   StickyNote,
   FolderOpen,
@@ -54,6 +55,7 @@ import {
 } from '@/hooks/useLibrary';
 import { useLibraryStore } from '@/stores/libraryStore';
 import { useAiTableStore } from '@/stores/aiTableStore';
+import { useAiClassifyStore } from '@/stores/aiClassifyStore';
 import { useReviewStore } from '@/stores/reviewStore';
 import { useTabStore } from '@/stores/tabStore';
 import { openNoteTab } from '@/lib/openNote';
@@ -584,6 +586,17 @@ function PaperRow({
       label: `AI 综述${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
       icon: <Sparkles size={14} />,
       onClick: () => useReviewStore.getState().openWith(targetPaperIds),
+    },
+    {
+      label: `AI 文献分类${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
+      icon: <Tags size={14} />,
+      onClick: () =>
+        useAiClassifyStore.getState().openWith(targetPaperIds, {
+          kind: 'selection',
+          collectionId: activeFilter.type === 'collection' ? activeFilter.id : null,
+          label:
+            targetPaperIds.length > 1 ? `所选 ${targetPaperIds.length} 篇` : '所选文献',
+        }),
     },
     {
       label: `添加到分类${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,

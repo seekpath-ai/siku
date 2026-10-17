@@ -8,6 +8,8 @@ import { PaperList } from './PaperList';
 import { PaperDetailPanel } from './PaperDetailPanel';
 import { AiTableDialog } from './AiTableDialog';
 import { ReviewGenDialog } from './ReviewGenDialog';
+import { AiClassifyDialog } from './AiClassifyDialog';
+import { AiClassifyRulesDialog } from './AiClassifyRulesDialog';
 import { ResizeHandle } from './ResizeHandle';
 
 const RIGHT_PANEL_COLLAPSE_THRESHOLD = 140;
@@ -162,6 +164,8 @@ export function LibraryLayout() {
 
       <AiTableDialog />
       <ReviewGenDialog />
+      <AiClassifyDialog />
+      <AiClassifyRulesDialog />
     </div>
   );
 }

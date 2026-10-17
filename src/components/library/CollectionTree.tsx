@@ -12,11 +12,14 @@ import {
   Clock,
   Table2,
   Sparkles,
+  Tags,
+  BookMarked,
 } from 'lucide-react';
 import { useCollections, useCreateCollection, useUpdateCollection, useDeleteCollection, useAddPapersToCollection, useTags, useCreateTag, useDeleteTag, useUpdateTag } from '@/hooks/useLibrary';
 import { useLibraryStore } from '@/stores/libraryStore';
 import { useAiTableStore } from '@/stores/aiTableStore';
 import { useReviewStore } from '@/stores/reviewStore';
+import { useAiClassifyStore } from '@/stores/aiClassifyStore';
 import { useDialog } from '@/hooks/useDialog';
 import { listPapers } from '@/lib/tauri';
 import type { Collection, Tag as TagType } from '@/lib/types';
@@ -178,6 +181,25 @@ function CollectionTreeItem({
       },
     },
     {
+      label: 'AI 文献分类',
+      icon: <Tags size={14} />,
+      onClick: async () => {
+        try {
+          const papers = await listPapers({ collection_id: node.collection.id, limit: 10000 });
+          if (papers.length === 0) {
+            await alert('该集合下没有文献');
+            return;
+          }
+          useAiClassifyStore.getState().openWith(
+            papers.map((p) => p.id),
+            { kind: 'collection', collectionId: node.collection.id, label: node.collection.name }
+          );
+        } catch (err) {
+          await alert(`获取集合文献失败: ${err}`);
+        }
+      },
+    },
+    {
       label: '删除集合',
       icon: <Trash2 size={14} />,
       destructive: true,
@@ -305,9 +327,10 @@ export function CollectionTree() {
   const addPapersToCollection = useAddPapersToCollection();
   const [tagMenu, setTagMenu] = useState<{ x: number; y: number; tag: TagType } | null>(null);
   const [colorPickerTag, setColorPickerTag] = useState<TagType | null>(null);
+  const [rootMenu, setRootMenu] = useState<{ x: number; y: number } | null>(null);
   const [tagCollapsed, setTagCollapsed] = useState<Set<string>>(new Set());
   const [libraryRootExpanded, setLibraryRootExpanded] = useState(true);
-  const { prompt, confirm } = useDialog();
+  const { prompt, confirm, alert } = useDialog();
 
   const activeFilter = useLibraryStore((s) => s.activeFilter);
   const setActiveCollection = useLibraryStore((s) => s.setActiveCollection);
@@ -479,6 +502,10 @@ export function CollectionTree() {
           </button>
           <button
             onClick={() => setActiveCollection(null)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              setRootMenu({ x: e.clientX, y: e.clientY });
+            }}
             className={`flex-1 flex items-center gap-2 px-2 py-1.5 rounded transition-colors ${
               activeFilter.type === 'all'
                 ? 'bg-primary/10 text-primary'
@@ -671,6 +698,48 @@ export function CollectionTree() {
             },
           ]}
           onClose={() => setTagMenu(null)}
+        />
+      )}
+
+      {rootMenu && (
+        <ContextMenu
+          x={rootMenu.x}
+          y={rootMenu.y}
+          items={[
+            {
+              label: '新建集合',
+              icon: <Plus size={14} />,
+              onClick: async () => {
+                const name = await prompt('集合名称', { title: '新建集合' });
+                if (name?.trim()) createCollection.mutate({ name: name.trim() });
+              },
+            },
+            {
+              label: 'AI 文献分类（全库）',
+              icon: <Tags size={14} />,
+              onClick: async () => {
+                try {
+                  const papers = await listPapers({ limit: 10000 });
+                  if (papers.length === 0) {
+                    await alert('图书馆里还没有文献');
+                    return;
+                  }
+                  useAiClassifyStore.getState().openWith(
+                    papers.map((p) => p.id),
+                    { kind: 'all', collectionId: null, label: '我的图书馆' }
+                  );
+                } catch (err) {
+                  await alert(`获取文献失败: ${err}`);
+                }
+              },
+            },
+            {
+              label: 'AI 自动分类规则…',
+              icon: <BookMarked size={14} />,
+              onClick: () => useAiClassifyStore.getState().openRules(),
+            },
+          ]}
+          onClose={() => setRootMenu(null)}
         />
       )}
 

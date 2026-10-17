@@ -2032,16 +2032,39 @@ export interface AiTablePaperBrief {
   year: number | null;
 }
 
+/** How verbose each cell is. An explicit length/verbosity in the column prompt
+ *  overrides it. */
+export type AiTableDetail = 'brief' | 'normal' | 'rich';
+
 export async function aiTableExtractStart(
   paperIds: string[],
   columns: AiTableColumn[],
-  providerId?: string | null
+  providerId?: string | null,
+  detail?: AiTableDetail,
+  force?: boolean
 ): Promise<void> {
-  return invoke<void>('ai_table_extract_start', { paperIds, columns, providerId: providerId ?? null });
+  return invoke<void>('ai_table_extract_start', {
+    paperIds,
+    columns,
+    providerId: providerId ?? null,
+    detail: detail ?? null,
+    force: force ?? null,
+  });
 }
 
 export async function aiTableExtractCancel(): Promise<void> {
   return invoke<void>('ai_table_extract_cancel');
+}
+
+export interface AiTableExtractStatus {
+  running: boolean;
+  progress: AiTableProgress | null;
+}
+
+/** Whether a run is still in flight, plus its last beat — lets a reopened
+ *  dialog re-attach instead of showing a dead spinner. */
+export async function aiTableExtractStatus(): Promise<AiTableExtractStatus> {
+  return invoke<AiTableExtractStatus>('ai_table_extract_status');
 }
 
 export async function aiTableCellsList(
@@ -2075,8 +2098,283 @@ export async function aiTablePresetDelete(id: string): Promise<void> {
   return invoke<void>('ai_table_preset_delete', { id });
 }
 
+export interface AiTableBuiltinPreset {
+  id: string;
+  name: string;
+  description: string;
+  columns: AiTableColumn[];
+}
+
+/** Read-only built-in column presets (picking one only fills the editor). */
+export async function aiTableBuiltinPresets(): Promise<AiTableBuiltinPreset[]> {
+  return invoke<AiTableBuiltinPreset[]>('ai_table_builtin_presets');
+}
+
 export async function aiTablePapersInfo(paperIds: string[]): Promise<AiTablePaperBrief[]> {
   return invoke<AiTablePaperBrief[]>('ai_table_papers_info', { paperIds });
+}
+
+// ============================================================
+// AI 文献分类
+// ============================================================
+
+/** One node in the (user-editable) taxonomy draft. Two levels max: a group's
+ *  children are leaves. */
+export interface ClassifyGroup {
+  name: string;
+  description: string;
+  /** Existing collection/tag id matched by full path; null = applying creates one. */
+  existingId: string | null;
+  children: ClassifyGroup[];
+}
+
+/** accepted = will be written on apply; pending = needs review. */
+export type ClassifyItemStatus = 'accepted' | 'pending' | 'failed';
+
+export interface ClassifyItem {
+  paperId: string;
+  title: string;
+  year: number | null;
+  /** Primary path (first label); empty = 待定. */
+  groupName: string;
+  /** All assigned paths (single element for the collection target). */
+  labels: string[];
+  confidence: number;
+  reason: string;
+  status: string;
+  /** Manual override; a rerun keeps it and it counts as accepted. */
+  edited: boolean;
+}
+
+export interface ClassifyRun {
+  id: string;
+  dimension: string;
+  target: string;
+  scopeKind: string;
+  scopeId: string | null;
+  sampleSize: number | null;
+  paperCount: number;
+  threshold: number;
+  twoLevel: boolean;
+  skipExisting: boolean;
+  groups: ClassifyGroup[];
+  items: ClassifyItem[];
+  status: string;
+  appliedAt: string | null;
+  undoneAt: string | null;
+}
+
+export interface ClassifyRequest {
+  paperIds: string[];
+  scopeKind: string;
+  scopeId: string | null;
+  dimension: string;
+  target: string;
+  sampleSize: number | null;
+  reuseExisting: boolean;
+  maxGroups: number;
+  /** Ask the model for a second level (one extra call). */
+  twoLevel: boolean;
+  /** Assignments at or above this confidence are accepted automatically. */
+  threshold: number;
+  /** Skip papers a previous applied run already filed under this dimension. */
+  skipExisting: boolean;
+  /** Draft engine: 'batch' | 'semantic'. Semantic falls back to batch. */
+  engine: 'batch' | 'semantic';
+  providerId: string | null;
+}
+
+export interface ClassifyCapabilities {
+  /** A real embeddings endpoint is configured, so clustering is possible. */
+  semantic: boolean;
+}
+
+export interface ClassifyRule {
+  id: string;
+  name: string;
+  dimension: string;
+  target: string;
+  scopeKind: string;
+  scopeId: string | null;
+  maxGroups: number;
+  threshold: number;
+  twoLevel: boolean;
+  reuseExisting: boolean;
+  cron: string;
+  enabled: boolean;
+  providerId: string | null;
+  lastRunAt: string | null;
+  lastResult: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ClassifyRuleInput {
+  name: string;
+  dimension: string;
+  target: string;
+  scopeKind: string;
+  scopeId: string | null;
+  maxGroups: number;
+  threshold: number;
+  twoLevel: boolean;
+  reuseExisting: boolean;
+  cron: string;
+  enabled: boolean;
+  providerId: string | null;
+}
+
+export interface VocabEntry {
+  id: string;
+  /** `父/子` for a child. */
+  path: string;
+  /** active | staged | rejected */
+  status: string;
+  /** ai | user | library */
+  source: string;
+  createdAt: string;
+}
+
+export interface ClassifyProgress {
+  /** draft | merge | assign | done | cancelled | error */
+  stage: string;
+  total: number;
+  done: number;
+  failed: number;
+  current: string;
+  groupCount: number;
+  /** Category paths proposed so far (grows batch by batch during the draft). */
+  groupsPreview?: string[];
+  log?: string;
+  /** Set when the run ends: done | cancelled | error. */
+  finished: string | null;
+}
+
+export interface ClassifyPaperBrief {
+  id: string;
+  title: string;
+  year: number | null;
+  journal: string | null;
+  abstractText: string;
+}
+
+export interface ApplyPlan {
+  targets: { groupName: string; create: boolean }[];
+  parentCollectionId: string | null;
+}
+
+export interface ApplySummary {
+  createdTargets: number;
+  reusedTargets: number;
+  linkedPapers: number;
+  skippedPapers: number;
+}
+
+export interface UndoSummary {
+  removedLinks: number;
+  removedTargets: number;
+}
+
+export const AI_CLASSIFY_PROGRESS_EVENT = 'library:ai-classify-progress';
+
+export async function aiClassifyStart(req: ClassifyRequest): Promise<string> {
+  return invoke<string>('ai_classify_start', { req });
+}
+
+export async function aiClassifyCancel(): Promise<void> {
+  return invoke<void>('ai_classify_cancel');
+}
+
+export async function aiClassifyRunGet(runId: string): Promise<ClassifyRun> {
+  return invoke<ClassifyRun>('ai_classify_run_get', { runId });
+}
+
+export async function aiClassifyGroupsSet(
+  runId: string,
+  groups: ClassifyGroup[]
+): Promise<void> {
+  return invoke<void>('ai_classify_groups_set', { runId, groups });
+}
+
+export async function aiClassifyItemSet(
+  runId: string,
+  paperId: string,
+  labels: string[]
+): Promise<void> {
+  return invoke<void>('ai_classify_item_set', { runId, paperId, labels });
+}
+
+/** Bulk override. `edited: true` marks a real user edit (protected from later
+ *  reruns and applied as accepted); omitting it is a pure sync that keeps the
+ *  existing flag, confidence and reason. */
+export async function aiClassifyItemsSet(
+  runId: string,
+  items: { paperId: string; labels: string[]; edited?: boolean }[]
+): Promise<void> {
+  return invoke<void>('ai_classify_items_set', { runId, items });
+}
+
+export async function aiClassifyCapabilities(): Promise<ClassifyCapabilities> {
+  return invoke<ClassifyCapabilities>('ai_classify_capabilities');
+}
+
+export async function aiClassifyRulesList(): Promise<ClassifyRule[]> {
+  return invoke<ClassifyRule[]>('ai_classify_rules_list');
+}
+
+export async function aiClassifyRuleSave(
+  id: string | null,
+  input: ClassifyRuleInput
+): Promise<ClassifyRule> {
+  return invoke<ClassifyRule>('ai_classify_rule_save', { id, input });
+}
+
+export async function aiClassifyRuleSetEnabled(id: string, enabled: boolean): Promise<void> {
+  return invoke<void>('ai_classify_rule_set_enabled', { id, enabled });
+}
+
+export async function aiClassifyRuleDelete(id: string): Promise<void> {
+  return invoke<void>('ai_classify_rule_delete', { id });
+}
+
+/** Fire a rule now (same path the scheduler uses). */
+export async function aiClassifyRuleRun(id: string): Promise<void> {
+  return invoke<void>('ai_classify_rule_run', { id });
+}
+
+export async function aiClassifyVocabList(
+  dimension: string,
+  target: string
+): Promise<VocabEntry[]> {
+  return invoke<VocabEntry[]>('ai_classify_vocab_list', { dimension, target });
+}
+
+/** Promote (`active`), un-promote (`staged`) or reject (`rejected`). */
+export async function aiClassifyVocabSetStatus(
+  ids: string[],
+  status: 'active' | 'staged' | 'rejected'
+): Promise<void> {
+  return invoke<void>('ai_classify_vocab_set_status', { ids, status });
+}
+
+export async function aiClassifyReassign(
+  runId: string,
+  providerId: string | null,
+  onlyMissing: boolean
+): Promise<void> {
+  return invoke<void>('ai_classify_reassign', { runId, providerId, onlyMissing });
+}
+
+export async function aiClassifyApply(runId: string, plan: ApplyPlan): Promise<ApplySummary> {
+  return invoke<ApplySummary>('ai_classify_apply', { runId, plan });
+}
+
+export async function aiClassifyUndo(runId: string): Promise<UndoSummary> {
+  return invoke<UndoSummary>('ai_classify_undo', { runId });
+}
+
+export async function aiClassifyPapersInfo(paperIds: string[]): Promise<ClassifyPaperBrief[]> {
+  return invoke<ClassifyPaperBrief[]>('ai_classify_papers_info', { paperIds });
 }
 
 // ============================================================
@@ -2091,8 +2389,9 @@ export interface ReviewSection {
 }
 
 export interface ReviewProgress {
-  /** "outline" | "section" | "assemble" | "done" | "cancelled" | "error" */
+  /** outline | section | assemble | done | partial | cancelled | error */
   stage: string;
+  /** 1-based section coordinate; kept even on failure. */
   sectionIndex: number;
   totalSections: number;
   sectionTitle: string;
@@ -2102,6 +2401,16 @@ export interface ReviewProgress {
   delta?: string;
   /** Reasoning fragment (thinking models), shown dimmed above the content. */
   reasoning?: string;
+  /** running | done | failed — the per-section state the dialog trusts. */
+  sectionStatus?: 'running' | 'done' | 'failed';
+  /** Failure text for this specific section. */
+  error?: string;
+  /** Retries already performed for this section (0 = first attempt). */
+  attempt?: number;
+  /** max_tokens in effect for this attempt (doubles per retry). */
+  maxTokens?: number;
+  /** Sections with content so far. */
+  doneSections?: number;
 }
 
 export async function reviewGenerateOutline(
@@ -2138,6 +2447,16 @@ export async function reviewGenerateStart(
     outline,
     providerId: providerId ?? null,
   });
+}
+
+/** Retry one failed section (1-based) with a doubled output budget. */
+export async function reviewGenerateRetrySection(sectionIndex: number): Promise<void> {
+  return invoke<void>('review_generate_retry_section', { sectionIndex });
+}
+
+/** Save the note from whatever sections exist (placeholders for the gaps). */
+export async function reviewGenerateSave(): Promise<string> {
+  return invoke<string>('review_generate_save');
 }
 
 export async function reviewGenerateCancel(): Promise<void> {

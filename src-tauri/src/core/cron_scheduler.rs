@@ -78,7 +78,7 @@ pub fn validate(expr: &str) -> Result<(), String> {
     parse_cron(expr).map(|_| ())
 }
 
-fn matches(now: &chrono::DateTime<Local>, expr: &str) -> bool {
+pub(crate) fn matches(now: &chrono::DateTime<Local>, expr: &str) -> bool {
     let Ok((mins, hours, doms, months, dows)) = parse_cron(expr) else {
         return false;
     };

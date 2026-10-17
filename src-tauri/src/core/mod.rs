@@ -1,5 +1,9 @@
 pub mod agent_memory_service;
+pub mod ai_classify;
+pub mod ai_classify_scheduler;
+pub mod ai_classify_semantic;
 pub mod ai_table;
+pub mod ai_table_builtin;
 pub mod annotation_service;
 pub mod batch_import;
 pub mod bibtex;

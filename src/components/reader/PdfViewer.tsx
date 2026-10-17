@@ -2270,8 +2270,53 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
         return null;
       };
 
-      const candidates = [pageNum, pageNum + 1, pageNum - 1]
-        .filter((p, i, a) => p >= 1 && p <= doc.numPages && a.indexOf(p) === i);
+      const needle = exact.replace(/\s+/g, '');
+      // Phase 1 (cheap): find the page that actually contains the quote by
+      // reading the text layer only — no canvas render. A wrong page hint (or
+      // none at all) used to end the search after ±1 page, so the reader jumped
+      // to the paper and highlighted nothing.
+      const pageHasQuote = async (pn: number): Promise<boolean> => {
+        try {
+          const page = await doc.getPage(pn);
+          const tc = await page.getTextContent();
+          const flat = (tc.items as Array<{ str?: string }>)
+            .map((it) => it.str ?? '')
+            .join('')
+            .replace(/\s+/g, '');
+          if (flat.includes(needle)) return true;
+          return needle.length > 40 && flat.includes(needle.slice(0, 40));
+        } catch {
+          return false;
+        }
+      };
+
+      const hint = pageNum >= 1 && pageNum <= doc.numPages ? pageNum : 1;
+      // Search order: the hint, then outward from it, then everything else —
+      // capped so a 300-page PDF cannot turn one click into a 30 s stall.
+      const order: number[] = [];
+      const push = (p: number) => {
+        if (p >= 1 && p <= doc.numPages && !order.includes(p)) order.push(p);
+      };
+      push(hint);
+      push(hint + 1);
+      push(hint - 1);
+      push(hint + 2);
+      push(hint - 2);
+      const SCAN_CAP = 40;
+      for (let step = 3; step <= doc.numPages && order.length < SCAN_CAP; step++) {
+        push(hint + step);
+        push(hint - step);
+      }
+
+      let target: number | null = null;
+      for (const pn of order) {
+        if (await pageHasQuote(pn)) {
+          target = pn;
+          break;
+        }
+      }
+      if (target == null) return null;
+      const candidates = [target];
 
       for (const pn of candidates) {
         const wrapper = wrapperMapRef.current.get(pn);
@@ -2297,7 +2342,6 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
             norm += joined[i];
           }
         }
-        const needle = exact.replace(/\s+/g, '');
         let pos = norm.indexOf(needle);
         if (pos < 0 && needle.length > 40) {
           // LLM quotes are not always perfectly verbatim: fall back to

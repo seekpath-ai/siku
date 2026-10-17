@@ -38,19 +38,22 @@ pub struct ReviewSection {
     pub subsections: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewProgress {
-    /// "outline" | "section" | "assemble" | "done" | "cancelled" | "error"
+    /// outline | section | assemble | done | partial | cancelled | error
     pub stage: String,
-    /// 1-based index of the section being written (0 when not applicable).
+    /// 1-based index of the section being / last processed (0 = not
+    /// applicable). Section-level events keep this coordinate even on failure —
+    /// the dialog derives its tick marks from per-section state, never from this
+    /// value alone (zeroing it used to wipe every completed tick mark).
     pub section_index: usize,
     pub total_sections: usize,
     pub section_title: String,
     pub note_id: Option<String>,
     pub message: Option<String>,
     /// Streaming text fragment of the section currently being written — the
-    /// dialog accumulates these into its live preview panel.
+    /// dialog accumulates these into that section's own buffer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta: Option<String>,
     /// Reasoning fragment (thinking models burn reasoning tokens before any
@@ -58,10 +61,73 @@ pub struct ReviewProgress {
     /// whole time). Shown dimmed above the content in the drawer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// running | done | failed — the per-section state the UI trusts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section_status: Option<String>,
+    /// Failure text for this section, kept per section so an error in one
+    /// section never erases the others' state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Retries already performed for this section (0 = first attempt).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// max_tokens in effect for this attempt (doubles per retry).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Sections with content so far, for the dialog's summary line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done_sections: Option<usize>,
+}
+
+fn base_progress(stage: &str) -> ReviewProgress {
+    ReviewProgress { stage: stage.to_string(), ..Default::default() }
+}
+
+/// Pipeline-level failure (nothing to retry against).
+fn failure_progress(msg: String) -> ReviewProgress {
+    ReviewProgress { stage: "error".into(), message: Some(msg), ..Default::default() }
+}
+
+/// A per-section state event. `index` is 1-based.
+#[allow(clippy::too_many_arguments)]
+fn section_progress(
+    stage: &str,
+    status: &str,
+    index: usize,
+    total: usize,
+    title: &str,
+    attempt: u32,
+    max_tokens: u32,
+    done_sections: Option<usize>,
+    error: Option<String>,
+) -> ReviewProgress {
+    ReviewProgress {
+        stage: stage.into(),
+        section_index: index,
+        total_sections: total,
+        section_title: title.to_string(),
+        section_status: Some(status.to_string()),
+        attempt: Some(attempt),
+        max_tokens: Some(max_tokens),
+        done_sections,
+        error,
+        ..Default::default()
+    }
 }
 
 pub fn request_cancel() {
     CANCEL.store(true, Ordering::SeqCst);
+}
+
+/// Resolve once a cancel is requested — polled so 停止 abandons an in-flight
+/// section instead of waiting for a 1–3 minute model call to finish.
+async fn cancelled_now() {
+    loop {
+        if CANCEL.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 struct RunGuard;
@@ -87,17 +153,25 @@ fn emit(app: &AppHandle, p: &ReviewProgress) {
 }
 
 /// Streaming beats from the drain tasks: a content delta OR a reasoning
-/// fragment of the section/outline currently being generated.
-fn emit_stream(app: &AppHandle, stage: &str, section_index: usize, total_sections: usize, delta: Option<String>, reasoning: Option<String>) {
+/// fragment of the section/outline currently being generated. `attempt` lets
+/// the dialog reset that section's buffer when a retry starts.
+fn emit_stream(
+    app: &AppHandle,
+    stage: &str,
+    section_index: usize,
+    total_sections: usize,
+    delta: Option<String>,
+    reasoning: Option<String>,
+    attempt: u32,
+) {
     emit(app, &ReviewProgress {
         stage: stage.into(),
         section_index,
         total_sections,
-        section_title: String::new(),
-        note_id: None,
-        message: None,
+        attempt: Some(attempt),
         delta,
         reasoning,
+        ..Default::default()
     });
 }
 
@@ -113,10 +187,25 @@ fn chat_msg(role: &str, content: String) -> ChatMessage {
     }
 }
 
-async fn default_llm(
+/// Hard ceiling for the per-attempt output budget. Providers cap lower than
+/// this on their own; beyond it, doubling stops and the dialog tells the user to
+/// switch models instead of silently retrying forever.
+const MAX_OUTPUT_TOKENS: u32 = 32768;
+/// Sentinel error for "the user asked to stop" (distinct from a real failure).
+const CANCELLED: &str = "已取消";
+
+/// Output budget a section needs for `words` characters of prose. Thinking
+/// models spend reasoning out of the same budget, hence the headroom.
+fn section_need(words: usize) -> u32 {
+    (words as u32).saturating_mul(2).saturating_add(4000).min(MAX_OUTPUT_TOKENS)
+}
+
+/// Build a client whose max_tokens is at least `need` (the provider row itself
+/// is never modified).
+async fn llm_with_need(
     db: &SqlitePool,
     provider_id: Option<&str>,
-    min_max_tokens: u32,
+    need: u32,
 ) -> Result<Box<dyn crate::ai::llm::LlmClient>, String> {
     let mut cfg = crate::core::llm_provider_service::load_llm_config_for(db, provider_id).await?;
     // Thinking models count reasoning toward max_tokens: a section needs its
@@ -124,15 +213,24 @@ async fn default_llm(
     // finish_reason=length with zero visible content — which is exactly how
     // a note of headings-with-empty-bodies is produced. Bump the cap (the
     // provider row stays untouched).
-    let need = (min_max_tokens.saturating_mul(2).saturating_add(4000)).min(32768);
     if cfg.max_tokens < need {
         cfg.max_tokens = need;
     }
     crate::ai::llm::client::create_llm_client(&cfg)
 }
 
+async fn default_llm(
+    db: &SqlitePool,
+    provider_id: Option<&str>,
+    min_max_tokens: u32,
+) -> Result<Box<dyn crate::ai::llm::LlmClient>, String> {
+    let need = (min_max_tokens.saturating_mul(2).saturating_add(4000)).min(MAX_OUTPUT_TOKENS);
+    llm_with_need(db, provider_id, need).await
+}
+
 /// A paper in the set: [n] numbering is the input order, stable across the
 /// outline call, the section calls, the linkify pass and the reference list.
+#[derive(Clone)]
 struct SourcePaper {
     id: String,
     title: String,
@@ -253,11 +351,11 @@ pub async fn generate_outline(
             if ev.event_type == "delta" {
                 if let Some(content) = ev.content {
                     text.push_str(&content);
-                    emit_stream(&app2, "outline", 0, 0, Some(content), None);
+                    emit_stream(&app2, "outline", 0, 0, Some(content), None, 0);
                 }
             } else if ev.event_type == "reasoning" {
                 if let Some(content) = ev.content {
-                    emit_stream(&app2, "outline", 0, 0, None, Some(content));
+                    emit_stream(&app2, "outline", 0, 0, None, Some(content), 0);
                 }
             }
         }
@@ -271,7 +369,67 @@ pub async fn generate_outline(
     Ok(outline)
 }
 
+/// One in-flight review. Kept in memory only: closing the dialog (or starting a
+/// new run) discards it, which is the same guarantee the old pipeline gave —
+/// without the "one bad section loses everything" part.
+struct ReviewSession {
+    sources: Vec<SourcePaper>,
+    question: String,
+    language: String,
+    outline: Vec<ReviewSection>,
+    section_words: Vec<usize>,
+    /// Output budget the first attempt ran with; retries double it.
+    base_need: u32,
+    provider_id: Option<String>,
+    /// Assembled markdown per section (None = not generated yet / failed).
+    results: Vec<Option<String>>,
+    /// Retries performed per section (0 = the pipeline's first attempt).
+    attempts: Vec<u32>,
+    /// Whether the pipeline already attempted this section (a section skipped by
+    /// cancel has not, so its first manual attempt keeps the base budget).
+    started: Vec<bool>,
+    errors: Vec<Option<String>>,
+    note_id: Option<String>,
+}
+
+static SESSION: std::sync::Mutex<Option<ReviewSession>> = std::sync::Mutex::new(None);
+
+fn store_session(s: ReviewSession) {
+    if let Ok(mut g) = SESSION.lock() {
+        *g = Some(s);
+    }
+}
+
+fn clear_session() {
+    if let Ok(mut g) = SESSION.lock() {
+        *g = None;
+    }
+}
+
+fn with_session<R>(f: impl FnOnce(&mut ReviewSession) -> R) -> Option<R> {
+    SESSION.lock().ok().and_then(|mut g| g.as_mut().map(f))
+}
+
+fn sections_done(s: &ReviewSession) -> usize {
+    s.results.iter().filter(|r| r.is_some()).count()
+}
+
+fn failed_titles(s: &ReviewSession) -> Vec<String> {
+    s.outline
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| s.results[*i].is_none())
+        .map(|(i, sec)| format!("{}.{}", i + 1, sec.title))
+        .collect()
+}
+
 /// Step 2+: run the full pipeline (spawned by the command layer).
+///
+/// A failing section no longer aborts the run: it is recorded (`section_status:
+/// failed` + its own error) and the pipeline moves on, so one bad section costs
+/// one section instead of the whole review. When every section has content the
+/// note is assembled and saved as before; otherwise the session stays alive for
+/// per-section retries and an explicit "save what we have".
 pub async fn run_review(
     app: AppHandle,
     db: SqlitePool,
@@ -285,18 +443,22 @@ pub async fn run_review(
     let _guard = match RunGuard::try_acquire() {
         Ok(g) => g,
         Err(e) => {
-            emit(&app, &ReviewProgress { stage: "error".into(), section_index: 0, total_sections: 0, section_title: String::new(), note_id: None, message: Some(e), delta: None, reasoning: None });
+            emit(&app, &failure_progress(e));
             return;
         }
     };
-    let fail = |app: &AppHandle, msg: String| {
-        emit(app, &ReviewProgress { stage: "error".into(), section_index: 0, total_sections: 0, section_title: String::new(), note_id: None, message: Some(msg), delta: None, reasoning: None });
-    };
+    clear_session();
 
     let sources = match load_sources(&db, &paper_ids).await {
         Ok(s) if !s.is_empty() => s,
-        Ok(_) => return fail(&app, "文献集为空（文献不存在或已删除）".into()),
-        Err(e) => return fail(&app, e),
+        Ok(_) => {
+            emit(&app, &failure_progress("文献集为空（文献不存在或已删除）".into()));
+            return;
+        }
+        Err(e) => {
+            emit(&app, &failure_progress(e));
+            return;
+        }
     };
     let total = outline.len();
     // Sections with subsections carry more prose: weight the word budget by
@@ -308,33 +470,271 @@ pub async fn run_review(
         .iter()
         .map(|w| (target_words as usize * w / weight_sum.max(1)).max(300))
         .collect();
-    let max_section_words = section_words.iter().copied().max().unwrap_or(300);
-    let llm = match default_llm(&db, provider_id.as_deref(), max_section_words as u32).await {
+    // One client for the first pass: sized for the largest section (retries
+    // rebuild it with a doubled budget for the section that failed).
+    let base_need = section_words.iter().copied().map(section_need).max().unwrap_or(4000);
+    let llm = match llm_with_need(&db, provider_id.as_deref(), base_need).await {
         Ok(c) => c,
-        Err(e) => return fail(&app, e),
-    };
-    let mut section_md: Vec<(String, String)> = Vec::new();
-
-    for (idx, section) in outline.iter().enumerate() {
-        if CANCEL.load(Ordering::SeqCst) {
-            emit(&app, &ReviewProgress { stage: "cancelled".into(), section_index: idx, total_sections: total, section_title: section.title.clone(), note_id: None, message: None, delta: None, reasoning: None });
+        Err(e) => {
+            emit(&app, &failure_progress(e));
             return;
         }
-        emit(&app, &ReviewProgress { stage: "section".into(), section_index: idx + 1, total_sections: total, section_title: section.title.clone(), note_id: None, message: None, delta: None, reasoning: None });
+    };
 
-        match write_section(&app, idx + 1, total, &db, llm.as_ref(), &sources, &question, &language, section_words[idx], section).await {
-            Ok(md) => section_md.push((section.title.clone(), md)),
-            Err(e) => return fail(&app, format!("第 {} 节「{}」生成失败：{e}", idx + 1, section.title)),
+    store_session(ReviewSession {
+        sources: sources.clone(),
+        question: question.clone(),
+        language: language.clone(),
+        outline: outline.clone(),
+        section_words: section_words.clone(),
+        base_need,
+        provider_id: provider_id.clone(),
+        results: vec![None; total],
+        attempts: vec![0; total],
+        started: vec![false; total],
+        errors: vec![None; total],
+        note_id: None,
+    });
+
+    for idx in 0..total {
+        if CANCEL.load(Ordering::SeqCst) {
+            let done = with_session(|s| sections_done(s)).unwrap_or(0);
+            let mut p = base_progress("cancelled");
+            p.section_index = idx + 1;
+            p.total_sections = total;
+            p.section_title = outline[idx].title.clone();
+            p.done_sections = Some(done);
+            p.message = Some(format!(
+                "已取消（完成 {done}/{total} 节）——未完成的节可以单独重试，或保存已完成部分。"
+            ));
+            emit(&app, &p);
+            // Session survives a cancel on purpose: the completed sections are
+            // still worth keeping, and per-section retry can finish the rest.
+            return;
+        }
+
+        with_session(|s| s.started[idx] = true);
+        emit(&app, &section_progress("section", "running", idx + 1, total, &outline[idx].title, 0, base_need, None, None));
+        match write_section(
+            &app,
+            idx + 1,
+            total,
+            &db,
+            llm.as_ref(),
+            &sources,
+            &question,
+            &language,
+            section_words[idx],
+            &outline[idx],
+            0,
+            base_need,
+        )
+        .await
+        {
+            Ok(md) => {
+                let done = with_session(|s| {
+                    s.results[idx] = Some(md);
+                    s.errors[idx] = None;
+                    sections_done(s)
+                })
+                .unwrap_or(0);
+                emit(&app, &section_progress("section", "done", idx + 1, total, &outline[idx].title, 0, base_need, Some(done), None));
+            }
+            Err(e) => {
+                if e == CANCELLED {
+                    // Cancel mid-flight: no section failure to record, just stop.
+                    let done = with_session(|s| sections_done(s)).unwrap_or(0);
+                    let mut p = base_progress("cancelled");
+                    p.section_index = idx + 1;
+                    p.total_sections = total;
+                    p.section_title = outline[idx].title.clone();
+                    p.done_sections = Some(done);
+                    p.message = Some(format!(
+                        "已取消（完成 {done}/{total} 节）——未完成的节可以单独重试，或保存已完成部分。"
+                    ));
+                    emit(&app, &p);
+                    return;
+                }
+                tracing::warn!(section = idx + 1, error = %e, "review section failed (continuing)");
+                let msg = e;
+                let done = with_session(|s| {
+                    s.errors[idx] = Some(msg.clone());
+                    s.results[idx] = None;
+                    sections_done(s)
+                })
+                .unwrap_or(0);
+                emit(&app, &section_progress("section", "failed", idx + 1, total, &outline[idx].title, 0, base_need, Some(done), Some(msg)));
+            }
         }
     }
 
-    // Assemble the note: title from the research question, sections, then
-    // the numbered reference list matching the [n] markers.
-    emit(&app, &ReviewProgress { stage: "assemble".into(), section_index: total, total_sections: total, section_title: String::new(), note_id: None, message: None, delta: None, reasoning: None });
+    finish_or_partial(&app, &db).await;
+}
+
+/// All sections have content → assemble + save; otherwise report what is
+/// missing and keep the session for retries.
+async fn finish_or_partial(app: &AppHandle, db: &SqlitePool) {
+    let info = with_session(|s| (s.outline.len(), sections_done(s), failed_titles(s)));
+    let Some((total, done, missing)) = info else {
+        return;
+    };
+    if done == total {
+        if let Err(e) = assemble_and_save(app, db, false).await {
+            emit(app, &failure_progress(format!("保存笔记失败：{e}")));
+        }
+        return;
+    }
+    let mut p = base_progress("partial");
+    p.total_sections = total;
+    p.done_sections = Some(done);
+    p.message = Some(format!(
+        "{done}/{total} 节已生成。缺失：{}——可单独重试（每次重试自动加倍输出额度），或先保存已完成部分。",
+        missing.join("、")
+    ));
+    emit(app, &p);
+}
+
+/// Retry ONE section with a doubled output budget. `section_index` is 1-based.
+///
+/// Every failure type doubles (uniform, predictable): a parse/network failure
+/// gains nothing from extra tokens but costs nothing either, and the user does
+/// not have to classify their own errors.
+pub async fn retry_section(app: AppHandle, db: SqlitePool, section_index: usize) -> Result<(), String> {
+    let idx = section_index.checked_sub(1).ok_or_else(|| "节号从 1 开始".to_string())?;
+    let (sources, question, language, section, words, base_need, exponent, provider_id, total) = {
+        let g = SESSION.lock().map_err(|_| "会话锁失败".to_string())?;
+        let s = g.as_ref().ok_or_else(|| "没有可续跑的综述任务，请重新生成".to_string())?;
+        let section = s.outline.get(idx).cloned().ok_or_else(|| "节号超出大纲范围".to_string())?;
+        // Attempts this section has already had: the pipeline's first pass (if
+        // it got there) plus every retry. The k-th attempt runs at base×2^(k-1),
+        // so the first retry of a failed section doubles, while a section that
+        // never ran (cancelled run) starts at the base budget.
+        let exponent = s.attempts[idx] + u32::from(s.started[idx]);
+        (
+            s.sources.clone(),
+            s.question.clone(),
+            s.language.clone(),
+            section,
+            s.section_words[idx],
+            s.base_need,
+            exponent,
+            s.provider_id.clone(),
+            s.outline.len(),
+        )
+    };
+
+    let _guard = RunGuard::try_acquire()?;
+    let attempt = exponent;
+    let need = base_need
+        .saturating_mul(1u32 << exponent.min(6))
+        .min(MAX_OUTPUT_TOKENS);
+    let llm = llm_with_need(&db, provider_id.as_deref(), need).await?;
+
+    with_session(|s| s.started[idx] = true);
+    emit(&app, &section_progress("section", "running", idx + 1, total, &section.title, attempt, need, None, None));
+    let outcome = write_section(
+        &app, idx + 1, total, &db, llm.as_ref(), &sources, &question, &language, words, &section, attempt, need,
+    )
+    .await;
+
+    match outcome {
+        Ok(md) => {
+            let done = with_session(|s| {
+                s.results[idx] = Some(md);
+                s.errors[idx] = None;
+                s.attempts[idx] = attempt;
+                sections_done(s)
+            })
+            .unwrap_or(0);
+            emit(&app, &section_progress("section", "done", idx + 1, total, &section.title, attempt, need, Some(done), None));
+        }
+        Err(e) if e == CANCELLED => {
+            let done = with_session(|s| sections_done(s)).unwrap_or(0);
+            let mut p = base_progress("cancelled");
+            p.section_index = idx + 1;
+            p.total_sections = total;
+            p.section_title = section.title.clone();
+            p.done_sections = Some(done);
+            p.message = Some("已取消本次重试".to_string());
+            emit(&app, &p);
+            return Err("已取消".to_string());
+        }
+        Err(e) => {
+            let msg = e;
+            let done = with_session(|s| {
+                s.errors[idx] = Some(msg.clone());
+                s.attempts[idx] = attempt;
+                sections_done(s)
+            })
+            .unwrap_or(0);
+            emit(&app, &section_progress("section", "failed", idx + 1, total, &section.title, attempt, need, Some(done), Some(msg)));
+            // Still report the overall state: the dialog uses the 'partial'
+            // beat to leave its busy state (a retry can fail and stop there).
+            finish_or_partial(&app, &db).await;
+            return Err("该节仍未成功".to_string());
+        }
+    }
+
+    finish_or_partial(&app, &db).await;
+    Ok(())
+}
+
+/// Assemble and save the note from whatever sections exist. `allow_partial`
+/// writes an explicit placeholder for the missing ones (and says so up top), so
+/// a half-finished review never looks like a complete one.
+pub async fn save_review(app: AppHandle, db: SqlitePool) -> Result<String, String> {
+    assemble_and_save(&app, &db, true).await
+}
+
+async fn assemble_and_save(app: &AppHandle, db: &SqlitePool, allow_partial: bool) -> Result<String, String> {
+    let (sources, question, outline, results, total, existing_note) = {
+        let g = SESSION.lock().map_err(|_| "会话锁失败".to_string())?;
+        let s = g.as_ref().ok_or_else(|| "没有可保存的综述任务，请重新生成".to_string())?;
+        (
+            s.sources.clone(),
+            s.question.clone(),
+            s.outline.clone(),
+            s.results.clone(),
+            s.outline.len(),
+            s.note_id.clone(),
+        )
+    };
+    let done = results.iter().filter(|r| r.is_some()).count();
+    if done == 0 {
+        return Err("还没有任何一节生成成功".to_string());
+    }
+    if !allow_partial && done < total {
+        return Err("还有小节未生成".to_string());
+    }
+
+    let mut p = base_progress("assemble");
+    p.total_sections = total;
+    p.done_sections = Some(done);
+    emit(app, &p);
+
     let note_title = format!("综述：{}", question.chars().take(40).collect::<String>());
-    let mut md = format!("# {note_title}\n\n> 研究问题：{question}\n> 基于 {} 篇文献由 AI 生成，引用编号可点击溯源到原文。\n\n", sources.len());
-    for (title, body) in &section_md {
-        md.push_str(&format!("## {title}\n\n{body}\n\n"));
+    let missing = failed_titles_of(&outline, &results);
+    let mut md = format!(
+        "# {note_title}\n\n> 研究问题：{question}\n> 基于 {} 篇文献由 AI 生成，引用编号可点击溯源到原文。\n",
+        sources.len()
+    );
+    if !missing.is_empty() {
+        md.push_str(&format!(
+            "> ⚠️ 本综述有 {} 节未生成成功：{}（可回到生成窗口重试后重新保存）。\n",
+            missing.len(),
+            missing.join("、")
+        ));
+    }
+    md.push('\n');
+    for (idx, section) in outline.iter().enumerate() {
+        md.push_str(&format!("## {}\n\n", section.title));
+        match &results[idx] {
+            Some(body) => {
+                md.push_str(body);
+                md.push_str("\n\n");
+            }
+            None => md.push_str("> 本节生成失败，未包含在本次综述中。\n\n"),
+        }
     }
     md.push_str("## 参考文献\n\n");
     for (i, p) in sources.iter().enumerate() {
@@ -342,16 +742,49 @@ pub async fn run_review(
         md.push('\n');
     }
 
-    let vault_id = match crate::core::vault_service::get_current_vault_id(&db).await {
-        Ok(v) => v,
-        Err(e) => return fail(&app, e),
-    };
-    match crate::core::note_service::create_note(&db, &note_title, &md, None, None, &vault_id, false).await {
-        Ok(note) => {
-            emit(&app, &ReviewProgress { stage: "done".into(), section_index: total, total_sections: total, section_title: String::new(), note_id: Some(note.id), message: None, delta: None, reasoning: None });
+    // A note saved from a partial run gets *updated* once the retries fill the
+    // gaps — creating a second note would leave the user with two reviews and no
+    // way to tell which is complete.
+    let had_existing = existing_note.is_some();
+    let note_id = match existing_note {
+        Some(id) => {
+            crate::core::note_service::update_note(db, &id, None, Some(&md), None, None, None, Some(true))
+                .await
+                .map(|_| id)
+                .map_err(|e| format!("更新笔记失败：{e}"))?
         }
-        Err(e) => fail(&app, format!("保存笔记失败：{e}")),
-    }
+        None => {
+            let vault_id = crate::core::vault_service::get_current_vault_id(db).await?;
+            let note =
+                crate::core::note_service::create_note(db, &note_title, &md, None, None, &vault_id, false).await?;
+            with_session(|s| s.note_id = Some(note.id.clone()));
+            note.id
+        }
+    };
+
+    let mut done_event = base_progress("done");
+    done_event.section_index = total;
+    done_event.total_sections = total;
+    done_event.done_sections = Some(done);
+    done_event.note_id = Some(note_id.clone());
+    done_event.message = Some(if !missing.is_empty() {
+        format!("已保存（含 {} 节缺口）", missing.len())
+    } else if had_existing {
+        "缺失小节已补全，笔记已更新".to_string()
+    } else {
+        String::new()
+    });
+    emit(app, &done_event);
+    Ok(note_id)
+}
+
+fn failed_titles_of(outline: &[ReviewSection], results: &[Option<String>]) -> Vec<String> {
+    outline
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| results.get(*i).map(|r| r.is_none()).unwrap_or(true))
+        .map(|(i, sec)| format!("{}.{}", i + 1, sec.title))
+        .collect()
 }
 
 /// Evidence characters per section (keeps small-context models in budget).
@@ -373,13 +806,16 @@ async fn write_section(
     language: &str,
     target_words: usize,
     section: &ReviewSection,
+    attempt: u32,
+    max_tokens: u32,
 ) -> Result<String, String> {
     let paper_ids: Vec<String> = sources.iter().map(|p| p.id.clone()).collect();
     let query = format!("{} {}", section.title, section.points);
     let mut hits = retriever::hybrid_search_scoped(db, &query, SECTION_TOP_K, false, Some(&paper_ids)).await?;
     retriever::expand_with_neighbors(db, &mut hits, false).await.ok();
 
-    let evidence = build_evidence_block(&hits, sources);
+    let evidence_items = build_evidence(&hits, sources);
+    let evidence = evidence_block(&evidence_items, sources);
     let points_line = if section.points.is_empty() {
         String::new()
     } else {
@@ -396,7 +832,8 @@ async fn write_section(
     let system = format!(
         "你是学术写作助手，正在撰写文献综述的一节。规则：\n\
         1. 只依据「参考段落」写作，不得编造文献中没有的事实；\n\
-        2. 引用事实必须在句末标注来源编号 [n]（n 为段落前的编号），一处事实可引多篇如 [1][3]；\n\
+        2. 引用事实必须在句末标注【证据编号】，格式如 [E3]（E 后面的数字就是「参考段落」前的编号）；\
+         同一处事实可引多条证据，写成 [E3][E7]；只能使用「参考段落」中出现过的编号，绝不自行编号或改写编号体系；\n\
         3. 使用{language}写作，学术语体，本节约 {target_words} 字；\n\
         4. 直接输出本节正文，不要输出章节标题，不要解释。{subsection_rule}"
     );
@@ -416,12 +853,12 @@ async fn write_section(
                 "delta" => {
                     if let Some(content) = ev.content {
                         text.push_str(&content);
-                        emit_stream(&app2, "section", section_index, total_sections, Some(content), None);
+                        emit_stream(&app2, "section", section_index, total_sections, Some(content), None, attempt);
                     }
                 }
                 "reasoning" => {
                     if let Some(content) = ev.content {
-                        emit_stream(&app2, "section", section_index, total_sections, None, Some(content));
+                        emit_stream(&app2, "section", section_index, total_sections, None, Some(content), attempt);
                     }
                 }
                 "finish" => finish = ev.content,
@@ -430,39 +867,91 @@ async fn write_section(
         }
         (text, finish)
     });
-    let call = llm.chat_completion_stream(&messages, &[], tx).await;
+    let call = tokio::select! {
+        r = llm.chat_completion_stream(&messages, &[], tx) => r,
+        _ = cancelled_now() => Err(CANCELLED.to_string()),
+    };
     let (text, finish) = drain.await.map_err(|e| format!("stream drain: {e}"))?;
     call?;
     if text.trim().is_empty() {
         // The classic failure is a thinking model exhausting max_tokens on
         // reasoning (finish=length) — say so plainly instead of letting the
         // pipeline assemble a note of empty sections.
-        tracing::warn!(section_index, finish_reason = finish.as_deref().unwrap_or("?"), "section produced no visible content");
+        tracing::warn!(section_index, finish_reason = finish.as_deref().unwrap_or("?"), attempt, max_tokens, "section produced no visible content");
         return Err(match finish.as_deref() {
-            Some("length") => "模型的思考占满了输出额度（max_tokens），未产生正文。请调大该模型的 max_tokens（设置 → 模型）后重试。".to_string(),
-            other => format!("模型未产生正文（finish_reason={}）。", other.unwrap_or("未知")),
+            Some("length") => format!(
+                "模型的思考占满了输出额度（max_tokens={max_tokens}），未产生正文。重试会自动加倍额度。"
+            ),
+            other => format!(
+                "模型未产生正文（finish_reason={}，max_tokens={max_tokens}）。",
+                other.unwrap_or("未知")
+            ),
         });
     }
-    Ok(linkify_citations(text.trim(), sources, &hits))
+    Ok(linkify_citations(text.trim(), sources, &evidence_items))
 }
 
-/// The evidence block: every chunk tagged with its paper's citation number,
-/// which is exactly what the model is told to cite.
-fn build_evidence_block(hits: &[SearchResult], sources: &[SourcePaper]) -> String {
-    let mut out: Vec<String> = Vec::new();
-    let mut used = 0usize;
+/// One retrievable passage handed to the model, addressable as `[E<k>]`.
+///
+/// Citation granularity is the PASSAGE, not the paper: a sentence backed by
+/// §3.2 of paper 9 links to §3.2, and a later sentence backed by §5 of the same
+/// paper links to §5. Both still *display* as `[9]` (the paper number) — the
+/// visible citation stays a normal reference, only the anchor gets specific.
+#[derive(Debug, Clone)]
+struct Evidence {
+    /// 1-based number of the owning paper inside `sources`.
+    paper_index: usize,
+    paper_id: String,
+    page: Option<i32>,
+    /// Full passage text handed to the model (writing needs the whole thing).
+    content: String,
+    /// Short word-boundary head used only as the reader's highlight anchor.
+    quote: String,
+}
+
+fn build_evidence(hits: &[SearchResult], sources: &[SourcePaper]) -> Vec<Evidence> {
+    let mut out = Vec::new();
     for hit in hits {
-        let Some(n) = sources.iter().position(|p| p.id == hit.paper_id).map(|i| i + 1) else {
+        // Neighbours exist for context, not as citable passages.
+        if hit.is_neighbor {
+            continue;
+        }
+        let Some(paper_index) = sources.iter().position(|p| p.id == hit.paper_id).map(|i| i + 1) else {
             continue;
         };
+        let quote = anchor_quote(&hit.content);
+        let content = hit.content.trim().to_string();
+        if quote.is_empty() || content.is_empty() {
+            continue;
+        }
+        out.push(Evidence {
+            paper_index,
+            paper_id: hit.paper_id.clone(),
+            page: hit.page_start,
+            content,
+            quote,
+        });
+    }
+    out
+}
+
+/// The evidence block the model reads: `[E1]（《title》 p.3）` + the passage.
+fn evidence_block(evidence: &[Evidence], sources: &[SourcePaper]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for (i, ev) in evidence.iter().enumerate() {
         let remaining = SECTION_EVIDENCE_CAP.saturating_sub(used);
         if remaining == 0 {
             break;
         }
-        let content: String = hit.content.chars().take(remaining.min(1200)).collect();
-        used += content.chars().count();
-        let page = hit.page_start.map(|p| format!(" p.{p}")).unwrap_or_default();
-        out.push(format!("[{n}]（《{}》{page}）\n{content}", hit.paper_title));
+        let title = sources
+            .get(ev.paper_index - 1)
+            .map(|p| p.title.clone())
+            .unwrap_or_default();
+        let page = ev.page.map(|p| format!(" p.{p}")).unwrap_or_default();
+        let body: String = ev.content.chars().take(remaining.min(1200)).collect();
+        used += body.chars().count();
+        out.push(format!("[E{}]（《{}》{}）\n{}", i + 1, title, page, body));
     }
     if out.is_empty() {
         "（文献集内未检索到相关段落，请依据摘要级信息概括，并减少具体断言）".to_string()
@@ -471,36 +960,232 @@ fn build_evidence_block(hits: &[SearchResult], sources: &[SourcePaper]) -> Strin
     }
 }
 
-/// Turn every valid `[n]` in the generated text into a clickable deep link.
-/// The link target is the section's own top evidence chunk for that paper —
-/// page + a short exact quote, which the reader's locateQuote resolves to a
-/// paragraph-level highlight. Markers outside the paper set are left as plain
-/// text (they may be figure/table numbers, and must never become fake links):
-/// what is clickable is real by construction.
-fn linkify_citations(text: &str, sources: &[SourcePaper], hits: &[SearchResult]) -> String {
-    let mut out = text.to_string();
-    for (i, p) in sources.iter().enumerate() {
-        let n = i + 1;
-        let marker = format!("[{n}]");
-        if !out.contains(&marker) {
+/// A citation marker as written by the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Marker {
+    /// `[E3]` — passage 3 of this section's evidence block (the new contract).
+    Evidence(usize),
+    /// `[9]` — paper 9 (legacy contract; still accepted so a model that ignores
+    /// the instruction degrades to the old one-anchor-per-paper behaviour
+    /// instead of leaking raw markers into the note).
+    Paper(usize),
+}
+
+fn is_separator(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ',' | '，' | '、' | ';' | '；')
+}
+
+/// Parse one `[...]` group at `start`. Returns the markers and the index just
+/// past the closing bracket. `None` = this bracket is not a citation group.
+fn parse_citation_group(
+    chars: &[char],
+    start: usize,
+    max_paper: usize,
+    max_evidence: usize,
+) -> Option<(Vec<Marker>, usize)> {
+    let mut i = start + 1;
+    let mut markers: Vec<Marker> = Vec::new();
+    loop {
+        while i < chars.len() && is_separator(chars[i]) {
+            i += 1;
+        }
+        if i >= chars.len() {
+            return None;
+        }
+        if chars[i] == ']' {
+            return if markers.is_empty() { None } else { Some((markers, i + 1)) };
+        }
+        let evidence = matches!(chars[i], 'E' | 'e');
+        if evidence {
+            i += 1;
+        }
+        let mut digits = String::new();
+        while i < chars.len() && chars[i].is_ascii_digit() && digits.len() < 4 {
+            digits.push(chars[i]);
+            i += 1;
+        }
+        if digits.is_empty() {
+            return None;
+        }
+        let Ok(n) = digits.parse::<usize>() else { return None };
+        // Out-of-range markers are kept so the renderer can decide: an unknown
+        // [E99] is a hallucinated passage (dropped), while an unknown [99] may
+        // be a figure/table number and must survive as literal text.
+        if evidence {
+            if max_evidence == 0 {
+                return None;
+            }
+            markers.push(Marker::Evidence(n));
+        } else {
+            if max_paper == 0 {
+                return None;
+            }
+            markers.push(Marker::Paper(n));
+        }
+    }
+}
+
+/// Parse one group plus any immediately adjacent groups (`[E3][E7]`,
+/// `[E3], [E7]`) into a single citation run.
+fn parse_citation_run(
+    chars: &[char],
+    start: usize,
+    max_paper: usize,
+    max_evidence: usize,
+) -> Option<(Vec<Marker>, usize)> {
+    let (mut markers, mut next) = parse_citation_group(chars, start, max_paper, max_evidence)?;
+    loop {
+        let mut k = next;
+        while k < chars.len() && is_separator(chars[k]) {
+            k += 1;
+        }
+        if k < chars.len() && chars[k] == '[' {
+            if let Some((more, after)) = parse_citation_group(chars, k, max_paper, max_evidence) {
+                markers.extend(more);
+                next = after;
+                continue;
+            }
+        }
+        break;
+    }
+    Some((markers, next))
+}
+
+fn reader_url(paper_id: &str, page: Option<i32>, quote: &str) -> String {
+    let exact = percent_encode(quote);
+    match page {
+        Some(p) => format!("siku-reader://{paper_id}?page={p}&exact={exact}"),
+        None => format!("siku-reader://{paper_id}?exact={exact}"),
+    }
+}
+
+/// Resolve one marker to (display number, link target).
+///
+/// The *display* number is always the paper's citation number — a citation must
+/// still read like `[9]` — while the *target* is the concrete passage, so two
+/// sentences citing the same paper point at their own paragraphs.
+fn resolve_marker(
+    marker: Marker,
+    sources: &[SourcePaper],
+    evidence: &[Evidence],
+) -> Option<(usize, Option<String>)> {
+    match marker {
+        Marker::Evidence(k) => {
+            let ev = evidence.get(k.checked_sub(1)?)?;
+            Some((ev.paper_index, Some(reader_url(&ev.paper_id, ev.page, &ev.quote))))
+        }
+        Marker::Paper(n) => {
+            // Range check only — the anchor comes from the evidence list.
+            sources.get(n.checked_sub(1)?)?;
+            // Legacy: anchor on this paper's first passage in the section.
+            let anchor = evidence.iter().find(|ev| ev.paper_index == n);
+            Some((
+                n,
+                anchor.map(|ev| reader_url(&ev.paper_id, ev.page, &ev.quote)),
+            ))
+        }
+    }
+    .filter(|(n, _)| *n >= 1 && *n <= sources.len())
+}
+
+/// Render a citation run into markdown that displays as `[9]` / `[9,13]` with
+/// each number carrying its own link (verified against react-markdown: literal
+/// brackets wrapped around per-number links render exactly like a paper
+/// citation). `None` when nothing resolves — the caller then keeps the source
+/// text verbatim.
+fn render_citation_run(
+    markers: &[Marker],
+    sources: &[SourcePaper],
+    evidence: &[Evidence],
+) -> Option<String> {
+    let mut items: Vec<(usize, Option<String>)> = Vec::new();
+    for m in markers {
+        let Some((display, url)) = resolve_marker(*m, sources, evidence) else {
+            continue;
+        };
+        // Same paper twice in one group (two passages cited together): keep the
+        // first anchor, show the number once.
+        if items.iter().any(|(d, _)| *d == display) {
             continue;
         }
-        let replacement = match hits.iter().find(|h| h.paper_id == p.id && !h.is_neighbor) {
-            Some(hit) => {
-                let exact: String = hit.content.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect();
-                format!("[{n}](siku-reader://{}?page={}&exact={})", p.id, hit.page_start.unwrap_or(1), percent_encode(&exact))
+        items.push((display, url));
+    }
+    if items.is_empty() {
+        return None;
+    }
+    if items.len() == 1 {
+        let (n, url) = &items[0];
+        return Some(match url {
+            Some(u) => format!("[[{n}]]({u})"),
+            None => format!("[{n}]"),
+        });
+    }
+    let inner = items
+        .iter()
+        .map(|(n, url)| match url {
+            Some(u) => format!("[{n}]({u})"),
+            None => n.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("[{inner}]"))
+}
+
+/// Rewrite every citation marker in a generated section.
+///
+/// `[E3]` → `[9]` (link → passage 3), `[E9][E13]` / `[E9, E13]` → `[9,13]`
+/// (each number its own passage), legacy `[9]` → `[9]` (link → that paper's
+/// first passage). Markers that resolve to nothing are removed when they claim
+/// to be evidence (a hallucinated `[E99]`), and left as literal text when they
+/// look like a paper number out of range (possibly a figure/table number).
+fn linkify_citations(text: &str, sources: &[SourcePaper], evidence: &[Evidence]) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '[' {
+            if let Some((markers, next)) = parse_citation_run(&chars, i, sources.len(), evidence.len()) {
+                match render_citation_run(&markers, sources, evidence) {
+                    Some(rendered) => {
+                        out.push_str(&rendered);
+                        i = next;
+                        continue;
+                    }
+                    None => {
+                        // Unresolvable group: drop evidence markers entirely
+                        // (never show a citation that points nowhere), keep
+                        // paper-number groups verbatim.
+                        if markers.iter().all(|m| matches!(m, Marker::Evidence(_))) {
+                            i = next;
+                            continue;
+                        }
+                    }
+                }
             }
-            // No evidence for this paper in this section: keep the number
-            // but not a link — never a dead deep link.
-            None => marker.clone(),
-        };
-        out = out.replace(&marker, &replacement);
+        }
+        out.push(chars[i]);
+        i += 1;
     }
     out
 }
 
-/// RFC 3986 unreserved characters pass through; everything else is %XX
-/// (UTF-8). Matches what the frontend's URLSearchParams parser decodes.
+/// The quote a deep link anchors on. Long enough to be specific, cut back to a
+/// word boundary so the reader's matcher is not fed half a word.
+fn anchor_quote(content: &str) -> String {
+    const CAP: usize = 90;
+    let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut head: String = flat.chars().take(CAP).collect();
+    if flat.chars().count() > CAP {
+        if let Some(idx) = head.rfind(' ') {
+            // Keep at least a few words even if the tail word is long.
+            if idx >= 40 {
+                head.truncate(idx);
+            }
+        }
+    }
+    head.trim().to_string()
+}
+
 fn percent_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.as_bytes() {
@@ -562,18 +1247,103 @@ mod tests {
         }
     }
 
+
+    fn ev(paper_index: usize, paper_id: &str, page: i32, quote: &str) -> Evidence {
+        Evidence {
+            paper_index,
+            paper_id: paper_id.into(),
+            page: Some(page),
+            content: quote.into(),
+            quote: quote.into(),
+        }
+    }
+
     #[test]
-    fn linkify_turns_valid_markers_into_reader_links() {
+    fn evidence_marker_displays_the_paper_number() {
         let sources = [src("p1", "甲"), src("p2", "乙")];
-        let hits = [hit("p1", 5, "这 是 一段 证据 文本")];
-        let out = linkify_citations("结论 [1] 与 [2] 都成立，还有无效编号 [9]。", &sources, &hits);
-        assert!(out.contains("[1](siku-reader://p1?page=5&exact="), "{out}");
-        // No evidence for p2: number stays but is not linked.
-        assert!(out.contains("[2]"), "{out}");
-        assert!(!out.contains("[2](siku-reader://"), "{out}");
-        // [9] is not part of the set — left as-is text (never a fake link).
-        assert!(out.contains("[9]"), "{out}");
-        assert!(!out.contains("[9]("), "{out}");
+        let evidence = [ev(1, "p1", 5, "这是证据文本"), ev(2, "p2", 9, "第二条证据")];
+        let out = linkify_citations("结论如[E1]所示。", &sources, &evidence);
+        assert!(out.starts_with("结论如[[1]](siku-reader://p1?page=5&exact="), "{out}");
+    }
+
+    #[test]
+    fn two_passages_of_the_same_paper_link_to_different_places() {
+        // The whole point: same paper cited twice → two distinct anchors.
+        let sources = [src("p1", "甲")];
+        let evidence = [
+            ev(1, "p1", 3, "第三章里的这段证据"),
+            ev(1, "p1", 11, "第十一章里的另一段证据"),
+        ];
+        let out = linkify_citations("先看[E1]，再看[E2]。", &sources, &evidence);
+        let links: Vec<&str> = out.split("siku-reader://").skip(1).collect();
+        assert_eq!(links.len(), 2, "{out}");
+        assert!(links[0].contains("page=3"), "{out}");
+        assert!(links[1].contains("page=11"), "{out}");
+        // Both still display as the paper's number.
+        assert_eq!(out.matches("[[1]]").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn adjacent_evidence_markers_collapse_into_one_bracket_group() {
+        let sources = [src("p1", "甲"), src("p2", "乙")];
+        let evidence = [ev(1, "p1", 3, "证据甲"), ev(2, "p2", 8, "证据乙")];
+        for src_text in ["见[E1][E2]。", "见[E1] [E2]。", "见[E1,E2]。", "见[E1，E2]。"] {
+            let out = linkify_citations(src_text, &sources, &evidence);
+            assert_eq!(
+                out,
+                "见[[1](siku-reader://p1?page=3&exact=%E8%AF%81%E6%8D%AE%E7%94%B2),[2](siku-reader://p2?page=8&exact=%E8%AF%81%E6%8D%AE%E4%B9%99)]。",
+                "source was {src_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_paper_grouped_twice_shows_one_number() {
+        let sources = [src("p1", "甲")];
+        let evidence = [ev(1, "p1", 3, "甲"), ev(1, "p1", 11, "乙")];
+        let out = linkify_citations("见[E1,E2]。", &sources, &evidence);
+        assert_eq!(out.matches("[[1]]").count(), 1, "{out}");
+        assert!(out.contains("page=3"), "{out}");
+    }
+
+    #[test]
+    fn legacy_paper_marker_still_works() {
+        let sources = [src("p1", "甲"), src("p2", "乙")];
+        let evidence = [ev(2, "p2", 9, "只有乙有证据")];
+        let out = linkify_citations("结论[1]与[2]。", &sources, &evidence);
+        // p1 has no passage → plain number, never a dead link.
+        assert!(out.contains("[1]"), "{out}");
+        assert!(!out.contains("siku-reader://p1"), "{out}");
+        assert!(out.contains("[[2]](siku-reader://p2?page=9&exact="), "{out}");
+    }
+
+    #[test]
+    fn hallucinated_evidence_marker_is_removed_not_leaked() {
+        let sources = [src("p1", "甲")];
+        let evidence = [ev(1, "p1", 3, "证据")];
+        let out = linkify_citations("结论[E99]成立。", &sources, &evidence);
+        assert_eq!(out, "结论成立。");
+    }
+
+    #[test]
+    fn out_of_range_paper_number_survives_as_literal_text() {
+        // A figure/table number must not be silently deleted.
+        let sources = [src("p1", "甲")];
+        let evidence = [ev(1, "p1", 3, "证据")];
+        let out = linkify_citations("如图[7]所示，结论[1]成立。", &sources, &evidence);
+        assert!(out.contains("如图[7]所示"), "{out}");
+        assert!(out.contains("[[1]]"), "{out}");
+    }
+
+    #[test]
+    fn anchor_quote_cuts_on_a_word_boundary() {
+        let long = "word ".repeat(40);
+        let q = anchor_quote(&long);
+        assert!(q.chars().count() <= 90);
+        assert!(!q.ends_with(' '));
+        // Never ends mid-word.
+        assert!(q.ends_with("word"), "quote ended with {q:?}");
+        assert_eq!(anchor_quote("  spaced   out  "), "spaced out");
     }
 
     #[test]

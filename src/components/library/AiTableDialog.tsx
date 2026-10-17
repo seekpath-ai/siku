@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle, PanelRight } from 'lucide-react';
+import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle, PanelRight, RefreshCw } from 'lucide-react';
 import { useAiTableStore } from '@/stores/aiTableStore';
 import { useDialog } from '@/hooks/useDialog';
 import { ModelOverrideSelect } from './ModelOverrideSelect';
@@ -13,12 +13,16 @@ import {
   aiTablePresetSave,
   aiTablePresetDelete,
   aiTablePapersInfo,
+  aiTableExtractStatus,
+  aiTableBuiltinPresets,
   saveTextFile,
   type AiTableColumn,
   type AiTableCell,
   type AiTableProgress,
   type AiTablePreset,
   type AiTablePaperBrief,
+  type AiTableBuiltinPreset,
+  type AiTableDetail,
 } from '@/lib/tauri';
 
 const cellKey = (paperId: string, columnKey: string) => `${paperId}::${columnKey}`;
@@ -41,6 +45,9 @@ export function AiTableDialog() {
   ]);
   const [presets, setPresets] = useState<AiTablePreset[]>([]);
   const [selectedPreset, setSelectedPreset] = useState('');
+  const [builtins, setBuiltins] = useState<AiTableBuiltinPreset[]>([]);
+  /** How verbose the cells are extracted; the column prompt can override it. */
+  const [detail, setDetail] = useState<AiTableDetail>('normal');
   const [cells, setCells] = useState<Map<string, AiTableCell>>(new Map());
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<AiTableProgress | null>(null);
@@ -80,6 +87,22 @@ export function AiTableDialog() {
     setRunning(false);
     aiTablePapersInfo(paperIds).then(setPapers).catch((err) => console.error('papers info:', err));
     aiTablePresetsList().then(setPresets).catch((err) => console.error('presets:', err));
+    aiTableBuiltinPresets().then(setBuiltins).catch((err) => console.error('builtin presets:', err));
+    // A run may outlive this dialog (closing must not stop it): re-attach so the
+    // stop button, the progress line and the log have something real behind them.
+    aiTableExtractStatus()
+      .then((s) => {
+        if (!s.running) return;
+        setRunning(true);
+        const p = s.progress;
+        if (p) {
+          setProgress(p);
+          setLogs((prev) =>
+            prev.length > 0 ? prev : [`↻ 接续进行中的抽取任务（${p.done}/${p.total}）`]
+          );
+        }
+      })
+      .catch((err) => console.error('extract status:', err));
   }, [open, paperIds]);
 
   useEffect(() => {
@@ -119,7 +142,7 @@ export function AiTableDialog() {
     return out;
   };
 
-  const startRun = async (ids?: string[]) => {
+  const startRun = async (ids?: string[], force = false) => {
     const cols = normalizedColumns();
     if (cols.length === 0) {
       await alert('请先添加至少一列');
@@ -130,7 +153,7 @@ export function AiTableDialog() {
     setProgress(null);
     setLogs([]);
     try {
-      await aiTableExtractStart(ids ?? paperIds, cols, providerId || null);
+      await aiTableExtractStart(ids ?? paperIds, cols, providerId || null, detail, force);
     } catch (err) {
       setRunning(false);
       await alert(`启动抽取失败: ${err}`);
@@ -226,12 +249,21 @@ export function AiTableDialog() {
   if (!open) return null;
 
   const colKeys = columns.map((c) => c.key.trim());
-  const doneCells = [...cells.values()].filter((c) => c.status === 'done' || c.edited).length;
+  // A cell the model could not fill is stored as `empty` (or, from older runs,
+  // `done` with no text): it is 待补, so it must not count as finished.
+  const isFilled = (c?: AiTableCell) => Boolean(c && (c.edited || c.value.trim().length > 0));
+  const doneCells = [...cells.values()].filter(isFilled).length;
+  const emptyCells = [...cells.values()].filter(
+    (c) => !isFilled(c) && (c.status === 'empty' || c.status === 'done')
+  ).length;
   const totalCells = papers.length * colKeys.filter(Boolean).length;
 
   return (
     <div className="fixed inset-0 z-[6000] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={running ? undefined : close} />
+      {/* Closing is always allowed: the run keeps going in the background and
+          the dialog re-attaches on reopen (ai_table_extract_status). Being
+          trapped in a modal because a model call is slow is unacceptable. */}
+      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={close} />
       <div className="relative w-[94vw] max-w-[1200px] h-[84vh] mx-4 flex bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         {/* Left: column definitions + presets */}
         <aside className="w-[260px] shrink-0 border-r border-surface-hover flex flex-col">
@@ -280,11 +312,27 @@ export function AiTableDialog() {
           </div>
           <div className="p-2.5 border-t border-surface-hover space-y-1.5">
             <select
+              value=""
+              onChange={(e) => {
+                const b = builtins.find((x) => x.id === e.target.value);
+                if (b) setColumns(b.columns.map((c) => ({ ...c })));
+              }}
+              className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none"
+              title={builtins.map((b) => `${b.name}：${b.description}`).join('\n')}
+            >
+              <option value="">内置学科模板…</option>
+              {builtins.map((b) => (
+                <option key={b.id} value={b.id}>
+                  {b.name}
+                </option>
+              ))}
+            </select>
+            <select
               value={selectedPreset}
               onChange={(e) => applyPreset(e.target.value)}
               className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none"
             >
-              <option value="">选择模板…</option>
+              <option value="">我的模板…</option>
               {presets.map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.name}
@@ -308,7 +356,21 @@ export function AiTableDialog() {
             </div>
           </div>
           <div className="p-2.5 border-t border-surface-hover space-y-1.5">
-            <label className="block text-[11px] text-text-secondary/60">模型</label>
+            <label className="block text-[11px] text-text-secondary/60">详细程度</label>
+            <select
+              value={detail}
+              onChange={(e) => setDetail(e.target.value as AiTableDetail)}
+              disabled={running}
+              className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none disabled:opacity-50"
+            >
+              <option value="brief">简洁（≤40 字）</option>
+              <option value="normal">标准（1~2 句）</option>
+              <option value="rich">详细（3~6 句，带数字）</option>
+            </select>
+            <p className="text-[10px] text-text-secondary/45 leading-snug">
+              列说明里写明长度/详略时以列说明为准；已抽取的单元格不会因改这里而重算。
+            </p>
+            <label className="block text-[11px] text-text-secondary/60 pt-1">模型</label>
             <ModelOverrideSelect value={providerId} onChange={setProviderId} disabled={running} className="w-full" />
           </div>
         </aside>
@@ -337,13 +399,38 @@ export function AiTableDialog() {
                   停止
                 </button>
               ) : (
-                <button
-                  onClick={() => void startRun()}
-                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-primary text-black text-[12px] font-medium hover:bg-primary/90"
-                >
-                  <Play size={12} />
-                  {doneCells > 0 && doneCells < totalCells ? '继续抽取' : doneCells >= totalCells && totalCells > 0 ? '重新抽取缺失' : '开始抽取'}
-                </button>
+                <>
+                  <button
+                    onClick={() => void startRun()}
+                    disabled={totalCells > 0 && doneCells >= totalCells}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-primary text-black text-[12px] font-medium hover:bg-primary/90 disabled:opacity-40"
+                  >
+                    <Play size={12} />
+                    {doneCells === 0
+                      ? '开始抽取'
+                      : doneCells < totalCells
+                        ? `补齐 ${totalCells - doneCells} 格`
+                        : '全部已填写'}
+                  </button>
+                  {doneCells > 0 && (
+                    <button
+                      onClick={async () => {
+                        if (
+                          await confirm(
+                            '重抽全部单元格？已抽取的内容会被覆盖，手工编辑过的单元格保持不变。'
+                          )
+                        ) {
+                          void startRun(undefined, true);
+                        }
+                      }}
+                      className="flex items-center gap-1 px-2 py-1.5 rounded-lg border border-surface-hover text-[12px] text-text-secondary hover:bg-surface-hover"
+                      title="用当前的详细程度重新抽取，用于改完详略设置后刷新内容"
+                    >
+                      <RefreshCw size={12} />
+                      重抽全部
+                    </button>
+                  )}
+                </>
               )}
               <button
                 onClick={() => void exportCsv()}
@@ -370,8 +457,8 @@ export function AiTableDialog() {
               </button>
               <button
                 onClick={close}
-                disabled={running}
-                className="p-1.5 rounded text-text-secondary/60 hover:text-text-primary hover:bg-surface-hover disabled:opacity-40"
+                title={running ? '关闭窗口不会中断抽取（可随时重新打开查看进度）' : '关闭'}
+                className="p-1.5 rounded text-text-secondary/60 hover:text-text-primary hover:bg-surface-hover"
               >
                 <X size={15} />
               </button>
@@ -379,7 +466,7 @@ export function AiTableDialog() {
           </div>
 
           <p className="px-4 py-1.5 text-[11px] text-text-secondary/50 border-b border-surface-hover/60">
-            每篇文献一次调用返回所有列；已完成和手动编辑的单元格不会被覆盖。点击单元格可编辑。
+            每篇文献一次调用返回所有列；已完成和手动编辑的单元格不会被覆盖，抽取不到的字段记为「待补」可再次补齐。点击单元格可编辑。{emptyCells > 0 ? ` 当前有 ${emptyCells} 格待补。` : ''}
           </p>
 
           <div className="flex-1 overflow-auto">
@@ -458,6 +545,20 @@ export function AiTableDialog() {
                             <span className={cell.edited ? 'text-primary' : 'text-text-primary/90'}>
                               {cell.value}
                             </span>
+                          ) : cell && (cell.status === 'empty' || cell.status === 'done') ? (
+                            // Extracted but the model found nothing here: 待补
+                            // (this used to be cached as "done" and could never
+                            // be refilled).
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (!running) void startRun([p.id]);
+                              }}
+                              className="flex items-center gap-1 text-amber-400/80 hover:text-amber-300"
+                              title="该字段未抽取到内容，点击只重试这一篇"
+                            >
+                              待补 · 重试
+                            </button>
                           ) : (
                             <span className="text-text-secondary/40">—</span>
                           )}

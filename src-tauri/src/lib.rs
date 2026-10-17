@@ -560,6 +560,14 @@ pub fn run() {
                     crate::core::cron_scheduler::run(sched_db, sched_handle, sched_shutdown).await;
                 });
 
+                // Start the AI 分类 rule scheduler (unattended classification).
+                let clf_handle = handle2.clone();
+                let clf_db = handle2.state::<AppState>().db.clone();
+                let clf_shutdown = shutdown_tx.subscribe();
+                tokio::spawn(async move {
+                    crate::core::ai_classify_scheduler::run(clf_db, clf_handle, clf_shutdown).await;
+                });
+
                 // Background research auto-discovery (active topics).
                 let auto_db = handle2.state::<AppState>().db.clone();
                 let auto_handle = handle2.clone();
@@ -759,16 +767,39 @@ pub fn run() {
             // AI 表格列
             commands::ai_table::ai_table_extract_start,
             commands::ai_table::ai_table_extract_cancel,
+            commands::ai_table::ai_table_extract_status,
             commands::ai_table::ai_table_cells_list,
             commands::ai_table::ai_table_cell_set,
             commands::ai_table::ai_table_presets_list,
+            commands::ai_table::ai_table_builtin_presets,
             commands::ai_table::ai_table_preset_save,
             commands::ai_table::ai_table_preset_delete,
             commands::ai_table::ai_table_papers_info,
+            // AI 文献分类
+            commands::ai_classify::ai_classify_start,
+            commands::ai_classify::ai_classify_cancel,
+            commands::ai_classify::ai_classify_run_get,
+            commands::ai_classify::ai_classify_groups_set,
+            commands::ai_classify::ai_classify_item_set,
+            commands::ai_classify::ai_classify_items_set,
+            commands::ai_classify::ai_classify_reassign,
+            commands::ai_classify::ai_classify_apply,
+            commands::ai_classify::ai_classify_undo,
+            commands::ai_classify::ai_classify_papers_info,
+            commands::ai_classify::ai_classify_vocab_list,
+            commands::ai_classify::ai_classify_vocab_set_status,
+            commands::ai_classify::ai_classify_capabilities,
+            commands::ai_classify::ai_classify_rules_list,
+            commands::ai_classify::ai_classify_rule_save,
+            commands::ai_classify::ai_classify_rule_set_enabled,
+            commands::ai_classify::ai_classify_rule_delete,
+            commands::ai_classify::ai_classify_rule_run,
             // AI 综述
             commands::review::review_generate_outline,
             commands::review::review_generate_start,
             commands::review::review_generate_cancel,
+            commands::review::review_generate_retry_section,
+            commands::review::review_generate_save,
             // Collections
             commands::collections::collections_list,
             commands::collections::collections_get,

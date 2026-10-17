@@ -67,6 +67,28 @@ pub fn request_cancel() {
     CANCEL.store(true, Ordering::SeqCst);
 }
 
+/// Resolve once a cancel is requested. Polling (not a Notify permit) on
+/// purpose: a permit left over from a previous run would make the next run
+/// cancel itself immediately, and 200 ms is imperceptible to the user.
+async fn cancelled_now() {
+    loop {
+        if CANCEL.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Last progress beat, so a dialog that was closed (or a webview that was
+/// reloaded) can re-attach to a run that is still going instead of showing a
+/// dead spinner.
+static LAST: std::sync::Mutex<Option<ExtractProgress>> = std::sync::Mutex::new(None);
+
+pub fn status() -> (bool, Option<ExtractProgress>) {
+    let last = LAST.lock().ok().and_then(|g| g.clone());
+    (RUNNING.load(Ordering::SeqCst), last)
+}
+
 struct RunGuard;
 impl RunGuard {
     fn try_acquire() -> Result<Self, String> {
@@ -84,16 +106,59 @@ impl Drop for RunGuard {
 }
 
 fn emit(app: &AppHandle, p: &ExtractProgress) {
+    if let Ok(mut g) = LAST.lock() {
+        *g = Some(p.clone());
+    }
     if let Err(e) = app.emit(PROGRESS_EVENT, p) {
         tracing::warn!(error = %e, "failed to emit ai-table progress");
     }
 }
 
-/// Total evidence characters fed to the model per paper (metadata+abstract
-/// come on top). Keeps small-context models inside their budget.
-const EVIDENCE_CHAR_CAP: usize = 6000;
-/// Chunks retrieved per column as extraction evidence.
-const CHUNKS_PER_COLUMN: usize = 3;
+/// How verbose each cell should be. The old prompt hard-coded "不超过 50 字",
+/// which is why every cell read like a label instead of an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    Brief,
+    Normal,
+    Rich,
+}
+
+impl Detail {
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.unwrap_or("normal").trim() {
+            "brief" => Detail::Brief,
+            "rich" => Detail::Rich,
+            _ => Detail::Normal,
+        }
+    }
+
+    /// The per-field length rule handed to the model.
+    fn length_rule(self) -> &'static str {
+        match self {
+            Detail::Brief => "每个字段不超过 40 字，只给结论、名称或数字，不要铺陈",
+            Detail::Normal => "每个字段 1~2 句、不超过 120 字，先给结论再给关键依据",
+            Detail::Rich => {
+                "每个字段尽量完整（3~6 句、不超过 400 字），保留关键数字、实验设定、结论倾向与作者的原话关键词"
+            }
+        }
+    }
+
+    /// Evidence budget per paper: a richer answer needs more source text.
+    fn evidence_cap(self) -> usize {
+        match self {
+            Detail::Brief => 5000,
+            Detail::Normal => 6000,
+            Detail::Rich => 9000,
+        }
+    }
+
+    fn chunks_per_column(self) -> usize {
+        match self {
+            Detail::Brief | Detail::Normal => 3,
+            Detail::Rich => 5,
+        }
+    }
+}
 
 /// Run the batch. `paper_ids` is the selected set, `columns` the column
 /// defs, `provider_id` overrides the default (starred) model when set.
@@ -104,11 +169,27 @@ pub async fn run_extraction(
     paper_ids: Vec<String>,
     columns: Vec<TableColumn>,
     provider_id: Option<String>,
+    detail: Detail,
+    force: bool,
 ) {
     let _guard = match RunGuard::try_acquire() {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(error = %e, "ai-table extraction already running");
+            // Silence here used to strand the dialog: it had already flipped to
+            // "running" and no finished event ever arrived, so 停止 pointed at
+            // nothing and the window could not be closed.
+            emit(
+                &app,
+                &ExtractProgress {
+                    total: 0,
+                    done: 0,
+                    failed: 0,
+                    current_title: String::new(),
+                    log: Some(format!("{e}（多半是上一次抽取还没结束，可稍后重试）")),
+                    finished: Some("busy".into()),
+                },
+            );
             return;
         }
     };
@@ -149,7 +230,13 @@ pub async fn run_extraction(
         emit(&app, &ExtractProgress { total, done, failed, current_title: title.clone(), log: None, finished: None });
 
         let started = std::time::Instant::now();
-        match extract_one(&db, llm.as_ref(), paper_id, &columns).await {
+        // Race the model call against the cancel flag: 停止 must take effect
+        // while a slow local model is still generating, not minutes later.
+        let outcome = tokio::select! {
+            r = extract_one(&db, llm.as_ref(), paper_id, &columns, detail, force) => r,
+            _ = cancelled_now() => Err("已取消".to_string()),
+        };
+        match outcome {
             Ok(did_work) => {
                 done += 1;
                 let log = if did_work {
@@ -160,6 +247,12 @@ pub async fn run_extraction(
                 emit(&app, &ExtractProgress { total, done, failed, current_title: title, log: Some(log), finished: None });
             }
             Err(e) => {
+                if CANCEL.load(Ordering::SeqCst) {
+                    // Cancelled mid-flight: leave the cells as they were so a
+                    // later run resumes them instead of seeing "failed".
+                    cancelled = true;
+                    break;
+                }
                 tracing::warn!(paper_id, error = %e, "ai-table extract failed for paper");
                 // Mark every missing cell as failed so the UI can offer a
                 // per-cell retry instead of a silently blank grid.
@@ -201,14 +294,16 @@ async fn extract_one(
     llm: &dyn crate::ai::llm::LlmClient,
     paper_id: &str,
     columns: &[TableColumn],
+    detail: Detail,
+    force: bool,
 ) -> Result<bool, String> {
-    let pending = pending_columns(db, paper_id, columns).await?;
+    let pending = pending_columns(db, paper_id, columns, force).await?;
     if pending.is_empty() {
         return Ok(false);
     }
 
     let meta = paper_metadata(db, paper_id).await?;
-    let evidence = gather_evidence(db, paper_id, &pending).await?;
+    let evidence = gather_evidence(db, paper_id, &pending, detail).await?;
 
     let column_spec = pending
         .iter()
@@ -222,10 +317,15 @@ async fn extract_one(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let system = "你是学术文献信息抽取引擎。根据给定的文献信息与段落，按用户列出的字段逐一抽取，\
-        只输出一个 JSON 对象：键为字段名，值为简短字符串（一般不超过 50 字）；\
-        文献中未提及的字段值用空字符串。不要输出 JSON 以外的任何内容。"
-        .to_string();
+    // The length rule scales with the requested detail level; an explicit
+    // instruction in the column prompt always wins over it.
+    let system = format!(
+        "你是学术文献信息抽取引擎。根据给定的文献信息与段落，按用户列出的字段逐一抽取。\
+         只输出一个 JSON 对象：键为字段名，值为字符串；{}。\
+         若某个字段的抽取说明另有长度或详略要求，以该说明为准。\
+         文献中确实没有的字段值用空字符串。不要输出 JSON 以外的任何内容。",
+        detail.length_rule()
+    );
     let user = format!(
         "【文献】\n{meta}\n\n【相关段落】\n{evidence}\n\n【待抽取字段】\n{column_spec}"
     );
@@ -245,7 +345,10 @@ async fn extract_one(
             .unwrap_or("")
             .trim()
             .to_string();
-        upsert_cell(db, paper_id, &col.key, &value, "done", false, &now).await?;
+        // An empty result is NOT a finished cell: storing it as `done` used to
+        // make the cell permanently un-refillable ("重新抽取缺失" skipped it).
+        let status = if value.is_empty() { "empty" } else { "done" };
+        upsert_cell(db, paper_id, &col.key, &value, status, false, &now).await?;
     }
     Ok(true)
 }
@@ -255,11 +358,12 @@ async fn pending_columns(
     db: &SqlitePool,
     paper_id: &str,
     columns: &[TableColumn],
+    force: bool,
 ) -> Result<Vec<TableColumn>, String> {
     let mut out = Vec::new();
     for col in columns {
-        let row = sqlx::query_as::<_, (String, i64)>(
-            "SELECT status, edited FROM ai_table_cells WHERE paper_id = ? AND column_key = ?",
+        let row = sqlx::query_as::<_, (String, i64, String)>(
+            "SELECT status, edited, value FROM ai_table_cells WHERE paper_id = ? AND column_key = ?",
         )
         .bind(paper_id)
         .bind(&col.key)
@@ -267,9 +371,18 @@ async fn pending_columns(
         .await
         .map_err(|e| format!("db: {e}"))?;
         match row {
-            // Manually edited or already extracted: keep.
-            Some((status, edited)) if edited == 1 || status == "done" => {}
-            _ => out.push(col.clone()),
+            Some((_, edited, _)) if edited == 1 => {
+                // A manual edit is the user's final word — even a forced rerun
+                // leaves it alone.
+            }
+            // A model that found nothing left the cell empty: that is "待补",
+            // not "done". `status = 'empty'` is the modern marker; a
+            // done-with-empty-value row is the legacy shape of the same thing.
+            Some((status, _, _)) if status == "empty" => out.push(col.clone()),
+            Some((status, _, value))
+                if status != "failed" && !force && status != "empty" && !value.trim().is_empty() => {}
+            Some(_) => out.push(col.clone()),
+            None => out.push(col.clone()),
         }
     }
     Ok(out)
@@ -306,6 +419,7 @@ async fn gather_evidence(
     db: &SqlitePool,
     paper_id: &str,
     columns: &[TableColumn],
+    detail: Detail,
 ) -> Result<String, String> {
     let mut seen = std::collections::HashSet::new();
     let mut blocks: Vec<String> = Vec::new();
@@ -313,14 +427,14 @@ async fn gather_evidence(
     let ids = [paper_id.to_string()];
     for col in columns {
         let query = if col.prompt.trim().is_empty() { &col.key } else { &col.prompt };
-        let hits = retriever::hybrid_search_scoped(db, query, CHUNKS_PER_COLUMN, false, Some(&ids))
+        let hits = retriever::hybrid_search_scoped(db, query, detail.chunks_per_column(), false, Some(&ids))
             .await
             .unwrap_or_default();
         for hit in hits {
             if !seen.insert(hit.chunk_id.clone()) {
                 continue;
             }
-            let remaining = EVIDENCE_CHAR_CAP.saturating_sub(used);
+            let remaining = detail.evidence_cap().saturating_sub(used);
             if remaining == 0 {
                 break;
             }

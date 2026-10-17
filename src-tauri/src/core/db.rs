@@ -1196,6 +1196,120 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     .execute(&db)
     .await?;
 
+    // AI 文献分类: one row per run (scope + confirmed taxonomy draft), one row
+    // per paper assignment, and an applied-log that makes the whole run
+    // revertible. Device-local like the AI-table tables: the *result* of
+    // classification lands in collections/tags/paper_* (which already sync),
+    // while the run history is this machine's action record.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ai_classify_runs (
+            id TEXT PRIMARY KEY NOT NULL,
+            scope_kind TEXT NOT NULL DEFAULT 'selection',
+            scope_id TEXT,
+            dimension TEXT NOT NULL DEFAULT '',
+            target TEXT NOT NULL DEFAULT 'collection',
+            engine TEXT NOT NULL DEFAULT 'batch',
+            sample_size INTEGER,
+            paper_ids_json TEXT NOT NULL DEFAULT '[]',
+            groups_json TEXT NOT NULL DEFAULT '[]',
+            provider_id TEXT,
+            status TEXT NOT NULL DEFAULT 'draft',
+            created_at TEXT NOT NULL,
+            applied_at TEXT,
+            undone_at TEXT
+        )"
+    )
+    .execute(&db)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ai_classify_items (
+            run_id TEXT NOT NULL,
+            paper_id TEXT NOT NULL,
+            group_name TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'proposed',
+            edited INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (run_id, paper_id)
+        )"
+    )
+    .execute(&db)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ai_classify_applied (
+            run_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            target_name TEXT NOT NULL DEFAULT '',
+            paper_id TEXT NOT NULL DEFAULT '',
+            created_new INTEGER NOT NULL DEFAULT 0,
+            link_created INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (run_id, kind, target_id, paper_id)
+        )"
+    )
+    .execute(&db)
+    .await?;
+    // P1: multi-label assignments, confidence-triage threshold, two-level
+    // drafts and the cross-run incremental switch.
+    add_column_if_missing(&db, "ai_classify_items", "labels_json", "TEXT NOT NULL DEFAULT '[]'")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for ai_classify_items.labels_json: {}", e))?;
+    add_column_if_missing(&db, "ai_classify_runs", "threshold", "REAL NOT NULL DEFAULT 0.75")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for ai_classify_runs.threshold: {}", e))?;
+    add_column_if_missing(&db, "ai_classify_runs", "two_level", "INTEGER NOT NULL DEFAULT 0")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for ai_classify_runs.two_level: {}", e))?;
+    add_column_if_missing(&db, "ai_classify_runs", "skip_existing", "INTEGER NOT NULL DEFAULT 0")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for ai_classify_runs.skip_existing: {}", e))?;
+    // P2: unattended classification rules. A rule re-runs the same pipeline on
+    // a schedule for NEW papers only (skip_existing) and applies just the
+    // high-confidence assignments — the review queue stays human.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ai_classify_rules (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            dimension TEXT NOT NULL DEFAULT '',
+            target TEXT NOT NULL DEFAULT 'collection',
+            scope_kind TEXT NOT NULL DEFAULT 'all',
+            scope_id TEXT,
+            max_groups INTEGER NOT NULL DEFAULT 8,
+            threshold REAL NOT NULL DEFAULT 0.85,
+            two_level INTEGER NOT NULL DEFAULT 1,
+            reuse_existing INTEGER NOT NULL DEFAULT 1,
+            cron TEXT NOT NULL DEFAULT '0 9 * * *',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            provider_id TEXT,
+            last_run_at TEXT,
+            last_result TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )"
+    )
+    .execute(&db)
+    .await?;
+
+    // Per-(dimension, target) controlled vocabulary. `staged` = proposed by the
+    // model but not yet promoted by the user; `rejected` is negative memory —
+    // the term is never proposed again for that dimension.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ai_classify_vocab (
+            id TEXT PRIMARY KEY NOT NULL,
+            dimension TEXT NOT NULL,
+            target TEXT NOT NULL,
+            path TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'staged',
+            source TEXT NOT NULL DEFAULT 'ai',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (dimension, target, path)
+        )"
+    )
+    .execute(&db)
+    .await?;
+
     // Per-paper figure/table metadata (page, label, caption, image bbox) for
     // the agent's paper_snapshot tool. Device-local derived data like
     // paper_paragraphs: rebuilt from the PDF when the paper is indexed, so no

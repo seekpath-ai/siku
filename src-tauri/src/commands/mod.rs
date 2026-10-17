@@ -1,5 +1,6 @@
 pub mod account;
 pub mod agent;
+pub mod ai_classify;
 pub mod ai_table;
 pub mod annotation;
 pub mod attachments;

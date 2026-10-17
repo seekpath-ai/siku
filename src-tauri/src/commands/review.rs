@@ -68,3 +68,30 @@ pub async fn review_generate_cancel() -> Result<(), String> {
     review_gen::request_cancel();
     Ok(())
 }
+
+/// Retry ONE failed section (1-based index) with a doubled output budget.
+/// Spawned: a section call can take minutes, and progress arrives on
+/// `library:review-progress` like every other beat.
+#[tauri::command]
+pub async fn review_generate_retry_section(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    section_index: usize,
+) -> Result<(), String> {
+    let db = state.db.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = review_gen::retry_section(app, db, section_index).await {
+            // The per-section failure event was already emitted by the core;
+            // this is just the tracing trail.
+            tracing::warn!(section_index, error = %e, "review section retry did not succeed");
+        }
+    });
+    Ok(())
+}
+
+/// Save the note from whatever sections exist (placeholders for the missing
+/// ones). Async because it writes a note, but fast enough to await.
+#[tauri::command]
+pub async fn review_generate_save(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    review_gen::save_review(app, state.db.clone()).await
+}

@@ -127,6 +127,9 @@ export function PrintNotePortal({ note, content, notes, attachmentsDir, options,
         onNavigate={() => {}}
         attachmentsDir={attachmentsDir}
         className="prose max-w-none"
+        // 引用链接修正: citations jump to the note's own 参考文献 instead of the
+        // reader, and the reference entries lose their first-line indent.
+        citations={options.citationFix ? 'reference' : 'reader'}
       />
     </div>,
     document.body

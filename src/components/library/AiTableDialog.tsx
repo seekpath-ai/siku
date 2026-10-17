@@ -54,13 +54,21 @@ export function AiTableDialog() {
   const [editing, setEditing] = useState<{ paperId: string; columnKey: string; value: string } | null>(null);
   const [providerId, setProviderId] = useState('');
   const [logs, setLogs] = useState<string[]>([]);
+  /** Live reasoning of the paper being extracted (thinking models spend most of
+   *  the call here; without it the panel looks frozen). */
+  const [reasoning, setReasoning] = useState('');
+  const [reasoningTitle, setReasoningTitle] = useState('');
   const [showLog, setShowLog] = useState(true);
   const logRef = useRef<HTMLDivElement>(null);
+  const reasoningRef = useRef<HTMLDivElement>(null);
 
   // Keep the process log pinned to its newest line.
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [logs]);
+  useEffect(() => {
+    reasoningRef.current?.scrollTo({ top: reasoningRef.current.scrollHeight });
+  }, [reasoning]);
 
   const reloadCells = useCallback(
     async (cols: AiTableColumn[]) => {
@@ -115,11 +123,23 @@ export function AiTableDialog() {
   useEffect(() => {
     if (!open) return;
     const un = listen<AiTableProgress>('library:ai-table-progress', (e) => {
-      setProgress(e.payload);
-      if (e.payload.log) {
-        setLogs((prev) => [...prev.slice(-99), e.payload.log!]);
+      const p = e.payload;
+      // A reasoning beat carries placeholder counters — keep the real progress.
+      if (!p.reasoning) setProgress(p);
+      if (p.reasoning) {
+        setReasoning((prev) => prev + p.reasoning);
+        if (p.currentTitle) setReasoningTitle(p.currentTitle);
+        return;
       }
-      if (e.payload.finished) {
+      // Per-paper start beat (no log): this paper's reasoning begins fresh.
+      if (!p.log && p.currentTitle) {
+        setReasoning('');
+        setReasoningTitle(p.currentTitle);
+      }
+      if (p.log) {
+        setLogs((prev) => [...prev.slice(-99), p.log!]);
+      }
+      if (p.finished) {
         setRunning(false);
         void reloadCells(columns);
       }
@@ -152,6 +172,8 @@ export function AiTableDialog() {
     setRunning(true);
     setProgress(null);
     setLogs([]);
+    setReasoning('');
+    setReasoningTitle('');
     try {
       await aiTableExtractStart(ids ?? paperIds, cols, providerId || null, detail, force);
     } catch (err) {
@@ -555,7 +577,7 @@ export function AiTableDialog() {
                                 if (!running) void startRun([p.id]);
                               }}
                               className="flex items-center gap-1 text-amber-400/80 hover:text-amber-300"
-                              title="该字段未抽取到内容，点击只重试这一篇"
+                              title="该字段未抽取到内容——原因见右侧「模型推理 / 过程日志」；点击只重试这一篇"
                             >
                               待补 · 重试
                             </button>
@@ -584,18 +606,34 @@ export function AiTableDialog() {
             stays visible next to it. */}
         <aside
           className={`shrink-0 flex flex-col overflow-hidden transition-all duration-200 ${
-            showLog ? 'w-[280px] border-l border-surface-hover' : 'w-0'
+            showLog ? 'w-[300px] border-l border-surface-hover' : 'w-0'
           }`}
         >
-          <div className="w-[280px] flex flex-col h-full">
-            <div className="flex items-center gap-1.5 px-3 py-2.5 border-b border-surface-hover text-[12px] text-text-secondary">
+          <div className="w-[300px] flex flex-col h-full">
+            {/* 模型推理：thinking 模型的绝大部分时间花在这里，不显示就只是一片沉默 */}
+            <div className="flex items-center gap-1.5 px-3 py-2 border-b border-surface-hover/60 text-[11px] text-text-secondary/70">
+              <span>模型推理</span>
+              {reasoning && reasoningTitle && (
+                <span className="truncate text-text-secondary/45">· 《{reasoningTitle}》</span>
+              )}
+              {running && reasoning && <Loader2 size={10} className="animate-spin shrink-0" />}
+            </div>
+            <div
+              ref={reasoningRef}
+              className={`overflow-y-auto px-3 py-2 whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-text-secondary/50 italic ${
+                reasoning ? 'basis-[45%] max-h-[45%] border-b border-surface-hover/50' : 'hidden'
+              }`}
+            >
+              {reasoning}
+            </div>
+            <div className="flex items-center gap-1.5 px-3 py-2 border-b border-surface-hover text-[12px] text-text-secondary">
               过程日志
               {running && <Loader2 size={11} className="animate-spin" />}
               {logs.length > 0 && <span className="text-text-secondary/40">（{logs.length}）</span>}
             </div>
             <div
               ref={logRef}
-              className="flex-1 overflow-y-auto px-3 py-2 font-mono text-[11px] leading-relaxed text-text-secondary/80 space-y-1"
+              className="flex-1 min-h-0 overflow-y-auto px-3 py-2 font-mono text-[11px] leading-relaxed text-text-secondary/80 space-y-1"
             >
               {logs.length === 0 ? (
                 <span className="text-text-secondary/40">运行后此处逐篇显示抽取结果。</span>

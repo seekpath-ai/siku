@@ -10,6 +10,9 @@ export interface PdfExportOptions {
   coverPage: boolean;
   /** 公文风格：正文加粗降为常规字重、行内代码去灰底 */
   officialStyle: boolean;
+  /** 引用链接修正：正文引用由「跳到文献证据段」改为「跳到文末参考文献」，
+   *  参考文献段落同时取消首行缩进（正式论文的引用形态）。只影响本次导出。 */
+  citationFix: boolean;
 }
 
 const STORAGE_KEY = 'siku.pdf-export-options';
@@ -17,20 +20,31 @@ const STORAGE_KEY = 'siku.pdf-export-options';
 function loadOptions(): PdfExportOptions {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return { numberSections: false, numberFigures: false, coverPage: false, officialStyle: false, ...JSON.parse(raw) };
+    if (raw)
+      return {
+        numberSections: false,
+        numberFigures: false,
+        coverPage: false,
+        officialStyle: false,
+        citationFix: true,
+        ...JSON.parse(raw),
+      };
   } catch { /* corrupted value — fall through to defaults */ }
-  return { numberSections: false, numberFigures: false, coverPage: false, officialStyle: false };
+  return { numberSections: false, numberFigures: false, coverPage: false, officialStyle: false, citationFix: true };
 }
 
 interface Props {
   noteTitle: string;
+  /** False when the note has no `siku-reader://` citations with a 参考文献 list
+   *  to point at — the option is then shown disabled with the reason. */
+  canFixCitations: boolean;
   onConfirm: (options: PdfExportOptions) => void;
   onCancel: () => void;
 }
 
 /** Pre-export options for 导出为 PDF. The choices are device-local
  *  (localStorage) — they are print-layout preferences, not note data. */
-export function ExportPdfDialog({ noteTitle, onConfirm, onCancel }: Props) {
+export function ExportPdfDialog({ noteTitle, canFixCitations, onConfirm, onCancel }: Props) {
   const [options, setOptions] = useState<PdfExportOptions>(loadOptions);
 
   const toggle = (key: keyof PdfExportOptions) =>
@@ -43,11 +57,19 @@ export function ExportPdfDialog({ noteTitle, onConfirm, onCancel }: Props) {
     onConfirm(options);
   };
 
-  const items: { key: keyof PdfExportOptions; label: string; hint: string }[] = [
+  const items: { key: keyof PdfExportOptions; label: string; hint: string; disabled?: boolean }[] = [
     { key: 'numberSections', label: '章节自动编号', hint: '正文标题前加 1 / 1.1 / 1.1.1' },
     { key: 'numberFigures', label: '图表自动编号', hint: '图片下方加「图 N」，表格加「表 N」' },
     { key: 'coverPage', label: '封面页', hint: '标题与导出日期独占首页' },
     { key: 'officialStyle', label: '公文风格', hint: '正文加粗降为常规字重，行内代码去灰底' },
+    {
+      key: 'citationFix',
+      label: '引用链接修正',
+      hint: canFixCitations
+        ? '正文引用改为跳到文末参考文献，参考文献段落取消首行缩进'
+        : '该笔记没有可修正的引用（需 AI 综述/文献分析生成的 [n] 引用 + 参考文献列表）',
+      disabled: !canFixCitations,
+    },
   ];
 
   return (
@@ -75,12 +97,19 @@ export function ExportPdfDialog({ noteTitle, onConfirm, onCancel }: Props) {
           {items.map((item) => (
             <label
               key={item.key}
-              className="flex items-center gap-2.5 px-2.5 py-2 rounded-lg border border-surface-hover hover:bg-surface-hover/50 cursor-pointer transition-colors"
+              className={`flex items-center gap-2.5 px-2.5 py-2 rounded-lg border border-surface-hover transition-colors ${
+                item.disabled
+                  ? 'opacity-50 cursor-not-allowed'
+                  : 'hover:bg-surface-hover/50 cursor-pointer'
+              }`}
             >
               <input
                 type="checkbox"
-                checked={options[item.key]}
-                onChange={() => toggle(item.key)}
+                checked={item.disabled ? false : options[item.key]}
+                disabled={item.disabled}
+                onChange={() => {
+                  if (!item.disabled) toggle(item.key);
+                }}
                 className="accent-primary"
               />
               <span className="flex-1 min-w-0">

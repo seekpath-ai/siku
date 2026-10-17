@@ -25,6 +25,7 @@ import {
 import { WikiMarkdown } from './WikiMarkdown';
 import { PrintNotePortal } from './PrintNotePortal';
 import { ExportPdfDialog, type PdfExportOptions } from './ExportPdfDialog';
+import { hasFixableCitations } from '@/lib/noteCitations';
 import { BacklinksPanel } from './BacklinksPanel';
 import { OutlinePanel } from './OutlinePanel';
 import { VersionHistoryDialog } from './VersionHistoryDialog';
@@ -968,6 +969,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
       {pdfOptionsOpen && (
         <ExportPdfDialog
           noteTitle={note.title}
+          canFixCitations={hasFixableCitations(content)}
           onCancel={() => setPdfOptionsOpen(false)}
           onConfirm={(opts) => {
             setPdfOptionsOpen(false);

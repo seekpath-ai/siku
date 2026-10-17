@@ -146,6 +146,35 @@ fn strip_footnote_definitions(body: &str) -> String {
         .join("\n")
 }
 
+fn heading_text(line: &str) -> Option<&str> {
+    let t = line.trim();
+    if !t.starts_with('#') {
+        return None;
+    }
+    Some(t.trim_start_matches('#').trim())
+}
+
+/// Drop a model-written 参考文献 section before the generated one is appended.
+///
+/// The prompt may tell the model not to write its own bibliography, but prompts
+/// are not a guarantee: the converter appends one unconditionally, so a
+/// compliant-looking reply that also lists references would end up with two
+/// sections. Only a trailing section is stripped — a 参考文献 heading followed by
+/// another heading is the user's own content and is left alone.
+fn strip_existing_reference_section(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let Some(start) = lines
+        .iter()
+        .rposition(|l| heading_text(l) == Some("参考文献"))
+    else {
+        return body.to_string();
+    };
+    if lines[start + 1..].iter().any(|l| heading_text(l).is_some()) {
+        return body.to_string();
+    }
+    lines[..start].join("\n").trim_end().to_string()
+}
+
 struct Linked {
     /// Reply body with citations rewritten to inline links.
     body: String,
@@ -270,6 +299,7 @@ pub async fn convert(
 ) -> Result<String, String> {
     let (body, items) = parse_evidence_block(content);
     let body = strip_footnote_definitions(&body);
+    let body = strip_existing_reference_section(&body);
     if items.is_empty() {
         return Ok(body.trim_end().to_string());
     }
@@ -391,6 +421,29 @@ mod tests {
         assert!(!out.contains("[^1]:"), "{out}");
         assert!(!out.contains("[^2]:"), "{out}");
         assert!(out.contains("结论[^1]。"), "{out}");
+    }
+
+    #[test]
+    fn model_written_bibliography_is_replaced_not_duplicated() {
+        // The old prompt told the model to hand-write footnote definitions, so a
+        // reply may still carry its own reference block. It must not survive next
+        // to the generated one.
+        let body = "结论[^1]。\n\n## 参考文献\n\n[1] 张三. 某研究. 学报, 2020.";
+        let out = strip_existing_reference_section(body);
+        assert!(!out.contains("参考文献"), "{out}");
+        assert!(out.contains("结论[^1]。"), "{out}");
+    }
+
+    #[test]
+    fn mid_document_reference_heading_is_user_content() {
+        let body = "## 参考文献\n\n我自己写的备注\n\n## 后续一节\n\n正文";
+        assert_eq!(strip_existing_reference_section(body), body);
+    }
+
+    #[test]
+    fn body_without_reference_section_is_untouched() {
+        let body = "## 摘要\n\n正文[^1]。";
+        assert_eq!(strip_existing_reference_section(body), body);
     }
 
     #[test]

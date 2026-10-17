@@ -2066,7 +2066,9 @@ export interface AiTableProgress {
   currentTitle: string;
   /** One process-panel log line (paper finished/failed/skipped). */
   log?: string;
-  /** "done" | "cancelled" once the run ends; null while running. */
+  /** Reasoning delta of the paper being extracted (thinking models). */
+  reasoning?: string;
+  /** "done" | "cancelled" | "busy" once the run ends; null while running. */
   finished: string | null;
 }
 

@@ -726,6 +726,12 @@ body.in-tauri {
   #siku-print-root .not-prose p {
     text-indent: 0;
   }
+  /* 参考文献条目：编号 + 书目信息，不是正文散文，不缩进（仅当导出时勾选
+     「引用链接修正」才会带上这个 class）。 */
+  #siku-print-root .pdf-ref-entry {
+    text-indent: 0;
+    margin-bottom: 0.2em;
+  }
 
   /* ── 行间公式：居中并留白 ────────────────────────────────────────── */
   #siku-print-root .katex-display {

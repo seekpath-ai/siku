@@ -12,7 +12,9 @@ import { openInBrowser } from '@/lib/externalLinks';
 import { resolveImageUrl } from '@/lib/imageCache';
 import { parseReaderUrl } from '@/lib/evidence';
 import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
+import { rehypeReferenceAnchors, toReferenceCitations } from '@/lib/noteCitations';
 import { rewritePasswordTokens } from '@/lib/passwordToken';
+import type { PluggableList } from 'unified';
 import { useNotesSettingsStore } from '@/stores/notesSettingsStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
 import { useAllUnlockedSet } from '@/stores/noteLockStore';
@@ -28,6 +30,12 @@ interface Props {
   className?: string;
   /** Absolute path to the vault attachments directory. */
   attachmentsDir?: string;
+  /** How citation links (`siku-reader://`) behave.
+   *  - `reader` (default): click jumps to the evidence passage in the PDF reader.
+   *  - `reference`: export only — citations are rewritten into in-note anchors
+   *    pointing at the 参考文献 list, and those entries get ids + lose the
+   *    first-line indent (see lib/noteCitations). */
+  citations?: 'reader' | 'reference';
 }
 
 const WIKI_LINK_RE = /\[\[([^\]]+?)\]\]/g;
@@ -235,7 +243,15 @@ function MdImage({
   );
 }
 
-export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, className, attachmentsDir }: Props) {
+export function WikiMarkdown({
+  content,
+  notes,
+  onNavigate,
+  onCreateLink,
+  className,
+  attachmentsDir,
+  citations = 'reader',
+}: Props) {
   const navigate = useNavigate();
   // Gated notes (subtrees of not-yet-unlocked lock roots): embeds render a
   // placeholder and link hover previews are scrubbed — both would otherwise
@@ -265,8 +281,11 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
       return `[${display}](note://${targetId})`;
     });
     // 4. LLM-style math delimiters \(...\) / \[...\] → remark-math's $..$.
-    return normalizeMathDelimiters(text);
-  }, [content, notes, isLockHidden]);
+    text = normalizeMathDelimiters(text);
+    // 5. Export only: citations jump to the note's own 参考文献 instead of the
+    //    reader (the deep link is dead in a printed PDF).
+    return citations === 'reference' ? toReferenceCitations(text) : text;
+  }, [content, notes, isLockHidden, citations]);
 
   const LinkComponent = useCallback(
     (props: React.AnchorHTMLAttributes<HTMLAnchorElement>) => {
@@ -396,6 +415,15 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
   // to a space). Memoized — a fresh plugins array per render would re-run the
   // whole pipeline on every keystroke's deferred re-render.
   const strictLineBreaks = useNotesSettingsStore((s) => s.strictLineBreaks);
+  // The plugin list is typed by unified, while the anchor plugin is written
+  // against a minimal local hast shape — the cast is a type-level bridge only.
+  const rehypePlugins: PluggableList = useMemo(
+    () =>
+      (citations === 'reference'
+        ? [[rehypeKatex, { throwOnError: false }], rehypeReferenceAnchors]
+        : [[rehypeKatex, { throwOnError: false }]]) as unknown as PluggableList,
+    [citations]
+  );
   const remarkPlugins = useMemo(
     () => (strictLineBreaks ? [remarkGfm, remarkMath, remarkStrictLineBreaks] : [remarkGfm, remarkMath]),
     [strictLineBreaks]
@@ -404,7 +432,7 @@ export function WikiMarkdown({ content, notes, onNavigate, onCreateLink, classNa
   return (
     <ReactMarkdown
       remarkPlugins={remarkPlugins}
-      rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
+      rehypePlugins={rehypePlugins}
       components={{ a: LinkComponent, code: MarkdownCode, pre: MarkdownPre, img: ImageComponent, td: TdComponent, th: ThComponent }}
       urlTransform={allowCustomProtocols}
       className={className}

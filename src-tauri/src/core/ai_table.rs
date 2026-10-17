@@ -48,7 +48,11 @@ pub struct ExtractProgress {
     /// skipped); None on the "starting paper X" beats.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log: Option<String>,
-    /// Set when the run ends: "done" | "cancelled".
+    /// Reasoning fragment of the paper being extracted (thinking models spend
+    /// most of the call here; without it the panel shows nothing for minutes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Set when the run ends: "done" | "cancelled" | "busy".
     pub finished: Option<String>,
 }
 
@@ -187,6 +191,7 @@ pub async fn run_extraction(
                     failed: 0,
                     current_title: String::new(),
                     log: Some(format!("{e}（多半是上一次抽取还没结束，可稍后重试）")),
+                    reasoning: None,
                     finished: Some("busy".into()),
                 },
             );
@@ -210,13 +215,13 @@ pub async fn run_extraction(
             match crate::ai::llm::client::create_llm_client(&cfg) {
                 Ok(c) => c,
                 Err(e) => {
-                    emit(&app, &ExtractProgress { total: 0, done: 0, failed: 0, current_title: String::new(), log: Some(format!("创建模型客户端失败：{e}")), finished: Some("done".into()) });
+                    emit(&app, &ExtractProgress { total: 0, done: 0, failed: 0, current_title: String::new(), log: Some(format!("创建模型客户端失败：{e}")), reasoning: None, finished: Some("done".into()) });
                     return;
                 }
             }
         }
         Err(e) => {
-            emit(&app, &ExtractProgress { total: 0, done: 0, failed: 0, current_title: String::new(), log: Some(format!("加载模型配置失败：{e}")), finished: Some("done".into()) });
+            emit(&app, &ExtractProgress { total: 0, done: 0, failed: 0, current_title: String::new(), log: Some(format!("加载模型配置失败：{e}")), reasoning: None, finished: Some("done".into()) });
             return;
         }
     };
@@ -232,24 +237,26 @@ pub async fn run_extraction(
             break;
         }
         let title = paper_title(&db, paper_id).await;
-        emit(&app, &ExtractProgress { total, done, failed, current_title: title.clone(), log: None, finished: None });
+        emit(&app, &ExtractProgress { total, done, failed, current_title: title.clone(), log: None, reasoning: None, finished: None });
 
         let started = std::time::Instant::now();
         // Race the model call against the cancel flag: 停止 must take effect
         // while a slow local model is still generating, not minutes later.
-        let outcome = tokio::select! {
-            r = extract_one(&db, llm.as_ref(), paper_id, &columns, detail, force) => r,
-            _ = cancelled_now() => Err("已取消".to_string()),
-        };
+        // extract_one races its own call against the cancel flag, so a plain
+        // await is enough here.
+        let outcome = extract_one(&app, &db, llm.as_ref(), paper_id, &columns, detail, force).await;
         match outcome {
-            Ok(did_work) => {
+            Ok(o) => {
                 done += 1;
-                let log = if did_work {
-                    format!("✓ 《{title}》抽取完成（{:.1}s）", started.elapsed().as_secs_f64())
-                } else {
+                let log = if o.skipped {
                     format!("— 《{title}》全部单元格已存在，跳过")
+                } else {
+                    match o.empty_note {
+                        Some(note) => note,
+                        None => format!("✓ 《{title}》抽取完成（{:.1}s）", started.elapsed().as_secs_f64()),
+                    }
                 };
-                emit(&app, &ExtractProgress { total, done, failed, current_title: title, log: Some(log), finished: None });
+                emit(&app, &ExtractProgress { total, done, failed, current_title: title, log: Some(log), reasoning: None, finished: None });
             }
             Err(e) => {
                 if CANCEL.load(Ordering::SeqCst) {
@@ -264,7 +271,7 @@ pub async fn run_extraction(
                 let _ = mark_failed(&db, paper_id, &columns).await;
                 failed += 1;
                 let log = format!("✗ 《{title}》：{e}");
-                emit(&app, &ExtractProgress { total, done, failed, current_title: title, log: Some(log), finished: None });
+                emit(&app, &ExtractProgress { total, done, failed, current_title: title, log: Some(log), reasoning: None, finished: None });
             }
         }
     }
@@ -275,6 +282,7 @@ pub async fn run_extraction(
         failed,
         current_title: String::new(),
         log: None,
+        reasoning: None,
         finished: Some(if cancelled { "cancelled".into() } else { "done".into() }),
     });
 }
@@ -294,17 +302,42 @@ async fn paper_title(db: &SqlitePool, paper_id: &str) -> String {
 /// already `done` or were manually `edited` are left untouched (the LLM call
 /// still returns all columns — upsert is selective). Returns false when no
 /// LLM call was needed (all cells already present).
+/// What one paper's extraction produced.
+struct ExtractOutcome {
+    /// Nothing was pending (all cells already filled) — not a failure.
+    skipped: bool,
+    /// Set when the call ran but produced no content for any column: the line
+    /// the process panel shows instead of a mute "待补".
+    empty_note: Option<String>,
+}
+
+fn emit_reasoning(app: &AppHandle, title: &str, delta: &str) {
+    emit(
+        app,
+        &ExtractProgress {
+            total: 0,
+            done: 0,
+            failed: 0,
+            current_title: title.to_string(),
+            log: None,
+            reasoning: Some(delta.to_string()),
+            finished: None,
+        },
+    );
+}
+
 async fn extract_one(
+    app: &AppHandle,
     db: &SqlitePool,
     llm: &dyn crate::ai::llm::LlmClient,
     paper_id: &str,
     columns: &[TableColumn],
     detail: Detail,
     force: bool,
-) -> Result<bool, String> {
+) -> Result<ExtractOutcome, String> {
     let pending = pending_columns(db, paper_id, columns, force).await?;
     if pending.is_empty() {
-        return Ok(false);
+        return Ok(ExtractOutcome { skipped: true, empty_note: None });
     }
 
     let meta = paper_metadata(db, paper_id).await?;
@@ -336,23 +369,87 @@ async fn extract_one(
         ChatMessage { reasoning_content: None, role: "system".into(), content: system, attachments: None, tool_calls: None, tool_call_id: None, name: None },
         ChatMessage { reasoning_content: None, role: "user".into(), content: user, attachments: None, tool_calls: None, tool_call_id: None, name: None },
     ];
-    let resp = llm.chat_completion(&messages, &[]).await?;
-    let values = parse_values(&resp.content)?;
+
+    // Stream the call: a thinking model spends most of its time reasoning, and
+    // a non-streaming request threw that away — the panel showed nothing for
+    // minutes, which read as "hang". Reasoning deltas go straight to the panel.
+    let title = paper_title(db, paper_id).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ai::llm::StreamEvent>();
+    let app2 = app.clone();
+    let title2 = title.clone();
+    let drain = tokio::spawn(async move {
+        let mut text = String::new();
+        while let Some(ev) = rx.recv().await {
+            match ev.event_type.as_str() {
+                "delta" => {
+                    if let Some(c) = ev.content {
+                        text.push_str(&c);
+                    }
+                }
+                "reasoning" => {
+                    if let Some(c) = ev.content {
+                        emit_reasoning(&app2, &title2, &c);
+                    }
+                }
+                _ => {}
+            }
+        }
+        text
+    });
+    let call = tokio::select! {
+        r = llm.chat_completion_stream(&messages, &[], tx) => r,
+        _ = cancelled_now() => Err("已取消".to_string()),
+    };
+    let text = drain.await.map_err(|e| format!("stream drain: {e}"))?;
+    call?;
+
+    let values = parse_values(&text)?;
 
     let now = crate::core::time::now_iso();
+    let mut written = 0usize;
+    let mut blanks: Vec<String> = Vec::new();
     for col in &pending {
-        let value = values
-            .get(&col.key)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
+        let value = lookup_value(&values, &col.key)
+            .unwrap_or_default()
             .trim()
             .to_string();
+        if value.is_empty() {
+            blanks.push(col.key.clone());
+        } else {
+            written += 1;
+        }
         // An empty result is NOT a finished cell: storing it as `done` used to
         // make the cell permanently un-refillable ("重新抽取缺失" skipped it).
         let status = if value.is_empty() { "empty" } else { "done" };
         upsert_cell(db, paper_id, &col.key, &value, status, false, &now).await?;
     }
-    Ok(true)
+
+    // Everything came back empty: say WHY instead of leaving a mute 待补. The
+    // two things that actually explain it are the source size (no index / no
+    // abstract) and the keys the model returned (usually a naming mismatch).
+    let empty_note = if written == 0 {
+        let (chunks, abstract_len) = source_stats(db, paper_id).await;
+        let got: Vec<String> = values.keys().cloned().collect();
+        let want: Vec<String> = pending.iter().map(|c| c.key.clone()).collect();
+        let snippet: String = text.chars().take(160).collect();
+        let mut line = format!(
+            "⚠ 《{title}》没抽到内容：来源=摘要 {abstract_len} 字 / 全文索引 {chunks} 段；模型返回键 {got:?}，期望键 {want:?}"
+        );
+        if chunks == 0 && abstract_len < 100 {
+            line.push_str("。⚠ 该文献没有全文索引且摘要过短，模型无从抽取——请先「重建索引」或补全摘要");
+        }
+        if !got.is_empty() && got.len() != want.len() {
+            line.push_str("。键名不一致是常见原因（已按去空格/去引号匹配，仍失败则是模型改写了字段名）");
+        }
+        line.push_str(&format!("。原始返回：{snippet}"));
+        Some(line)
+    } else if !blanks.is_empty() {
+        Some(format!("· 《{title}》部分字段为空：{}", blanks.join("、")))
+    } else {
+        None
+    };
+
+    Ok(ExtractOutcome { skipped: false, empty_note })
 }
 
 /// Columns whose cell is missing or failed — the ones a run must produce.
@@ -451,6 +548,52 @@ async fn gather_evidence(
     } else {
         blocks.join("\n\n")
     })
+}
+
+/// Column keys as the model may echo them: surrounding quotes/brackets and
+/// whitespace (incl. full-width) removed.
+fn norm_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| !c.is_whitespace() && *c != '\u{3000}')
+        .filter(|c| !matches!(c, '"' | '\'' | '`' | '“' | '”' | '「' | '」' | '『' | '』' | '【' | '】' | '[' | ']'))
+        .collect()
+}
+
+/// Look a column up in the model's JSON: exact key first, then a normalised
+/// match (models echo `"研究问题 "` or `【研究问题】` often enough that an exact
+/// match silently produced an empty cell).
+fn lookup_value(values: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    if let Some(v) = values.get(key).and_then(|v| v.as_str()) {
+        return Some(v.to_string());
+    }
+    let target = norm_key(key);
+    values
+        .iter()
+        .find(|(k, _)| norm_key(k) == target)
+        .and_then(|(_, v)| v.as_str())
+        .map(|v| v.to_string())
+}
+
+/// How much source text this paper actually has: (indexed chunk count, abstract
+/// chars). All-empty results are almost always explained by these two numbers.
+async fn source_stats(db: &SqlitePool, paper_id: &str) -> (i64, usize) {
+    let chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE paper_id = ?")
+        .bind(paper_id)
+        .fetch_one(db)
+        .await
+        .unwrap_or(0);
+    let abstract_len: usize = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT abstract FROM papers WHERE id = ?",
+    )
+    .bind(paper_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .map(|a| a.trim().chars().count())
+    .unwrap_or(0);
+    (chunks, abstract_len)
 }
 
 /// Parse the model's JSON object, tolerating ```json fences and prose around
@@ -581,6 +724,22 @@ mod tests {
 
         let v = parse_values("结果如下：{\"a\": \"1\"} 以上。").unwrap();
         assert_eq!(v["a"], "1");
+    }
+
+    #[test]
+    fn lookup_value_tolerates_model_echoed_keys() {
+        // The model often echoes the key with spaces / brackets / quotes.
+        let json = serde_json::json!({
+            " 研究问题 ": "问题 A",
+            "【动机缺口】": "缺口 B",
+            "核心洞察": "洞察 C"
+        });
+        let map = json.as_object().unwrap();
+        assert_eq!(lookup_value(map, "研究问题").as_deref(), Some("问题 A"));
+        assert_eq!(lookup_value(map, "动机缺口").as_deref(), Some("缺口 B"));
+        assert_eq!(lookup_value(map, "核心洞察").as_deref(), Some("洞察 C"));
+        // Genuinely absent stays absent (never a silent blank cell).
+        assert_eq!(lookup_value(map, "主要结果"), None);
     }
 
     #[test]

@@ -197,10 +197,15 @@ pub async fn run_extraction(
     let llm = match crate::core::llm_provider_service::load_llm_config_for(&db, provider_id.as_deref()).await {
         Ok(cfg) => {
             // Thinking models count reasoning toward max_tokens: a tiny
-            // provider cap can be exhausted before any JSON is emitted.
+            // provider cap can be exhausted before any JSON is emitted. 6000 is
+            // the built-in floor; a user budget (设置 → 领域智能体) can raise it.
             let mut cfg = cfg;
-            if cfg.max_tokens < 6000 {
-                cfg.max_tokens = 6000;
+            let floor = crate::core::task_prompts::apply_floor(
+                6000,
+                crate::core::task_prompts::budget_floor(&db, "ai_table").await,
+            );
+            if cfg.max_tokens < floor {
+                cfg.max_tokens = floor;
             }
             match crate::ai::llm::client::create_llm_client(&cfg) {
                 Ok(c) => c,
@@ -319,12 +324,9 @@ async fn extract_one(
 
     // The length rule scales with the requested detail level; an explicit
     // instruction in the column prompt always wins over it.
-    let system = format!(
-        "你是学术文献信息抽取引擎。根据给定的文献信息与段落，按用户列出的字段逐一抽取。\
-         只输出一个 JSON 对象：键为字段名，值为字符串；{}。\
-         若某个字段的抽取说明另有长度或详略要求，以该说明为准。\
-         文献中确实没有的字段值用空字符串。不要输出 JSON 以外的任何内容。",
-        detail.length_rule()
+    let system = crate::core::task_prompts::render(
+        &crate::core::task_prompts::effective(db, crate::core::task_prompts::AI_TABLE_EXTRACT).await,
+        &[("detail_rule", detail.length_rule())],
     );
     let user = format!(
         "【文献】\n{meta}\n\n【相关段落】\n{evidence}\n\n【待抽取字段】\n{column_spec}"

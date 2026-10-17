@@ -51,8 +51,29 @@ impl Tool for NoteWriteTool {
 
     async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
         let title = args["title"].as_str().unwrap_or("Untitled");
-        let content = args["content"].as_str().unwrap_or("");
+        let raw = args["content"].as_str().unwrap_or("");
         let now = time::now_iso();
+
+        // The agent answers with `[^n]` markers + a trailing ```evidence block.
+        // Convert it to the same citation form a 综述 note uses — inline `[n]`
+        // links to the evidence passage plus a `## 参考文献` list — so both note
+        // pipelines produce the same shape. Papers other than the context paper
+        // must name their `paper` id in the evidence entries.
+        let note_paper: Option<String> = match args["note_id"].as_str() {
+            Some(id) => sqlx::query_scalar::<_, Option<String>>("SELECT paper_id FROM notes WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.db)
+                .await
+                .ok()
+                .flatten()
+                .flatten(),
+            None => None,
+        };
+        let default_paper = args["paper_id"].as_str().map(|s| s.to_string()).or(note_paper);
+        let content = crate::core::evidence_note::convert(&self.db, raw, default_paper.as_deref())
+            .await
+            .map_err(|e| format!("引用格式转换失败: {e}"))?;
+        let content = content.as_str();
 
         if let Some(note_id) = args["note_id"].as_str() {
             // Privacy lock: the agent must not modify locked notes.

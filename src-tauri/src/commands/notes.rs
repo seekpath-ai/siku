@@ -32,6 +32,32 @@ pub async fn note_duplicate(
     crate::core::note_service::duplicate_note(&state.db, &id).await
 }
 
+/// Save an agent reply as a note, converting its `[^n]` + ```evidence citations
+/// into the note citation form (inline `[n]` links + `## 参考文献`). Same
+/// conversion the `note_write` tool applies, so both paths agree.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn note_create_from_reply(
+    state: State<'_, AppState>,
+    paper_id: Option<String>,
+    title: String,
+    content: String,
+) -> Result<Note, String> {
+    let markdown =
+        crate::core::evidence_note::convert(&state.db, &content, paper_id.as_deref()).await?;
+    let vault_id = crate::core::vault_service::get_current_vault_id(&state.db).await?;
+    match paper_id.as_deref().filter(|p| !p.is_empty()) {
+        Some(pid) => {
+            crate::core::note_service::create_note_under_paper(&state.db, pid, &title, &markdown, &vault_id)
+                .await
+        }
+        None => {
+            crate::core::note_service::create_note(&state.db, &title, &markdown, None, None, &vault_id, false)
+                .await
+        }
+    }
+}
+
 /// Create a note under the paper's collection folder tree (Zotero-style).
 #[tauri::command]
 #[instrument(skip(state))]

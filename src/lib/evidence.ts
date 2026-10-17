@@ -104,30 +104,3 @@ export function parseReaderUrl(href: string): ReaderLinkTarget | null {
 
 // ── Note conversion ──
 
-/** Collapse whitespace (quotes come from chunked PDF text and may contain
- *  embedded newlines, which would break a single-line footnote definition). */
-function flattenQuote(text: string): string {
-  return text.replace(/\s+/g, ' ').trim();
-}
-
-/** Convert an assistant reply into portable note Markdown: the evidence
- *  block is stripped and each citation becomes a standard GFM footnote whose
- *  text is the quoted passage, prefixed by a clickable deep link back to the
- *  PDF page (when the paper id is known). The result stays readable in any
- *  Markdown editor — the link is in-app sugar, not the content itself. */
-export function buildNoteMarkdown(content: string, paperId?: string): string {
-  const { clean, evidence } = parseEvidence(content);
-  if (evidence.size === 0) return clean;
-  const defs: string[] = [];
-  for (const [n, ev] of [...evidence.entries()].sort((a, b) => a[0] - b[0])) {
-    const quote = `「${flattenQuote(ev.exact)}」`;
-    if (paperId) {
-      const label = ev.page != null ? `第 ${ev.page} 页` : 'PDF 原文';
-      defs.push(`[^${n}]: [${label}](${evidenceReaderUrl(paperId, ev)}) · ${quote}`);
-    } else {
-      const label = ev.page != null ? `第 ${ev.page} 页 · ` : '';
-      defs.push(`[^${n}]: ${label}${quote}`);
-    }
-  }
-  return `${clean}\n\n${defs.join('\n')}\n`;
-}

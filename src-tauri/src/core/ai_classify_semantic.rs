@@ -314,11 +314,10 @@ pub async fn draft(
         ));
     }
 
-    let system = format!(
-        "你是学术文献分类专家。下面是把文献按语义向量聚成若干簇后，每个簇里最具代表性的文献标题。\
-         请为每个簇起一个「{dimension}」维度的类目名（简短，不超过 12 字），并给一句话界定。\
-         只输出 JSON：{{\"clusters\":[{{\"index\":<簇编号>,\"name\":\"类目名\",\"description\":\"一句话界定\"}}]}}。\
-         不要输出 JSON 以外的任何内容。"
+    let system = crate::core::task_prompts::render(
+        &crate::core::task_prompts::effective(db, crate::core::task_prompts::CLASSIFY_CLUSTER_NAMING)
+            .await,
+        &[("dimension", dimension)],
     );
     let messages = vec![
         chat_msg("system", system),

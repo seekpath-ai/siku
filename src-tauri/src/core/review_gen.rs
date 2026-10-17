@@ -190,7 +190,7 @@ fn chat_msg(role: &str, content: String) -> ChatMessage {
 /// Hard ceiling for the per-attempt output budget. Providers cap lower than
 /// this on their own; beyond it, doubling stops and the dialog tells the user to
 /// switch models instead of silently retrying forever.
-const MAX_OUTPUT_TOKENS: u32 = 32768;
+const MAX_OUTPUT_TOKENS: u32 = crate::core::task_prompts::OUTPUT_CAP;
 /// Sentinel error for "the user asked to stop" (distinct from a real failure).
 const CANCELLED: &str = "已取消";
 
@@ -207,6 +207,12 @@ async fn llm_with_need(
     provider_id: Option<&str>,
     need: u32,
 ) -> Result<Box<dyn crate::ai::llm::LlmClient>, String> {
+    // A user-set budget floor (设置 → 领域智能体) only RAISES the budget: the
+    // computed need is never lowered, because a lower cap truncates prose.
+    let need = crate::core::task_prompts::apply_floor(
+        need,
+        crate::core::task_prompts::budget_floor(db, "review").await,
+    );
     let mut cfg = crate::core::llm_provider_service::load_llm_config_for(db, provider_id).await?;
     // Thinking models count reasoning toward max_tokens: a section needs its
     // prose budget PLUS reasoning headroom, or the call ends on
@@ -326,11 +332,7 @@ pub async fn generate_outline(
     let llm = default_llm(db, provider_id, 1500).await?;
 
     let section_count = ((target_words / 800) as usize).clamp(3, 8);
-    let system = "你是学术写作助手，擅长设计文献综述的目录框架。只输出 JSON 数组，\
-        每个元素为 {\"title\": \"章节标题\", \"points\": \"该节应覆盖的要点（一句话）\", \
-        \"subsections\": [\"小节标题\", ...]}；内容较多的章节设计 2-4 个小节，\
-        引言、总结/展望等简短章节的小节数组可为空。不要输出 JSON 以外的内容。"
-        .to_string();
+    let system = crate::core::task_prompts::effective(db, crate::core::task_prompts::REVIEW_OUTLINE).await;
     let scope_line = if scope.trim().is_empty() {
         String::new()
     } else {
@@ -829,13 +831,13 @@ async fn write_section(
             format!("\n本节小节：{}", section.subsections.join("；")),
         )
     };
-    let system = format!(
-        "你是学术写作助手，正在撰写文献综述的一节。规则：\n\
-        1. 只依据「参考段落」写作，不得编造文献中没有的事实；\n\
-        2. 引用事实必须在句末标注【证据编号】，格式如 [E3]（E 后面的数字就是「参考段落」前的编号）；\
-         同一处事实可引多条证据，写成 [E3][E7]；只能使用「参考段落」中出现过的编号，绝不自行编号或改写编号体系；\n\
-        3. 使用{language}写作，学术语体，本节约 {target_words} 字；\n\
-        4. 直接输出本节正文，不要输出章节标题，不要解释。{subsection_rule}"
+    let system = crate::core::task_prompts::render(
+        &crate::core::task_prompts::effective(db, crate::core::task_prompts::REVIEW_SECTION).await,
+        &[
+            ("language", language),
+            ("target_words", &target_words.to_string()),
+            ("subsection_rule", subsection_rule.as_str()),
+        ],
     );
     let user = format!("研究问题：{question}\n本节主题：{}{points_line}{subsection_line}\n\n参考段落：\n{evidence}", section.title);
     let messages = vec![chat_msg("system", system), chat_msg("user", user)];
@@ -1186,7 +1188,7 @@ fn anchor_quote(content: &str) -> String {
     head.trim().to_string()
 }
 
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.as_bytes() {
         match *b {
@@ -1199,22 +1201,45 @@ fn percent_encode(s: &str) -> String {
 
 /// `[n] 作者. 标题. 期刊, 年份. DOI/URL` — compact GB/T 7714-style line.
 fn reference_line(n: usize, p: &SourcePaper) -> String {
-    let authors = crate::core::citation_export::parse_authors(&p.authors);
+    bibliography_line(
+        n,
+        &p.authors,
+        &p.title,
+        p.journal.as_deref(),
+        p.year,
+        p.doi.as_deref(),
+        p.url.as_deref(),
+    )
+}
+
+/// One numbered bibliography entry. Shared with `core::evidence_note` so a note
+/// produced by the 文献分析 agent cites exactly like a 综述 note.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bibliography_line(
+    n: usize,
+    authors_json: &str,
+    title: &str,
+    journal: Option<&str>,
+    year: Option<i64>,
+    doi: Option<&str>,
+    url: Option<&str>,
+) -> String {
+    let authors = crate::core::citation_export::parse_authors(authors_json);
     let author_str = if authors.len() > 3 {
         format!("{}, 等", authors[..3].join(", "))
     } else {
         authors.join(", ")
     };
-    let mut line = format!("[{n}] {author_str}. {}.", p.title);
-    match (&p.journal, p.year) {
+    let mut line = format!("[{n}] {author_str}. {title}.");
+    match (journal, year) {
         (Some(j), Some(y)) if !j.is_empty() => line.push_str(&format!(" {j}, {y}.")),
         (Some(j), None) if !j.is_empty() => line.push_str(&format!(" {j}.")),
         (None, Some(y)) => line.push_str(&format!(" {y}.")),
         _ => {}
     }
-    if let Some(doi) = p.doi.as_deref().filter(|d| !d.is_empty()) {
+    if let Some(doi) = doi.filter(|d| !d.is_empty()) {
         line.push_str(&format!(" DOI: {doi}."));
-    } else if let Some(url) = p.url.as_deref().filter(|u| !u.is_empty()) {
+    } else if let Some(url) = url.filter(|u| !u.is_empty()) {
         line.push_str(&format!(" {url}"));
     }
     line

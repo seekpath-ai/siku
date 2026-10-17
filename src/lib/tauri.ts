@@ -339,6 +339,46 @@ export interface PetDomainInfo {
 }
 
 /** List built-in pet domain agents with their default system prompts. */
+export interface TaskPromptPlaceholder {
+  name: string;
+  description: string;
+}
+
+/** A system prompt behind a batch feature (AI 综述 / 表格列 / 分类 …). */
+export interface TaskPromptInfo {
+  id: string;
+  /** Feature the prompt belongs to. */
+  group: string;
+  name: string;
+  description: string;
+  /** Built-in text; the settings page shows it as the textarea placeholder. */
+  defaultPrompt: string;
+  /** What is actually in use right now. */
+  effectivePrompt: string;
+  overridden: boolean;
+  placeholders: TaskPromptPlaceholder[];
+  /** Rewriting the JSON contract in this prompt breaks the feature. */
+  affectsParsing: boolean;
+}
+
+/** Per-feature "单轮输出上限" (a floor: it only raises the automatic budget). */
+export interface TaskPromptGroup {
+  id: string;
+  name: string;
+  description: string;
+  builtinDefault: number;
+  overrideValue: number | null;
+  effective: number;
+}
+
+export async function taskPromptGroups(): Promise<TaskPromptGroup[]> {
+  return invoke<TaskPromptGroup[]>('task_prompt_groups');
+}
+
+export async function taskPromptsList(): Promise<TaskPromptInfo[]> {
+  return invoke<TaskPromptInfo[]>('task_prompts_list');
+}
+
 export async function petDomains(): Promise<PetDomainInfo[]> {
   return invoke<PetDomainInfo[]>('pet_domains');
 }
@@ -1326,6 +1366,17 @@ export async function noteVersionRestore(versionId: string): Promise<Note> {
   return invoke<Note>('note_version_restore', { versionId });
 }
 /** Create a note under the paper's collection folder tree (Zotero-style). */
+/** Save an agent reply as a note. The reply's `[^n]` markers + ```evidence
+ *  block are converted server-side into inline `[n]` links plus a
+ *  `## 参考文献` list — the same citation form AI 综述 notes use. */
+export async function noteCreateFromReply(
+  paperId: string | null,
+  title: string,
+  content: string
+): Promise<Note> {
+  return invoke<Note>('note_create_from_reply', { paperId, title, content });
+}
+
 export async function noteCreateUnderPaper(paperId: string, title: string, content: string): Promise<Note> {
   return invoke<Note>('note_create_under_paper', { paperId, title, content });
 }

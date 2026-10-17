@@ -386,7 +386,10 @@ async fn default_llm(
     let mut cfg = crate::core::llm_provider_service::load_llm_config_for(db, provider_id).await?;
     // Thinking models spend max_tokens on reasoning before emitting any JSON;
     // a small provider cap otherwise ends the call with an empty body.
-    let need = (min_max_tokens.saturating_mul(2).saturating_add(4000)).min(32768);
+    let need = crate::core::task_prompts::apply_floor(
+        min_max_tokens.saturating_mul(2).saturating_add(4000),
+        crate::core::task_prompts::budget_floor(db, "classify").await,
+    );
     if cfg.max_tokens < need {
         cfg.max_tokens = need;
     }
@@ -1370,13 +1373,9 @@ async fn draft_inner(
             },
         );
 
-        let system = format!(
-            "你是学术文献分类助手。请把给定的一批文献按「{dimension}」这个维度分成若干互斥的类目，\
-             类目数量控制在 3~{max_groups} 个之间；同类目必须能用一句话说清界定。\
-             只输出一个 JSON 对象，格式：{{\"groups\":[{{\"name\":\"类目名（简短，不超过 12 字）\",\
-             \"description\":\"一句话界定\",\"papers\":[{{\"paper\":\"文献 id\",\"confidence\":0.0~1.0,\
-             \"reason\":\"归类依据（不超过 20 字）\"}}]}}]}}。\
-             每篇文献必须且只能出现在一个类目里；不要输出 JSON 以外的任何内容。"
+        let system = crate::core::task_prompts::render(
+            &crate::core::task_prompts::effective(db, crate::core::task_prompts::CLASSIFY_DRAFT).await,
+            &[("dimension", dimension.as_str()), ("max_groups", &max_groups.to_string())],
         );
         let user = format!(
             "分类维度：{dimension}{}\n\n【待分类文献】\n{}",
@@ -1464,7 +1463,7 @@ async fn draft_inner(
                 finished: None,
             },
         );
-        if let Ok(merged) = merge_groups(&*llm, &all_groups, max_groups).await {
+        if let Ok(merged) = merge_groups(db, &*llm, &all_groups, max_groups).await {
             let mut next: Vec<ClassifyGroup> = Vec::new();
             let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             for g in &merged {
@@ -1503,7 +1502,7 @@ async fn draft_inner(
                 finished: None,
             },
         );
-        match hierarchize_groups(&*llm, &all_groups).await {
+        match hierarchize_groups(db, &*llm, &all_groups).await {
             Ok(parents) => {
                 if let Some((tree, mapping)) = apply_hierarchy(&all_groups, &parents) {
                     all_groups = tree;
@@ -1701,6 +1700,7 @@ async fn semantic_draft(
 }
 
 async fn merge_groups(
+    db: &SqlitePool,
     llm: &dyn crate::ai::llm::LlmClient,
     groups: &[ClassifyGroup],
     max_groups: u32,
@@ -1710,11 +1710,9 @@ async fn merge_groups(
         .map(|g| format!("- 「{}」：{}", g.name, g.description))
         .collect::<Vec<_>>()
         .join("\n");
-    let system = format!(
-        "你是学术文献分类专家。下面是一批由不同批次分别提出的类目，存在近义与重叠。\
-         请归并成不超过 {max_groups} 个类目，且不丢失任何原类目的语义。\
-         只输出 JSON：{{\"groups\":[{{\"name\":\"归并后的类目名\",\"description\":\"一句话界定\",\
-         \"from\":[\"被归并的原类目名\",……]}}]}}。每个原类目都必须出现在某个 from 里。"
+    let system = crate::core::task_prompts::render(
+        &crate::core::task_prompts::effective(db, crate::core::task_prompts::CLASSIFY_MERGE).await,
+        &[("max_groups", &max_groups.to_string())],
     );
     let messages = vec![
         chat_msg("system", system),
@@ -1728,6 +1726,7 @@ async fn merge_groups(
 }
 
 async fn hierarchize_groups(
+    db: &SqlitePool,
     llm: &dyn crate::ai::llm::LlmClient,
     groups: &[ClassifyGroup],
 ) -> Result<Vec<RawParent>, String> {
@@ -1736,12 +1735,10 @@ async fn hierarchize_groups(
         .map(|g| format!("- 「{}」：{}", g.name, g.description))
         .collect::<Vec<_>>()
         .join("\n");
-    let system = format!(
-        "你是学术文献分类专家。下面是同一维度下的一批扁平类目，请把它们归纳成不超过 {MAX_PARENTS} 个上位父类，\
-         每个父类下挂 2~5 个子类；父类名也要简短（不超过 10 字）。\
-         每个子类必须且只能出现在一个父类里，且必须使用原文的类目名（一字不差）。\
-         只输出 JSON：{{\"parents\":[{{\"name\":\"父类名\",\"description\":\"一句话界定\",\
-         \"children\":[\"子类名\",……]}}]}}。"
+    let system = crate::core::task_prompts::render(
+        &crate::core::task_prompts::effective(db, crate::core::task_prompts::CLASSIFY_HIERARCHIZE)
+            .await,
+        &[("max_parents", &MAX_PARENTS.to_string())],
     );
     let messages = vec![
         chat_msg("system", system),
@@ -2002,9 +1999,14 @@ async fn reassign_inner(
             failed += batch.len();
             continue;
         }
-        let system = format!(
-            "你是学术文献分类助手。{label_spec}。类目只能取自下面的固定清单，不得新增、不得改名。\
-             只输出 JSON：{output_spec}。\n\n【固定类目清单】（分类维度：{dimension}）\n{taxonomy}"
+        let system = crate::core::task_prompts::render(
+            &crate::core::task_prompts::effective(db, crate::core::task_prompts::CLASSIFY_ASSIGN).await,
+            &[
+                ("label_spec", label_spec.as_str()),
+                ("output_spec", output_spec),
+                ("dimension", dimension.as_str()),
+                ("taxonomy", taxonomy.as_str()),
+            ],
         );
         let user = format!("【待判定文献】\n{}", paper_block(&papers, ASSIGN_ABSTRACT_CAP));
         let messages = vec![chat_msg("system", system), chat_msg("user", user)];

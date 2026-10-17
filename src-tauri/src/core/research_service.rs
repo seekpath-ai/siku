@@ -241,10 +241,16 @@ async fn score_candidates_llm(
     keywords: &[String],
     candidates: &[ScoringCandidate],
 ) -> Result<Vec<(String, i64, String)>, String> {
-    let llm_config = crate::core::settings_service::load_llm_config(db).await?;
+    let mut llm_config = crate::core::settings_service::load_llm_config(db).await?;
     if llm_config.api_key.is_empty() && llm_config.provider != crate::ai::llm::LlmProvider::Ollama {
         return Err("no LLM configured".into());
     }
+    // 设置 → 领域智能体 的输出预算（只提高不降低）。
+    let need = crate::core::task_prompts::apply_floor(
+        llm_config.max_tokens,
+        crate::core::task_prompts::budget_floor(db, "research").await,
+    );
+    llm_config.max_tokens = need;
     let client = crate::ai::llm::client::create_llm_client(&llm_config)
         .map_err(|e| format!("client: {e}"))?;
 
@@ -270,7 +276,7 @@ async fn score_candidates_llm(
         crate::ai::llm::ChatMessage {
             reasoning_content: None,
             role: "system".into(),
-            content: "你是文献相关性评估助手，只输出 JSON。".into(),
+            content: crate::core::task_prompts::effective(db, crate::core::task_prompts::RESEARCH_RELEVANCE).await,
             attachments: None, tool_calls: None, tool_call_id: None, name: None,
         },
         crate::ai::llm::ChatMessage {
@@ -445,10 +451,15 @@ pub async fn run_auto_discovery(
 /// Best-effort LLM keyword expansion. Any failure returns an empty string so
 /// the caller falls back to the raw topic keywords.
 async fn expand_query(db: &SqlitePool, topic_name: &str, keywords: &[String]) -> Result<String, String> {
-    let llm_config = crate::core::settings_service::load_llm_config(db).await?;
+    let mut llm_config = crate::core::settings_service::load_llm_config(db).await?;
     if llm_config.api_key.is_empty() && llm_config.provider != crate::ai::llm::LlmProvider::Ollama {
         return Ok(String::new());
     }
+    let need = crate::core::task_prompts::apply_floor(
+        llm_config.max_tokens,
+        crate::core::task_prompts::budget_floor(db, "research").await,
+    );
+    llm_config.max_tokens = need;
     let client = match crate::ai::llm::client::create_llm_client(&llm_config) {
         Ok(c) => c,
         Err(_) => return Ok(String::new()),
@@ -465,7 +476,7 @@ async fn expand_query(db: &SqlitePool, topic_name: &str, keywords: &[String]) ->
     let messages = vec![
         crate::ai::llm::ChatMessage { reasoning_content: None,
             role: "system".into(),
-            content: "你是文献检索助手，只输出检索关键词。".into(),
+            content: crate::core::task_prompts::effective(db, crate::core::task_prompts::RESEARCH_KEYWORDS).await,
             attachments: None, tool_calls: None, tool_call_id: None, name: None,
         },
         crate::ai::llm::ChatMessage { reasoning_content: None,

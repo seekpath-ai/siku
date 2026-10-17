@@ -6,8 +6,8 @@ import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors,
 import { usePetStore } from '@/stores/petStore';
 import type { PetContext } from '@/stores/petContextStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
-import { agentCancel, agentIsRunning, getChatMessages, getAgentSteps, notesCreate, noteCreateUnderPaper, readImageFile, settingsAppGet, settingsGet, settingsSet } from '@/lib/tauri';
-import { parseEvidence, buildNoteMarkdown } from '@/lib/evidence';
+import { agentCancel, agentIsRunning, getChatMessages, getAgentSteps, noteCreateFromReply, readImageFile, settingsAppGet, settingsGet, settingsSet } from '@/lib/tauri';
+import { parseEvidence } from '@/lib/evidence';
 import { formatFileToolApproval } from '@/lib/agent-tools';
 import type { EvidenceEntry } from '@/lib/evidence';
 import { MarkdownLink } from '@/components/chat/FilePathLink';
@@ -398,12 +398,12 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
     const paperId = onPaperPage ? context?.objectId : undefined;
     setSavingNoteId(msg.id);
     try {
-      const markdown = buildNoteMarkdown(msg.content, paperId ?? undefined);
+      // The reply still holds `[^n]` markers + the ```evidence block; the backend
+      // converts them into the note citation form (inline `[n]` links +
+      // `## 参考文献`), identical to a 综述 note.
       const heading = /^#{1,6}\s+(.+?)\s*#*$/m.exec(parseEvidence(msg.content).clean)?.[1]?.trim();
       const title = (heading || (context?.title ? `${context.title} · 总结` : '智能体回复')).slice(0, 80);
-      const note = paperId
-        ? await noteCreateUnderPaper(paperId, title, markdown)
-        : await notesCreate(title, markdown);
+      const note = await noteCreateFromReply(paperId ?? null, title, msg.content);
       showToast('success', `已保存到笔记「${note.title}」`);
     } catch (err) {
       showToast('error', `保存失败：${err instanceof Error ? err.message : String(err)}`);

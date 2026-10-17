@@ -1,0 +1,401 @@
+//! Convert an agent reply's footnote citations into the same citation form the
+//! AI 综述 uses: **inline `[n]` links + a `## 参考文献` list**.
+//!
+//! The 文献分析 agent answers with `[^1]` markers plus a trailing
+//! ```evidence JSON block (see `LITERATURE_ANALYZER_PROMPT`). That is a chat
+//! format; a note must not carry it. Instead of making the model hand-build
+//! URLs (fragile, and it cannot know other papers' ids), the conversion happens
+//! here — deterministically, with database access for the bibliography.
+//!
+//! Rules:
+//! * one citation number per **paper**, ordered by first appearance — the same
+//!   semantics as a 综述 note, so a note looks the same however it was produced;
+//! * each marker links to its OWN passage (page + quote), so two sentences
+//!   citing the same paper still point at their own paragraphs;
+//! * a marker with no evidence entry is dropped — no fake citations;
+//! * when no paper can be resolved at all (no context paper, no `paper` fields)
+//!   the markers survive as plain `[n]` text and no bibliography is written.
+
+use serde::Deserialize;
+use sqlx::SqlitePool;
+
+/// One `[^n]` citation's evidence, as emitted by the agent.
+#[derive(Debug, Clone, Deserialize)]
+struct RawItem {
+    n: usize,
+    #[serde(default)]
+    page: Option<PageField>,
+    #[serde(default)]
+    exact: String,
+    /// Paper id — required when the citation is not about the context paper.
+    #[serde(default, alias = "paper_id")]
+    paper: Option<String>,
+}
+
+/// Models emit the page as a number or a string ("3").
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum PageField {
+    Num(i32),
+    Text(String),
+}
+
+impl PageField {
+    fn value(&self) -> Option<i32> {
+        match self {
+            PageField::Num(n) => Some(*n),
+            PageField::Text(t) => t.trim().parse().ok(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Item {
+    n: usize,
+    page: Option<i32>,
+    exact: String,
+    paper: Option<String>,
+}
+
+/// Escape control characters that sit INSIDE JSON strings — models emit raw
+/// newlines/tabs in `exact` quotes even though JSON forbids them.
+fn sanitize_json(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in text.chars() {
+        if in_string {
+            if escaped {
+                out.push(c);
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' => {
+                    out.push(c);
+                    escaped = true;
+                }
+                '"' => {
+                    out.push(c);
+                    in_string = false;
+                }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ => out.push(c),
+            }
+        } else {
+            if c == '"' {
+                in_string = true;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Split the trailing ```evidence block off the reply. An unterminated block
+/// (still streaming) is stripped too: by contract it is metadata and always
+/// comes last.
+fn parse_evidence_block(content: &str) -> (String, Vec<Item>) {
+    let Some(start) = content.find("```evidence") else {
+        return (content.to_string(), Vec::new());
+    };
+    let body = content[..start].trim_end().to_string();
+    let after_fence = start + "```evidence".len();
+    // JSON starts on the line after the opening fence.
+    let Some(nl) = content[after_fence..].find('\n') else {
+        return (body, Vec::new());
+    };
+    let json_start = after_fence + nl + 1;
+    let json = match content[json_start..].find("```") {
+        Some(i) => &content[json_start..json_start + i],
+        None => &content[json_start..],
+    };
+    let parsed: Vec<RawItem> = serde_json::from_str(&sanitize_json(json)).unwrap_or_default();
+    let items = parsed
+        .into_iter()
+        .filter(|r| !r.exact.trim().is_empty())
+        .map(|r| Item {
+            n: r.n,
+            page: r.page.as_ref().and_then(|p| p.value()),
+            exact: r.exact.trim().to_string(),
+            paper: r.paper.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()),
+        })
+        .collect();
+    (body, items)
+}
+
+/// strip GFM footnote definitions the model may have written by hand
+/// (`[^1]: [第 3 页](…) · 「原文」`) — they are replaced by the bibliography.
+fn strip_footnote_definitions(body: &str) -> String {
+    body.lines()
+        .filter(|line| {
+            let t = line.trim_start();
+            let Some(rest) = t.strip_prefix("[^") else {
+                return true;
+            };
+            let Some(colon) = rest.find("]:") else {
+                return true;
+            };
+            let label = &rest[..colon];
+            // `[^3]: value` is a definition; `[^3] text` is not.
+            !(!label.is_empty() && label.chars().all(|c| c.is_ascii_digit()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+struct Linked {
+    /// Reply body with citations rewritten to inline links.
+    body: String,
+    /// Paper ids in citation order (index 0 = `[1]`).
+    papers: Vec<String>,
+}
+
+fn reader_url(paper_id: &str, page: Option<i32>, exact: &str) -> String {
+    let encoded = crate::core::review_gen::percent_encode(exact);
+    match page {
+        Some(p) => format!("siku-reader://{paper_id}?page={p}&exact={encoded}"),
+        None => format!("siku-reader://{paper_id}?exact={encoded}"),
+    }
+}
+
+/// Rewrite `[^n]` markers into `[[k]](siku-reader://…)` where `k` is the
+/// paper's citation number.
+fn linkify_reply(body: &str, items: &[Item], default_paper: Option<&str>) -> Linked {
+    let mut papers: Vec<String> = Vec::new();
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len() + 64);
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '[' && i + 1 < chars.len() && chars[i + 1] == '^' {
+            let mut j = i + 2;
+            let mut digits = String::new();
+            while j < chars.len() && chars[j].is_ascii_digit() && digits.len() < 4 {
+                digits.push(chars[j]);
+                j += 1;
+            }
+            if !digits.is_empty() && j < chars.len() && chars[j] == ']' {
+                if let Ok(n) = digits.parse::<usize>() {
+                    let item = items.iter().find(|it| it.n == n);
+                    let paper = item
+                        .and_then(|it| it.paper.clone())
+                        .or_else(|| default_paper.map(|p| p.to_string()));
+                    match (item, paper) {
+                        // Cited, with a known paper: link to this passage.
+                        (Some(it), Some(pid)) => {
+                            let idx = match papers.iter().position(|p| p == &pid) {
+                                Some(i) => i,
+                                None => {
+                                    papers.push(pid.clone());
+                                    papers.len() - 1
+                                }
+                            };
+                            let url = reader_url(&pid, it.page, &it.exact);
+                            out.push_str(&format!("[[{}]]({})", idx + 1, url));
+                            i = j + 1;
+                            continue;
+                        }
+                        // Cited but no paper to point at: keep the number only.
+                        (Some(_), None) => {
+                            let idx = match papers.iter().position(|p| p == "__unknown__") {
+                                Some(i) => i,
+                                None => {
+                                    papers.push("__unknown__".to_string());
+                                    papers.len() - 1
+                                }
+                            };
+                            out.push_str(&format!("[{}]", idx + 1));
+                            i = j + 1;
+                            continue;
+                        }
+                        // No evidence at all: drop the marker (never a fake citation).
+                        (None, _) => {
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    Linked { body: out.trim_end().to_string(), papers }
+}
+
+/// Rows fetched for the bibliography.
+struct Meta {
+    id: String,
+    title: String,
+    authors: String,
+    year: Option<i64>,
+    journal: Option<String>,
+    doi: Option<String>,
+    url: Option<String>,
+}
+
+async fn load_meta(db: &SqlitePool, ids: &[String]) -> Result<Vec<Meta>, String> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT id, title, authors, year, journal, doi, url FROM papers WHERE id IN ({ph})"
+    );
+    let mut q = sqlx::query_as::<_, (String, String, String, Option<i64>, Option<String>, Option<String>, Option<String>)>(&sql);
+    for id in ids {
+        q = q.bind(id);
+    }
+    let rows = q.fetch_all(db).await.map_err(|e| format!("db: {e}"))?;
+    let mut map: std::collections::HashMap<String, Meta> = rows
+        .into_iter()
+        .map(|(id, title, authors, year, journal, doi, url)| {
+            (
+                id.clone(),
+                Meta { id, title, authors, year, journal, doi, url },
+            )
+        })
+        .collect();
+    Ok(ids.iter().filter_map(|id| map.remove(id)).collect())
+}
+
+/// Convert an agent reply into note Markdown: inline `[n]` citations that jump
+/// straight to the evidence passage, plus a `## 参考文献` list.
+pub async fn convert(
+    db: &SqlitePool,
+    content: &str,
+    default_paper: Option<&str>,
+) -> Result<String, String> {
+    let (body, items) = parse_evidence_block(content);
+    let body = strip_footnote_definitions(&body);
+    if items.is_empty() {
+        return Ok(body.trim_end().to_string());
+    }
+    let linked = linkify_reply(&body, &items, default_paper);
+    let cited: Vec<String> = linked
+        .papers
+        .iter()
+        .filter(|p| p.as_str() != "__unknown__")
+        .cloned()
+        .collect();
+    if cited.is_empty() {
+        return Ok(linked.body);
+    }
+    let metas = load_meta(db, &cited).await?;
+    let mut out = linked.body;
+    out.push_str("\n\n## 参考文献\n\n");
+    for (i, pid) in cited.iter().enumerate() {
+        let line = match metas.iter().find(|m| &m.id == pid) {
+            Some(m) => crate::core::review_gen::bibliography_line(
+                i + 1,
+                &m.authors,
+                &m.title,
+                m.journal.as_deref(),
+                m.year,
+                m.doi.as_deref(),
+                m.url.as_deref(),
+            ),
+            // The paper row is gone: keep the numbering honest.
+            None => format!("[{}] （文献已删除）", i + 1),
+        };
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(n: usize, page: i32, exact: &str, paper: Option<&str>) -> Item {
+        Item {
+            n,
+            page: Some(page),
+            exact: exact.into(),
+            paper: paper.map(|p| p.into()),
+        }
+    }
+
+    #[test]
+    fn parses_a_fenced_block_and_strips_it() {
+        let content = "结论成立[^1]。\n\n```evidence\n[{\"n\":1,\"page\":3,\"exact\":\"原文片段\"}]\n```\n";
+        let (body, items) = parse_evidence_block(content);
+        assert!(!body.contains("evidence"), "{body}");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].page, Some(3));
+        assert_eq!(items[0].exact, "原文片段");
+    }
+
+    #[test]
+    fn tolerates_raw_newlines_inside_the_quote() {
+        // Models emit literal newlines inside JSON strings; strict parsers die.
+        let content = "结论[^1]。\n```evidence\n[{\"n\":1,\"page\":\"5\",\"exact\":\"第一行\n第二行\"}]\n```";
+        let (_, items) = parse_evidence_block(content);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].page, Some(5));
+        assert!(items[0].exact.contains("第一行"), "{:?}", items[0].exact);
+    }
+
+    #[test]
+    fn markers_become_inline_links_numbered_per_paper() {
+        let body = "甲说[^1]。乙说[^2]。又说[^1]。";
+        let items = [
+            item(1, 3, "证据一", Some("p1")),
+            item(2, 9, "证据二", Some("p2")),
+        ];
+        let linked = linkify_reply(body, &items, None);
+        assert_eq!(linked.papers, vec!["p1".to_string(), "p2".to_string()]);
+        assert_eq!(linked.body.matches("[[1]]").count(), 2, "{}", linked.body);
+        assert_eq!(linked.body.matches("[[2]]").count(), 1, "{}", linked.body);
+        // Different passages of the same paper keep their own page.
+        assert!(linked.body.contains("page=3"), "{}", linked.body);
+        assert!(linked.body.contains("page=9"), "{}", linked.body);
+    }
+
+    #[test]
+    fn falls_back_to_the_context_paper() {
+        let body = "结论[^1][^2]。";
+        let items = [item(1, 4, "片段一", None), item(2, 7, "片段二", None)];
+        let linked = linkify_reply(body, &items, Some("ctx"));
+        assert_eq!(linked.papers, vec!["ctx".to_string()]);
+        // Same paper twice → one number, two different anchors.
+        assert!(linked.body.contains("page=4"), "{}", linked.body);
+        assert!(linked.body.contains("page=7"), "{}", linked.body);
+        assert!(linked.body.starts_with("结论[[1]](siku-reader://ctx?page=4"), "{}", linked.body);
+    }
+
+    #[test]
+    fn marker_without_evidence_is_dropped() {
+        let body = "结论[^9]成立。";
+        let items = [item(1, 3, "证据", Some("p1"))];
+        let linked = linkify_reply(body, &items, None);
+        assert_eq!(linked.body, "结论成立。");
+    }
+
+    #[test]
+    fn unknown_paper_keeps_a_plain_number() {
+        let body = "结论[^1]。";
+        let items = [item(1, 3, "证据", None)];
+        let linked = linkify_reply(body, &items, None);
+        assert_eq!(linked.body, "结论[1]。");
+        assert_eq!(linked.papers, vec!["__unknown__".to_string()]);
+    }
+
+    #[test]
+    fn hand_written_footnote_definitions_are_removed() {
+        let body = "结论[^1]。\n\n[^1]: [第 3 页](siku-reader://p1?page=3&exact=x) · 「原文」\n[^2]: 别的定义";
+        let out = strip_footnote_definitions(body);
+        assert!(!out.contains("[^1]:"), "{out}");
+        assert!(!out.contains("[^2]:"), "{out}");
+        assert!(out.contains("结论[^1]。"), "{out}");
+    }
+
+    #[test]
+    fn inline_marker_text_is_not_treated_as_a_definition() {
+        let body = "结论[^1] 后面还有正文。";
+        assert_eq!(strip_footnote_definitions(body), body);
+    }
+}

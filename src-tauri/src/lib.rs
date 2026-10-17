@@ -810,6 +810,8 @@ pub fn run() {
             commands::collections::collections_remove_papers,
             commands::collections::paper_get_collections,
             // Tags
+            commands::task_prompts::task_prompts_list,
+            commands::task_prompts::task_prompt_groups,
             commands::tags::tags_list,
             commands::tags::tags_get,
             commands::tags::tags_create,
@@ -952,6 +954,7 @@ pub fn run() {
             commands::notes::note_versions_list,
             commands::notes::note_version_restore,
             commands::notes::note_create_under_paper,
+            commands::notes::note_create_from_reply,
             commands::notes::note_add_excerpt,
             commands::notes::note_merge_into_excerpt,
             // Vault files

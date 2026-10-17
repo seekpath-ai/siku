@@ -43,14 +43,14 @@ function ProcessDrawer({
         show ? 'w-[300px] border border-surface-hover/70' : 'w-0'
       }`}
     >
-      <div className="w-[300px] flex flex-col h-full max-h-full">
+      <div className="w-[300px] flex flex-col h-full">
         <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-surface-hover/60 text-[11px] text-text-secondary/60">
           生成过程
           {busy && <Loader2 size={10} className="animate-spin" />}
         </div>
         <div
           ref={previewRef}
-          className="flex-1 overflow-y-auto px-3 py-2 whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-text-secondary/85"
+          className="flex-1 min-h-0 overflow-y-auto px-3 py-2 whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-text-secondary/85"
         >
           {reasoning && (
             <div className="italic text-text-secondary/45 border-b border-dashed border-surface-hover/50 pb-1.5 mb-1.5">
@@ -227,10 +227,10 @@ export function ReviewGenDialog() {
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto px-4 py-3">
+        <div className="flex-1 min-h-0 flex flex-col overflow-hidden px-4 py-3">
           {step === 'form' && (
-            <div className="flex gap-3 h-full">
-              <div className="flex-1 min-w-0 space-y-3">
+            <div className="flex gap-3 flex-1 min-h-0">
+              <div className="flex-1 min-w-0 overflow-y-auto space-y-3">
               <div className="space-y-1.5">
                 <label className="text-xs text-text-secondary">研究问题</label>
                 <textarea
@@ -289,7 +289,7 @@ export function ReviewGenDialog() {
           )}
 
           {step === 'outline' && (
-            <div className="space-y-2.5">
+            <div className="flex-1 min-h-0 overflow-y-auto space-y-2.5">
               <p className="text-[11px] text-text-secondary/60">
                 调整目录后再开始：可改标题与要点、增删章节、调整顺序。
               </p>
@@ -341,8 +341,8 @@ export function ReviewGenDialog() {
           )}
 
           {step === 'run' && (
-            <div className="flex gap-3 h-full">
-              <div className="flex-1 min-w-0 space-y-3">
+            <div className="flex gap-3 flex-1 min-h-0">
+              <div className="flex-1 min-w-0 overflow-y-auto space-y-3">
                 <ul className="space-y-1.5">
                   {outline.map((s, i) => {
                     const current = progress?.stage === 'section' && progress.sectionIndex === i + 1;

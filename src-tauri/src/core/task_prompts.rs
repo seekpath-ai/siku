@@ -153,7 +153,8 @@ pub const PROMPTS: &[TaskPrompt] = &[
         default: "你是学术写作助手，正在撰写文献综述的一节。规则：\n\
 1. 只依据「参考段落」写作，不得编造文献中没有的事实；\n\
 2. 引用事实必须在句末标注【证据编号】，格式如 [E3]（E 后面的数字就是「参考段落」前的编号）；同一处事实可引多条证据，写成 [E3][E7]；只能使用「参考段落」中出现过的编号，绝不自行编号或改写编号体系；\n\
-3. 使用{language}写作，学术语体，本节约 {target_words} 字；\n\
+3. 使用{language}写作，学术语体，篇幅约 {target_words} 字——这只是量级参考，\n\
+   写完后系统会统一校准篇幅；你只需把要点写透，不要核对、统计或掂量字数；\n\
 4. 直接输出本节正文，不要输出章节标题，不要解释。{subsection_rule}",
         placeholders: &[
             Placeholder { name: "language", description: "写作语言（中文 / English）" },

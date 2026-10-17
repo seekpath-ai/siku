@@ -197,7 +197,11 @@ const CANCELLED: &str = "已取消";
 /// Output budget a section needs for `words` characters of prose. Thinking
 /// models spend reasoning out of the same budget, hence the headroom.
 fn section_need(words: usize) -> u32 {
-    (words as u32).saturating_mul(2).saturating_add(4000).min(MAX_OUTPUT_TOKENS)
+    // Prose budget (≈2 tokens per CJK char) plus reasoning headroom. The
+    // headroom is deliberately generous: a thinking model that decides to
+    // "measure" the length spends thousands of tokens before writing anything,
+    // and max_tokens is a ceiling — raising it costs nothing unless used.
+    (words as u32).saturating_mul(2).saturating_add(6000).min(MAX_OUTPUT_TOKENS)
 }
 
 /// Build a client whose max_tokens is at least `need` (the provider row itself
@@ -890,7 +894,39 @@ async fn write_section(
             ),
         });
     }
-    Ok(linkify_citations(text.trim(), sources, &evidence_items))
+    let body = text.trim();
+    let produced = body.chars().count();
+    let mut final_body = body.to_string();
+
+    // Length is a MEASURED post-condition, not an instruction: the prompt tells
+    // the model not to count, and the gap is closed here — one expansion call
+    // only when the section came out clearly short (no recursion, no loop).
+    if produced > 0 && produced < target_words * 6 / 10 {
+        tracing::info!(section_index, produced, target_words, "section short, expanding");
+        emit(
+            app,
+            &ReviewProgress {
+                stage: "section".into(),
+                section_index,
+                total_sections,
+                section_title: section.title.clone(),
+                message: Some(format!("第 {section_index} 节偏短（{produced} 字），已自动补写")),
+                ..Default::default()
+            },
+        );
+        match expand_section(llm, section, body, target_words).await {
+            Ok(expanded) => {
+                let got = expanded.chars().count();
+                if got > produced {
+                    tracing::info!(section_index, produced, got, "section expanded");
+                    final_body = expanded;
+                }
+            }
+            Err(e) => tracing::warn!(section_index, error = %e, "section expansion failed"),
+        }
+    }
+
+    Ok(linkify_citations(final_body.trim(), sources, &evidence_items))
 }
 
 /// One retrievable passage handed to the model, addressable as `[E<k>]`.
@@ -909,6 +945,31 @@ struct Evidence {
     content: String,
     /// Short word-boundary head used only as the reader's highlight anchor.
     quote: String,
+}
+
+/// Ask for a denser version of a too-short section. Only the body is rewritten:
+/// the draft's `[E n]` markers must survive because the linkify pass resolves
+/// them into evidence anchors afterwards.
+async fn expand_section(
+    llm: &dyn crate::ai::llm::LlmClient,
+    section: &ReviewSection,
+    draft: &str,
+    target_words: usize,
+) -> Result<String, String> {
+    let system = format!(
+        "你是学术写作助手。下面这一节的草稿偏短，请在不改变论点和既有引用标记的前提下把它写得更充实：\
+         补上论证过程、对比与例证，使篇幅达到约 {target_words} 字的密度。\
+         必须保留草稿里已有的 [E数字] 引用标记及其位置；不要新增没有依据的论断；\
+         不要统计或核对字数；只输出改写后的本节正文，不要输出标题或解释。"
+    );
+    let user = format!("本节主题：{}\n\n【草稿】\n{draft}", section.title);
+    let messages = vec![chat_msg("system", system), chat_msg("user", user)];
+    let resp = llm.chat_completion(&messages, &[]).await?;
+    let text = resp.content.trim();
+    if text.is_empty() {
+        return Err("补写未返回内容".to_string());
+    }
+    Ok(text.to_string())
 }
 
 fn build_evidence(hits: &[SearchResult], sources: &[SourcePaper]) -> Vec<Evidence> {

@@ -71,6 +71,40 @@ const checks = [
   ['识别：普通笔记', hasFixableCitations('## 标题\n\n普通文字') === false],
 ];
 
+// ── 文献分析形态：正文 [1]..[3] 逐条编号 → ## 引用出处 逐条 + 无编号书目 ──
+const analysisForm = [
+  '# 某文献总结',
+  '',
+  '结论一[[1]](siku-reader://p1?page=12&exact=a)。结论二[[2]](siku-reader://p1?page=13&exact=b)。再看[[3]](siku-reader://p1?page=6&exact=c)。',
+  '',
+  '## 引用出处',
+  '',
+  '[1] 第 12 页 · 《Agents》 · 「a」',
+  '',
+  '[2] 第 13 页 · 《Agents》 · 「b」',
+  '',
+  '[3] 第 6 页 · 《Agents》 · 「c」',
+  '',
+  '## 参考文献',
+  '',
+  '- 作者. Agents. 顶会, 2025.',
+].join('\n');
+
+const analysisHtml = renderToStaticMarkup(
+  React.createElement(ReactMarkdown, {
+    remarkPlugins: [remarkGfm],
+    rehypePlugins: [[await import('rehype-katex').then((m) => m.default), { throwOnError: false }], rehypeReferenceAnchors],
+  }, preprocessWiki(toReferenceCitations(analysisForm)))
+);
+
+const analysisChecks = [
+  ['逐条编号：正文三个不同锚点', (analysisHtml.match(/href="#siku-ref-\d"/g) || []).length === 3],
+  ['引用出处 [1][2][3] 均有 id', ['1', '2', '3'].every((n) => analysisHtml.includes(`id="siku-ref-${n}"`))],
+  ['无编号书目保持为列表', analysisHtml.includes('<ul>') && !analysisHtml.includes('siku-ref-作者')],
+];
+
+checks.push(...analysisChecks);
+
 let failed = 0;
 for (const [name, ok] of checks) {
   if (!ok) failed += 1;

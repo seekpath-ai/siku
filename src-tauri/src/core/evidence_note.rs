@@ -178,7 +178,9 @@ fn strip_existing_reference_section(body: &str) -> String {
 struct Linked {
     /// Reply body with citations rewritten to inline links.
     body: String,
-    /// Paper ids in citation order (index 0 = `[1]`).
+    /// Cited passages in number order — the 引用出处 list.
+    citations: Vec<(usize, Item)>,
+    /// Distinct paper ids in first-citation order — the 参考文献 list.
     papers: Vec<String>,
 }
 
@@ -193,6 +195,11 @@ fn reader_url(paper_id: &str, page: Option<i32>, exact: &str) -> String {
 /// Rewrite `[^n]` markers into `[[k]](siku-reader://…)` where `k` is the
 /// paper's citation number.
 fn linkify_reply(body: &str, items: &[Item], default_paper: Option<&str>) -> Linked {
+    // Numbering is PER CITATION, not per paper: a single-paper analysis cites
+    // one source 20+ times, and re-numbering by paper collapsed all of them to
+    // `[1]` — the reader lost which passage each marker meant. The marker's own
+    // `n` is already the identity of the evidence entry, so it is kept.
+    let mut citations: Vec<(usize, Item)> = Vec::new();
     let mut papers: Vec<String> = Vec::new();
     let chars: Vec<char> = body.chars().collect();
     let mut out = String::with_capacity(body.len() + 64);
@@ -207,51 +214,39 @@ fn linkify_reply(body: &str, items: &[Item], default_paper: Option<&str>) -> Lin
             }
             if !digits.is_empty() && j < chars.len() && chars[j] == ']' {
                 if let Ok(n) = digits.parse::<usize>() {
-                    let item = items.iter().find(|it| it.n == n);
+                    let Some(item) = items.iter().find(|it| it.n == n) else {
+                        // No evidence at all: drop the marker (never a fake citation).
+                        i = j + 1;
+                        continue;
+                    };
                     let paper = item
-                        .and_then(|it| it.paper.clone())
+                        .paper
+                        .clone()
                         .or_else(|| default_paper.map(|p| p.to_string()));
-                    match (item, paper) {
-                        // Cited, with a known paper: link to this passage.
-                        (Some(it), Some(pid)) => {
-                            let idx = match papers.iter().position(|p| p == &pid) {
-                                Some(i) => i,
-                                None => {
-                                    papers.push(pid.clone());
-                                    papers.len() - 1
-                                }
-                            };
-                            let url = reader_url(&pid, it.page, &it.exact);
-                            out.push_str(&format!("[[{}]]({})", idx + 1, url));
-                            i = j + 1;
-                            continue;
+                    match &paper {
+                        Some(pid) => {
+                            if !papers.iter().any(|p| p == pid) {
+                                papers.push(pid.clone());
+                            }
+                            let url = reader_url(pid, item.page, &item.exact);
+                            out.push_str(&format!("[[{}]]({})", n, url));
                         }
                         // Cited but no paper to point at: keep the number only.
-                        (Some(_), None) => {
-                            let idx = match papers.iter().position(|p| p == "__unknown__") {
-                                Some(i) => i,
-                                None => {
-                                    papers.push("__unknown__".to_string());
-                                    papers.len() - 1
-                                }
-                            };
-                            out.push_str(&format!("[{}]", idx + 1));
-                            i = j + 1;
-                            continue;
-                        }
-                        // No evidence at all: drop the marker (never a fake citation).
-                        (None, _) => {
-                            i = j + 1;
-                            continue;
-                        }
+                        None => out.push_str(&format!("[{n}]")),
                     }
+                    if !citations.iter().any(|(x, _)| *x == n) {
+                        citations.push((n, item.clone()));
+                    }
+                    i = j + 1;
+                    continue;
                 }
             }
         }
         out.push(chars[i]);
         i += 1;
     }
-    Linked { body: out.trim_end().to_string(), papers }
+    citations.sort_by_key(|(n, _)| *n);
+    Linked { body: out.trim_end().to_string(), citations, papers }
 }
 
 /// Rows fetched for the bibliography.
@@ -304,38 +299,58 @@ pub async fn convert(
         return Ok(body.trim_end().to_string());
     }
     let linked = linkify_reply(&body, &items, default_paper);
-    let cited: Vec<String> = linked
-        .papers
-        .iter()
-        .filter(|p| p.as_str() != "__unknown__")
-        .cloned()
-        .collect();
-    if cited.is_empty() {
+    if linked.citations.is_empty() {
         return Ok(linked.body);
     }
-    let metas = load_meta(db, &cited).await?;
-    let mut out = linked.body;
-    out.push_str("\n\n## 参考文献\n\n");
-    for (i, pid) in cited.iter().enumerate() {
-        let line = match metas.iter().find(|m| &m.id == pid) {
-            Some(m) => crate::core::review_gen::bibliography_line(
-                i + 1,
-                &m.authors,
-                &m.title,
-                m.journal.as_deref(),
-                m.year,
-                m.doi.as_deref(),
-                m.url.as_deref(),
-            ),
-            // The paper row is gone: keep the numbering honest.
-            None => format!("[{}] （文献已删除）", i + 1),
-        };
-        out.push_str(&line);
-        out.push('\n');
-    }
-    Ok(out)
-}
 
+    let cited: Vec<String> = linked.papers.clone();
+    let metas = load_meta(db, &cited).await?;
+    let title_of = |pid: &str| -> String {
+        metas
+            .iter()
+            .find(|m| m.id == pid)
+            .map(|m| m.title.clone())
+            .unwrap_or_else(|| "（未知文献）".to_string())
+    };
+
+    let mut out = linked.body;
+
+    // 引用出处: one line per citation, numbered exactly like the body so `[17]`
+    // still means "the 17th piece of evidence" in a single-source note.
+    out.push_str("\n\n## 引用出处\n\n");
+    for (n, item) in &linked.citations {
+        let page = item.page.map(|p| format!("第 {p} 页 · ")).unwrap_or_default();
+        let paper = item
+            .paper
+            .clone()
+            .or_else(|| default_paper.map(|p| p.to_string()))
+            .map(|pid| format!("《{}》 · ", title_of(&pid)))
+            .unwrap_or_default();
+        out.push_str(&format!("[{n}] {page}{paper}「{}」\n\n", item.exact));
+    }
+
+    // 参考文献: the distinct sources, deliberately unnumbered — a numbered list
+    // here would suggest `[1]`..`[23]` are 23 different papers.
+    if !cited.is_empty() {
+        out.push_str("## 参考文献\n\n");
+        for pid in &cited {
+            let line = match metas.iter().find(|m| &m.id == pid) {
+                Some(m) => crate::core::review_gen::bibliography_entry(
+                    &m.authors,
+                    &m.title,
+                    m.journal.as_deref(),
+                    m.year,
+                    m.doi.as_deref(),
+                    m.url.as_deref(),
+                ),
+                // The paper row is gone: keep the note honest.
+                None => "（文献已删除）".to_string(),
+            };
+            out.push_str(&format!("- {line}\n"));
+        }
+    }
+    Ok(out.trim_end().to_string())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,7 +426,8 @@ mod tests {
         let items = [item(1, 3, "证据", None)];
         let linked = linkify_reply(body, &items, None);
         assert_eq!(linked.body, "结论[1]。");
-        assert_eq!(linked.papers, vec!["__unknown__".to_string()]);
+        // No paper id → nothing to list in 参考文献.
+        assert!(linked.papers.is_empty());
     }
 
     #[test]

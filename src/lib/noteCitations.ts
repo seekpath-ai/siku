@@ -22,7 +22,10 @@ export const REF_ANCHOR_PREFIX = 'siku-ref-';
  *  drop the first-line indent there (a bibliography is not body prose). */
 export const REF_ENTRY_CLASS = 'pdf-ref-entry';
 
-const REF_HEADING = /^#{1,6}\s+参考文献\s*$/;
+/// Sections the citation anchors may point into. AI 综述 notes number their
+/// bibliography (`## 参考文献` + `[9] …`); 文献分析 notes number each citation
+/// (`## 引用出处` + `[1] …`) and keep an unnumbered `## 参考文献` list below.
+const REF_HEADING = /^#{1,6}\s+(?:参考文献|引用出处)\s*$/;
 
 /** True when this note has citations that the rewrite could act on: at least
  *  one `siku-reader://` citation link AND a 参考文献 section to point at. */
@@ -107,7 +110,8 @@ export function rehypeReferenceAnchors() {
     let inRefs = false;
     for (const node of tree.children ?? []) {
       if (node.type === 'element' && node.tagName && /^h[1-6]$/.test(node.tagName)) {
-        inRefs = nodeText(node).trim() === '参考文献';
+        const heading = nodeText(node).trim();
+        inRefs = heading === '参考文献' || heading === '引用出处';
         continue;
       }
       if (!inRefs) continue;

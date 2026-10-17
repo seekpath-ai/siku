@@ -1224,13 +1224,30 @@ pub(crate) fn bibliography_line(
     doi: Option<&str>,
     url: Option<&str>,
 ) -> String {
+    format!(
+        "[{n}] {}",
+        bibliography_entry(authors_json, title, journal, year, doi, url)
+    )
+}
+
+/// The same entry without a citation number — used where the list must not
+/// collide with the body's numbering (文献分析 notes number their 引用出处 per
+/// citation, so a numbered bibliography would not line up).
+pub(crate) fn bibliography_entry(
+    authors_json: &str,
+    title: &str,
+    journal: Option<&str>,
+    year: Option<i64>,
+    doi: Option<&str>,
+    url: Option<&str>,
+) -> String {
     let authors = crate::core::citation_export::parse_authors(authors_json);
     let author_str = if authors.len() > 3 {
         format!("{}, 等", authors[..3].join(", "))
     } else {
         authors.join(", ")
     };
-    let mut line = format!("[{n}] {author_str}. {title}.");
+    let mut line = format!("{author_str}. {title}.");
     match (journal, year) {
         (Some(j), Some(y)) if !j.is_empty() => line.push_str(&format!(" {j}, {y}.")),
         (Some(j), None) if !j.is_empty() => line.push_str(&format!(" {j}.")),

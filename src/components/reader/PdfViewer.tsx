@@ -4,6 +4,7 @@ import { Loader2 } from 'lucide-react';
 import { FindBar } from './FindBar';
 import { ContextMenu } from '@/components/ui/ContextMenu';
 import { openInBrowser, routeLink } from '@/lib/externalLinks';
+import { findQuote, matchStrength, quoteNeedles } from '@/lib/quoteMatch';
 import { TextHighlighter } from './TextHighlighter';
 import { PasswordPrompt } from './PasswordPrompt';
 import type { DetectedRegion, PageRegionResult, LlmRegionRequest } from './regions';
@@ -2270,23 +2271,25 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
         return null;
       };
 
-      const needle = exact.replace(/\s+/g, '');
+      // The quote comes from OUR indexed chunk text, which is not byte-identical
+      // to the pdf.js text layer (de-hyphenation, column spacing, case). See
+      // lib/quoteMatch: comparing raw characters made a review citation jump to
+      // the page and then highlight nothing.
+      const needles = quoteNeedles(exact);
+
       // Phase 1 (cheap): find the page that actually contains the quote by
       // reading the text layer only — no canvas render. A wrong page hint (or
       // none at all) used to end the search after ±1 page, so the reader jumped
-      // to the paper and highlighted nothing.
-      const pageHasQuote = async (pn: number): Promise<boolean> => {
+      // to the paper and highlighted nothing. A page matching only the short
+      // head is kept as a weak candidate instead of winning immediately.
+      const pageMatchStrength = async (pn: number): Promise<number> => {
         try {
           const page = await doc.getPage(pn);
           const tc = await page.getTextContent();
-          const flat = (tc.items as Array<{ str?: string }>)
-            .map((it) => it.str ?? '')
-            .join('')
-            .replace(/\s+/g, '');
-          if (flat.includes(needle)) return true;
-          return needle.length > 40 && flat.includes(needle.slice(0, 40));
+          const flat = (tc.items as Array<{ str?: string }>).map((it) => it.str ?? '').join('');
+          return matchStrength(flat, needles);
         } catch {
-          return false;
+          return 0;
         }
       };
 
@@ -2309,12 +2312,19 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
       }
 
       let target: number | null = null;
+      let weak: number | null = null;
       for (const pn of order) {
-        if (await pageHasQuote(pn)) {
+        const strength = await pageMatchStrength(pn);
+        // A full/head match on the hinted page is decisive; a page that only
+        // matches the short head is remembered and used if nothing better shows
+        // up anywhere in the scan window.
+        if (strength >= 2) {
           target = pn;
           break;
         }
+        if (strength === 1 && weak == null) weak = pn;
       }
+      if (target == null) target = weak;
       if (target == null) return null;
       const candidates = [target];
 
@@ -2331,26 +2341,11 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
 
         const items: string[] = tl.textContentItemsStr;
         const joined = items.join('');
-        // Whitespace-insensitive matching with an index map back to the raw
-        // string: line breaks and hyphenation differ between agent-side
-        // chunk text and the pdf.js text layer.
-        const normToRaw: number[] = [];
-        let norm = '';
-        for (let i = 0; i < joined.length; i++) {
-          if (!/\s/.test(joined[i])) {
-            normToRaw.push(i);
-            norm += joined[i];
-          }
-        }
-        let pos = norm.indexOf(needle);
-        if (pos < 0 && needle.length > 40) {
-          // LLM quotes are not always perfectly verbatim: fall back to
-          // anchoring on the head of the quote.
-          pos = norm.indexOf(needle.slice(0, 40));
-        }
-        if (pos < 0 || normToRaw.length === 0) continue;
-        const rawStart = normToRaw[pos];
-        const rawEnd = normToRaw[Math.min(pos + needle.length - 1, normToRaw.length - 1)] + 1;
+        // Same normalisation as the page scan; the returned range addresses the
+        // RAW text-layer string so the rectangles below stay exact.
+        const hit = findQuote(joined, needles);
+        if (!hit) continue;
+        const { start: rawStart, end: rawEnd } = hit;
 
         const wrapperRect = wrapper.getBoundingClientRect();
         const rects: SnippetRect[] = [];

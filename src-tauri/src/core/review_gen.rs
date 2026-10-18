@@ -1126,26 +1126,30 @@ fn reader_url(paper_id: &str, page: Option<i32>, quote: &str) -> String {
 ///
 /// The *display* number is always the paper's citation number — a citation must
 /// still read like `[9]` — while the *target* is the concrete passage, so two
-/// sentences citing the same paper point at their own paragraphs.
+/// sentences citing the same paper point at their own paragraphs. `hint` is the
+/// review sentence carrying this marker: it picks which sentence *inside* the
+/// passage the highlight lands on.
 fn resolve_marker(
     marker: Marker,
     sources: &[SourcePaper],
     evidence: &[Evidence],
+    hint: &str,
 ) -> Option<(usize, Option<String>)> {
+    let url_for = |ev: &Evidence| {
+        let quote = anchor_for(&ev.content, &ev.quote, hint);
+        reader_url(&ev.paper_id, ev.page, &quote)
+    };
     match marker {
         Marker::Evidence(k) => {
             let ev = evidence.get(k.checked_sub(1)?)?;
-            Some((ev.paper_index, Some(reader_url(&ev.paper_id, ev.page, &ev.quote))))
+            Some((ev.paper_index, Some(url_for(ev))))
         }
         Marker::Paper(n) => {
             // Range check only — the anchor comes from the evidence list.
             sources.get(n.checked_sub(1)?)?;
             // Legacy: anchor on this paper's first passage in the section.
             let anchor = evidence.iter().find(|ev| ev.paper_index == n);
-            Some((
-                n,
-                anchor.map(|ev| reader_url(&ev.paper_id, ev.page, &ev.quote)),
-            ))
+            Some((n, anchor.map(|ev| url_for(ev))))
         }
     }
     .filter(|(n, _)| *n >= 1 && *n <= sources.len())
@@ -1160,10 +1164,11 @@ fn render_citation_run(
     markers: &[Marker],
     sources: &[SourcePaper],
     evidence: &[Evidence],
+    hint: &str,
 ) -> Option<String> {
     let mut items: Vec<(usize, Option<String>)> = Vec::new();
     for m in markers {
-        let Some((display, url)) = resolve_marker(*m, sources, evidence) else {
+        let Some((display, url)) = resolve_marker(*m, sources, evidence, hint) else {
             continue;
         };
         // Same paper twice in one group (two passages cited together): keep the
@@ -1208,7 +1213,10 @@ fn linkify_citations(text: &str, sources: &[SourcePaper], evidence: &[Evidence])
     while i < chars.len() {
         if chars[i] == '[' {
             if let Some((markers, next)) = parse_citation_run(&chars, i, sources.len(), evidence.len()) {
-                match render_citation_run(&markers, sources, evidence) {
+                // Which claim is being cited: the review sentence right before
+                // the marker decides where inside the passage the highlight goes.
+                let hint = citing_sentence(&chars, i);
+                match render_citation_run(&markers, sources, evidence, &hint) {
                     Some(rendered) => {
                         out.push_str(&rendered);
                         i = next;
@@ -1232,13 +1240,36 @@ fn linkify_citations(text: &str, sources: &[SourcePaper], evidence: &[Evidence])
     out
 }
 
+/// The review's own sentence leading up to a citation marker — the claim whose
+/// source passage has to be found. A marker often trails its sentence
+/// ("…91%。见[E1]"), so a fragment shorter than a few characters keeps reaching
+/// back for the sentence before it.
+fn citing_sentence(chars: &[char], at: usize) -> String {
+    const CAP: usize = 240;
+    const MIN: usize = 8;
+    let mut start = at;
+    let mut taken = 0usize;
+    while start > 0 && taken < CAP {
+        start -= 1;
+        taken += 1;
+        if is_sentence_break(chars[start]) && at - start >= MIN {
+            start += 1;
+            break;
+        }
+    }
+    chars[start..at].iter().collect::<String>().trim().to_string()
+}
+
 /// The quote a deep link anchors on. Long enough to be specific, cut back to a
 /// word boundary so the reader's matcher is not fed half a word.
 fn anchor_quote(content: &str) -> String {
-    const CAP: usize = 90;
+    anchor_quote_capped(content, 90)
+}
+
+fn anchor_quote_capped(content: &str, cap: usize) -> String {
     let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut head: String = flat.chars().take(CAP).collect();
-    if flat.chars().count() > CAP {
+    let mut head: String = flat.chars().take(cap).collect();
+    if flat.chars().count() > cap {
         if let Some(idx) = head.rfind(' ') {
             // Keep at least a few words even if the tail word is long.
             if idx >= 40 {
@@ -1247,6 +1278,110 @@ fn anchor_quote(content: &str) -> String {
         }
     }
     head.trim().to_string()
+}
+
+/// Sentence boundaries used to choose an anchor. `.` is deliberately absent:
+/// "et al." and "0.93" would shred the passage into useless fragments.
+fn is_sentence_break(c: char) -> bool {
+    matches!(c, '。' | '！' | '？' | '；' | '!' | '?' | ';' | '\n')
+}
+
+/// Split a passage into sentences (delimiters kept, whitespace trimmed).
+fn split_sentences(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        cur.push(c);
+        // A full stop only ends a sentence when whitespace follows it: "et al."
+        // and "0.93" must not shred the passage, and a spurious split is
+        // harmless anyway (every fragment is still a real substring).
+        let dot_break = c == '.' && chars.get(i + 1).map(|n| n.is_whitespace()).unwrap_or(true);
+        if is_sentence_break(c) || dot_break {
+            let t = cur.trim();
+            if !t.is_empty() {
+                out.push(t.to_string());
+            }
+            cur.clear();
+        }
+        i += 1;
+    }
+    let t = cur.trim();
+    if !t.is_empty() {
+        out.push(t.to_string());
+    }
+    out
+}
+
+/// Overlap between a passage sentence and the review sentence that cites it.
+///
+/// The 文献分析 agent gets this for free: the model names the exact sentence it
+/// used. A 综述 cites by marker, so the anchor used to be a mechanical 90-char
+/// head of the retrieved chunk — often a sentence the author never had in mind,
+/// and long enough to cross a hyphenated line break the reader then failed to
+/// match. Scoring CJK bigrams and English words recovers the same thing without
+/// another model call.
+fn overlap_score(sentence: &str, hint: &str) -> usize {
+    if hint.trim().is_empty() {
+        return 0;
+    }
+    let lower = sentence.to_lowercase();
+    let mut score = 0usize;
+    // CJK: character bigrams are a cheap fuzzy signal that survives word-level
+    // rewording ("该方法提升准确率" vs "准确率显著提升").
+    let hint_chars: Vec<char> = hint.chars().collect();
+    for w in hint_chars.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a.is_ascii() || b.is_ascii() || !a.is_alphanumeric() || !b.is_alphanumeric() {
+            continue;
+        }
+        let bigram: String = [a, b].iter().collect();
+        if lower.contains(&bigram) {
+            score += 1;
+        }
+    }
+    // Latin text: whole words of three letters and up.
+    let mut word = String::new();
+    let mut flush = |word: &mut String, score: &mut usize| {
+        if word.chars().count() >= 3 && lower.contains(word.as_str()) {
+            *score += 2;
+        }
+        word.clear();
+    };
+    for c in hint.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_alphanumeric() {
+            word.push(c.to_ascii_lowercase());
+        } else {
+            flush(&mut word, &mut score);
+        }
+    }
+    score
+}
+
+/// The passage sentence that best matches the citing sentence, capped for the
+/// URL. Falls back to the chunk head when nothing overlaps (the model may have
+/// paraphrased the passage beyond recognition).
+fn anchor_for(content: &str, fallback: &str, hint: &str) -> String {
+    const MIN_SENTENCE: usize = 12;
+    let mut best: Option<(usize, String)> = None;
+    for s in split_sentences(content) {
+        if s.chars().count() < MIN_SENTENCE {
+            continue;
+        }
+        let score = overlap_score(&s, hint);
+        if score == 0 {
+            continue;
+        }
+        if best.as_ref().map(|(b, _)| score > *b).unwrap_or(true) {
+            best = Some((score, s));
+        }
+    }
+    match best {
+        Some((_, sentence)) => anchor_quote_capped(&sentence, 120),
+        None => fallback.to_string(),
+    }
 }
 
 pub(crate) fn percent_encode(s: &str) -> String {
@@ -1447,6 +1582,93 @@ mod tests {
         // Never ends mid-word.
         assert!(q.ends_with("word"), "quote ended with {q:?}");
         assert_eq!(anchor_quote("  spaced   out  "), "spaced out");
+    }
+
+    /// `exact=%XX` back to text, so a test can read the link the user clicks.
+    fn decode(encoded: &str) -> String {
+        let bytes = encoded.as_bytes();
+        let mut out: Vec<u8> = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                if let Ok(b) = u8::from_str_radix(hex, 16) {
+                    out.push(b);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).to_string()
+    }
+
+    /// The anchor must land on the sentence the review actually cites, not on
+    /// whatever happened to be at the head of the retrieved chunk.
+    #[test]
+    fn anchor_picks_the_sentence_the_review_cites() {
+        let content = "我们收集了 42 个开源项目的数据集。该方法把准确率提升到 91.3%，\
+                       显著优于三个基线。最后我们讨论了构念效度方面的威胁。";
+        let hint = "该方法显著提升了准确率 91.3%";
+        let anchor = anchor_for(content, "FALLBACK", hint);
+        assert!(anchor.contains("91.3%"), "{anchor}");
+        assert!(!anchor.contains("数据集"), "{anchor}");
+        assert!(!anchor.contains("构念效度"), "{anchor}");
+
+        // Latin re-wording: whole words, three letters and up.
+        let en = "We collected 42 repositories for the study. Accuracy improved to 91.3% \
+                  over all three baselines. Threats to validity are discussed at the end.";
+        let anchor = anchor_for(en, "FALLBACK", "the method improved accuracy to 91.3%");
+        assert!(anchor.contains("Accuracy improved"), "{anchor}");
+        assert!(!anchor.contains("repositories"), "{anchor}");
+    }
+
+    #[test]
+    fn anchor_falls_back_to_the_passage_head_when_nothing_matches() {
+        let content = "第一句话讲的是数据集。第二句话讲的是模型结构。";
+        // No overlap at all (an LLM may paraphrase beyond recognition).
+        assert_eq!(
+            anchor_for(content, "fallback quote", "完全无关的另一件事"),
+            "fallback quote"
+        );
+        // Empty hint (no sentence before the marker) also falls back.
+        assert_eq!(anchor_for(content, "fallback quote", "  "), "fallback quote");
+        // A too-short sentence is never used as an anchor.
+        assert_eq!(anchor_for("短句。第二句稍微长一点但也不够。", "fb", "短句"), "fb");
+    }
+
+    #[test]
+    fn citing_sentence_is_the_clause_before_the_marker() {
+        let text: Vec<char> = "先说背景。该方法的准确率达到 91%。见[E1]。".chars().collect();
+        let at = text.iter().position(|c| *c == '[').unwrap();
+        let hint = citing_sentence(&text, at);
+        // A one-character trailing fragment is not a usable hint: keep the
+        // sentence it belongs to.
+        assert!(hint.contains("准确率达到 91%"), "{hint}");
+        assert!(!hint.contains("先说背景"), "{hint}");
+    }
+
+    #[test]
+    fn deep_link_anchors_on_the_cited_sentence_not_the_chunk_head() {
+        let sources = [src("p1", "甲")];
+        let evidence = [Evidence {
+            paper_index: 1,
+            paper_id: "p1".into(),
+            page: Some(7),
+            content: "本文研究了代码审查中的沟通问题。我们在 42 个项目上评估了该方法，\
+                      准确率提升到 91.3%。最后讨论了外部效度方面的威胁。"
+                .into(),
+            quote: anchor_quote(
+                "本文研究了代码审查中的沟通问题。我们在 42 个项目上评估了该方法，\
+                 准确率提升到 91.3%。最后讨论了外部效度方面的威胁。",
+            ),
+        }];
+        let out = linkify_citations("评估表明准确率提升到 91.3%[E1]。", &sources, &evidence);
+        let link = out.split("exact=").nth(1).unwrap();
+        let exact = decode(link.trim_end_matches([')', ']']));
+        assert!(exact.contains("91.3%"), "{exact}");
+        assert!(!exact.contains("代码审查中的沟通问题"), "{exact}");
     }
 
     #[test]

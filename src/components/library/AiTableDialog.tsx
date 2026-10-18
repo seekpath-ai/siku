@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle, PanelRight, RefreshCw } from 'lucide-react';
+import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle, PanelRight, RefreshCw, Search, ChevronDown, ChevronRight } from 'lucide-react';
 import { useAiTableStore } from '@/stores/aiTableStore';
 import { useDialog } from '@/hooks/useDialog';
 import { ModelOverrideSelect } from './ModelOverrideSelect';
@@ -15,15 +15,22 @@ import {
   aiTablePapersInfo,
   aiTableExtractStatus,
   aiTableBuiltinPresets,
+  aiTableTermsGet,
+  aiTableTermsSet,
+  aiTableTermsRegenerate,
+  aiTableCellEvidence,
   saveTextFile,
   type AiTableColumn,
   type AiTableCell,
+  type AiTableColumnTerms,
+  type AiTableEvidenceRef,
   type AiTableProgress,
   type AiTablePreset,
   type AiTablePaperBrief,
   type AiTableBuiltinPreset,
   type AiTableDetail,
   type AiTableDepth,
+  type AiTableVerify,
 } from '@/lib/tauri';
 
 const cellKey = (paperId: string, columnKey: string) => `${paperId}::${columnKey}`;
@@ -52,7 +59,20 @@ export function AiTableDialog() {
   /** How hard the run looks for evidence — cost and accuracy are the user's
    *  call, never silently traded by us. */
   const [depth, setDepth] = useState<AiTableDepth>('standard');
+  /** Cross-check pass: only flagged cells (default), everything, or nothing. */
+  const [verify, setVerify] = useState<AiTableVerify>('doubtful');
   const [cells, setCells] = useState<Map<string, AiTableCell>>(new Map());
+  /** Stored search terms per column key, so a miss can be fixed by hand. */
+  const [terms, setTerms] = useState<Record<string, AiTableColumnTerms>>({});
+  /** Column key → the text currently in its term editor. */
+  const [termDraft, setTermDraft] = useState<Record<string, string>>({});
+  const [termsOpen, setTermsOpen] = useState<Record<string, boolean>>({});
+  const [termBusy, setTermBusy] = useState<Record<string, boolean>>({});
+  /** Only rows that have at least one doubtful cell. */
+  const [onlySuspect, setOnlySuspect] = useState(false);
+  /** Evidence panel: which cell is open, and its passages. */
+  const [detailCell, setDetailCell] = useState<{ paperId: string; columnKey: string; title: string } | null>(null);
+  const [detailRefs, setDetailRefs] = useState<AiTableEvidenceRef[] | null>(null);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<AiTableProgress | null>(null);
   const [editing, setEditing] = useState<{ paperId: string; columnKey: string; value: string } | null>(null);
@@ -62,7 +82,8 @@ export function AiTableDialog() {
    *  the call here; without it the panel looks frozen). */
   const [reasoning, setReasoning] = useState('');
   const [reasoningTitle, setReasoningTitle] = useState('');
-  const [showLog, setShowLog] = useState(true);
+  const [showLog, setShowLog] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
   /** Throttled grid refresh while a run is in progress: cells are written per
    *  paper on the backend, so waiting for `finished` showed "等待" for minutes
@@ -73,10 +94,10 @@ export function AiTableDialog() {
   // Keep the process log pinned to its newest line.
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-  }, [logs]);
+  }, [logs, showLog]);
   useEffect(() => {
     reasoningRef.current?.scrollTo({ top: reasoningRef.current.scrollHeight });
-  }, [reasoning]);
+  }, [reasoning, showLog]);
 
   const reloadCells = useCallback(
     async (cols: AiTableColumn[]) => {
@@ -94,6 +115,63 @@ export function AiTableDialog() {
     },
     [paperIds]
   );
+
+  /** Search terms are stored per column key: read them for whatever the editor
+   *  currently holds (cache only, no model call). */
+  const reloadTerms = useCallback(async (cols: AiTableColumn[]) => {
+    const keys = cols.map((c) => c.key.trim()).filter(Boolean);
+    if (keys.length === 0) {
+      setTerms({});
+      return;
+    }
+    try {
+      const list = await aiTableTermsGet(keys);
+      setTerms(Object.fromEntries(list.map((t) => [t.columnKey, t])));
+    } catch (err) {
+      console.error('load ai-table terms:', err);
+    }
+  }, []);
+
+  const openEvidence = useCallback(async (paperId: string, columnKey: string, title: string) => {
+    setDetailCell({ paperId, columnKey, title });
+    setDetailRefs(null);
+    try {
+      setDetailRefs(await aiTableCellEvidence(paperId, columnKey));
+    } catch (err) {
+      console.error('load cell evidence:', err);
+      setDetailRefs([]);
+    }
+  }, []);
+
+  const saveTerms = async (key: string, raw: string) => {
+    const list = raw
+      .split(/[,，;；\s]+/)
+      .map((t) => t.trim())
+      .filter(Boolean);
+    setTermBusy((prev) => ({ ...prev, [key]: true }));
+    try {
+      const list2 = await aiTableTermsSet(key, list);
+      setTerms((prev) => ({ ...prev, [key]: list2[0] }));
+      setTermDraft((prev) => ({ ...prev, [key]: list2[0]?.terms.join(' ') ?? '' }));
+    } catch (err) {
+      await alert(`保存检索词失败: ${err}`);
+    } finally {
+      setTermBusy((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  const regenerateTerms = async (key: string, prompt: string) => {
+    setTermBusy((prev) => ({ ...prev, [key]: true }));
+    try {
+      const list = await aiTableTermsRegenerate(key, prompt);
+      setTermDraft((prev) => ({ ...prev, [key]: list.join(' ') }));
+      await reloadTerms([{ key, prompt }]);
+    } catch (err) {
+      await alert(`生成检索词失败: ${err}`);
+    } finally {
+      setTermBusy((prev) => ({ ...prev, [key]: false }));
+    }
+  };
 
   // Initial load: paper briefs + presets + any cached cells.
   useEffect(() => {
@@ -124,8 +202,9 @@ export function AiTableDialog() {
   useEffect(() => {
     if (!open) return;
     void reloadCells(columns);
+    void reloadTerms(columns);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, columns.map((c) => c.key).join('|'), reloadCells]);
+  }, [open, columns.map((c) => c.key).join('|'), reloadCells, reloadTerms]);
 
   // Progress events drive the run state; a finished run reloads the grid.
   useEffect(() => {
@@ -157,6 +236,8 @@ export function AiTableDialog() {
       if (p.finished) {
         setRunning(false);
         void reloadCells(columns);
+        // The run may have generated search terms for columns that had none.
+        void reloadTerms(columns);
       }
     });
     return () => {
@@ -166,7 +247,7 @@ export function AiTableDialog() {
         reloadTimer.current = null;
       }
     };
-  }, [open, columns, reloadCells]);
+  }, [open, columns, reloadCells, reloadTerms]);
 
   /** Trim keys, drop empties, dedupe — the canonical column list for a run. */
   const normalizedColumns = (): AiTableColumn[] => {
@@ -194,7 +275,7 @@ export function AiTableDialog() {
     setReasoning('');
     setReasoningTitle('');
     try {
-      await aiTableExtractStart(ids ?? paperIds, cols, providerId || null, detail, depth, force);
+      await aiTableExtractStart(ids ?? paperIds, cols, providerId || null, detail, depth, verify, force);
     } catch (err) {
       setRunning(false);
       await alert(`启动抽取失败: ${err}`);
@@ -217,6 +298,10 @@ export function AiTableDialog() {
           edited: true,
           src: '',
           conf: 1,
+          suspect: false,
+          suspectReason: '',
+          verifyVerdict: '',
+          verifyNote: '',
         });
         return next;
       });
@@ -307,7 +392,15 @@ export function AiTableDialog() {
   ).length;
   /** 模型确认文中没有——不是待补，重试也没用（除非强制重抽）。 */
   const absentCells = [...cells.values()].filter((c) => !isFilled(c) && c.status === 'absent').length;
+  /** 有值但站不住：无证据 / 无出处 / 置信度低 / 复核未通过。 */
+  const isSuspect = (c?: AiTableCell) => Boolean(c && isFilled(c) && c.suspect);
+  const suspectCells = [...cells.values()].filter(isSuspect).length;
+  const visiblePapers = onlySuspect
+    ? papers.filter((p) => colKeys.some((k) => k && isSuspect(cells.get(cellKey(p.id, k)))))
+    : papers;
   const totalCells = papers.length * colKeys.filter(Boolean).length;
+  /** 还要抽的格子：未填、且不是「文中无此」（那是最终答案，只有「重抽全部」才重判）。 */
+  const pendingCells = Math.max(0, totalCells - doneCells - absentCells);
 
   return (
     <div className="fixed inset-0 z-[6000] flex items-center justify-center">
@@ -315,14 +408,15 @@ export function AiTableDialog() {
           the dialog re-attaches on reopen (ai_table_extract_status). Being
           trapped in a modal because a model call is slow is unacceptable. */}
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={close} />
-      <div className="relative w-[94vw] max-w-[1200px] h-[84vh] mx-4 flex bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
+      <div className="relative w-[94vw] max-w-[1200px] h-[calc(100dvh-3rem)] max-h-[1200px] min-h-0 mx-4 flex bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         {/* Left: column definitions + presets */}
-        <aside className="w-[260px] shrink-0 border-r border-surface-hover flex flex-col">
+        <aside className="w-[280px] shrink-0 border-r border-surface-hover flex flex-col min-h-0">
           <div className="px-3 py-2.5 border-b border-surface-hover">
             <span className="text-[13px] font-medium text-text-primary">列定义</span>
             <p className="text-[11px] text-text-secondary/60 mt-0.5">每列一个提取说明，对每篇文献抽取一次</p>
           </div>
-          <div className="flex-1 overflow-y-auto p-2.5 space-y-2.5">
+          <div className="flex-1 min-h-0 overflow-y-auto flex flex-col">
+            <section className="flex-1 min-h-[300px] p-2.5 space-y-2.5">
             {columns.map((col, i) => (
               <div key={i} className="rounded-lg border border-surface-hover/70 p-2 space-y-1.5">
                 <div className="flex items-center gap-1.5">
@@ -348,9 +442,94 @@ export function AiTableDialog() {
                     setColumns((prev) => prev.map((c, j) => (j === i ? { ...c, prompt: e.target.value } : c)))
                   }
                   placeholder="提取说明（留空则按列名提取）"
-                  rows={2}
-                  className="w-full bg-background border border-surface-hover rounded px-2 py-1 text-[11px] text-text-primary outline-none focus:border-primary/50 resize-none"
+                  rows={3}
+                  className="w-full min-h-[64px] max-h-40 resize-y overflow-y-auto bg-background border border-surface-hover rounded px-2 py-1 text-[11px] text-text-primary outline-none focus:border-primary/50"
                 />
+                {/* 检索词：这一列到底拿什么词去全文里找证据。可查看、可改、可重算 ——
+                    "没抽到"十有八九是检索词没命中，用户必须能干预。 */}
+                {(() => {
+                  const key = col.key.trim();
+                  if (!key) return null;
+                  const info = terms[key];
+                  const isOpen = Boolean(termsOpen[key]);
+                  const busy = Boolean(termBusy[key]);
+                  const label = !info || info.terms.length === 0 ? '未生成' : `${info.terms.length} 个`;
+                  return (
+                    <div className="pt-0.5">
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => {
+                            setTermsOpen((prev) => ({ ...prev, [key]: !isOpen }));
+                            setTermDraft((prev) => ({
+                              ...prev,
+                              [key]: prev[key] ?? (info?.terms.join(' ') ?? ''),
+                            }));
+                          }}
+                          className="flex items-center gap-1 text-[10px] text-text-secondary/60 hover:text-text-primary"
+                          title="该列在全文里检索用的词（决定证据能不能被找到）"
+                        >
+                          <Search size={10} />
+                          检索词 · {label}
+                          {info?.source === 'manual' && <span className="text-primary/80">自定义</span>}
+                        </button>
+                        {busy && <Loader2 size={10} className="animate-spin text-text-secondary/60" />}
+                      </div>
+                      {isOpen && (
+                        <div className="mt-1 space-y-1 rounded border border-surface-hover/60 p-1.5">
+                          <div className="flex flex-wrap gap-1">
+                            {(info?.terms ?? []).length === 0 ? (
+                              <span className="text-[10px] text-text-secondary/45">
+                                首次抽取时自动生成（内置映射或一次 AI 生成）
+                              </span>
+                            ) : (
+                              info!.terms.map((t) => (
+                                <span
+                                  key={t}
+                                  className="px-1.5 py-0.5 rounded bg-surface-hover/50 text-[10px] text-text-secondary/80"
+                                >
+                                  {t}
+                                </span>
+                              ))
+                            )}
+                          </div>
+                          <input
+                            value={termDraft[key] ?? ''}
+                            onChange={(e) => setTermDraft((prev) => ({ ...prev, [key]: e.target.value }))}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                void saveTerms(key, termDraft[key] ?? '');
+                              }
+                              if (e.key === 'Escape') setTermsOpen((prev) => ({ ...prev, [key]: false }));
+                            }}
+                            placeholder="空格或逗号分隔，回车保存；清空回车=恢复默认"
+                            className="w-full bg-background border border-surface-hover rounded px-1.5 py-1 text-[10px] text-text-primary outline-none focus:border-primary/50"
+                          />
+                          <div className="flex gap-1">
+                            <button
+                              onClick={() => void saveTerms(key, termDraft[key] ?? '')}
+                              disabled={busy}
+                              className="flex-1 px-1.5 py-1 rounded border border-surface-hover text-[10px] text-text-secondary hover:bg-surface-hover disabled:opacity-40"
+                            >
+                              保存
+                            </button>
+                            <button
+                              onClick={() => void regenerateTerms(key, col.prompt)}
+                              disabled={busy}
+                              className="flex-1 px-1.5 py-1 rounded border border-surface-hover text-[10px] text-text-secondary hover:bg-surface-hover disabled:opacity-40"
+                              title="丢掉当前词，重新按列名/说明生成（可能调用一次模型）"
+                            >
+                              AI 重算
+                            </button>
+                          </div>
+                          <p className="text-[9px] text-text-secondary/40 leading-snug">
+                            中文列名在英文论文里几乎检索不到命中，这些词就是用来跨语言对上证据的。
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             ))}
             <button
@@ -360,8 +539,8 @@ export function AiTableDialog() {
               <Plus size={12} />
               添加列
             </button>
-          </div>
-          <div className="p-2.5 border-t border-surface-hover space-y-1.5">
+            </section>
+          <div className="shrink-0 p-2.5 border-t border-surface-hover space-y-1.5">
             <select
               value=""
               onChange={(e) => {
@@ -406,7 +585,26 @@ export function AiTableDialog() {
               </button>
             </div>
           </div>
-          <div className="p-2.5 border-t border-surface-hover space-y-1.5">
+          <section className="shrink-0 border-t border-surface-hover">
+            <button
+              type="button"
+              onClick={() => setSettingsOpen((v) => !v)}
+              aria-expanded={settingsOpen}
+              aria-controls="ai-table-extraction-settings"
+              className="w-full flex items-center gap-1.5 px-3 py-2.5 text-left hover:bg-surface-hover/50"
+            >
+              {settingsOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+              <span className="text-[12px] font-medium text-text-primary">提取设置</span>
+              {!settingsOpen && (
+                <span className="ml-auto truncate text-[10px] font-normal text-text-secondary/45">
+                  {depth === 'fast' ? '快速' : depth === 'standard' ? '标准' : depth === 'deep' ? '深入' : '逐列精查'}
+                  {' · '}
+                  {detail === 'brief' ? '简洁' : detail === 'normal' ? '1~2 句' : '3~6 句'}
+                </span>
+              )}
+            </button>
+            {settingsOpen && (
+              <div id="ai-table-extraction-settings" className="px-2.5 pb-2.5 space-y-1.5">
             <label className="block text-[11px] text-text-secondary/60">提取深度（成本 ↔ 精度）</label>
             <select
               value={depth}
@@ -450,17 +648,52 @@ export function AiTableDialog() {
             <p className="text-[10px] text-text-secondary/45 leading-snug">
               列说明里写明长度/详略时以列说明为准；已抽取的单元格不会因改这里而重算。
             </p>
+            <label className="block text-[11px] text-text-secondary/60 pt-1">交叉验证（额外调用）</label>
+            <select
+              value={verify}
+              onChange={(e) => setVerify(e.target.value as AiTableVerify)}
+              disabled={running}
+              className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none disabled:opacity-50"
+            >
+              <option value="off">关闭 · 不额外调用</option>
+              <option value="doubtful">仅存疑格 · 每篇最多 6 格</option>
+              <option value="all">全部已抽取值 · 每篇最多 10 格</option>
+            </select>
+            <p className="text-[10px] text-text-secondary/45 leading-snug">
+              {verify === 'off'
+                ? '只做一次抽取；可疑的格子仍会被标出来，但不复核。'
+                : verify === 'doubtful'
+                  ? '推荐：把无证据/无出处/置信度低的格子重新对照原文核对一次，核对通过即不再存疑。'
+                  : '每篇多一次调用逐格核对，最严也最贵；被判定不支持的值会标为存疑。'}
+            </p>
             <label className="block text-[11px] text-text-secondary/60 pt-1">模型</label>
             <ModelOverrideSelect value={providerId} onChange={setProviderId} disabled={running} className="w-full" />
+              </div>
+            )}
+          </section>
           </div>
         </aside>
 
         {/* Right: toolbar + grid */}
-        <div className="flex-1 min-w-0 flex flex-col">
+        <div className="flex-1 min-w-0 min-h-0 flex flex-col">
           <div className="flex items-center gap-2 px-4 py-2.5 border-b border-surface-hover">
             <span className="text-sm font-medium text-text-primary">AI 表格列</span>
             <span className="text-[11px] text-text-secondary/60">{papers.length} 篇文献</span>
             <div className="ml-auto flex items-center gap-2">
+              {suspectCells > 0 && (
+                <button
+                  onClick={() => setOnlySuspect((v) => !v)}
+                  className={`flex items-center gap-1 px-2 py-1.5 rounded-lg border text-[12px] ${
+                    onlySuspect
+                      ? 'border-amber-400/60 text-amber-400 bg-amber-400/10'
+                      : 'border-surface-hover text-text-secondary hover:bg-surface-hover'
+                  }`}
+                  title="只显示至少有 1 格存疑的文献"
+                >
+                  <AlertTriangle size={12} />
+                  {onlySuspect ? '显示全部' : `只看存疑 ${suspectCells}`}
+                </button>
+              )}
               {progress && (
                 <span className="text-[11px] text-text-secondary/70">
                   {progress.finished
@@ -482,14 +715,14 @@ export function AiTableDialog() {
                 <>
                   <button
                     onClick={() => void startRun()}
-                    disabled={totalCells > 0 && doneCells >= totalCells}
+                    disabled={totalCells > 0 && pendingCells === 0}
                     className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-primary text-black text-[12px] font-medium hover:bg-primary/90 disabled:opacity-40"
                   >
                     <Play size={12} />
                     {doneCells === 0
                       ? '开始抽取'
-                      : doneCells < totalCells
-                        ? `补齐 ${totalCells - doneCells} 格`
+                      : pendingCells > 0
+                        ? `补齐 ${pendingCells} 格`
                         : '全部已填写'}
                   </button>
                   {doneCells > 0 && (
@@ -530,7 +763,10 @@ export function AiTableDialog() {
               </button>
               <button
                 onClick={() => setShowLog((v) => !v)}
-                title="过程日志"
+                title="模型推理 / 过程日志"
+                aria-label="模型推理 / 过程日志"
+                aria-expanded={showLog}
+                aria-controls="ai-table-run-details"
                 className={`p-1.5 rounded hover:bg-surface-hover ${showLog ? 'text-primary bg-primary/10' : 'text-text-secondary/60'}`}
               >
                 <PanelRight size={14} />
@@ -546,10 +782,10 @@ export function AiTableDialog() {
           </div>
 
           <p className="px-4 py-1.5 text-[11px] text-text-secondary/50 border-b border-surface-hover/60">
-            每篇文献一次调用返回所有列；已完成和手动编辑的单元格不会被覆盖，抽取不到的字段记为「待补」可再次补齐。点击单元格可编辑。{emptyCells > 0 ? ` 当前有 ${emptyCells} 格待补` : ''}{absentCells > 0 ? `、${absentCells} 格文中无此内容` : ''}。
+            每篇文献一次调用返回所有列；已完成和手动编辑的单元格不会被覆盖，抽取不到的字段记为「待补」可再次补齐。点击单元格可编辑，点「证据」看这一格用了哪些原文段落。{emptyCells > 0 ? ` 当前有 ${emptyCells} 格待补` : ''}{absentCells > 0 ? `、${absentCells} 格文中无此内容` : ''}{suspectCells > 0 ? `、${suspectCells} 格存疑（依据不足，建议核对）` : ''}。
           </p>
 
-          <div className="flex-1 overflow-auto">
+          <div className="flex-1 min-h-0 overflow-auto overscroll-contain">
             <table className="w-full border-collapse text-[12px]">
               <thead className="sticky top-0 bg-surface z-10">
                 <tr>
@@ -570,7 +806,7 @@ export function AiTableDialog() {
                 </tr>
               </thead>
               <tbody>
-                {papers.map((p) => (
+                {visiblePapers.map((p) => (
                   <tr key={p.id} className="border-b border-surface-hover/50 hover:bg-surface-hover/30">
                     <td className="px-3 py-2 align-top">
                       <span className="block text-text-primary line-clamp-2">{p.title}</span>
@@ -583,7 +819,7 @@ export function AiTableDialog() {
                       return (
                         <td
                           key={i}
-                          className="px-3 py-2 align-top cursor-text"
+                          className="px-3 py-2 align-top cursor-text group"
                           onClick={() => {
                             if (!isEditing) setEditing({ paperId: p.id, columnKey: key, value: cell?.value ?? '' });
                           }}
@@ -622,18 +858,56 @@ export function AiTableDialog() {
                               等待
                             </span>
                           ) : cell?.value ? (
-                            <span
-                              className={cell.edited ? 'text-primary' : 'text-text-primary/90'}
-                              title={
-                                cell.edited
-                                  ? '手动编辑'
-                                  : [cell.src && `依据：${cell.src}`, cell.conf > 0 && `置信度 ${Math.round(cell.conf * 100)}%`]
-                                      .filter(Boolean)
-                                      .join(' · ') || undefined
-                              }
-                            >
-                              {cell.value}
-                            </span>
+                            <div className="space-y-1">
+                              <span
+                                className={`${cell.edited ? 'text-primary' : 'text-text-primary/90'} ${
+                                  isSuspect(cell) ? 'underline decoration-amber-400/60 decoration-dotted' : ''
+                                }`}
+                                title={
+                                  cell.edited
+                                    ? '手动编辑'
+                                    : [cell.src && `依据：${cell.src}`, cell.conf > 0 && `置信度 ${Math.round(cell.conf * 100)}%`]
+                                        .filter(Boolean)
+                                        .join(' · ') || undefined
+                                }
+                              >
+                                {cell.value}
+                              </span>
+                              <div className="flex items-center gap-2 text-[10px]">
+                                {isSuspect(cell) && (
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void openEvidence(p.id, key, p.title);
+                                    }}
+                                    className="flex items-center gap-0.5 text-amber-400/90 hover:text-amber-300"
+                                    title={cell.suspectReason || '该值依据不足'}
+                                  >
+                                    <AlertTriangle size={10} />
+                                    存疑
+                                  </button>
+                                )}
+                                {cell.verifyVerdict === 'yes' && (
+                                  <span className="text-emerald-500/70" title={cell.verifyNote || '已复核通过'}>
+                                    已复核
+                                  </span>
+                                )}
+                                {!cell.edited && (
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void openEvidence(p.id, key, p.title);
+                                    }}
+                                    className={`text-text-secondary/50 hover:text-primary ${
+                                      isSuspect(cell) ? '' : 'opacity-0 group-hover:opacity-100'
+                                    }`}
+                                    title="查看这一格的原文依据"
+                                  >
+                                    证据
+                                  </button>
+                                )}
+                              </div>
+                            </div>
                           ) : cell?.status === 'absent' ? (
                             // 模型读了证据后确认文中没有：这是最终答案，不是待补
                             <button
@@ -675,53 +949,171 @@ export function AiTableDialog() {
                     </td>
                   </tr>
                 )}
+                {papers.length > 0 && visiblePapers.length === 0 && (
+                  <tr>
+                    <td colSpan={colKeys.filter(Boolean).length + 1} className="px-3 py-8 text-center text-text-secondary/50">
+                      没有存疑的格子
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
         </div>
 
-        {/* Right drawer: process log — per-paper outcomes, so a long run
-            never looks stuck. Inline (flex) rather than overlay: the grid
-            stays visible next to it. */}
-        <aside
-          className={`shrink-0 flex flex-col overflow-hidden transition-all duration-200 ${
-            showLog ? 'w-[300px] border-l border-surface-hover' : 'w-0'
-          }`}
-        >
-          <div className="w-[300px] flex flex-col h-full">
-            {/* 模型推理：thinking 模型的绝大部分时间花在这里，不显示就只是一片沉默 */}
-            <div className="flex items-center gap-1.5 px-3 py-2 border-b border-surface-hover/60 text-[11px] text-text-secondary/70">
-              <span>模型推理</span>
-              {reasoning && reasoningTitle && (
-                <span className="truncate text-text-secondary/45">· 《{reasoningTitle}》</span>
-              )}
-              {running && reasoning && <Loader2 size={10} className="animate-spin shrink-0" />}
+        {/* Right drawer: overlays the grid so live details never shrink the table. */}
+        {showLog && (
+          <aside
+            id="ai-table-run-details"
+            aria-label="模型推理与过程日志"
+            className="absolute inset-y-0 right-0 z-10 w-[300px] flex flex-col overflow-hidden border-l border-surface-hover bg-surface shadow-2xl"
+          >
+            <div className="w-full flex flex-col h-full">
+              {/* 模型推理：thinking 模型的绝大部分时间花在这里，不显示就只是一片沉默 */}
+              <div className="flex items-center gap-1.5 px-3 py-2 border-b border-surface-hover/60 text-[11px] text-text-secondary/70">
+                <span className="shrink-0">模型推理</span>
+                {reasoning && reasoningTitle && (
+                  <span className="truncate text-text-secondary/45">· 《{reasoningTitle}》</span>
+                )}
+                {running && reasoning && <Loader2 size={10} className="animate-spin shrink-0" />}
+                <button
+                  onClick={() => setShowLog(false)}
+                  title="收起运行详情"
+                  className="ml-auto shrink-0 p-1 rounded text-text-secondary/60 hover:text-text-primary hover:bg-surface-hover"
+                >
+                  <X size={13} />
+                </button>
+              </div>
+              <div
+                ref={reasoningRef}
+                className={`overflow-y-auto px-3 py-2 whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-text-secondary/50 italic ${
+                  reasoning ? 'basis-[45%] max-h-[45%] border-b border-surface-hover/50' : 'hidden'
+                }`}
+              >
+                {reasoning}
+              </div>
+              <div className="flex items-center gap-1.5 px-3 py-2 border-b border-surface-hover text-[12px] text-text-secondary">
+                过程日志
+                {running && <Loader2 size={11} className="animate-spin" />}
+                {logs.length > 0 && <span className="text-text-secondary/40">（{logs.length}）</span>}
+              </div>
+              <div
+                ref={logRef}
+                className="flex-1 min-h-0 overflow-y-auto px-3 py-2 font-mono text-[11px] leading-relaxed text-text-secondary/80 space-y-1"
+              >
+                {logs.length === 0 ? (
+                  <span className="text-text-secondary/40">运行后此处逐篇显示抽取结果。</span>
+                ) : (
+                  logs.map((l, i) => <div key={i}>{l}</div>)
+                )}
+              </div>
             </div>
+          </aside>
+        )}
+
+        {/* 证据面板：这一格的原文依据。抽取值旁边没有证据可查，表格就只能是"看起来对" */}
+        {detailCell && (
+          <div
+            className="absolute inset-0 z-20 flex items-center justify-center bg-black/40 p-6"
+            onClick={() => setDetailCell(null)}
+          >
             <div
-              ref={reasoningRef}
-              className={`overflow-y-auto px-3 py-2 whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-text-secondary/50 italic ${
-                reasoning ? 'basis-[45%] max-h-[45%] border-b border-surface-hover/50' : 'hidden'
-              }`}
+              className="w-[620px] max-h-full flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
+              onClick={(e) => e.stopPropagation()}
             >
-              {reasoning}
-            </div>
-            <div className="flex items-center gap-1.5 px-3 py-2 border-b border-surface-hover text-[12px] text-text-secondary">
-              过程日志
-              {running && <Loader2 size={11} className="animate-spin" />}
-              {logs.length > 0 && <span className="text-text-secondary/40">（{logs.length}）</span>}
-            </div>
-            <div
-              ref={logRef}
-              className="flex-1 min-h-0 overflow-y-auto px-3 py-2 font-mono text-[11px] leading-relaxed text-text-secondary/80 space-y-1"
-            >
-              {logs.length === 0 ? (
-                <span className="text-text-secondary/40">运行后此处逐篇显示抽取结果。</span>
-              ) : (
-                logs.map((l, i) => <div key={i}>{l}</div>)
-              )}
+              {(() => {
+                const cell = cells.get(cellKey(detailCell.paperId, detailCell.columnKey));
+                return (
+                  <>
+                    <div className="flex items-start gap-2 px-4 py-2.5 border-b border-surface-hover">
+                      <div className="min-w-0">
+                        <p className="text-[12px] text-text-primary truncate">《{detailCell.title}》</p>
+                        <p className="text-[11px] text-text-secondary/60">
+                          {detailCell.columnKey}
+                          {cell?.src ? ` · 模型标注位置 ${cell.src}` : ' · 模型未标注位置'}
+                          {cell && cell.conf > 0 ? ` · 置信度 ${Math.round(cell.conf * 100)}%` : ''}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => setDetailCell(null)}
+                        className="ml-auto p-1 rounded text-text-secondary/60 hover:text-text-primary hover:bg-surface-hover"
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
+                    <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-2.5">
+                      {cell?.value && (
+                        <div className="rounded-lg bg-surface-hover/40 px-2.5 py-2 text-[12px] text-text-primary">
+                          {cell.value}
+                        </div>
+                      )}
+                      {cell?.suspect && (
+                        <div className="flex items-start gap-1.5 rounded-lg border border-amber-400/40 bg-amber-400/5 px-2.5 py-2 text-[11px] text-amber-400/90">
+                          <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                          <span>{cell.suspectReason || '依据不足'}</span>
+                        </div>
+                      )}
+                      {cell?.verifyVerdict && cell.verifyVerdict !== 'yes' && (
+                        <div className="rounded-lg border border-amber-400/40 px-2.5 py-2 text-[11px] text-amber-400/90">
+                          复核结论：{cell.verifyVerdict === 'no' ? '证据不支持' : '证据仅部分支持'}
+                          {cell.verifyNote ? `——${cell.verifyNote}` : ''}
+                        </div>
+                      )}
+                      {cell?.verifyVerdict === 'yes' && (
+                        <div className="rounded-lg border border-emerald-500/30 px-2.5 py-2 text-[11px] text-emerald-500/80">
+                          复核通过{cell.verifyNote ? `：${cell.verifyNote}` : ''}
+                        </div>
+                      )}
+                      {cell?.edited && (
+                        <p className="text-[11px] text-text-secondary/60">
+                          这一格是手动填写，没有 AI 证据链。
+                        </p>
+                      )}
+                      {detailRefs === null ? (
+                        <div className="flex items-center gap-1.5 text-[11px] text-text-secondary/60">
+                          <Loader2 size={11} className="animate-spin" />
+                          读取证据…
+                        </div>
+                      ) : detailRefs.length === 0 ? (
+                        <p className="text-[11px] text-text-secondary/60">
+                          没有记录到证据段落（可能是早于证据留存的旧数据，或该篇没有全文索引）。用「重抽全部」可补上。
+                        </p>
+                      ) : (
+                        <div className="space-y-2">
+                          <p className="text-[11px] text-text-secondary/60">
+                            本次调用给模型的 {detailRefs.length} 段原文（标「本列」的是由这一列的检索词命中）：
+                          </p>
+                          {detailRefs
+                            .slice()
+                            .sort(
+                              (a, b) =>
+                                Number(b.fromColumn === detailCell.columnKey) -
+                                Number(a.fromColumn === detailCell.columnKey)
+                            )
+                            .map((r, idx) => (
+                              <div key={idx} className="rounded-lg border border-surface-hover/70 px-2.5 py-2 space-y-1">
+                                <div className="flex items-center gap-2 text-[10px] text-text-secondary/60">
+                                  <span className="font-mono text-primary/70">{r.label || '（无页码）'}</span>
+                                  {r.fromColumn === detailCell.columnKey ? (
+                                    <span className="px-1 rounded bg-primary/15 text-primary/80">本列</span>
+                                  ) : (
+                                    r.fromColumn && <span>· 由「{r.fromColumn}」检索命中</span>
+                                  )}
+                                </div>
+                                <p className="text-[11px] text-text-primary/80 whitespace-pre-wrap break-words leading-relaxed">
+                                  {r.snippet}
+                                </p>
+                              </div>
+                            ))}
+                        </div>
+                      )}
+                    </div>
+                  </>
+                );
+              })()}
             </div>
           </div>
-        </aside>
+        )}
       </div>
     </div>
   );

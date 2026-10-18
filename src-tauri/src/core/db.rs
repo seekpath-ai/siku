@@ -1201,6 +1201,19 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     )
     .execute(&db)
     .await?;
+    // Audit trail: the passages that backed each cell, kept out of
+    // ai_table_cells so the grid query stays small. Device-local derived data.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ai_table_cell_evidence (
+            paper_id TEXT NOT NULL,
+            column_key TEXT NOT NULL,
+            refs_json TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (paper_id, column_key)
+        )"
+    )
+    .execute(&db)
+    .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ai_table_presets (

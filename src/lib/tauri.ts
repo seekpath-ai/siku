@@ -2061,6 +2061,32 @@ export interface AiTableCell {
   src: string;
   /** Model-reported confidence (0 when unreported). */
   conf: number;
+  /** True when nothing solid backs this value (no evidence / no location / low
+   *  confidence / failed cross-check). Shown, never silently trusted. */
+  suspect: boolean;
+  suspectReason: string;
+  /** Cross-check verdict: '' | yes | partial | no. */
+  verifyVerdict: string;
+  verifyNote: string;
+}
+
+/** One retrieved passage behind a cell (the audit trail). */
+export interface AiTableEvidenceRef {
+  label: string;
+  page: number | null;
+  section: string;
+  /** Column whose query surfaced it ('' for a neighbouring chunk). */
+  fromColumn: string;
+  snippet: string;
+}
+
+/** Search terms stored for a column. */
+export interface AiTableColumnTerms {
+  columnKey: string;
+  terms: string[];
+  /** slot | ai | ascii | manual ('' when nothing is stored yet). */
+  source: string;
+  updatedAt: string;
 }
 
 export interface AiTableProgress {
@@ -2100,12 +2126,18 @@ export type AiTableDetail = 'brief' | 'normal' | 'rich';
  *  per_column: one call PER COLUMN (most accurate, most expensive) */
 export type AiTableDepth = 'fast' | 'standard' | 'deep' | 'per_column';
 
+/** Cross-check ("交叉验证"): re-read the passages behind a value and ask whether
+ *  they support it. off: no extra calls; doubtful: only flagged cells (default);
+ *  all: every filled cell. */
+export type AiTableVerify = 'off' | 'doubtful' | 'all';
+
 export async function aiTableExtractStart(
   paperIds: string[],
   columns: AiTableColumn[],
   providerId?: string | null,
   detail?: AiTableDetail,
   depth?: AiTableDepth,
+  verify?: AiTableVerify,
   force?: boolean
 ): Promise<void> {
   return invoke<void>('ai_table_extract_start', {
@@ -2114,6 +2146,7 @@ export async function aiTableExtractStart(
     providerId: providerId ?? null,
     detail: detail ?? null,
     depth: depth ?? null,
+    verify: verify ?? null,
     force: force ?? null,
   });
 }
@@ -2178,6 +2211,35 @@ export async function aiTableBuiltinPresets(): Promise<AiTableBuiltinPreset[]> {
 
 export async function aiTablePapersInfo(paperIds: string[]): Promise<AiTablePaperBrief[]> {
   return invoke<AiTablePaperBrief[]>('ai_table_papers_info', { paperIds });
+}
+
+/** Stored search terms for these columns (cache only — no model call). */
+export async function aiTableTermsGet(columnKeys: string[]): Promise<AiTableColumnTerms[]> {
+  return invoke<AiTableColumnTerms[]>('ai_table_terms_get', { columnKeys });
+}
+
+/** Hand-write a column's search terms; [] clears the override. */
+export async function aiTableTermsSet(
+  columnKey: string,
+  terms: string[]
+): Promise<AiTableColumnTerms[]> {
+  return invoke<AiTableColumnTerms[]>('ai_table_terms_set', { columnKey, terms });
+}
+
+/** Recompute a column's search terms now (one model call when needed). */
+export async function aiTableTermsRegenerate(
+  columnKey: string,
+  prompt: string
+): Promise<string[]> {
+  return invoke<string[]>('ai_table_terms_regenerate', { columnKey, prompt });
+}
+
+/** The passages that backed one cell. */
+export async function aiTableCellEvidence(
+  paperId: string,
+  columnKey: string
+): Promise<AiTableEvidenceRef[]> {
+  return invoke<AiTableEvidenceRef[]>('ai_table_cell_evidence', { paperId, columnKey });
 }
 
 // ============================================================

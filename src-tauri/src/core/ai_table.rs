@@ -69,6 +69,61 @@ pub struct TableCell {
     pub src: String,
     /// Model's self-reported confidence, 0 when unreported.
     pub conf: f64,
+    /// True when nothing solid backs this cell (no evidence, no location, low
+    /// confidence, or a failed cross-check). Flagged, never silently trusted.
+    pub suspect: bool,
+    /// Why it is doubtful, in the user's words. Empty when not suspect.
+    pub suspect_reason: String,
+    /// Cross-check verdict: "" | yes | partial | no (see [`Verify`]).
+    pub verify_verdict: String,
+    /// One line of the checker's reasoning.
+    pub verify_note: String,
+}
+
+/// One retrieved passage behind a value — the audit trail a user can re-read
+/// before trusting a cell.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceRef {
+    /// Same label the model saw ("p.21 §5.2").
+    pub label: String,
+    pub page: Option<i64>,
+    pub section: String,
+    /// Which column's query surfaced it ("" for a neighbour chunk).
+    pub from_column: String,
+    /// First few hundred characters of the passage.
+    pub snippet: String,
+}
+
+/// Why a filled cell is doubtful. The rule is "flag loudly, never quietly
+/// delete": a doubtful value is still shown, marked, and re-checkable.
+#[derive(Debug, Clone, Default)]
+struct Doubt {
+    suspect: bool,
+    reason: String,
+}
+
+fn doubt_of(field: &FieldValue, evidence_chars: Option<usize>) -> Doubt {
+    if field.value.trim().is_empty() {
+        return Doubt::default();
+    }
+    let mut reasons: Vec<String> = Vec::new();
+    // Unknown for cells written before provenance was recorded — no verdict
+    // rather than a false alarm.
+    if let Some(0) = evidence_chars {
+        reasons.push("没有检索到全文证据，只能依据标题/摘要判断".to_string());
+    }
+    if field.src.trim().is_empty() {
+        reasons.push("模型没有指出依据所在的原文位置".to_string());
+    }
+    match field.conf {
+        Some(c) if c <= 0.0 => {
+            reasons.push("模型自评置信度为 0 却仍填了内容（自相矛盾）".to_string())
+        }
+        Some(c) if c < 0.5 => reasons.push(format!("模型自评置信度仅 {}%", (c * 100.0).round())),
+        _ => {}
+    }
+    Doubt { suspect: !reasons.is_empty(), reason: reasons.join("；") }
 }
 
 pub fn request_cancel() {
@@ -191,15 +246,16 @@ struct FieldValue {
     value: String,
     /// Where in the paper the model says the value comes from ("p.21 §5").
     src: String,
-    /// Model's self-reported confidence (0 when it did not say).
-    conf: f64,
+    /// Model's self-reported confidence; None when it did not say (which is
+    /// itself worth knowing: the contract requires it).
+    conf: Option<f64>,
 }
 
 /// Parse one field entry: either a bare string (legacy contract) or
 /// `{"v": "...", "src": "p.21", "conf": 0.8}`.
 fn parse_field(entry: &serde_json::Value) -> FieldValue {
     if let Some(s) = entry.as_str() {
-        return FieldValue { value: s.trim().to_string(), src: String::new(), conf: 0.0 };
+        return FieldValue { value: s.trim().to_string(), src: String::new(), conf: None };
     }
     let Some(obj) = entry.as_object() else {
         return FieldValue::default();
@@ -219,8 +275,7 @@ fn parse_field(entry: &serde_json::Value) -> FieldValue {
         .to_string();
     let conf = pick(&["conf", "confidence"])
         .and_then(|v| v.as_f64())
-        .unwrap_or(0.0)
-        .clamp(0.0, 1.0);
+        .map(|c| c.clamp(0.0, 1.0));
     FieldValue { value, src, conf }
 }
 
@@ -245,10 +300,50 @@ fn cell_state(field: &FieldValue, evidence_chars: usize) -> CellState {
         return CellState::Unretrieved;
     }
     // Model said "nothing there" with reasonable confidence and it had material.
-    if field.conf >= 0.5 {
+    if field.conf.unwrap_or(0.0) >= 0.5 {
         CellState::Absent
     } else {
         CellState::Unretrieved
+    }
+}
+
+/// Optional cross-check pass ("交叉验证"). It re-reads the passages behind a cell
+/// and asks whether they actually support the claimed value. Cost is the user's
+/// decision: only doubtful cells, every filled cell, or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verify {
+    Off,
+    /// Only cells that tripped a doubt signal (default: no accuracy loss vs.
+    /// trusting them, one extra call per affected paper).
+    Doubtful,
+    /// Every filled cell.
+    All,
+}
+
+impl Verify {
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.unwrap_or("doubtful").trim() {
+            "off" | "none" => Verify::Off,
+            "all" => Verify::All,
+            _ => Verify::Doubtful,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Verify::Off => "关闭",
+            Verify::Doubtful => "仅存疑",
+            Verify::All => "全部",
+        }
+    }
+
+    /// How many cells one paper may have checked (bounds the extra cost).
+    fn cap(self) -> usize {
+        match self {
+            Verify::Off => 0,
+            Verify::Doubtful => 6,
+            Verify::All => 10,
+        }
     }
 }
 
@@ -285,6 +380,7 @@ impl Detail {
 /// Run the batch. `paper_ids` is the selected set, `columns` the column
 /// defs, `provider_id` overrides the default (starred) model when set.
 /// Spawning/cancellation is the command layer's job.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_extraction(
     app: AppHandle,
     db: SqlitePool,
@@ -293,6 +389,7 @@ pub async fn run_extraction(
     provider_id: Option<String>,
     detail: Detail,
     depth: Depth,
+    verify: Verify,
     force: bool,
 ) {
     let _guard = match RunGuard::try_acquire() {
@@ -350,6 +447,14 @@ pub async fn run_extraction(
     // definition find passages in an English paper at all.
     let pairs: Vec<(String, String)> = columns.iter().map(|c| (c.key.clone(), c.prompt.clone())).collect();
     let terms = crate::core::query_expand::prepare(&db, Some(llm.as_ref()), &pairs, true).await;
+    // How many columns run on a hand-written term set: part of the run's
+    // provenance, so "why did it miss this paper" has an answer later.
+    let keys: Vec<String> = columns.iter().map(|c| c.key.clone()).collect();
+    let manual_terms = crate::core::query_expand::terms_of(&db, &keys)
+        .await
+        .iter()
+        .filter(|t| t.source == "manual")
+        .count();
 
     let total = paper_ids.len();
     let mut done = 0usize;
@@ -366,13 +471,15 @@ pub async fn run_extraction(
             failed: 0,
             current_title: String::new(),
             log: Some(format!(
-                "口径：深度={}（{} 段/列，证据≤{} 字，{}）/ 详略={:?} / 检索词={} 列已就绪",
+                "口径：深度={}（{} 段/列，证据≤{} 字，{}）/ 详略={:?} / 复核={} / 检索词={} 列（{} 列自定义）",
                 depth.label(),
                 depth.chunks_per_column(),
                 depth.evidence_cap(),
                 if depth.per_column_calls() { "逐列调用" } else if depth.second_pass() { "含二次补判" } else { "单轮" },
                 detail,
-                terms.values().filter(|t| !t.is_empty()).count()
+                verify.label(),
+                terms.values().filter(|t| !t.is_empty()).count(),
+                manual_terms,
             )),
             reasoning: None,
             finished: None,
@@ -388,7 +495,7 @@ pub async fn run_extraction(
         emit(&app, &ExtractProgress { total, done, failed, current_title: title.clone(), log: None, reasoning: None, finished: None });
 
         let started = std::time::Instant::now();
-        let outcome = extract_paper(&app, &db, llm.as_ref(), paper_id, &columns, detail, depth, &terms, force).await;
+        let outcome = extract_paper(&app, &db, llm.as_ref(), paper_id, &columns, detail, depth, verify, &terms, force).await;
         match outcome {
             Ok(o) => {
                 done += 1;
@@ -466,6 +573,25 @@ fn emit_reasoning(app: &AppHandle, title: &str, delta: &str) {
     );
 }
 
+/// One column's extraction result, before it is persisted. Carries its own audit
+/// trail so a value can never reach the grid without its provenance.
+struct Slot {
+    column: TableColumn,
+    field: FieldValue,
+    state: CellState,
+    /// Source characters that backed it; None when unknown (legacy rows).
+    evidence_chars: Option<usize>,
+    doubt: Doubt,
+    refs: Vec<EvidenceRef>,
+    /// Cross-check result: (yes|partial|no, checker's note).
+    checked: Option<(String, String)>,
+}
+
+fn make_slot(column: TableColumn, field: FieldValue, state: CellState, ev: usize, refs: Vec<EvidenceRef>) -> Slot {
+    let doubt = doubt_of(&field, Some(ev));
+    Slot { column, field, state, evidence_chars: Some(ev), doubt, refs, checked: None }
+}
+
 /// Extract one paper under the chosen depth: single pass, per-column calls,
 /// and/or one follow-up pass for fields whose evidence was insufficient.
 #[allow(clippy::too_many_arguments)]
@@ -477,6 +603,7 @@ async fn extract_paper(
     columns: &[TableColumn],
     detail: Detail,
     depth: Depth,
+    verify: Verify,
     terms: &std::collections::HashMap<String, Vec<String>>,
     force: bool,
 ) -> Result<ExtractOutcome, String> {
@@ -487,27 +614,26 @@ async fn extract_paper(
     let title = paper_title(db, paper_id).await;
     let meta = paper_metadata(db, paper_id).await?;
 
-    // (column, value, state, evidence chars that backed it)
-    let mut results: Vec<(TableColumn, FieldValue, CellState, usize)> = Vec::new();
+    let mut results: Vec<Slot> = Vec::new();
 
     if depth.per_column_calls() {
         // One call per column: (columns × papers) calls, the most accurate mode.
         for col in &pending {
             let one = std::slice::from_ref(col);
-            let (evidence, ev_chars) = gather_evidence(db, paper_id, one, depth, terms).await;
+            let (evidence, ev_chars, refs) = gather_evidence(db, paper_id, one, depth, terms).await;
             let mut map =
                 model_call(app, db, llm, &title, &meta, &evidence, one, detail).await?;
             let field = map.remove(&col.key).unwrap_or_default();
             let state = cell_state(&field, ev_chars);
-            results.push((col.clone(), field, state, ev_chars));
+            results.push(make_slot(col.clone(), field, state, ev_chars, refs));
         }
     } else {
-        let (evidence, ev_chars) = gather_evidence(db, paper_id, &pending, depth, terms).await;
+        let (evidence, ev_chars, refs) = gather_evidence(db, paper_id, &pending, depth, terms).await;
         let mut map = model_call(app, db, llm, &title, &meta, &evidence, &pending, detail).await?;
         for col in &pending {
             let field = map.remove(&col.key).unwrap_or_default();
             let state = cell_state(&field, ev_chars);
-            results.push((col.clone(), field, state, ev_chars));
+            results.push(make_slot(col.clone(), field, state, ev_chars, refs.clone()));
         }
     }
 
@@ -517,26 +643,78 @@ async fn extract_paper(
     if depth.second_pass() {
         let retry: Vec<TableColumn> = results
             .iter()
-            .filter(|(_, _, state, _)| *state == CellState::Unretrieved)
-            .map(|(col, _, _, _)| col.clone())
+            .filter(|s| s.state == CellState::Unretrieved)
+            .map(|s| s.column.clone())
             .take(6)
             .collect();
         if !retry.is_empty() {
-            let (evidence, ev_chars) = gather_evidence(db, paper_id, &retry, depth, terms).await;
+            let (evidence, ev_chars, refs) = gather_evidence(db, paper_id, &retry, depth, terms).await;
             if ev_chars > 0 {
                 if let Ok(mut map) = model_call(app, db, llm, &title, &meta, &evidence, &retry, detail).await {
-                    for slot in results.iter_mut() {
-                        if slot.2 != CellState::Unretrieved {
+                    for s in results.iter_mut() {
+                        if s.state != CellState::Unretrieved {
                             continue;
                         }
-                        if let Some(field) = map.remove(&slot.0.key) {
+                        if let Some(field) = map.remove(&s.column.key) {
                             let state = cell_state(&field, ev_chars);
                             if state != CellState::Unretrieved {
-                                slot.1 = field;
-                                slot.2 = state;
-                                slot.3 = ev_chars;
+                                s.doubt = doubt_of(&field, Some(ev_chars));
+                                s.field = field;
+                                s.state = state;
+                                s.evidence_chars = Some(ev_chars);
+                                s.refs = refs.clone();
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // Cross-check: re-read the passages behind the chosen cells and ask whether
+    // they really support the value. Anything the checker rejects stays visible
+    // but is marked 存疑.
+    if verify != Verify::Off {
+        let candidates: Vec<usize> = results
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.state == CellState::Filled)
+            .filter(|(_, s)| verify == Verify::All || s.doubt.suspect)
+            .map(|(i, _)| i)
+            .take(verify.cap())
+            .collect();
+        if !candidates.is_empty() {
+            let cols: Vec<TableColumn> = candidates.iter().map(|i| results[*i].column.clone()).collect();
+            // (column, claimed value, model-reported location) — inert data, so
+            // the checker does not have to know the internal Slot type.
+            let items: Vec<(String, String, String)> = candidates
+                .iter()
+                .map(|i| {
+                    let s = &results[*i];
+                    (s.column.key.clone(), s.field.value.clone(), s.field.src.clone())
+                })
+                .collect();
+            let (evidence, ev_chars, _) = gather_evidence(db, paper_id, &cols, depth, terms).await;
+            if ev_chars > 0 {
+                if let Ok(checks) = verify_call(app, db, llm, &title, &evidence, &items).await {
+                    for (pos, (verdict, note)) in checks {
+                        let Some(&idx) = candidates.get(pos) else { continue };
+                        let s = &mut results[idx];
+                        if verdict == "yes" {
+                            // Confirmed against the source: the doubt is resolved.
+                            s.doubt = Doubt { suspect: false, reason: String::new() };
+                        } else {
+                            let what = if verdict == "no" { "证据不支持" } else { "证据仅部分支持" };
+                            s.doubt = Doubt {
+                                suspect: true,
+                                reason: if note.is_empty() {
+                                    format!("复核：{what}")
+                                } else {
+                                    format!("复核：{what}——{note}")
+                                },
+                            };
+                        }
+                        s.checked = Some((verdict, note));
                     }
                 }
             }
@@ -547,20 +725,46 @@ async fn extract_paper(
     let mut written = 0usize;
     let mut absent: Vec<String> = Vec::new();
     let mut unretrieved: Vec<String> = Vec::new();
-    for (col, field, state, _) in &results {
-        let status = match state {
+    let mut doubtful: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    let mut rejected = 0usize;
+    for s in &results {
+        let status = match s.state {
             CellState::Filled => "done",
             // The model read real evidence and reported the paper has no such
             // content: a final answer, not a retry candidate.
             CellState::Absent => "absent",
             CellState::Unretrieved => "empty",
         };
-        match state {
+        match s.state {
             CellState::Filled => written += 1,
-            CellState::Absent => absent.push(col.key.clone()),
-            CellState::Unretrieved => unretrieved.push(col.key.clone()),
+            CellState::Absent => absent.push(s.column.key.clone()),
+            CellState::Unretrieved => unretrieved.push(s.column.key.clone()),
         }
-        upsert_cell(db, paper_id, &col.key, &field.value, status, false, field, &now).await?;
+        if s.doubt.suspect {
+            doubtful.push(s.column.key.clone());
+        }
+        if let Some((verdict, _)) = &s.checked {
+            checked += 1;
+            if verdict != "yes" {
+                rejected += 1;
+            }
+        }
+        write_slot(db, paper_id, s, status, false, &now).await?;
+    }
+
+    let mut details: Vec<String> = Vec::new();
+    if !absent.is_empty() {
+        details.push(format!("文中无此内容：{}", absent.join("、")));
+    }
+    if !unretrieved.is_empty() {
+        details.push(format!("证据不足：{}", unretrieved.join("、")));
+    }
+    if checked > 0 {
+        details.push(format!("复核 {checked} 格，{rejected} 格未通过"));
+    }
+    if !doubtful.is_empty() {
+        details.push(format!("存疑 {} 格：{}", doubtful.len(), doubtful.join("、")));
     }
 
     let empty_note = if written == 0 {
@@ -568,25 +772,15 @@ async fn extract_paper(
         let mut line = format!(
             "⚠ 《{title}》没抽到内容：来源=摘要 {abstract_len} 字 / 全文索引 {chunks} 段"
         );
-        if !absent.is_empty() {
-            line.push_str(&format!("；模型确认文中没有：{}", absent.join("、")));
-        }
-        if !unretrieved.is_empty() {
-            line.push_str(&format!("；证据不足（可换「深入/逐列精查」重试）：{}", unretrieved.join("、")));
+        for d in &details {
+            line.push_str(&format!("；{d}"));
         }
         if chunks == 0 && abstract_len < 100 {
             line.push_str("。⚠ 该文献没有全文索引且摘要过短——请先「重建索引」或补全摘要");
         }
         Some(line)
-    } else if !absent.is_empty() || !unretrieved.is_empty() {
-        let mut line = format!("✓ 《{title}》抽取完成");
-        if !absent.is_empty() {
-            line.push_str(&format!("；文中无此内容：{}", absent.join("、")));
-        }
-        if !unretrieved.is_empty() {
-            line.push_str(&format!("；证据不足：{}", unretrieved.join("、")));
-        }
-        Some(line)
+    } else if !details.is_empty() {
+        Some(format!("✓ 《{title}》抽取完成；{}", details.join("；")))
     } else {
         None
     };
@@ -668,6 +862,151 @@ async fn model_call(
     Ok(out)
 }
 
+/// One checker call for a paper: are these values really supported by the
+/// passages? Returns (index into `items`, (verdict, note)). A checker failure
+/// must never lose the extraction, so callers treat an error as "not checked".
+async fn verify_call(
+    app: &AppHandle,
+    db: &SqlitePool,
+    llm: &dyn crate::ai::llm::LlmClient,
+    title: &str,
+    evidence: &str,
+    items: &[(String, String, String)],
+) -> Result<Vec<(usize, (String, String))>, String> {
+    let wanted = items
+        .iter()
+        .map(|(k, v, src)| {
+            if src.is_empty() {
+                format!("- {k}：{v}")
+            } else {
+                format!("- {k}：{v}（模型标注位置 {src}）")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let system = crate::core::task_prompts::effective(db, crate::core::task_prompts::AI_TABLE_VERIFY).await;
+    let user = format!("【文献】{title}\n\n【相关段落】\n{evidence}\n\n【待核对字段】\n{wanted}");
+
+    let messages = vec![
+        ChatMessage { reasoning_content: None, role: "system".into(), content: system, attachments: None, tool_calls: None, tool_call_id: None, name: None },
+        ChatMessage { reasoning_content: None, role: "user".into(), content: user, attachments: None, tool_calls: None, tool_call_id: None, name: None },
+    ];
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ai::llm::StreamEvent>();
+    let app2 = app.clone();
+    let title2 = title.to_string();
+    let drain = tokio::spawn(async move {
+        let mut text = String::new();
+        while let Some(ev) = rx.recv().await {
+            match ev.event_type.as_str() {
+                "delta" => {
+                    if let Some(c) = ev.content {
+                        text.push_str(&c);
+                    }
+                }
+                "reasoning" => {
+                    if let Some(c) = ev.content {
+                        emit_reasoning(&app2, &title2, &c);
+                    }
+                }
+                _ => {}
+            }
+        }
+        text
+    });
+    let call = tokio::select! {
+        r = llm.chat_completion_stream(&messages, &[], tx) => r,
+        _ = cancelled_now() => Err("已取消".to_string()),
+    };
+    let text = drain.await.map_err(|e| format!("stream drain: {e}"))?;
+    call?;
+
+    let mut out: Vec<(usize, (String, String))> = Vec::new();
+    for (key, verdict, note) in parse_checks(&text) {
+        let target = norm_key(&key);
+        let pos = items.iter().position(|(k, _, _)| norm_key(k) == target);
+        if let Some(pos) = pos {
+            if out.iter().any(|(p, _)| *p == pos) {
+                continue;
+            }
+            out.push((pos, (verdict, note)));
+        }
+    }
+    Ok(out)
+}
+
+/// Read the checker's JSON: `{"checks":[{"k":"字段","s":"yes|partial|no","n":"理由"}]}`.
+/// Tolerates fenced output, Chinese keys and a bare array.
+fn parse_checks(content: &str) -> Vec<(String, String, String)> {
+    let trimmed = content.trim();
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|s| s.strip_suffix("```"))
+        .unwrap_or(trimmed)
+        .trim();
+
+    let entry = |v: &serde_json::Value| -> Option<(String, String, String)> {
+        let obj = v.as_object()?;
+        let get = |keys: &[&str]| -> String {
+            keys.iter()
+                .find_map(|k| obj.get(*k))
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let key = get(&["k", "key", "column", "字段", "字段名", "列"]);
+        let support = get(&["s", "support", "verdict", "结论", "支持"]);
+        let note = get(&["n", "note", "reason", "理由", "说明"]);
+        let verdict = verdict_of(&support)?;
+        if key.is_empty() {
+            return None;
+        }
+        Some((key, verdict, note))
+    };
+
+    // Object form with a `checks` / `核对` array.
+    if let (Some(s), Some(e)) = (unfenced.find('{'), unfenced.rfind('}')) {
+        if e > s {
+            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&unfenced[s..=e]) {
+                for name in ["checks", "核对", "核对结果", "results"] {
+                    if let Some(serde_json::Value::Array(list)) = map.get(name) {
+                        return list.iter().filter_map(entry).collect();
+                    }
+                }
+            }
+        }
+    }
+    // Bare array form.
+    if let (Some(s), Some(e)) = (unfenced.find('['), unfenced.rfind(']')) {
+        if e > s {
+            if let Ok(serde_json::Value::Array(list)) = serde_json::from_str(&unfenced[s..=e]) {
+                return list.iter().filter_map(entry).collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Normalise a checker verdict, accepting both the contract keywords and the
+/// Chinese words a model may answer with anyway.
+fn verdict_of(raw: &str) -> Option<String> {
+    let s = raw.trim().to_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    if s.starts_with("no") || s.starts_with("不支持") || s.starts_with('否') || s.starts_with("错误") {
+        return Some("no".to_string());
+    }
+    if s.starts_with("partial") || s.starts_with("部分") || s.starts_with("不完整") {
+        return Some("partial".to_string());
+    }
+    if s.starts_with("yes") || s.starts_with("支持") || s.starts_with('是') || s.starts_with("ok") || s.starts_with("正确") {
+        return Some("yes".to_string());
+    }
+    None
+}
+
 async fn pending_columns(
     db: &SqlitePool,
     paper_id: &str,
@@ -689,6 +1028,10 @@ async fn pending_columns(
                 // A manual edit is the user's final word — even a forced rerun
                 // leaves it alone.
             }
+            // "The model read the evidence and the paper has no such content" is
+            // an answer, not a gap: re-asking it on every 补齐 run burned a call
+            // per cell for the same result. 重抽全部 (force) still re-judges it.
+            Some((status, _, _)) if status == "absent" && !force => {}
             // A model that found nothing left the cell empty: that is "待补",
             // not "done". `status = 'empty'` is the modern marker; a
             // done-with-empty-value row is the legacy shape of the same thing.
@@ -731,18 +1074,18 @@ async fn paper_metadata(db: &SqlitePool, paper_id: &str) -> Result<String, Strin
 /// empty evidence block (metadata+abstract still go to the model).
 /// Build the evidence block for one call: per-column bilingual retrieval, then
 /// section-aware ordering so a single long section cannot consume the whole
-/// budget. Returns (block, characters used) — 0 characters means the model is
-/// being asked to answer without any source text, which the caller reports as
-/// "unretrieved" rather than "the paper says nothing".
+/// budget. Returns (block, characters used, passages) — 0 characters means the
+/// model is being asked to answer without any source text, which the caller
+/// reports as "unretrieved" rather than "the paper says nothing".
 async fn gather_evidence(
     db: &SqlitePool,
     paper_id: &str,
     columns: &[TableColumn],
     depth: Depth,
     terms: &std::collections::HashMap<String, Vec<String>>,
-) -> (String, usize) {
+) -> (String, usize, Vec<EvidenceRef>) {
     let ids = [paper_id.to_string()];
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = std::collections::HashMap::new();
     let mut picked: Vec<retriever::SearchResult> = Vec::new();
 
     for col in columns {
@@ -761,14 +1104,17 @@ async fn gather_evidence(
         .await
         .unwrap_or_default();
         for hit in hits {
-            if seen.insert(hit.chunk_id.clone()) {
+            // Remember which column pulled each chunk: that is what makes an
+            // "why is this cell wrong" question answerable.
+            seen.entry(hit.chunk_id.clone()).or_insert_with(|| col.key.clone());
+            if !picked.iter().any(|p| p.chunk_id == hit.chunk_id) {
                 picked.push(hit);
             }
         }
     }
 
     if picked.is_empty() {
-        return ("（该文献没有全文索引，或检索未命中任何段落）".to_string(), 0);
+        return ("（该文献没有全文索引，或检索未命中任何段落）".to_string(), 0, Vec::new());
     }
 
     // Neighbours carry the sentence before/after a hit — cheap continuity.
@@ -777,6 +1123,7 @@ async fn gather_evidence(
 
     let mut used = 0usize;
     let mut blocks: Vec<String> = Vec::new();
+    let mut refs: Vec<EvidenceRef> = Vec::new();
     for hit in ordered {
         let remaining = depth.evidence_cap().saturating_sub(used);
         if remaining == 0 {
@@ -791,13 +1138,20 @@ async fn gather_evidence(
             .or(hit.section.clone())
             .unwrap_or_default();
         let label = if section.is_empty() {
-            page
+            page.clone()
         } else {
             format!("{page} §{section}")
         };
+        refs.push(EvidenceRef {
+            label: label.clone(),
+            page: hit.page_start.map(|p| p as i64),
+            section: section.clone(),
+            from_column: seen.get(&hit.chunk_id).cloned().unwrap_or_default(),
+            snippet: content.chars().take(400).collect(),
+        });
         blocks.push(format!("[{label}]\n{content}"));
     }
-    (blocks.join("\n\n"), used)
+    (blocks.join("\n\n"), used, refs)
 }
 
 /// Round-robin across sections: hit i of each section before hit i+1 of any, so
@@ -900,17 +1254,53 @@ fn parse_values(content: &str) -> Result<serde_json::Map<String, serde_json::Val
     }
 }
 
-async fn upsert_cell(
+/// Persist one extraction result: the cell, its provenance, and the passages
+/// that backed it. A value that reaches the grid always has both.
+async fn write_slot(
+    db: &SqlitePool,
+    paper_id: &str,
+    slot: &Slot,
+    status: &str,
+    edited: bool,
+    now: &str,
+) -> Result<(), String> {
+    let meta = serde_json::json!({
+        "src": slot.field.src,
+        "conf": slot.field.conf,
+        "ev": slot.evidence_chars,
+        "suspect": slot.doubt.suspect,
+        "suspectReason": slot.doubt.reason,
+        "verify": match &slot.checked {
+            Some((v, n)) => serde_json::json!({ "v": v, "n": n }),
+            None => serde_json::Value::Null,
+        },
+    })
+    .to_string();
+    write_cell(
+        db,
+        paper_id,
+        &slot.column.key,
+        &slot.field.value,
+        status,
+        edited,
+        &meta,
+        now,
+    )
+    .await?;
+    write_evidence(db, paper_id, &slot.column.key, &slot.refs).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_cell(
     db: &SqlitePool,
     paper_id: &str,
     column_key: &str,
     value: &str,
     status: &str,
     edited: bool,
-    field: &FieldValue,
+    meta_json: &str,
     now: &str,
 ) -> Result<(), String> {
-    let meta = serde_json::json!({ "src": field.src, "conf": field.conf }).to_string();
     sqlx::query(
         "INSERT INTO ai_table_cells (paper_id, column_key, value, status, edited, meta_json, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -923,13 +1313,66 @@ async fn upsert_cell(
     .bind(value)
     .bind(status)
     .bind(if edited { 1 } else { 0 })
-    .bind(&meta)
+    .bind(meta_json)
     .bind(now)
     .bind(now)
     .execute(db)
     .await
     .map_err(|e| format!("db: {e}"))?;
     Ok(())
+}
+
+/// Store (or clear) the passages behind one cell. Empty `refs` removes the row:
+/// a manually edited value must not keep pointing at the AI's old evidence.
+async fn write_evidence(
+    db: &SqlitePool,
+    paper_id: &str,
+    column_key: &str,
+    refs: &[EvidenceRef],
+) -> Result<(), String> {
+    if refs.is_empty() {
+        let _ = sqlx::query("DELETE FROM ai_table_cell_evidence WHERE paper_id = ? AND column_key = ?")
+            .bind(paper_id)
+            .bind(column_key)
+            .execute(db)
+            .await;
+        return Ok(());
+    }
+    let json = serde_json::to_string(refs).unwrap_or_else(|_| "[]".to_string());
+    // Best-effort: losing the audit trail must not lose the extraction itself.
+    let _ = sqlx::query(
+        "INSERT INTO ai_table_cell_evidence (paper_id, column_key, refs_json, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (paper_id, column_key) DO UPDATE SET
+           refs_json = excluded.refs_json, updated_at = excluded.updated_at",
+    )
+    .bind(paper_id)
+    .bind(column_key)
+    .bind(&json)
+    .bind(crate::core::time::now_iso())
+    .execute(db)
+    .await;
+    Ok(())
+}
+
+/// The passages behind one cell, for the evidence panel.
+pub async fn cell_evidence(
+    db: &SqlitePool,
+    paper_id: &str,
+    column_key: &str,
+) -> Result<Vec<EvidenceRef>, String> {
+    let json: Option<String> = sqlx::query_scalar(
+        "SELECT refs_json FROM ai_table_cell_evidence WHERE paper_id = ? AND column_key = ?",
+    )
+    .bind(paper_id)
+    .bind(column_key)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("db: {e}"))?
+    .flatten();
+    Ok(json
+        .and_then(|j| serde_json::from_str::<Vec<EvidenceRef>>(&j).ok())
+        .unwrap_or_default())
 }
 
 async fn mark_failed(db: &SqlitePool, paper_id: &str, columns: &[TableColumn]) -> Result<(), String> {
@@ -991,12 +1434,31 @@ pub async fn list_cells(
                     .unwrap_or("")
                     .to_string(),
                 conf: meta.get("conf").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                suspect: meta.get("suspect").and_then(|v| v.as_bool()).unwrap_or(false),
+                suspect_reason: meta
+                    .get("suspectReason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                verify_verdict: meta
+                    .get("verify")
+                    .and_then(|v| v.get("v"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                verify_note: meta
+                    .get("verify")
+                    .and_then(|v| v.get("n"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             }
         })
         .collect())
 }
 
-/// Manual cell edit: marks the cell `edited` so later extraction runs keep it.
+/// Manual cell edit: marks the cell `edited` so later extraction runs keep it,
+/// and drops the old evidence trail (the value is now the user's, not the AI's).
 pub async fn set_cell(
     db: &SqlitePool,
     paper_id: &str,
@@ -1004,8 +1466,18 @@ pub async fn set_cell(
     value: &str,
 ) -> Result<(), String> {
     let now = crate::core::time::now_iso();
-    let field = FieldValue { value: value.to_string(), src: String::new(), conf: 1.0 };
-    upsert_cell(db, paper_id, column_key, value, "edited", true, &field, &now).await
+    let meta = serde_json::json!({
+        "src": "",
+        "conf": 1.0,
+        "ev": null,
+        "suspect": false,
+        "suspectReason": "",
+        "verify": serde_json::Value::Null,
+        "manual": true,
+    })
+    .to_string();
+    write_cell(db, paper_id, column_key, value, "edited", true, &meta, &now).await?;
+    write_evidence(db, paper_id, column_key, &[]).await
 }
 
 #[cfg(test)]
@@ -1044,7 +1516,7 @@ mod tests {
         let field = parse_field(lookup_entry(obj.as_object().unwrap(), "主要发现").unwrap());
         assert_eq!(field.value, "提升 12%");
         assert_eq!(field.src, "p.9");
-        assert!((field.conf - 0.8).abs() < 1e-6);
+        assert!((field.conf.unwrap_or(0.0) - 0.8).abs() < 1e-6);
         // Genuinely absent stays absent (never a silent blank cell).
         assert!(lookup_entry(map, "主要结果").is_none());
     }
@@ -1070,13 +1542,13 @@ mod tests {
         // No source text reached the model → OUR problem, retryable.
         assert_eq!(cell_state(&blank, 0), CellState::Unretrieved);
         // Evidence was there and the model says the paper has no such content.
-        let confident = FieldValue { conf: 0.9, ..Default::default() };
+        let confident = FieldValue { conf: Some(0.9), ..Default::default() };
         assert_eq!(cell_state(&confident, 5000), CellState::Absent);
         // Evidence was there but the model could not decide.
-        let unsure = FieldValue { conf: 0.0, ..Default::default() };
+        let unsure = FieldValue { conf: Some(0.0), ..Default::default() };
         assert_eq!(cell_state(&unsure, 5000), CellState::Unretrieved);
         // Anything non-empty is filled regardless of confidence.
-        let filled = FieldValue { value: "120 名开发者".into(), conf: 0.1, ..Default::default() };
+        let filled = FieldValue { value: "120 名开发者".into(), conf: Some(0.1), ..Default::default() };
         assert_eq!(cell_state(&filled, 0), CellState::Filled);
     }
 
@@ -1125,5 +1597,143 @@ mod tests {
     fn parse_values_rejects_non_object() {
         assert!(parse_values("[1,2,3]").is_err());
         assert!(parse_values("没有 JSON").is_err());
+    }
+
+    #[test]
+    fn doubt_flags_cells_the_model_could_not_stand_behind() {
+        // Well-backed: has a location, real confidence, real evidence.
+        let ok = FieldValue {
+            value: "120 名开发者".into(),
+            src: "p.7 §4.1".into(),
+            conf: Some(0.9),
+        };
+        assert!(!doubt_of(&ok, Some(9000)).suspect);
+
+        // Answered without any retrieved passage (abstract only).
+        let no_evidence = doubt_of(&ok, Some(0)).reason;
+        assert!(no_evidence.contains("没有检索到全文证据"), "{no_evidence}");
+
+        // No source location given.
+        let no_src = FieldValue { src: String::new(), ..ok.clone() };
+        assert!(doubt_of(&no_src, Some(9000)).suspect);
+
+        // Low self-reported confidence.
+        let low = FieldValue { conf: Some(0.3), ..ok.clone() };
+        assert!(doubt_of(&low, Some(9000)).reason.contains("30%"));
+
+        // Contract violation: "conf 0" means 证据不足, yet a value was produced.
+        let contradictory = FieldValue { conf: Some(0.0), ..ok.clone() };
+        assert!(doubt_of(&contradictory, Some(9000)).reason.contains("自相矛盾"));
+
+        // Legacy row: no provenance recorded at all → do not invent a verdict
+        // from the missing confidence, only from the missing location.
+        let legacy = FieldValue { value: "旧数据".into(), src: String::new(), conf: None };
+        let d = doubt_of(&legacy, None);
+        assert!(d.suspect);
+        assert!(!d.reason.contains("置信度"), "{}", d.reason);
+
+        // Empty cells are the other statuses' business, not "存疑".
+        assert!(!doubt_of(&FieldValue::default(), Some(0)).suspect);
+    }
+
+    #[test]
+    fn verify_parsing_defaults_to_only_doubtful_cells() {
+        assert_eq!(Verify::parse(None), Verify::Doubtful);
+        assert_eq!(Verify::parse(Some("off")), Verify::Off);
+        assert_eq!(Verify::parse(Some("all")), Verify::All);
+        assert_eq!(Verify::parse(Some("nonsense")), Verify::Doubtful);
+        // Off may not spend a single extra call.
+        assert_eq!(Verify::Off.cap(), 0);
+        assert!(Verify::Doubtful.cap() > 0);
+        assert!(Verify::All.cap() >= Verify::Doubtful.cap());
+    }
+
+    #[test]
+    fn parse_checks_reads_the_contract_and_tolerates_chinese_keys() {
+        let json = "```json\n{\"checks\":[\
+            {\"k\":\"样本量\",\"s\":\"yes\",\"n\":\"p.7 明确写了 120 人\"},\
+            {\"k\":\"研究方法\",\"s\":\"no\",\"n\":\"段落写的是访谈，不是 RCT\"},\
+            {\"k\":\"威胁\",\"s\":\"partial\",\"n\":\"证据不足\"}]}\n```";
+        let checks = parse_checks(json);
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[0].0, "样本量");
+        assert_eq!(checks[0].1, "yes");
+        assert_eq!(checks[1].1, "no");
+        assert_eq!(checks[2].1, "partial");
+
+        // Chinese verdict words and key names still land.
+        let chinese = "{\"核对\":[{\"字段\":\"样本量\",\"支持\":\"不支持\",\"理由\":\"没有\"}]}";
+        let checks = parse_checks(chinese);
+        assert_eq!(checks[0], ("样本量".into(), "no".into(), "没有".into()));
+        // Prose around the JSON is tolerated; garbage yields nothing.
+        assert!(parse_checks("没有 JSON").is_empty());
+        assert_eq!(verdict_of("支持"), Some("yes".to_string()));
+        assert_eq!(verdict_of("部分支持"), Some("partial".to_string()));
+        assert_eq!(verdict_of("否"), Some("no".to_string()));
+    }
+
+    async fn cell_db() -> SqlitePool {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        sqlx::raw_sql(
+            "CREATE TABLE ai_table_cells (
+                paper_id TEXT NOT NULL,
+                column_key TEXT NOT NULL,
+                value TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'done',
+                edited INTEGER NOT NULL DEFAULT 0,
+                meta_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (paper_id, column_key)
+            );",
+        )
+        .execute(&pool)
+        .await
+        .expect("schema");
+        pool
+    }
+
+    #[tokio::test]
+    async fn pending_columns_spends_calls_only_where_an_answer_is_missing() {
+        let db = cell_db().await;
+        for (key, value, status, edited) in [
+            ("filled", "120 人", "done", 0),
+            ("待补的", "", "empty", 0),
+            ("文中没有的", "", "absent", 0),
+            ("人工改的", "我写的内容", "edited", 1),
+            ("失败的", "", "failed", 0),
+        ] {
+            sqlx::query(
+                "INSERT INTO ai_table_cells (paper_id, column_key, value, status, edited, created_at, updated_at)
+                 VALUES ('p1', ?, ?, ?, ?, 't', 't')",
+            )
+            .bind(key)
+            .bind(value)
+            .bind(status)
+            .bind(edited)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        let wanted: Vec<TableColumn> = ["filled", "待补的", "文中没有的", "人工改的", "失败的", "还没有的"]
+            .iter()
+            .map(|k| TableColumn { key: (*k).to_string(), prompt: String::new() })
+            .collect();
+
+        let normal = pending_columns(&db, "p1", &wanted, false).await.unwrap();
+        let keys: Vec<&str> = normal.iter().map(|c| c.key.as_str()).collect();
+        // Already answered, hand-written and "the paper has no such content"
+        // are NOT re-asked: only genuinely missing cells cost a call.
+        assert_eq!(keys, vec!["待补的", "失败的", "还没有的"]);
+
+        // 重抽全部 re-judges everything except hand-written cells.
+        let forced = pending_columns(&db, "p1", &wanted, true).await.unwrap();
+        let forced_keys: Vec<&str> = forced.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(forced_keys, vec!["filled", "待补的", "文中没有的", "失败的", "还没有的"]);
     }
 }

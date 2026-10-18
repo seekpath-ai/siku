@@ -18,12 +18,10 @@ pub struct TablePreset {
 
 /// Start a batch extraction run (spawned; progress on
 /// `library:ai-table-progress`). One run at a time. `provider_id` overrides
-/// the default (starred) model when set.
-/// Start a batch extraction run (spawned; progress on
-/// `library:ai-table-progress`). One run at a time. `provider_id` overrides
 /// the default (starred) model when set; `detail` scales how verbose each cell
-/// is (brief | normal | rich); `force` re-extracts cells that already have a
-/// value (manual edits are still kept).
+/// is (brief | normal | rich); `depth` how hard it looks for evidence; `verify`
+/// whether doubtful cells get cross-checked (off | doubtful | all); `force`
+/// re-extracts cells that already have a value (manual edits are still kept).
 #[tauri::command]
 pub async fn ai_table_extract_start(
     app: AppHandle,
@@ -33,6 +31,7 @@ pub async fn ai_table_extract_start(
     provider_id: Option<String>,
     detail: Option<String>,
     depth: Option<String>,
+    verify: Option<String>,
     force: Option<bool>,
 ) -> Result<(), String> {
     if paper_ids.is_empty() {
@@ -44,11 +43,68 @@ pub async fn ai_table_extract_start(
     let db = state.db.clone();
     let detail = crate::core::ai_table::Detail::parse(detail.as_deref());
     let depth = crate::core::ai_table::Depth::parse(depth.as_deref());
+    let verify = crate::core::ai_table::Verify::parse(verify.as_deref());
     let force = force.unwrap_or(false);
     tauri::async_runtime::spawn(async move {
-        ai_table::run_extraction(app, db, paper_ids, columns, provider_id, detail, depth, force).await;
+        ai_table::run_extraction(app, db, paper_ids, columns, provider_id, detail, depth, verify, force)
+            .await;
     });
     Ok(())
+}
+
+/// Search terms currently stored for these columns (cache only — never calls the
+/// model), so the column editor can show and override them.
+#[tauri::command]
+pub async fn ai_table_terms_get(
+    state: State<'_, AppState>,
+    column_keys: Vec<String>,
+) -> Result<Vec<crate::core::query_expand::ColumnTerms>, String> {
+    Ok(crate::core::query_expand::terms_of(&state.db, &column_keys).await)
+}
+
+/// Hand-write a column's search terms; an empty list clears the override and
+/// returns the column to automatic behaviour.
+#[tauri::command]
+pub async fn ai_table_terms_set(
+    state: State<'_, AppState>,
+    column_key: String,
+    terms: Vec<String>,
+) -> Result<Vec<crate::core::query_expand::ColumnTerms>, String> {
+    crate::core::query_expand::set_terms(&state.db, &column_key, &terms).await?;
+    Ok(crate::core::query_expand::terms_of(&state.db, &[column_key]).await)
+}
+
+/// Recompute a column's search terms now (one model call when the built-in
+/// mapping has nothing for it).
+#[tauri::command]
+pub async fn ai_table_terms_regenerate(
+    state: State<'_, AppState>,
+    column_key: String,
+    prompt: Option<String>,
+) -> Result<Vec<String>, String> {
+    let llm = crate::core::llm_provider_service::load_llm_config_for(&state.db, None)
+        .await
+        .ok()
+        .and_then(|cfg| crate::ai::llm::client::create_llm_client(&cfg).ok());
+    let prompt = prompt.unwrap_or_default();
+    let terms = crate::core::query_expand::regenerate(
+        &state.db,
+        llm.as_ref().map(|c| c.as_ref() as &dyn crate::ai::llm::LlmClient),
+        &column_key,
+        &prompt,
+    )
+    .await?;
+    Ok(terms)
+}
+
+/// The passages that backed one cell — the audit trail behind a value.
+#[tauri::command]
+pub async fn ai_table_cell_evidence(
+    state: State<'_, AppState>,
+    paper_id: String,
+    column_key: String,
+) -> Result<Vec<crate::core::ai_table::EvidenceRef>, String> {
+    ai_table::cell_evidence(&state.db, &paper_id, &column_key).await
 }
 
 /// Built-in column presets (read-only starting points, see

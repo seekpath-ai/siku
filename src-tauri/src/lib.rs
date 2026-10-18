@@ -775,6 +775,10 @@ pub fn run() {
             commands::ai_table::ai_table_preset_save,
             commands::ai_table::ai_table_preset_delete,
             commands::ai_table::ai_table_papers_info,
+            commands::ai_table::ai_table_terms_get,
+            commands::ai_table::ai_table_terms_set,
+            commands::ai_table::ai_table_terms_regenerate,
+            commands::ai_table::ai_table_cell_evidence,
             // AI 文献分类
             commands::ai_classify::ai_classify_start,
             commands::ai_classify::ai_classify_cancel,

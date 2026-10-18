@@ -23,6 +23,7 @@ use sqlx::SqlitePool;
 pub const REVIEW_OUTLINE: &str = "review.outline";
 pub const REVIEW_SECTION: &str = "review.section";
 pub const AI_TABLE_EXTRACT: &str = "ai_table.extract";
+pub const AI_TABLE_VERIFY: &str = "ai_table.verify";
 pub const CLASSIFY_DRAFT: &str = "classify.draft";
 pub const CLASSIFY_MERGE: &str = "classify.merge";
 pub const CLASSIFY_HIERARCHIZE: &str = "classify.hierarchize";
@@ -177,6 +178,18 @@ v 的详略：{detail_rule}；若某个字段的抽取说明另有长度或详�
         placeholders: &[
             Placeholder { name: "detail_rule", description: "「详细程度」下拉对应的长度规则（简洁 / 标准 / 详细）" },
         ],
+        affects_parsing: true,
+    },
+    TaskPrompt {
+        id: AI_TABLE_VERIFY,
+        group: "AI 表格列",
+        name: "结果复核",
+        description: "交叉验证：每篇一次，核对已抽取值是否真被段落支持",
+        default: "你是学术文献核对员。给定文献段落与若干「字段：取值」，逐条判断这些取值是否被段落支持。\n\
+只输出一个 JSON 对象：{\"checks\": [{\"k\": \"字段名\", \"s\": \"yes|partial|no\", \"n\": \"不超过 40 字的理由；若为 no/partial 请写出段落里实际是什么\"}]}。\n\
+yes = 段落明确支持该取值；partial = 只支持一部分，或数字、范围、条件有出入；no = 段落不支持或与之矛盾。\n\
+段落不足以判断时用 partial，并在 n 里写「证据不足」。只依据给定段落判断，不得补充段落以外的知识，不要输出 JSON 以外的任何内容。",
+        placeholders: &[],
         affects_parsing: true,
     },
     TaskPrompt {

@@ -155,9 +155,17 @@ export async function paperImportBibtex(paperId: string, bibtex: string): Promis
   return invoke<Paper>('paper_import_bibtex', { paperId, bibtex });
 }
 
-/** Rebuild a paper's text index (extract → chunk → embed). Returns chunk count. */
-export async function paperReprocessIndex(id: string): Promise<number> {
-  return invoke<number>('paper_reprocess_index', { id });
+/** What a rebuild produced. `croppableFigures` are the ones whose caption has a
+ *  bbox, i.e. the ones a `paper_snapshot(label=…)` can crop precisely. */
+export interface PaperReprocessResult {
+  chunks: number;
+  figures: number;
+  croppableFigures: number;
+}
+
+/** Rebuild a paper's text AND figure index (extract → chunk → figures → embed). */
+export async function paperReprocessIndex(id: string): Promise<PaperReprocessResult> {
+  return invoke<PaperReprocessResult>('paper_reprocess_index', { id });
 }
 
 /** Enrich a paper's bibliographic metadata from CrossRef (DOI/title). */

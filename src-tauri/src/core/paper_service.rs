@@ -358,7 +358,11 @@ async fn insert_figures_tx(
 /// Re-extract figure/table metadata for a paper and swap the rows in
 /// atomically. Best-effort at the call sites: a failure only means the
 /// paper_snapshot label lookup degrades for this paper.
-async fn replace_paper_figures(db: &SqlitePool, paper_id: &str, pdf_path: &Path) -> Result<usize> {
+pub(crate) async fn replace_paper_figures(
+    db: &SqlitePool,
+    paper_id: &str,
+    pdf_path: &Path,
+) -> Result<usize> {
     let figures = pdf::figures::extract_figures(pdf_path)?;
     let now = now_iso();
     let mut tx = db.begin().await?;
@@ -369,6 +373,85 @@ async fn replace_paper_figures(db: &SqlitePool, paper_id: &str, pdf_path: &Path)
     insert_figures_tx(&mut tx, paper_id, &figures, &now).await?;
     tx.commit().await?;
     Ok(figures.len())
+}
+
+/// Build one paper's figure index on demand and remember that it was attempted.
+///
+/// Two situations used to be indistinguishable: "the index was never built"
+/// (papers imported before figure metadata existed are never backfilled) and
+/// "this paper really has no figure captions". The scan row records the second,
+/// so a caption-less paper is not re-parsed on every launch, while a paper with
+/// a missing index gets fixed the first time something asks for it.
+pub(crate) async fn index_figures(
+    db: &SqlitePool,
+    paper_id: &str,
+    pdf_path: &Path,
+) -> Result<usize> {
+    let count = replace_paper_figures(db, paper_id, pdf_path).await?;
+    let _ = sqlx::query(
+        "INSERT INTO paper_figure_scans (paper_id, figures, scanned_at) VALUES (?, ?, ?)
+         ON CONFLICT (paper_id) DO UPDATE SET figures = excluded.figures,
+           scanned_at = excluded.scanned_at",
+    )
+    .bind(paper_id)
+    .bind(count as i64)
+    .bind(now_iso())
+    .execute(db)
+    .await;
+    Ok(count)
+}
+
+/// Build the figure index for papers that never got one.
+///
+/// The figure index shipped after most of a long-lived library was imported, and
+/// nothing ever went back for those papers: every `paper_snapshot(label=…)` on
+/// them answered "no figure found" and fell back to a coarse page crop. This
+/// walks the backlog in bounded batches (one launch picks up where the last one
+/// stopped, because a finished paper leaves rows behind or a scan marker) so the
+/// first launch after an upgrade repairs the library without blocking the UI.
+pub async fn backfill_figure_index(
+    db: &SqlitePool,
+    app_data_dir: &Path,
+    limit: usize,
+) -> Result<usize> {
+    let pending: Vec<(String, String)> = sqlx::query_as(
+        "SELECT p.id, p.file_path FROM papers p
+         WHERE p.deleted_at IS NULL
+           AND p.file_path IS NOT NULL AND p.file_path <> ''
+           AND EXISTS (SELECT 1 FROM chunks c WHERE c.paper_id = p.id)
+           AND NOT EXISTS (SELECT 1 FROM paper_figures f WHERE f.paper_id = p.id)
+           AND NOT EXISTS (SELECT 1 FROM paper_figure_scans s WHERE s.paper_id = p.id)
+         ORDER BY p.created_at
+         LIMIT ?",
+    )
+    .bind(limit as i64)
+    .fetch_all(db)
+    .await?;
+
+    let mut done = 0usize;
+    let total = pending.len();
+    for (paper_id, rel_path) in pending {
+        let path = file_store::resolve_blob_path(app_data_dir, &rel_path);
+        if !path.exists() {
+            continue;
+        }
+        match index_figures(db, &paper_id, &path).await {
+            Ok(n) => {
+                done += 1;
+                if n > 0 {
+                    info!(paper_id = %paper_id, figures = n, "figure backfill indexed");
+                }
+            }
+            Err(e) => warn!(paper_id = %paper_id, error = %e, "figure backfill failed"),
+        }
+        // Yield between papers: pdfium work is serialized process-wide, so a
+        // tight loop would stall the reader's rendering.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    if total > 0 {
+        info!(done, total, "figure backfill batch finished");
+    }
+    Ok(done)
 }
 
 /// Kick off embedding generation in the background. The embedder picks up
@@ -411,17 +494,29 @@ pub async fn insert_chunks_for_paper(
     Ok(chunks.len())
 }
 
+/// What a rebuild produced. A text-only report hid the fact that the figure
+/// index was empty — the user saw "索引已重建" while `paper_snapshot(label=…)`
+/// kept saying "no figure found".
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReprocessSummary {
+    pub chunks: usize,
+    pub figures: usize,
+    /// Figures whose caption carries a bbox: the ones a label snapshot can crop
+    /// precisely instead of falling back to a coarse page region.
+    pub croppable_figures: usize,
+}
+
 /// Rebuild a paper's text index from its stored PDF: re-extract and re-chunk
 /// FIRST (a parse failure leaves the existing index intact), then atomically
 /// swap old chunks for new ones (embeddings cascade-delete, FTS stays in
-/// sync via triggers), and finally re-embed in the background. Returns the
-/// new chunk count.
+/// sync via triggers), and finally re-embed in the background.
 #[instrument(skip(db))]
 pub async fn reprocess_paper_index(
     db: &SqlitePool,
     app_data_dir: &Path,
     paper: &Paper,
-) -> Result<usize> {
+) -> Result<ReprocessSummary> {
     // Serialize rebuilds: concurrent DELETE+INSERT cycles (double-click,
     // multiple windows) would interleave and produce duplicate chunks.
     static REPROCESS_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -481,7 +576,20 @@ pub async fn reprocess_paper_index(
         spawn_embedding_task(db, &paper.id);
     }
 
-    Ok(chunks.len())
+    let croppable_figures = figures.iter().filter(|f| f.caption_bbox.is_some()).count();
+    info!(
+        paper_id = %paper.id,
+        chunks = chunks.len(),
+        figures = figures.len(),
+        croppable_figures,
+        "index rebuilt"
+    );
+
+    Ok(ReprocessSummary {
+        chunks: chunks.len(),
+        figures: figures.len(),
+        croppable_figures,
+    })
 }
 
 /// Bump when the extraction pipeline's output shape changes (geometry fixes,
@@ -1639,6 +1747,81 @@ pub async fn set_creators(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Papers indexed before the figure index existed have no `paper_figures`
+    /// rows; `paper_snapshot(label=…)` then answered "no figure found" forever.
+    /// The backfill must repair them once — and must not keep re-parsing a paper
+    /// that genuinely has no figures.
+    #[tokio::test]
+    async fn figure_index_backfill_repairs_legacy_papers_once() -> anyhow::Result<()> {
+        let demo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../demo2.pdf");
+        if !demo.exists() {
+            return Ok(());
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "siku-figure-backfill-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = crate::core::db::tests::connect_with_crsqlite(&dir.join("t.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL)
+            .execute(&db)
+            .await?;
+
+        // Two legacy papers with a PDF and an index, but no figure rows.
+        std::fs::write(dir.join("a.pdf"), std::fs::read(&demo)?)?;
+        std::fs::write(dir.join("b.pdf"), std::fs::read(&demo)?)?;
+        for (id, file) in [("legacy-a", "a.pdf"), ("legacy-b", "b.pdf")] {
+            sqlx::query("INSERT INTO papers (id, title, file_path) VALUES (?, ?, ?)")
+                .bind(id)
+                .bind("Legacy")
+                .bind(file)
+                .execute(&db)
+                .await?;
+            sqlx::query(
+                "INSERT INTO chunks (id, paper_id, content, search_text, block_type, is_tail, chunk_index, created_at)
+                 VALUES (?, ?, 'text', 'text', 'prose', 0, 0, 't')",
+            )
+            .bind(format!("c-{id}"))
+            .bind(id)
+            .execute(&db)
+            .await?;
+        }
+        // A paper with no PDF text index (never imported properly) stays alone.
+        sqlx::query("INSERT INTO papers (id, title, file_path) VALUES ('no-index', 'X', 'a.pdf')")
+            .execute(&db)
+            .await?;
+
+        let done = backfill_figure_index(&db, &dir, 10).await?;
+        assert_eq!(done, 2, "both legacy papers should be repaired");
+
+        let figures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM paper_figures")
+            .fetch_one(&db)
+            .await?;
+        assert!(figures >= 12, "figure rows missing: {figures}");
+        // Roman-numbered tables are part of the index now.
+        let roman: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM paper_figures WHERE label = 'Table III'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(roman, 2);
+
+        // Second launch: nothing left to do, and no endless re-parsing of a
+        // caption-less paper (the scan marker covers that case).
+        assert_eq!(backfill_figure_index(&db, &dir, 10).await?, 0);
+        let scans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM paper_figure_scans")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(scans, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 
     /// purge_paper must delete the disk blobs of BOTH the main PDF
     /// (paper.file_path) and non-main attachments (attachments.file_path) —

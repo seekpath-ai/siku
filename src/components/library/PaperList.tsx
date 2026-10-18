@@ -389,31 +389,38 @@ function PaperRow({
     try {
       const ids = targetPaperIds;
       let totalChunks = 0;
+      let totalFigures = 0;
+      let croppableFigures = 0;
       let noText = 0;
       let failed = 0;
       for (const id of ids) {
         try {
-          const chunkCount = await paperReprocessIndex(id);
-          if (chunkCount > 0) totalChunks += chunkCount;
+          const result = await paperReprocessIndex(id);
+          if (result.chunks > 0) totalChunks += result.chunks;
           else noText += 1;
+          totalFigures += result.figures;
+          croppableFigures += result.croppableFigures;
           // page_count may have changed — refresh the detail cache.
           queryClient.invalidateQueries({ queryKey: ['paper', id] });
         } catch {
           failed += 1;
         }
       }
+      // 图表索引也必须报出来：只说"共 N 个文本分块"时，图表索引为空是完全看不见的，
+      // 用户只能从 AI 嘴里听说"没有图表索引"。
+      const figureLine = `图表 ${totalFigures} 个（${croppableFigures} 个可按标签精确裁剪）`;
       if (ids.length === 1) {
         await alert(
           failed > 0
             ? '重建索引失败（详见日志）'
             : totalChunks > 0
-              ? `索引已重建，共生成 ${totalChunks} 个文本分块`
-              : '未提取到可索引的文本（可能为扫描版 PDF）',
+              ? `索引已重建：${totalChunks} 个文本分块，${figureLine}`
+              : `未提取到可索引的文本（可能为扫描版 PDF）；${figureLine}`,
           '重建索引'
         );
       } else {
         await alert(
-          `重建完成：${ids.length - failed}/${ids.length} 篇成功，共 ${totalChunks} 个分块` +
+          `重建完成：${ids.length - failed}/${ids.length} 篇成功，共 ${totalChunks} 个分块，${figureLine}` +
             (noText > 0 ? `，${noText} 篇无文本（可能为扫描版）` : '') +
             (failed > 0 ? `，${failed} 篇失败` : ''),
           '重建索引'

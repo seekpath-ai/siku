@@ -76,8 +76,12 @@ pub struct FigureRecord {
 pub fn caption_label(text: &str) -> Option<(FigureKind, String)> {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
+        // `S2` covers supplementary figures ("Fig. S2"), `[IVXLCDM]+` the Roman
+        // numbering IEEE/ACM journals use ("TABLE III", "Figure IV"). Without
+        // them such papers indexed zero captions and every snapshot fell back to
+        // a coarse page crop.
         regex::Regex::new(
-            r"^\s*(?:(图|表)\s*(\d+(?:[.\-]\d+)*)|(Figure|Fig\.?|Table)\s*(\d+(?:[.\-]\d+)*))",
+            r"(?i)^\s*(?:(图|表)\s*(\d+(?:[.\-]\d+)*)|(Figure|Fig\.?|Table)\s*((?:S\d+|[IVXLCDM]+|\d+)(?:[.\-]\d+)*))",
         )
         .expect("caption regex")
     });
@@ -128,6 +132,61 @@ pub fn normalize_label(s: &str) -> String {
         .collect();
     if let Some(rest) = out.strip_prefix("figure") {
         out = format!("fig{rest}");
+    }
+    // Roman numbering is the same figure as the Arabic one it is printed
+    // instead of: a model asking for "Table 3" must find "TABLE III".
+    for head in ["table", "fig", "图", "表"] {
+        if let Some(rest) = out.strip_prefix(head) {
+            if let Some(n) = roman_to_arabic(rest) {
+                out = format!("{head}{n}");
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// Value of a Roman numeral string (lowercase, `i`..`m`), or `None` when the
+/// token is not one (a digit suffix, empty, or junk).
+fn roman_to_arabic(s: &str) -> Option<u32> {
+    if s.is_empty() || s.len() > 8 || !s.chars().all(|c| "ivxlcdm".contains(c)) {
+        return None;
+    }
+    let value = |c: char| match c {
+        'i' => 1,
+        'v' => 5,
+        'x' => 10,
+        'l' => 50,
+        'c' => 100,
+        'd' => 500,
+        'm' => 1000,
+        _ => 0,
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let mut total = 0i64;
+    for (i, c) in chars.iter().enumerate() {
+        let v = value(*c);
+        let next = chars.get(i + 1).map(|n| value(*n)).unwrap_or(0);
+        total += if v < next { -v } else { v };
+    }
+    // Reject nonsense like "iiii" or "vv": only canonical forms are numbers.
+    if total <= 0 || total > 3999 || to_roman(total as u32) != s {
+        return None;
+    }
+    Some(total as u32)
+}
+
+fn to_roman(mut n: u32) -> String {
+    const TABLE: &[(u32, &str)] = &[
+        (1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
+        (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"),
+    ];
+    let mut out = String::new();
+    for (v, sym) in TABLE {
+        while n >= *v {
+            out.push_str(sym);
+            n -= *v;
+        }
     }
     out
 }
@@ -239,9 +298,13 @@ fn associate(
 pub fn extract_figures(path: &Path) -> Result<Vec<FigureRecord>> {
     // pdfium is process-global and not thread-safe; see `bindings::pdfium_guard`.
     let _pdfium = crate::pdf::bindings::pdfium_guard();
-    let Ok(pdfium) = crate::pdf::bindings::pdfium() else {
-        return Ok(Vec::new());
-    };
+    // A missing pdfium used to return an empty list, which is INDISTINGUISHABLE
+    // from "this paper has no figure captions": the import logged
+    // `figure_count = 0` and the snapshot tool degraded to a coarse page crop
+    // without anyone being able to tell why. Report it as a real failure.
+    let pdfium = crate::pdf::bindings::pdfium().map_err(|e| {
+        SikuError::PdfParse(format!("pdfium 不可用，无法建立图表索引: {e}"))
+    })?;
     let doc = pdfium
         .load_pdf_from_file(path, None)
         .map_err(|e| SikuError::PdfParse(format!("failed to load PDF: {e}")))?;
@@ -453,6 +516,37 @@ mod tests {
         assert!(caption_label("Fig. 6 plots mean total tokens per run").is_none());
         assert!(caption_label("Table 4 partitions SREGYM's problems").is_none());
         assert!(caption_label("").is_none());
+    }
+
+    #[test]
+    fn roman_and_supplementary_captions_are_indexed_and_found_by_arabic_number() {
+        // IEEE/ACM style: the caption is Roman, the model asks in Arabic.
+        let (kind, label) = caption_label("TABLE III").unwrap();
+        assert_eq!(kind, FigureKind::Table);
+        assert_eq!(label, "Table III");
+        assert_eq!(normalize_label("TABLE III"), normalize_label("Table 3"));
+        assert_eq!(normalize_label("Table III"), "table3");
+
+        let (kind, label) = caption_label("Figure IV: Results of the ablation study").unwrap();
+        assert_eq!(kind, FigureKind::Figure);
+        assert_eq!(label, "Fig. IV");
+        assert_eq!(normalize_label("Fig. IV"), normalize_label("Figure 4"));
+        assert_eq!(normalize_label("Fig. IV"), "fig4");
+
+        // Supplementary numbering stays distinct from the main sequence.
+        let (kind, label) = caption_label("Fig. S2. Extra runs").unwrap();
+        assert_eq!(kind, FigureKind::Figure);
+        assert_eq!(label, "Fig. S2");
+        assert_eq!(normalize_label("Fig. S2"), "figs2");
+        assert_ne!(normalize_label("Fig. S2"), normalize_label("Fig. 2"));
+
+        // Prose mentions are still rejected, Roman or not.
+        assert!(caption_label("Table III lists the configurations").is_none());
+        assert!(caption_label("Figure IV shows the trend").is_none());
+        // Roman letters that are not numbers are not misread as figures.
+        assert!(roman_to_arabic("iiii").is_none());
+        assert!(roman_to_arabic("s1").is_none());
+        assert_eq!(roman_to_arabic("xiv"), Some(14));
     }
 
     #[test]

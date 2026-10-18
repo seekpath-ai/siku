@@ -455,6 +455,15 @@ CREATE TABLE IF NOT EXISTS paper_figures (
 );
 CREATE INDEX IF NOT EXISTS idx_paper_figures_paper ON paper_figures(paper_id);
 
+-- paper_figure_scans: which papers have had a figure-index attempt and what it
+-- produced. Separates "the index was never built" (backfill it) from "this paper
+-- truly has no figure captions" (stop retrying). Device-local, no sync.
+CREATE TABLE IF NOT EXISTS paper_figure_scans (
+    paper_id TEXT PRIMARY KEY NOT NULL,
+    figures INTEGER NOT NULL DEFAULT 0,
+    scanned_at TEXT NOT NULL
+);
+
 -- tool_executions
 CREATE TABLE IF NOT EXISTS tool_executions (
     id TEXT PRIMARY KEY,

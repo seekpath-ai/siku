@@ -1371,6 +1371,19 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     )
     .execute(&db)
     .await?;
+    // Which papers have had a figure-index attempt, and what it produced. This
+    // is what separates "the index was never built" (backfill it) from "this
+    // paper truly has no figure captions" (stop retrying) — device-local, like
+    // the index itself.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS paper_figure_scans (
+            paper_id TEXT PRIMARY KEY NOT NULL,
+            figures INTEGER NOT NULL DEFAULT 0,
+            scanned_at TEXT NOT NULL
+        )"
+    )
+    .execute(&db)
+    .await?;
 
     // Migration: grant the new paper_snapshot tool to existing literature/
     // research pet sessions — their tool allowlist (tools_enabled) was

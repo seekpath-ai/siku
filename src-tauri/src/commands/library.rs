@@ -143,13 +143,15 @@ pub async fn import_paper_from_link(
         .await
 }
 
-/// Rebuild a paper's text index (extract → chunk → embed). Idempotent.
+/// Rebuild a paper's text AND figure index (extract → chunk → figures → embed).
+/// Idempotent. Returns what was produced, so the UI can report the figure count
+/// — "索引已重建" alone hid that the figure index was empty.
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn paper_reprocess_index(
     state: State<'_, AppState>,
     id: String,
-) -> Result<usize, String> {
+) -> Result<paper_service::ReprocessSummary, String> {
     let paper = paper_service::get_paper(&state.db, &id)
         .await
         .map_err(|e| e.to_string())?;

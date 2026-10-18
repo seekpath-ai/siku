@@ -40,6 +40,40 @@ struct FigureRow {
     caption_bbox: Option<[f32; 4]>,
 }
 
+/// One `paper_figures` row as read for label lookup.
+struct FigureQueryRow {
+    id: String,
+    page: i32,
+    kind: String,
+    label: String,
+    caption: String,
+    bbox: Option<String>,
+    caption_bbox: Option<String>,
+}
+
+async fn figure_rows(db: &SqlitePool, paper_id: &str) -> Result<Vec<FigureQueryRow>, String> {
+    let rows: Vec<(String, i32, String, String, String, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, page, kind, label, caption, bbox, caption_bbox FROM paper_figures WHERE paper_id = ? ORDER BY page",
+        )
+        .bind(paper_id)
+        .fetch_all(db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, page, kind, label, caption, bbox, caption_bbox)| FigureQueryRow {
+            id,
+            page,
+            kind,
+            label,
+            caption,
+            bbox,
+            caption_bbox,
+        })
+        .collect())
+}
+
 #[derive(Debug, Deserialize)]
 struct VisionLocation {
     bbox: [f32; 4],
@@ -289,42 +323,75 @@ impl Tool for PaperSnapshotTool {
         let mut crop_source = "region";
         let mut confidence = 0.35;
         let mut location_note: Option<String> = None;
+        // Set when the tool had to build this paper's figure index on the fly.
+        let mut index_note: Option<String> = None;
 
         let (page, mut rect, page_w, page_h): (u16, [f32; 4], f32, f32) = if let Some(lbl) = label {
             let want = figures::normalize_label(lbl);
-            let rows: Vec<(String, i32, String, String, String, Option<String>, Option<String>)> =
-                sqlx::query_as(
-                    "SELECT id, page, kind, label, caption, bbox, caption_bbox FROM paper_figures WHERE paper_id = ? ORDER BY page",
-                )
-                .bind(paper_id)
-                .fetch_all(&self.db)
-                .await
-                .map_err(|e| format!("db error: {e}"))?;
+            let mut rows = figure_rows(&self.db, paper_id).await?;
+            // A paper imported before the figure index existed has no rows at
+            // all, and nothing ever backfilled it — the snapshot then degraded
+            // to a coarse page crop forever. Building the index here is a few
+            // hundred ms of local work (no model call) and turns that into a
+            // precise crop, so do it before giving up on the label.
+            let has_label = |rows: &[FigureQueryRow]| {
+                rows.iter()
+                    .any(|r| !r.label.is_empty() && figures::normalize_label(&r.label) == want)
+            };
+            if !has_label(&rows) {
+                let total: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM paper_figures WHERE paper_id = ?")
+                        .bind(paper_id)
+                        .fetch_one(&self.db)
+                        .await
+                        .unwrap_or(0);
+                if total == 0 {
+                    match crate::core::paper_service::index_figures(&self.db, paper_id, &pdf_path)
+                        .await
+                    {
+                        Ok(n) => {
+                            rows = figure_rows(&self.db, paper_id).await?;
+                            index_note = Some(if n == 0 {
+                                "该文献的图表索引原本是空的，已就地补建：抽取完成，但这份 PDF 没有可识别的图表图注（既没有匹配的 Figure/Table 标题，也没有可用的图片对象）。".to_string()
+                            } else {
+                                format!("该文献原本没有图表索引，已就地补建（{n} 条图表记录）。")
+                            });
+                        }
+                        Err(e) => {
+                            index_note = Some(format!("图表索引为空，就地补建失败：{e}"));
+                        }
+                    }
+                }
+            }
             let found = rows
                 .iter()
-                .filter(|r| !r.3.is_empty() && figures::normalize_label(&r.3) == want)
-                .filter(|r| page_arg.map(|p| r.1 == p as i32).unwrap_or(true))
+                .filter(|r| !r.label.is_empty() && figures::normalize_label(&r.label) == want)
+                .filter(|r| page_arg.map(|p| r.page == p as i32).unwrap_or(true))
                 .map(|r| FigureRow {
-                    id: r.0.clone(),
-                    page: r.1,
-                    kind: FigureKind::from_str(&r.2),
-                    label: r.3.clone(),
-                    caption: r.4.clone(),
-                    bbox: parse_bbox_json(r.5.as_deref()),
-                    caption_bbox: parse_bbox_json(r.6.as_deref()),
+                    id: r.id.clone(),
+                    page: r.page,
+                    kind: FigureKind::from_str(&r.kind),
+                    label: r.label.clone(),
+                    caption: r.caption.clone(),
+                    bbox: parse_bbox_json(r.bbox.as_deref()),
+                    caption_bbox: parse_bbox_json(r.caption_bbox.as_deref()),
                 })
                 .next();
             let Some(fig) = found else {
                 let available: Vec<String> = rows
                     .iter()
-                    .filter(|r| !r.3.is_empty())
-                    .map(|r| format!("{} (p.{})", r.3, r.1))
+                    .filter(|r| !r.label.is_empty())
+                    .map(|r| format!("{} (p.{})", r.label, r.page))
                     .collect();
+                let situation = match &index_note {
+                    Some(note) => note.clone(),
+                    None => "该文献没有这个标签的图表。".to_string(),
+                };
                 return Ok(format!(
-                    "No figure/table labelled \"{lbl}\" found in the index of this paper{}.\n\
+                    "No figure/table labelled \"{lbl}\" in this paper{}.\n\
+                     {situation}\n\
                      Indexed labels: {}\n\
-                     (Labels are collected when the paper is indexed — re-index the paper if this list is empty. \
-                     You can still snapshot by page + region/rect, but do not guess rect coordinates.)",
+                     (You can still snapshot by page + region, but do not guess rect coordinates.)",
                     page_arg.map(|p| format!(" on page {p}")).unwrap_or_default(),
                     if available.is_empty() { "(none)".into() } else { available.join(", ") },
                 ));
@@ -505,6 +572,9 @@ impl Tool for PaperSnapshotTool {
             "confidence_score": (confidence * 100.0).round() / 100.0,
             "includes_caption": label.is_some() && include_caption,
         });
+        if let Some(note) = &index_note {
+            info["index_note"] = serde_json::json!(note);
+        }
         if let Some(fig) = &matched_figure {
             info["label"] = serde_json::json!(fig.label);
             info["kind"] = serde_json::json!(fig.kind.as_str());
@@ -718,6 +788,81 @@ mod tests {
         assert!(parse_vision_location("{\"bbox\":[0,0,1,1],\"confidence\":0.2}").is_err());
         let (location, _) = parse_vision_location("{\"bbox\":[0.1,0.1,0.1,0.8]}").unwrap();
         assert!(normalized_vision_rect(&location, 600.0, 800.0, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_figure_index_is_built_on_demand() {
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../demo2.pdf");
+        if !source.exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(&source, dir.path().join("paper.pdf")).unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE papers (id TEXT PRIMARY KEY, title TEXT, file_path TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE paper_figures (
+                id TEXT PRIMARY KEY, paper_id TEXT, page INTEGER, kind TEXT,
+                label TEXT, caption TEXT, bbox TEXT, caption_bbox TEXT,
+                image_path TEXT, created_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE paper_figure_scans (
+                paper_id TEXT PRIMARY KEY, figures INTEGER, scanned_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The situation the user hit: the paper is indexed, the figure index is
+        // empty, and nothing ever backfills it.
+        let paper_id = "99f0a2b1-no-figure-index";
+        sqlx::query("INSERT INTO papers (id, title, file_path) VALUES (?, ?, ?)")
+            .bind(paper_id)
+            .bind("StrokeGuard")
+            .bind("paper.pdf")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let empty: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM paper_figures")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(empty.0, 0);
+
+        let tool = PaperSnapshotTool::new(pool.clone(), dir.path().to_path_buf(), None);
+        let output = tool
+            .execute(serde_json::json!({"paper_id": paper_id, "label": "Table 3"}))
+            .await
+            .unwrap();
+        let info: serde_json::Value = serde_json::from_str(output.lines().next().unwrap()).unwrap();
+        // Roman "TABLE III" in the PDF, Arabic number in the request — and the
+        // index that did not exist was built before giving up.
+        assert_eq!(info["label"], "Table III");
+        assert_eq!(info["crop_source"], "caption_inferred");
+        assert!(info["index_note"].as_str().unwrap().contains("补建"));
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM paper_figures")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(count.0 >= 6, "figure index was not rebuilt: {}", count.0);
+        let scanned: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM paper_figure_scans")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(scanned.0, 1, "the scan marker is what stops endless retries");
+        assert!(std::path::Path::new(info["path"].as_str().unwrap()).exists());
     }
 
     #[tokio::test]

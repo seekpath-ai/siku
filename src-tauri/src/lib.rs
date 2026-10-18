@@ -568,6 +568,28 @@ pub fn run() {
                     crate::core::ai_classify_scheduler::run(clf_db, clf_handle, clf_shutdown).await;
                 });
 
+                // Repair the figure index for papers imported before it existed.
+                // Those papers answered "no figure found" to every
+                // `paper_snapshot(label=…)` and fell back to a coarse page crop
+                // forever. Bounded per launch (and recorded per paper) so an
+                // upgrade never stalls startup; the next launch continues.
+                {
+                    let fig_db = handle2.state::<AppState>().db.clone();
+                    let fig_dir = handle2.state::<AppState>().app_data_dir.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        match crate::core::paper_service::backfill_figure_index(
+                            &fig_db, &fig_dir, 40,
+                        )
+                        .await
+                        {
+                            Ok(0) => {}
+                            Ok(n) => tracing::info!(indexed = n, "figure index backfill batch done"),
+                            Err(e) => tracing::warn!(error = %e, "figure index backfill failed"),
+                        }
+                    });
+                }
+
                 // Background research auto-discovery (active topics).
                 let auto_db = handle2.state::<AppState>().db.clone();
                 let auto_handle = handle2.clone();

@@ -32,6 +32,7 @@ pub async fn ai_table_extract_start(
     columns: Vec<TableColumn>,
     provider_id: Option<String>,
     detail: Option<String>,
+    depth: Option<String>,
     force: Option<bool>,
 ) -> Result<(), String> {
     if paper_ids.is_empty() {
@@ -42,9 +43,10 @@ pub async fn ai_table_extract_start(
     }
     let db = state.db.clone();
     let detail = crate::core::ai_table::Detail::parse(detail.as_deref());
+    let depth = crate::core::ai_table::Depth::parse(depth.as_deref());
     let force = force.unwrap_or(false);
     tauri::async_runtime::spawn(async move {
-        ai_table::run_extraction(app, db, paper_ids, columns, provider_id, detail, force).await;
+        ai_table::run_extraction(app, db, paper_ids, columns, provider_id, detail, depth, force).await;
     });
     Ok(())
 }

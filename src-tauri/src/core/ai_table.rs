@@ -62,9 +62,13 @@ pub struct TableCell {
     pub paper_id: String,
     pub column_key: String,
     pub value: String,
-    /// done | failed | edited (edited = user overrode the extracted value).
+    /// done | failed | edited | empty (未检索到) | absent (文中无此内容)
     pub status: String,
     pub edited: bool,
+    /// Where the model says the value came from ("p.21 §5").
+    pub src: String,
+    /// Model's self-reported confidence, 0 when unreported.
+    pub conf: f64,
 }
 
 pub fn request_cancel() {
@@ -118,6 +122,136 @@ fn emit(app: &AppHandle, p: &ExtractProgress) {
     }
 }
 
+/// How hard the run looks for evidence. Cost (LLM calls per paper) and the
+/// amount of source text handed to the model are the user's choice — the code
+/// never silently trades accuracy for money.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth {
+    /// 1 call, 3 chunks per column, ≤6k chars.
+    Fast,
+    /// 1 call + one follow-up pass for fields whose evidence was insufficient.
+    Standard,
+    /// 1 call, 8 chunks per column, section-aware coverage, ≤24k chars.
+    Deep,
+    /// One call PER COLUMN, each with its own retrieval — the most accurate and
+    /// the most expensive.
+    PerColumn,
+}
+
+impl Depth {
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.unwrap_or("standard").trim() {
+            "fast" => Depth::Fast,
+            "deep" => Depth::Deep,
+            "per_column" | "per-column" => Depth::PerColumn,
+            _ => Depth::Standard,
+        }
+    }
+
+    fn chunks_per_column(self) -> usize {
+        match self {
+            Depth::Fast => 3,
+            Depth::Standard => 5,
+            Depth::Deep => 8,
+            Depth::PerColumn => 10,
+        }
+    }
+
+    fn evidence_cap(self) -> usize {
+        match self {
+            Depth::Fast => 6000,
+            Depth::Standard => 12000,
+            Depth::Deep | Depth::PerColumn => 24000,
+        }
+    }
+
+    /// One extra pass for fields the first call could not decide.
+    fn second_pass(self) -> bool {
+        matches!(self, Depth::Standard | Depth::Deep | Depth::PerColumn)
+    }
+
+    /// One call per column instead of one per paper.
+    fn per_column_calls(self) -> bool {
+        matches!(self, Depth::PerColumn)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Depth::Fast => "快速",
+            Depth::Standard => "标准",
+            Depth::Deep => "深入",
+            Depth::PerColumn => "逐列精查",
+        }
+    }
+}
+
+/// One extracted field with its provenance.
+#[derive(Debug, Clone, Default)]
+struct FieldValue {
+    value: String,
+    /// Where in the paper the model says the value comes from ("p.21 §5").
+    src: String,
+    /// Model's self-reported confidence (0 when it did not say).
+    conf: f64,
+}
+
+/// Parse one field entry: either a bare string (legacy contract) or
+/// `{"v": "...", "src": "p.21", "conf": 0.8}`.
+fn parse_field(entry: &serde_json::Value) -> FieldValue {
+    if let Some(s) = entry.as_str() {
+        return FieldValue { value: s.trim().to_string(), src: String::new(), conf: 0.0 };
+    }
+    let Some(obj) = entry.as_object() else {
+        return FieldValue::default();
+    };
+    let pick = |keys: &[&str]| -> Option<&serde_json::Value> {
+        keys.iter().find_map(|k| obj.get(*k))
+    };
+    let value = pick(&["v", "value"])
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let src = pick(&["src", "source", "evidence"])
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let conf = pick(&["conf", "confidence"])
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    FieldValue { value, src, conf }
+}
+
+/// Empty-value semantics. "The paper does not say this" and "we did not manage
+/// to show the model the right passage" are completely different answers, and
+/// collapsing them into one blank cell is what made the table untrustworthy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellState {
+    Filled,
+    /// The model looked at real evidence and reported the paper has no such
+    /// content.
+    Absent,
+    /// No usable evidence reached the model — OUR problem, worth retrying.
+    Unretrieved,
+}
+
+fn cell_state(field: &FieldValue, evidence_chars: usize) -> CellState {
+    if !field.value.is_empty() {
+        return CellState::Filled;
+    }
+    if evidence_chars == 0 {
+        return CellState::Unretrieved;
+    }
+    // Model said "nothing there" with reasonable confidence and it had material.
+    if field.conf >= 0.5 {
+        CellState::Absent
+    } else {
+        CellState::Unretrieved
+    }
+}
+
 /// How verbose each cell should be. The old prompt hard-coded "不超过 50 字",
 /// which is why every cell read like a label instead of an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,22 +280,6 @@ impl Detail {
             }
         }
     }
-
-    /// Evidence budget per paper: a richer answer needs more source text.
-    fn evidence_cap(self) -> usize {
-        match self {
-            Detail::Brief => 5000,
-            Detail::Normal => 6000,
-            Detail::Rich => 9000,
-        }
-    }
-
-    fn chunks_per_column(self) -> usize {
-        match self {
-            Detail::Brief | Detail::Normal => 3,
-            Detail::Rich => 5,
-        }
-    }
 }
 
 /// Run the batch. `paper_ids` is the selected set, `columns` the column
@@ -174,6 +292,7 @@ pub async fn run_extraction(
     columns: Vec<TableColumn>,
     provider_id: Option<String>,
     detail: Detail,
+    depth: Depth,
     force: bool,
 ) {
     let _guard = match RunGuard::try_acquire() {
@@ -226,10 +345,39 @@ pub async fn run_extraction(
         }
     };
 
+    // Search terms are prepared once per run (an AI-generated term set is cached
+    // per column key), never per paper — this is what lets a Chinese column
+    // definition find passages in an English paper at all.
+    let pairs: Vec<(String, String)> = columns.iter().map(|c| (c.key.clone(), c.prompt.clone())).collect();
+    let terms = crate::core::query_expand::prepare(&db, Some(llm.as_ref()), &pairs, true).await;
+
     let total = paper_ids.len();
     let mut done = 0usize;
     let mut failed = 0usize;
     let mut cancelled = false;
+
+    // Run header: the exact configuration is written into the log so a result
+    // can always be traced back to how it was produced.
+    emit(
+        &app,
+        &ExtractProgress {
+            total,
+            done: 0,
+            failed: 0,
+            current_title: String::new(),
+            log: Some(format!(
+                "口径：深度={}（{} 段/列，证据≤{} 字，{}）/ 详略={:?} / 检索词={} 列已就绪",
+                depth.label(),
+                depth.chunks_per_column(),
+                depth.evidence_cap(),
+                if depth.per_column_calls() { "逐列调用" } else if depth.second_pass() { "含二次补判" } else { "单轮" },
+                detail,
+                terms.values().filter(|t| !t.is_empty()).count()
+            )),
+            reasoning: None,
+            finished: None,
+        },
+    );
 
     for paper_id in &paper_ids {
         if CANCEL.load(Ordering::SeqCst) {
@@ -240,11 +388,7 @@ pub async fn run_extraction(
         emit(&app, &ExtractProgress { total, done, failed, current_title: title.clone(), log: None, reasoning: None, finished: None });
 
         let started = std::time::Instant::now();
-        // Race the model call against the cancel flag: 停止 must take effect
-        // while a slow local model is still generating, not minutes later.
-        // extract_one races its own call against the cancel flag, so a plain
-        // await is enough here.
-        let outcome = extract_one(&app, &db, llm.as_ref(), paper_id, &columns, detail, force).await;
+        let outcome = extract_paper(&app, &db, llm.as_ref(), paper_id, &columns, detail, depth, &terms, force).await;
         match outcome {
             Ok(o) => {
                 done += 1;
@@ -260,14 +404,10 @@ pub async fn run_extraction(
             }
             Err(e) => {
                 if CANCEL.load(Ordering::SeqCst) {
-                    // Cancelled mid-flight: leave the cells as they were so a
-                    // later run resumes them instead of seeing "failed".
                     cancelled = true;
                     break;
                 }
                 tracing::warn!(paper_id, error = %e, "ai-table extract failed for paper");
-                // Mark every missing cell as failed so the UI can offer a
-                // per-cell retry instead of a silently blank grid.
                 let _ = mark_failed(&db, paper_id, &columns).await;
                 failed += 1;
                 let log = format!("✗ 《{title}》：{e}");
@@ -326,24 +466,148 @@ fn emit_reasoning(app: &AppHandle, title: &str, delta: &str) {
     );
 }
 
-async fn extract_one(
+/// Extract one paper under the chosen depth: single pass, per-column calls,
+/// and/or one follow-up pass for fields whose evidence was insufficient.
+#[allow(clippy::too_many_arguments)]
+async fn extract_paper(
     app: &AppHandle,
     db: &SqlitePool,
     llm: &dyn crate::ai::llm::LlmClient,
     paper_id: &str,
     columns: &[TableColumn],
     detail: Detail,
+    depth: Depth,
+    terms: &std::collections::HashMap<String, Vec<String>>,
     force: bool,
 ) -> Result<ExtractOutcome, String> {
     let pending = pending_columns(db, paper_id, columns, force).await?;
     if pending.is_empty() {
         return Ok(ExtractOutcome { skipped: true, empty_note: None });
     }
-
+    let title = paper_title(db, paper_id).await;
     let meta = paper_metadata(db, paper_id).await?;
-    let evidence = gather_evidence(db, paper_id, &pending, detail).await?;
 
-    let column_spec = pending
+    // (column, value, state, evidence chars that backed it)
+    let mut results: Vec<(TableColumn, FieldValue, CellState, usize)> = Vec::new();
+
+    if depth.per_column_calls() {
+        // One call per column: (columns × papers) calls, the most accurate mode.
+        for col in &pending {
+            let one = std::slice::from_ref(col);
+            let (evidence, ev_chars) = gather_evidence(db, paper_id, one, depth, terms).await;
+            let mut map =
+                model_call(app, db, llm, &title, &meta, &evidence, one, detail).await?;
+            let field = map.remove(&col.key).unwrap_or_default();
+            let state = cell_state(&field, ev_chars);
+            results.push((col.clone(), field, state, ev_chars));
+        }
+    } else {
+        let (evidence, ev_chars) = gather_evidence(db, paper_id, &pending, depth, terms).await;
+        let mut map = model_call(app, db, llm, &title, &meta, &evidence, &pending, detail).await?;
+        for col in &pending {
+            let field = map.remove(&col.key).unwrap_or_default();
+            let state = cell_state(&field, ev_chars);
+            results.push((col.clone(), field, state, ev_chars));
+        }
+    }
+
+    // Follow-up pass: only fields whose evidence was insufficient ("we could not
+    // show the model the right passage"). Capped so a pathological paper cannot
+    // turn into an unbounded call loop.
+    if depth.second_pass() {
+        let retry: Vec<TableColumn> = results
+            .iter()
+            .filter(|(_, _, state, _)| *state == CellState::Unretrieved)
+            .map(|(col, _, _, _)| col.clone())
+            .take(6)
+            .collect();
+        if !retry.is_empty() {
+            let (evidence, ev_chars) = gather_evidence(db, paper_id, &retry, depth, terms).await;
+            if ev_chars > 0 {
+                if let Ok(mut map) = model_call(app, db, llm, &title, &meta, &evidence, &retry, detail).await {
+                    for slot in results.iter_mut() {
+                        if slot.2 != CellState::Unretrieved {
+                            continue;
+                        }
+                        if let Some(field) = map.remove(&slot.0.key) {
+                            let state = cell_state(&field, ev_chars);
+                            if state != CellState::Unretrieved {
+                                slot.1 = field;
+                                slot.2 = state;
+                                slot.3 = ev_chars;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let now = crate::core::time::now_iso();
+    let mut written = 0usize;
+    let mut absent: Vec<String> = Vec::new();
+    let mut unretrieved: Vec<String> = Vec::new();
+    for (col, field, state, _) in &results {
+        let status = match state {
+            CellState::Filled => "done",
+            // The model read real evidence and reported the paper has no such
+            // content: a final answer, not a retry candidate.
+            CellState::Absent => "absent",
+            CellState::Unretrieved => "empty",
+        };
+        match state {
+            CellState::Filled => written += 1,
+            CellState::Absent => absent.push(col.key.clone()),
+            CellState::Unretrieved => unretrieved.push(col.key.clone()),
+        }
+        upsert_cell(db, paper_id, &col.key, &field.value, status, false, field, &now).await?;
+    }
+
+    let empty_note = if written == 0 {
+        let (chunks, abstract_len) = source_stats(db, paper_id).await;
+        let mut line = format!(
+            "⚠ 《{title}》没抽到内容：来源=摘要 {abstract_len} 字 / 全文索引 {chunks} 段"
+        );
+        if !absent.is_empty() {
+            line.push_str(&format!("；模型确认文中没有：{}", absent.join("、")));
+        }
+        if !unretrieved.is_empty() {
+            line.push_str(&format!("；证据不足（可换「深入/逐列精查」重试）：{}", unretrieved.join("、")));
+        }
+        if chunks == 0 && abstract_len < 100 {
+            line.push_str("。⚠ 该文献没有全文索引且摘要过短——请先「重建索引」或补全摘要");
+        }
+        Some(line)
+    } else if !absent.is_empty() || !unretrieved.is_empty() {
+        let mut line = format!("✓ 《{title}》抽取完成");
+        if !absent.is_empty() {
+            line.push_str(&format!("；文中无此内容：{}", absent.join("、")));
+        }
+        if !unretrieved.is_empty() {
+            line.push_str(&format!("；证据不足：{}", unretrieved.join("、")));
+        }
+        Some(line)
+    } else {
+        None
+    };
+
+    Ok(ExtractOutcome { skipped: false, empty_note })
+}
+
+/// One model call for the given columns. Streams, so the thinking model's
+/// reasoning is visible instead of looking frozen.
+#[allow(clippy::too_many_arguments)]
+async fn model_call(
+    app: &AppHandle,
+    db: &SqlitePool,
+    llm: &dyn crate::ai::llm::LlmClient,
+    title: &str,
+    meta: &str,
+    evidence: &str,
+    columns: &[TableColumn],
+    detail: Detail,
+) -> Result<std::collections::HashMap<String, FieldValue>, String> {
+    let column_spec = columns
         .iter()
         .map(|c| {
             if c.prompt.trim().is_empty() {
@@ -355,28 +619,19 @@ async fn extract_one(
         .collect::<Vec<_>>()
         .join("\n");
 
-    // The length rule scales with the requested detail level; an explicit
-    // instruction in the column prompt always wins over it.
     let system = crate::core::task_prompts::render(
         &crate::core::task_prompts::effective(db, crate::core::task_prompts::AI_TABLE_EXTRACT).await,
         &[("detail_rule", detail.length_rule())],
     );
-    let user = format!(
-        "【文献】\n{meta}\n\n【相关段落】\n{evidence}\n\n【待抽取字段】\n{column_spec}"
-    );
-
+    let user = format!("【文献】\n{meta}\n\n【相关段落】\n{evidence}\n\n【待抽取字段】\n{column_spec}");
     let messages = vec![
         ChatMessage { reasoning_content: None, role: "system".into(), content: system, attachments: None, tool_calls: None, tool_call_id: None, name: None },
         ChatMessage { reasoning_content: None, role: "user".into(), content: user, attachments: None, tool_calls: None, tool_call_id: None, name: None },
     ];
 
-    // Stream the call: a thinking model spends most of its time reasoning, and
-    // a non-streaming request threw that away — the panel showed nothing for
-    // minutes, which read as "hang". Reasoning deltas go straight to the panel.
-    let title = paper_title(db, paper_id).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::ai::llm::StreamEvent>();
     let app2 = app.clone();
-    let title2 = title.clone();
+    let title2 = title.to_string();
     let drain = tokio::spawn(async move {
         let mut text = String::new();
         while let Some(ev) = rx.recv().await {
@@ -404,55 +659,15 @@ async fn extract_one(
     call?;
 
     let values = parse_values(&text)?;
-
-    let now = crate::core::time::now_iso();
-    let mut written = 0usize;
-    let mut blanks: Vec<String> = Vec::new();
-    for col in &pending {
-        let value = lookup_value(&values, &col.key)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if value.is_empty() {
-            blanks.push(col.key.clone());
-        } else {
-            written += 1;
+    let mut out = std::collections::HashMap::new();
+    for col in columns {
+        if let Some(entry) = lookup_entry(&values, &col.key) {
+            out.insert(col.key.clone(), parse_field(entry));
         }
-        // An empty result is NOT a finished cell: storing it as `done` used to
-        // make the cell permanently un-refillable ("重新抽取缺失" skipped it).
-        let status = if value.is_empty() { "empty" } else { "done" };
-        upsert_cell(db, paper_id, &col.key, &value, status, false, &now).await?;
     }
-
-    // Everything came back empty: say WHY instead of leaving a mute 待补. The
-    // two things that actually explain it are the source size (no index / no
-    // abstract) and the keys the model returned (usually a naming mismatch).
-    let empty_note = if written == 0 {
-        let (chunks, abstract_len) = source_stats(db, paper_id).await;
-        let got: Vec<String> = values.keys().cloned().collect();
-        let want: Vec<String> = pending.iter().map(|c| c.key.clone()).collect();
-        let snippet: String = text.chars().take(160).collect();
-        let mut line = format!(
-            "⚠ 《{title}》没抽到内容：来源=摘要 {abstract_len} 字 / 全文索引 {chunks} 段；模型返回键 {got:?}，期望键 {want:?}"
-        );
-        if chunks == 0 && abstract_len < 100 {
-            line.push_str("。⚠ 该文献没有全文索引且摘要过短，模型无从抽取——请先「重建索引」或补全摘要");
-        }
-        if !got.is_empty() && got.len() != want.len() {
-            line.push_str("。键名不一致是常见原因（已按去空格/去引号匹配，仍失败则是模型改写了字段名）");
-        }
-        line.push_str(&format!("。原始返回：{snippet}"));
-        Some(line)
-    } else if !blanks.is_empty() {
-        Some(format!("· 《{title}》部分字段为空：{}", blanks.join("、")))
-    } else {
-        None
-    };
-
-    Ok(ExtractOutcome { skipped: false, empty_note })
+    Ok(out)
 }
 
-/// Columns whose cell is missing or failed — the ones a run must produce.
 async fn pending_columns(
     db: &SqlitePool,
     paper_id: &str,
@@ -514,44 +729,114 @@ async fn paper_metadata(db: &SqlitePool, paper_id: &str) -> Result<String, Strin
 /// Per column, scoped-retrieve the best chunks inside THIS paper; dedupe
 /// across columns and cap the total. A paper with no index contributes an
 /// empty evidence block (metadata+abstract still go to the model).
+/// Build the evidence block for one call: per-column bilingual retrieval, then
+/// section-aware ordering so a single long section cannot consume the whole
+/// budget. Returns (block, characters used) — 0 characters means the model is
+/// being asked to answer without any source text, which the caller reports as
+/// "unretrieved" rather than "the paper says nothing".
 async fn gather_evidence(
     db: &SqlitePool,
     paper_id: &str,
     columns: &[TableColumn],
-    detail: Detail,
-) -> Result<String, String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut blocks: Vec<String> = Vec::new();
-    let mut used = 0usize;
+    depth: Depth,
+    terms: &std::collections::HashMap<String, Vec<String>>,
+) -> (String, usize) {
     let ids = [paper_id.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    let mut picked: Vec<retriever::SearchResult> = Vec::new();
+
     for col in columns {
-        let query = if col.prompt.trim().is_empty() { &col.key } else { &col.prompt };
-        let hits = retriever::hybrid_search_scoped(db, query, detail.chunks_per_column(), false, Some(&ids))
-            .await
-            .unwrap_or_default();
+        // The column prompt doubles as the retrieval query; the expanded terms
+        // make a Chinese column reachable inside an English paper.
+        let base = if col.prompt.trim().is_empty() { col.key.clone() } else { col.prompt.clone() };
+        let extra = terms.get(&col.key).map(|t| t.join(" ")).unwrap_or_default();
+        let query = format!("{base} {extra}").trim().to_string();
+        let hits = retriever::hybrid_search_scoped(
+            db,
+            &query,
+            depth.chunks_per_column() * 3,
+            false,
+            Some(&ids),
+        )
+        .await
+        .unwrap_or_default();
         for hit in hits {
-            if !seen.insert(hit.chunk_id.clone()) {
-                continue;
+            if seen.insert(hit.chunk_id.clone()) {
+                picked.push(hit);
             }
-            let remaining = detail.evidence_cap().saturating_sub(used);
-            if remaining == 0 {
-                break;
-            }
-            let content: String = hit.content.chars().take(remaining.min(1200)).collect();
-            used += content.chars().count();
-            let page = hit.page_start.map(|p| format!("p.{p}")).unwrap_or_default();
-            blocks.push(format!("[{page} {}]\n{content}", hit.section_path.unwrap_or_default()));
         }
     }
-    Ok(if blocks.is_empty() {
-        "（该文献未建立全文索引，仅依据元数据与摘要抽取）".to_string()
-    } else {
-        blocks.join("\n\n")
-    })
+
+    if picked.is_empty() {
+        return ("（该文献没有全文索引，或检索未命中任何段落）".to_string(), 0);
+    }
+
+    // Neighbours carry the sentence before/after a hit — cheap continuity.
+    retriever::expand_with_neighbors(db, &mut picked, false).await.ok();
+    let ordered = order_by_section(picked, depth.chunks_per_column());
+
+    let mut used = 0usize;
+    let mut blocks: Vec<String> = Vec::new();
+    for hit in ordered {
+        let remaining = depth.evidence_cap().saturating_sub(used);
+        if remaining == 0 {
+            break;
+        }
+        let content: String = hit.content.chars().take(remaining.min(1400)).collect();
+        used += content.chars().count();
+        let page = hit.page_start.map(|p| format!("p.{p}")).unwrap_or_default();
+        let section = hit
+            .section_path
+            .clone()
+            .or(hit.section.clone())
+            .unwrap_or_default();
+        let label = if section.is_empty() {
+            page
+        } else {
+            format!("{page} §{section}")
+        };
+        blocks.push(format!("[{label}]\n{content}"));
+    }
+    (blocks.join("\n\n"), used)
 }
 
-/// Column keys as the model may echo them: surrounding quotes/brackets and
-/// whitespace (incl. full-width) removed.
+/// Round-robin across sections: hit i of each section before hit i+1 of any, so
+/// the evidence spans the paper (intro/method/results/limitations) instead of
+/// being three chunks of the same paragraph.
+fn order_by_section(
+    hits: Vec<retriever::SearchResult>,
+    per_section_cap: usize,
+) -> Vec<retriever::SearchResult> {
+    let mut groups: Vec<(String, Vec<retriever::SearchResult>)> = Vec::new();
+    for hit in hits {
+        let key = hit
+            .section_path
+            .clone()
+            .or(hit.section.clone())
+            .unwrap_or_default();
+        match groups.iter_mut().find(|(k, _)| k == &key) {
+            Some((_, list)) => list.push(hit),
+            None => groups.push((key, vec![hit])),
+        }
+    }
+    let mut out: Vec<retriever::SearchResult> = Vec::new();
+    let mut round = 0usize;
+    loop {
+        let mut pushed = false;
+        for (_, list) in groups.iter() {
+            if round < list.len() && round < per_section_cap {
+                out.push(list[round].clone());
+                pushed = true;
+            }
+        }
+        if !pushed {
+            break;
+        }
+        round += 1;
+    }
+    out
+}
+
 fn norm_key(key: &str) -> String {
     key.chars()
         .filter(|c| !c.is_whitespace() && *c != '\u{3000}')
@@ -559,19 +844,17 @@ fn norm_key(key: &str) -> String {
         .collect()
 }
 
-/// Look a column up in the model's JSON: exact key first, then a normalised
-/// match (models echo `"研究问题 "` or `【研究问题】` often enough that an exact
-/// match silently produced an empty cell).
-fn lookup_value(values: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
-    if let Some(v) = values.get(key).and_then(|v| v.as_str()) {
-        return Some(v.to_string());
+/// Look a column up in the model's JSON and return the raw entry, so both the
+/// legacy string form and the `{v,src,conf}` object form are handled.
+fn lookup_entry<'a>(
+    values: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    if let Some(v) = values.get(key) {
+        return Some(v);
     }
     let target = norm_key(key);
-    values
-        .iter()
-        .find(|(k, _)| norm_key(k) == target)
-        .and_then(|(_, v)| v.as_str())
-        .map(|v| v.to_string())
+    values.iter().find(|(k, _)| norm_key(k) == target).map(|(_, v)| v)
 }
 
 /// How much source text this paper actually has: (indexed chunk count, abstract
@@ -624,20 +907,23 @@ async fn upsert_cell(
     value: &str,
     status: &str,
     edited: bool,
+    field: &FieldValue,
     now: &str,
 ) -> Result<(), String> {
+    let meta = serde_json::json!({ "src": field.src, "conf": field.conf }).to_string();
     sqlx::query(
-        "INSERT INTO ai_table_cells (paper_id, column_key, value, status, edited, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO ai_table_cells (paper_id, column_key, value, status, edited, meta_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (paper_id, column_key) DO UPDATE SET
            value = excluded.value, status = excluded.status, edited = excluded.edited,
-           updated_at = excluded.updated_at",
+           meta_json = excluded.meta_json, updated_at = excluded.updated_at",
     )
     .bind(paper_id)
     .bind(column_key)
     .bind(value)
     .bind(status)
     .bind(if edited { 1 } else { 0 })
+    .bind(&meta)
     .bind(now)
     .bind(now)
     .execute(db)
@@ -678,10 +964,10 @@ pub async fn list_cells(
     let p_ph = paper_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let c_ph = column_keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT paper_id, column_key, value, status, edited FROM ai_table_cells
+        "SELECT paper_id, column_key, value, status, edited, meta_json FROM ai_table_cells
          WHERE paper_id IN ({p_ph}) AND column_key IN ({c_ph})"
     );
-    let mut q = sqlx::query_as::<_, (String, String, String, String, i64)>(&sql);
+    let mut q = sqlx::query_as::<_, (String, String, String, String, i64, String)>(&sql);
     for id in paper_ids {
         q = q.bind(id);
     }
@@ -691,12 +977,21 @@ pub async fn list_cells(
     let rows = q.fetch_all(db).await.map_err(|e| format!("db: {e}"))?;
     Ok(rows
         .into_iter()
-        .map(|(paper_id, column_key, value, status, edited)| TableCell {
-            paper_id,
-            column_key,
-            value,
-            status,
-            edited: edited != 0,
+        .map(|(paper_id, column_key, value, status, edited, meta_json)| {
+            let meta: serde_json::Value = serde_json::from_str(&meta_json).unwrap_or_default();
+            TableCell {
+                paper_id,
+                column_key,
+                value,
+                status,
+                edited: edited != 0,
+                src: meta
+                    .get("src")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                conf: meta.get("conf").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            }
         })
         .collect())
 }
@@ -709,7 +1004,8 @@ pub async fn set_cell(
     value: &str,
 ) -> Result<(), String> {
     let now = crate::core::time::now_iso();
-    upsert_cell(db, paper_id, column_key, value, "edited", true, &now).await
+    let field = FieldValue { value: value.to_string(), src: String::new(), conf: 1.0 };
+    upsert_cell(db, paper_id, column_key, value, "edited", true, &field, &now).await
 }
 
 #[cfg(test)]
@@ -735,11 +1031,94 @@ mod tests {
             "核心洞察": "洞察 C"
         });
         let map = json.as_object().unwrap();
-        assert_eq!(lookup_value(map, "研究问题").as_deref(), Some("问题 A"));
-        assert_eq!(lookup_value(map, "动机缺口").as_deref(), Some("缺口 B"));
-        assert_eq!(lookup_value(map, "核心洞察").as_deref(), Some("洞察 C"));
+        assert_eq!(
+            lookup_entry(map, "研究问题").and_then(|v| v.as_str()),
+            Some("问题 A")
+        );
+        assert_eq!(
+            lookup_entry(map, "动机缺口").and_then(|v| v.as_str()),
+            Some("缺口 B")
+        );
+        // Object form ({v,src,conf}) parses too.
+        let obj = serde_json::json!({ "主要发现": { "v": "提升 12%", "src": "p.9", "conf": 0.8 } });
+        let field = parse_field(lookup_entry(obj.as_object().unwrap(), "主要发现").unwrap());
+        assert_eq!(field.value, "提升 12%");
+        assert_eq!(field.src, "p.9");
+        assert!((field.conf - 0.8).abs() < 1e-6);
         // Genuinely absent stays absent (never a silent blank cell).
-        assert_eq!(lookup_value(map, "主要结果"), None);
+        assert!(lookup_entry(map, "主要结果").is_none());
+    }
+
+    #[test]
+    fn depth_parsing_and_cost_shape() {
+        assert_eq!(Depth::parse(None), Depth::Standard);
+        assert_eq!(Depth::parse(Some("fast")), Depth::Fast);
+        assert_eq!(Depth::parse(Some("deep")), Depth::Deep);
+        assert_eq!(Depth::parse(Some("per_column")), Depth::PerColumn);
+        // Deeper modes look at more, and cost more calls.
+        assert!(Depth::Deep.chunks_per_column() > Depth::Fast.chunks_per_column());
+        assert!(Depth::Deep.evidence_cap() > Depth::Standard.evidence_cap());
+        assert!(!Depth::Fast.second_pass());
+        assert!(Depth::Standard.second_pass());
+        assert!(!Depth::Standard.per_column_calls());
+        assert!(Depth::PerColumn.per_column_calls());
+    }
+
+    #[test]
+    fn empty_value_distinguishes_absent_from_unretrieved() {
+        let blank = FieldValue::default();
+        // No source text reached the model → OUR problem, retryable.
+        assert_eq!(cell_state(&blank, 0), CellState::Unretrieved);
+        // Evidence was there and the model says the paper has no such content.
+        let confident = FieldValue { conf: 0.9, ..Default::default() };
+        assert_eq!(cell_state(&confident, 5000), CellState::Absent);
+        // Evidence was there but the model could not decide.
+        let unsure = FieldValue { conf: 0.0, ..Default::default() };
+        assert_eq!(cell_state(&unsure, 5000), CellState::Unretrieved);
+        // Anything non-empty is filled regardless of confidence.
+        let filled = FieldValue { value: "120 名开发者".into(), conf: 0.1, ..Default::default() };
+        assert_eq!(cell_state(&filled, 0), CellState::Filled);
+    }
+
+    #[test]
+    fn order_by_section_spreads_across_sections() {
+        fn hit(id: &str, section: &str) -> crate::ai::retriever::SearchResult {
+            crate::ai::retriever::SearchResult {
+                chunk_id: id.into(),
+                paper_id: "p1".into(),
+                chunk_index: 0,
+                content: format!("{section} body"),
+                page_start: Some(1),
+                page_end: Some(1),
+                section: Some(section.into()),
+                section_path: Some(section.into()),
+                block_type: "prose".into(),
+                is_tail: false,
+                is_neighbor: false,
+                paper_title: String::new(),
+                score: 1.0,
+                source: "fts5".into(),
+            }
+        }
+        let hits = vec![
+            hit("a1", "Intro"),
+            hit("a2", "Intro"),
+            hit("a3", "Intro"),
+            hit("b1", "Method"),
+            hit("c1", "Threats"),
+        ];
+        let ordered = order_by_section(hits, 2);
+        // First round hits three distinct sections before repeating one.
+        let first_three: Vec<&str> = ordered
+            .iter()
+            .take(3)
+            .map(|h| h.section.as_deref().unwrap_or(""))
+            .collect();
+        assert!(first_three.contains(&"Intro"));
+        assert!(first_three.contains(&"Method"));
+        assert!(first_three.contains(&"Threats"));
+        // Per-section cap is respected (2 of the 3 Intro chunks).
+        assert_eq!(ordered.iter().filter(|h| h.section.as_deref() == Some("Intro")).count(), 2);
     }
 
     #[test]

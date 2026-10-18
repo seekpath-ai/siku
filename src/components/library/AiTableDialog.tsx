@@ -23,6 +23,7 @@ import {
   type AiTablePaperBrief,
   type AiTableBuiltinPreset,
   type AiTableDetail,
+  type AiTableDepth,
 } from '@/lib/tauri';
 
 const cellKey = (paperId: string, columnKey: string) => `${paperId}::${columnKey}`;
@@ -48,6 +49,9 @@ export function AiTableDialog() {
   const [builtins, setBuiltins] = useState<AiTableBuiltinPreset[]>([]);
   /** How verbose the cells are extracted; the column prompt can override it. */
   const [detail, setDetail] = useState<AiTableDetail>('normal');
+  /** How hard the run looks for evidence — cost and accuracy are the user's
+   *  call, never silently traded by us. */
+  const [depth, setDepth] = useState<AiTableDepth>('standard');
   const [cells, setCells] = useState<Map<string, AiTableCell>>(new Map());
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<AiTableProgress | null>(null);
@@ -190,7 +194,7 @@ export function AiTableDialog() {
     setReasoning('');
     setReasoningTitle('');
     try {
-      await aiTableExtractStart(ids ?? paperIds, cols, providerId || null, detail, force);
+      await aiTableExtractStart(ids ?? paperIds, cols, providerId || null, detail, depth, force);
     } catch (err) {
       setRunning(false);
       await alert(`启动抽取失败: ${err}`);
@@ -205,7 +209,15 @@ export function AiTableDialog() {
       await aiTableCellSet(paperId, columnKey, value);
       setCells((prev) => {
         const next = new Map(prev);
-        next.set(cellKey(paperId, columnKey), { paperId, columnKey, value, status: 'edited', edited: true });
+        next.set(cellKey(paperId, columnKey), {
+          paperId,
+          columnKey,
+          value,
+          status: 'edited',
+          edited: true,
+          src: '',
+          conf: 1,
+        });
         return next;
       });
     } catch (err) {
@@ -293,6 +305,8 @@ export function AiTableDialog() {
   const emptyCells = [...cells.values()].filter(
     (c) => !isFilled(c) && (c.status === 'empty' || c.status === 'done')
   ).length;
+  /** 模型确认文中没有——不是待补，重试也没用（除非强制重抽）。 */
+  const absentCells = [...cells.values()].filter((c) => !isFilled(c) && c.status === 'absent').length;
   const totalCells = papers.length * colKeys.filter(Boolean).length;
 
   return (
@@ -393,7 +407,36 @@ export function AiTableDialog() {
             </div>
           </div>
           <div className="p-2.5 border-t border-surface-hover space-y-1.5">
-            <label className="block text-[11px] text-text-secondary/60">详细程度</label>
+            <label className="block text-[11px] text-text-secondary/60">提取深度（成本 ↔ 精度）</label>
+            <select
+              value={depth}
+              onChange={(e) => setDepth(e.target.value as AiTableDepth)}
+              disabled={running}
+              className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none disabled:opacity-50"
+            >
+              <option value="fast">快速 · 1 次/篇，3 段/列</option>
+              <option value="standard">标准 · 1 次 + 弱证据补判</option>
+              <option value="deep">深入 · 8 段/列，章节覆盖</option>
+              <option value="per_column">逐列精查 · 每列 1 次</option>
+            </select>
+            <p className="text-[10px] text-text-secondary/45 leading-snug">
+              {depth === 'fast'
+                ? '最省：证据 ≤6000 字，可能漏抽长文里的细节。'
+                : depth === 'standard'
+                  ? '推荐：证据 ≤12000 字；证据不足的格子会再补判一次。'
+                  : depth === 'deep'
+                    ? '证据 ≤24000 字，按章节覆盖检索，适合精读与综述。'
+                    : '每列单独检索并单独调用，最准也最贵（调用次数 ≈ 列数 × 篇数）。'}
+            </p>
+            <p className="text-[10px] text-text-secondary/45">
+              预计调用：{papers.length} 篇 ×{' '}
+              {depth === 'per_column'
+                ? `约 ${Math.max(1, columns.filter((c) => c.key.trim()).length)} 次`
+                : depth === 'standard'
+                  ? '1~2 次'
+                  : '1 次'}
+            </p>
+            <label className="block text-[11px] text-text-secondary/60 pt-1">详细程度</label>
             <select
               value={detail}
               onChange={(e) => setDetail(e.target.value as AiTableDetail)}
@@ -503,7 +546,7 @@ export function AiTableDialog() {
           </div>
 
           <p className="px-4 py-1.5 text-[11px] text-text-secondary/50 border-b border-surface-hover/60">
-            每篇文献一次调用返回所有列；已完成和手动编辑的单元格不会被覆盖，抽取不到的字段记为「待补」可再次补齐。点击单元格可编辑。{emptyCells > 0 ? ` 当前有 ${emptyCells} 格待补。` : ''}
+            每篇文献一次调用返回所有列；已完成和手动编辑的单元格不会被覆盖，抽取不到的字段记为「待补」可再次补齐。点击单元格可编辑。{emptyCells > 0 ? ` 当前有 ${emptyCells} 格待补` : ''}{absentCells > 0 ? `、${absentCells} 格文中无此内容` : ''}。
           </p>
 
           <div className="flex-1 overflow-auto">
@@ -579,9 +622,30 @@ export function AiTableDialog() {
                               等待
                             </span>
                           ) : cell?.value ? (
-                            <span className={cell.edited ? 'text-primary' : 'text-text-primary/90'}>
+                            <span
+                              className={cell.edited ? 'text-primary' : 'text-text-primary/90'}
+                              title={
+                                cell.edited
+                                  ? '手动编辑'
+                                  : [cell.src && `依据：${cell.src}`, cell.conf > 0 && `置信度 ${Math.round(cell.conf * 100)}%`]
+                                      .filter(Boolean)
+                                      .join(' · ') || undefined
+                              }
+                            >
                               {cell.value}
                             </span>
+                          ) : cell?.status === 'absent' ? (
+                            // 模型读了证据后确认文中没有：这是最终答案，不是待补
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (!running) void startRun([p.id], true);
+                              }}
+                              className="text-text-secondary/45 hover:text-text-secondary/70"
+                              title="模型确认本文没有该内容（点击可强制重抽这一篇）"
+                            >
+                              文中无此
+                            </button>
                           ) : cell && (cell.status === 'empty' || cell.status === 'done') ? (
                             // Extracted but the model found nothing here: 待补
                             // (this used to be cached as "done" and could never

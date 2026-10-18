@@ -2054,9 +2054,13 @@ export interface AiTableCell {
   paperId: string;
   columnKey: string;
   value: string;
-  /** done | failed | edited */
+  /** done | failed | edited | empty（未检索到） | absent（文中无此内容） */
   status: string;
   edited: boolean;
+  /** Model-reported source location, e.g. "p.21 §5". */
+  src: string;
+  /** Model-reported confidence (0 when unreported). */
+  conf: number;
 }
 
 export interface AiTableProgress {
@@ -2089,11 +2093,19 @@ export interface AiTablePaperBrief {
  *  overrides it. */
 export type AiTableDetail = 'brief' | 'normal' | 'rich';
 
+/** How hard the run looks for evidence (cost ↔ accuracy, the user's choice).
+ *  fast: 1 call/paper, 3 chunks/column, ≤6k chars
+ *  standard: 1 call + one follow-up pass for weakly-evidenced fields
+ *  deep: 8 chunks/column, section-aware coverage, ≤24k chars
+ *  per_column: one call PER COLUMN (most accurate, most expensive) */
+export type AiTableDepth = 'fast' | 'standard' | 'deep' | 'per_column';
+
 export async function aiTableExtractStart(
   paperIds: string[],
   columns: AiTableColumn[],
   providerId?: string | null,
   detail?: AiTableDetail,
+  depth?: AiTableDepth,
   force?: boolean
 ): Promise<void> {
   return invoke<void>('ai_table_extract_start', {
@@ -2101,6 +2113,7 @@ export async function aiTableExtractStart(
     columns,
     providerId: providerId ?? null,
     detail: detail ?? null,
+    depth: depth ?? null,
     force: force ?? null,
   });
 }

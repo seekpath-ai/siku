@@ -1184,6 +1184,24 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     )
     .execute(&db)
     .await?;
+    // P1: per-cell provenance (src page/section, model confidence) and the
+    // "empty vs. absent" distinction. Device-local derived data like the cells.
+    add_column_if_missing(&db, "ai_table_cells", "meta_json", "TEXT NOT NULL DEFAULT '{}'")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for ai_table_cells.meta_json: {}", e))?;
+    // Retrieval-term cache: a column's search terms are generated once (built-in
+    // slot mapping or one LLM call) and reused across papers and runs.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ai_table_term_cache (
+            column_key TEXT PRIMARY KEY NOT NULL,
+            terms_json TEXT NOT NULL DEFAULT '[]',
+            source TEXT NOT NULL DEFAULT 'ai',
+            updated_at TEXT NOT NULL
+        )"
+    )
+    .execute(&db)
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ai_table_presets (
             id TEXT PRIMARY KEY NOT NULL,

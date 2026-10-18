@@ -30,6 +30,7 @@ pub mod office_text;
 pub mod paper_service;
 pub mod project_service;
 pub mod process;
+pub mod query_expand;
 pub mod redact;
 pub mod research_service;
 pub mod review_gen;

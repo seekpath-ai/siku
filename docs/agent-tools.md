@@ -103,17 +103,22 @@
 
 ### `paper_snapshot`
 
-把论文某页的一块区域渲染成 PNG 并返回路径——模型拿到路径后**必须在回复正文用 `![](path)` 嵌入**，气泡会渲染缩略图供用户点击放大。区域三选一：`label`（优先，如 "图3"、"Fig. 2"、"Table 1"；图表元数据在文献索引时由 pdfium 的页面 Image 对象 + caption 段落关联生成，存于设备本地 `paper_figures` 表；caption 无匹配 Image 对象时——矢量图/手绘表——按 caption 位置与图表类型惯例推断区域）、`rect`（显式 "x0,y0,x1,y1"，PDF points、y-up）、`region`（top/middle/bottom/full 页三分区，默认 full）。`analyze=true` 时用会话配置的多模态模型对截图做一次图像理解（图：类型/坐标轴/数据趋势/结论；表：转录 markdown 表格），描述随结果返回；未配置视觉模型时优雅降级为一句说明。
+把论文某页的一块区域渲染成 PNG 并返回路径——模型拿到路径后**必须在回复正文用 `![](path)` 嵌入**，气泡会渲染缩略图供用户点击放大。`label`、`rect`、`region` 互斥；三者都省略时截取整页。
+
+指定图表优先只传 `label`（如 "图3"、"Fig. 2"、"Table 1"）。后端结合索引中的图注位置与 PDF 页面的图片、矢量、文本几何信息，按栏和相邻正文边界计算完整裁剪区域；低置信度时若配置了视觉模型，会先在完整页面上定位再高清裁剪。`label` 模式默认包含图注。`rect` 是显式 "x0,y0,x1,y1"（PDF points、y-up），只能使用用户或工具已提供的坐标，模型不得猜测。`region`（top/middle/bottom/full）仅用于有意的粗略页面截图。
+
+结果包含实际 `rect`、页面尺寸、`crop_source`、`confidence` 和 `includes_caption`，便于追踪和核验。`analyze=true` 时用会话配置的多模态模型解读最终截图；主 Agent 需要把图中内容作为分析依据时必须开启，只有图片路径不代表模型看到了图片。视觉解读仅可依据可见内容，裁剪置信度低或关键内容缺失时必须说明并用 `paper_read` 核验，不得补全不可见数据。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `paper_id` | string | ✅ | 论文 UUID（同 `paper_read`） |
 | `page` | integer | ❌ | 页码（1 起）；给了 `label` 时可省略（全篇搜索该标签），默认 1 |
-| `label` | string | ❌ | 图表 caption 标签，如 "图3"、"Fig. 2"、"Table 1" |
-| `rect` | string | ❌ | 显式裁剪矩形 "x0,y0,x1,y1"（PDF points，y-up） |
-| `region` | string | ❌ | top / middle / bottom / full，默认 full |
+| `label` | string | ❌ | 图表 caption 标签；指定图表时优先使用，不与 rect/region 混用 |
+| `rect` | string | ❌ | 显式裁剪矩形 "x0,y0,x1,y1"（PDF points，y-up）；不得猜坐标 |
+| `region` | string | ❌ | 粗略页面区域 top / middle / bottom / full |
+| `include_caption` | boolean | ❌ | `label` 截图是否包含图注，默认 `true` |
 | `analyze` | boolean | ❌ | 用多模态模型解读截图并返回描述，默认 `false` |
-| `analyze_prompt` | string | ❌ | 自定义视觉解读提示词（仅 analyze=true 时生效） |
+| `analyze_prompt` | string | ❌ | 自定义视觉解读提示词（仅 analyze=true 时生效；可见性约束仍生效） |
 
 ### `paper_import`
 

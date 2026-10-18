@@ -144,21 +144,27 @@ fn x_overlap(a: &[f32; 4], b: &[f32; 4]) -> f32 {
 }
 
 fn union(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
-    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+    [
+        a[0].min(b[0]),
+        a[1].min(b[1]),
+        a[2].max(b[2]),
+        a[3].max(b[3]),
+    ]
 }
 
 /// Match one page's image bboxes to its captions. Returns the page's records.
+/// Each image belongs to at most one caption; subfigures can still share a caption.
 fn associate(
     page: u16,
     images: &[[f32; 4]],
     captions: &[(FigureKind, String, String, [f32; 4])],
 ) -> Vec<FigureRecord> {
-    let mut records = Vec::new();
+    let mut matched = vec![None; captions.len()];
     let mut claimed = vec![false; images.len()];
 
-    for (kind, label, text, cbbox) in captions {
-        let mut matched: Option<[f32; 4]> = None;
-        for (i, img) in images.iter().enumerate() {
+    for (i, img) in images.iter().enumerate() {
+        let mut best: Option<(usize, f32)> = None;
+        for (ci, (kind, _, _, cbbox)) in captions.iter().enumerate() {
             // Figure captions sit BELOW the figure (smaller y); table captions
             // sit ABOVE the table.
             let dist = match kind {
@@ -184,21 +190,31 @@ fn associate(
             if x_overlap(img, cbbox) < narrower * 0.2 {
                 continue;
             }
-            matched = Some(match matched {
-                Some(m) => union(m, *img),
+            if best.map(|(_, best_dist)| dist < best_dist).unwrap_or(true) {
+                best = Some((ci, dist));
+            }
+        }
+        if let Some((ci, _)) = best {
+            matched[ci] = Some(match matched[ci] {
+                Some(current) => union(current, *img),
                 None => *img,
             });
             claimed[i] = true;
         }
-        records.push(FigureRecord {
+    }
+
+    let mut records: Vec<FigureRecord> = captions
+        .iter()
+        .enumerate()
+        .map(|(ci, (kind, label, text, cbbox))| FigureRecord {
             page,
             kind: *kind,
             label: label.clone(),
             caption: text.chars().take(500).collect(),
-            bbox: matched,
+            bbox: matched[ci],
             caption_bbox: Some(*cbbox),
-        });
-    }
+        })
+        .collect();
 
     // Orphan images (caption missed by the regex, or in the references tail).
     for (i, img) in images.iter().enumerate() {
@@ -270,9 +286,7 @@ pub fn extract_figures(path: &Path) -> Result<Vec<FigureRecord>> {
             let lines =
                 crate::pdf::paragraphs::pdfium_lines(&text_page, display_w, display_h, rotation);
             for group in crate::pdf::paragraphs::group_paragraphs(&lines) {
-                if let Some(anchored) =
-                    crate::pdf::extractor::anchor_paragraph(page_no, &group)
-                {
+                if let Some(anchored) = crate::pdf::extractor::anchor_paragraph(page_no, &group) {
                     if let Some((kind, label)) = caption_label(&anchored.text) {
                         captions.push((
                             kind,
@@ -355,14 +369,15 @@ pub fn infer_rect_from_caption(
 
 /// Parse "x0,y0,x1,y1" (PDF points, y-up) from a tool argument.
 pub fn parse_rect(s: &str) -> Option<[f32; 4]> {
-    let v: Vec<f32> = s
+    let v: Option<Vec<f32>> = s
         .trim()
         .trim_start_matches('[')
         .trim_end_matches(']')
         .split(',')
-        .filter_map(|p| p.trim().parse::<f32>().ok())
+        .map(|p| p.trim().parse::<f32>().ok())
         .collect();
-    if v.len() != 4 {
+    let v = v?;
+    if v.len() != 4 || !v.iter().all(|n| n.is_finite()) {
         return None;
     }
     let r = [v[0], v[1], v[2], v[3]];
@@ -455,7 +470,10 @@ mod tests {
         let (w, h) = (612.0, 792.0);
         assert_eq!(region_rect("full", w, h), Some([0.0, 0.0, 612.0, 792.0]));
         assert_eq!(region_rect("top", w, h), Some([0.0, 528.0, 612.0, 792.0]));
-        assert_eq!(region_rect("middle", w, h), Some([0.0, 264.0, 612.0, 528.0]));
+        assert_eq!(
+            region_rect("middle", w, h),
+            Some([0.0, 264.0, 612.0, 528.0])
+        );
         assert_eq!(region_rect("bottom", w, h), Some([0.0, 0.0, 612.0, 264.0]));
         assert!(region_rect("left", w, h).is_none());
     }
@@ -480,10 +498,18 @@ mod tests {
 
     #[test]
     fn parse_rect_accepts_csv_and_brackets() {
-        assert_eq!(parse_rect("10,20,100,200"), Some([10.0, 20.0, 100.0, 200.0]));
-        assert_eq!(parse_rect("[10.5, 20, 100, 200]"), Some([10.5, 20.0, 100.0, 200.0]));
+        assert_eq!(
+            parse_rect("10,20,100,200"),
+            Some([10.0, 20.0, 100.0, 200.0])
+        );
+        assert_eq!(
+            parse_rect("[10.5, 20, 100, 200]"),
+            Some([10.5, 20.0, 100.0, 200.0])
+        );
         assert!(parse_rect("10,20,100").is_none());
         assert!(parse_rect("10,20,10.2,200").is_none()); // degenerate
+        assert!(parse_rect("10,20,bad,100,200").is_none());
+        assert!(parse_rect("10,20,NaN,200").is_none());
         assert!(parse_rect("garbage").is_none());
     }
 
@@ -555,6 +581,29 @@ mod tests {
     }
 
     #[test]
+    fn associate_assigns_an_image_only_to_the_nearest_caption() {
+        let images = vec![[100.0, 400.0, 500.0, 700.0]];
+        let captions = vec![
+            (
+                FigureKind::Figure,
+                "Fig. 1".to_string(),
+                "Fig. 1".to_string(),
+                [150.0, 380.0, 450.0, 396.0],
+            ),
+            (
+                FigureKind::Figure,
+                "Fig. 2".to_string(),
+                "Fig. 2".to_string(),
+                [150.0, 250.0, 450.0, 266.0],
+            ),
+        ];
+        let records = associate(1, &images, &captions);
+        assert_eq!(records[0].bbox, Some(images[0]));
+        assert_eq!(records[1].bbox, None);
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
     fn infer_rect_from_caption_respects_kind() {
         let (w, h) = (612.0, 792.0);
         // Figure caption at y 300..316: content band goes UP from its top.
@@ -580,7 +629,10 @@ mod tests {
         {
             Some(dir)
         } else {
-            println!("[figures] SKIPPED: demo0/1/2.pdf not found in {}", dir.display());
+            println!(
+                "[figures] SKIPPED: demo0/1/2.pdf not found in {}",
+                dir.display()
+            );
             None
         }
     }
@@ -601,17 +653,20 @@ mod tests {
                 .count();
             total_captions += captions;
             total_with_bbox += with_bbox;
-            println!("[figures] {name}: {} captions ({} with bbox), {} orphan images",
+            println!(
+                "[figures] {name}: {} captions ({} with bbox), {} orphan images",
                 captions,
                 with_bbox,
-                records.iter().filter(|r| r.label.is_empty()).count());
+                records.iter().filter(|r| r.label.is_empty()).count()
+            );
             for r in records.iter().filter(|r| !r.label.is_empty()).take(30) {
                 println!(
                     "  p.{} {} {:?} bbox={:?} :: {}",
                     r.page,
                     r.kind.as_str(),
                     r.label,
-                    r.bbox.map(|b| [b[0] as i32, b[1] as i32, b[2] as i32, b[3] as i32]),
+                    r.bbox
+                        .map(|b| [b[0] as i32, b[1] as i32, b[2] as i32, b[3] as i32]),
                     r.caption.chars().take(60).collect::<String>()
                 );
             }
@@ -638,9 +693,14 @@ mod tests {
             .expect("demo2 has no bbox-backed figure");
         let (pw, ph) = page_size(&demo2, fig.page - 1).unwrap();
         let rect = pad_rect(fig.bbox.unwrap(), 8.0, pw, ph);
-        let out = out_dir.join(format!("demo2_p{}_{}.png", fig.page, fig.label.replace(' ', "_")));
-        let (w, h) = crate::pdf::renderer::render_page_region(&demo2, fig.page - 1, rect, 250.0, &out)
-            .unwrap();
+        let out = out_dir.join(format!(
+            "demo2_p{}_{}.png",
+            fig.page,
+            fig.label.replace(' ', "_")
+        ));
+        let (w, h) =
+            crate::pdf::renderer::render_page_region(&demo2, fig.page - 1, rect, 250.0, &out)
+                .unwrap();
         println!("[figures] snapshot: {} ({w}x{h})", out.display());
         assert!(w > 10 && h > 10);
         assert!(std::fs::metadata(&out).unwrap().len() > 1000);
@@ -670,7 +730,8 @@ mod tests {
         let (pw, ph) = page_size(&demo2, 2).unwrap();
         let rect = region_rect("middle", pw, ph).unwrap();
         let out = out_dir.join("demo2_p3_middle.png");
-        let (w, h) = crate::pdf::renderer::render_page_region(&demo2, 2, rect, 250.0, &out).unwrap();
+        let (w, h) =
+            crate::pdf::renderer::render_page_region(&demo2, 2, rect, 250.0, &out).unwrap();
         println!("[figures] region snapshot: {} ({w}x{h})", out.display());
         assert!((h as f32 - ph / 3.0 * 250.0 / 72.0).abs() < 4.0);
     }

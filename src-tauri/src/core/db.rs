@@ -591,6 +591,8 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // Initialize schema if tables don't exist (data persists across restarts)
     info!("initializing schema from schema_init.sql");
     sqlx::query(SCHEMA_INIT_SQL).execute(&db).await?;
+    // AI 综述 run、卡片和分节均为设备本地派生状态，不注册到 CR-SQLite 同步表。
+    sqlx::raw_sql(crate::core::review_store::SCHEMA_SQL).execute(&db).await?;
 
     // Migration: sync_outbox gains the relay message_id so outbox retries
     // re-deposit with the same id (relay-side idempotent dedupe) (added 2026-08-31)

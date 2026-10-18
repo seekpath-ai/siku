@@ -1,15 +1,11 @@
-//! AI 综述生成 commands: outline generation + pipeline lifecycle.
-
 use tauri::{AppHandle, State};
 
-use crate::core::review_gen::{self, ReviewSection};
+use crate::core::review_gen;
+use crate::core::review_store::{self, ReviewPaperCard, ReviewSection, ReviewSnapshot};
 use crate::AppState;
 
-/// Step 1: design the section outline for the selected paper set. The dialog
-/// lets the user edit it before calling review_generate_start.
 #[tauri::command]
-pub async fn review_generate_outline(
-    app: AppHandle,
+pub async fn review_create(
     state: State<'_, AppState>,
     paper_ids: Vec<String>,
     question: String,
@@ -17,19 +13,12 @@ pub async fn review_generate_outline(
     language: String,
     target_words: u32,
     provider_id: Option<String>,
-) -> Result<Vec<ReviewSection>, String> {
-    if paper_ids.is_empty() {
-        return Err("未选择文献".to_string());
-    }
-    if question.trim().is_empty() {
-        return Err("请填写研究问题".to_string());
-    }
-    review_gen::generate_outline(
-        &app,
+) -> Result<ReviewSnapshot, String> {
+    review_gen::create(
         &state.db,
         &paper_ids,
-        question.trim(),
-        scope.trim(),
+        &question,
+        &scope,
         &language,
         target_words,
         provider_id.as_deref(),
@@ -37,61 +26,99 @@ pub async fn review_generate_outline(
     .await
 }
 
-/// Step 2: run the section-by-section pipeline (spawned; progress on
-/// `library:review-progress`; the terminal event carries the new note id).
+#[tauri::command]
+pub async fn review_get(state: State<'_, AppState>, run_id: String) -> Result<ReviewSnapshot, String> {
+    review_gen::get(&state.db, &run_id).await
+}
+
+#[tauri::command]
+pub async fn review_read_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<(), String> {
+    review_store::load_state(&state.db, &run_id).await?;
+    let db = state.db.clone();
+    tauri::async_runtime::spawn(async move {
+        review_gen::run_reading(app, db, run_id).await;
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn review_read_retry(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    run_id: String,
+    paper_id: String,
+) -> Result<(), String> {
+    review_gen::prepare_read_retry(&state.db, &run_id, &paper_id).await?;
+    let db = state.db.clone();
+    tauri::async_runtime::spawn(async move {
+        review_gen::run_reading(app, db, run_id).await;
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn review_card_update(
+    state: State<'_, AppState>,
+    run_id: String,
+    paper_id: String,
+    card: ReviewPaperCard,
+) -> Result<ReviewSnapshot, String> {
+    review_gen::update_card(&state.db, &run_id, &paper_id, card).await
+}
+
+#[tauri::command]
+pub async fn review_generate_outline(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<Vec<ReviewSection>, String> {
+    review_gen::generate_outline(&app, &state.db, &run_id).await
+}
+
 #[tauri::command]
 pub async fn review_generate_start(
     app: AppHandle,
     state: State<'_, AppState>,
-    paper_ids: Vec<String>,
-    question: String,
-    language: String,
-    target_words: u32,
+    run_id: String,
     outline: Vec<ReviewSection>,
-    provider_id: Option<String>,
 ) -> Result<(), String> {
-    if paper_ids.is_empty() {
-        return Err("未选择文献".to_string());
-    }
-    if outline.is_empty() {
-        return Err("大纲为空".to_string());
-    }
+    review_gen::prepare_generation(&state.db, &run_id, &outline).await?;
     let db = state.db.clone();
     tauri::async_runtime::spawn(async move {
-        review_gen::run_review(app, db, paper_ids, question, language, target_words, outline, provider_id).await;
+        review_gen::run_generation(app, db, run_id).await;
     });
     Ok(())
 }
 
-#[tauri::command]
-pub async fn review_generate_cancel() -> Result<(), String> {
-    review_gen::request_cancel();
-    Ok(())
-}
-
-/// Retry ONE failed section (1-based index) with a doubled output budget.
-/// Spawned: a section call can take minutes, and progress arrives on
-/// `library:review-progress` like every other beat.
 #[tauri::command]
 pub async fn review_generate_retry_section(
     app: AppHandle,
     state: State<'_, AppState>,
+    run_id: String,
     section_index: usize,
 ) -> Result<(), String> {
+    review_gen::prepare_section_retry(&state.db, &run_id, section_index).await?;
     let db = state.db.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = review_gen::retry_section(app, db, section_index).await {
-            // The per-section failure event was already emitted by the core;
-            // this is just the tracing trail.
-            tracing::warn!(section_index, error = %e, "review section retry did not succeed");
-        }
+        review_gen::run_generation(app, db, run_id).await;
     });
     Ok(())
 }
 
-/// Save the note from whatever sections exist (placeholders for the missing
-/// ones). Async because it writes a note, but fast enough to await.
 #[tauri::command]
-pub async fn review_generate_save(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
-    review_gen::save_review(app, state.db.clone()).await
+pub async fn review_generate_cancel(state: State<'_, AppState>, run_id: String) -> Result<(), String> {
+    review_gen::request_cancel(&state.db, &run_id).await
+}
+
+#[tauri::command]
+pub async fn review_generate_save(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    run_id: String,
+) -> Result<String, String> {
+    review_gen::save_review(&app, &state.db, &run_id).await
 }

@@ -34,6 +34,8 @@ pub mod query_expand;
 pub mod redact;
 pub mod research_service;
 pub mod review_gen;
+pub mod review_sources;
+pub mod review_store;
 pub mod search_service;
 pub mod settings_service;
 pub mod skill_review;

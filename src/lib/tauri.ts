@@ -2514,12 +2514,109 @@ export interface ReviewSection {
   points: string;
   /** Subsection headings; empty = the section is written as one block. */
   subsections: string[];
+  /** Papers assigned to this section; preserved by the outline editor. */
+  paperIds: string[];
+}
+
+export interface ReviewFinding {
+  claim: string;
+  evidenceIds: string[];
+}
+
+export interface ReviewEvidence {
+  id: string;
+  chunkId: string | null;
+  page: number | null;
+  quote: string;
+  content: string;
+}
+
+export interface ReviewPaperCard {
+  paperId: string;
+  researchQuestion: string;
+  methods: string;
+  dataAndSample: string;
+  findings: ReviewFinding[];
+  limitations: string;
+  relevance: string;
+  evidence: ReviewEvidence[];
+  sourceType: 'fulltext' | 'abstract';
+  edited: boolean;
+}
+
+export interface ReviewSource {
+  paperId: string;
+  paperIndex: number;
+  title: string;
+  /** JSON-encoded author array, matching the library's Paper.authors format. */
+  authors: string;
+  year: number | null;
+  sourceKind: 'fulltext' | 'abstract' | 'unusable';
+  status: 'pending' | 'running' | 'done' | 'failed';
+  chunkCount: number;
+  abstractChars: number;
+  card: ReviewPaperCard | null;
+  error: string | null;
+}
+
+export interface ReviewSynthesisItem {
+  title: string;
+  detail: string;
+  paperIds: string[];
+}
+
+export interface ReviewSynthesis {
+  themes: ReviewSynthesisItem[];
+  agreements: ReviewSynthesisItem[];
+  conflicts: ReviewSynthesisItem[];
+  gaps: ReviewSynthesisItem[];
+}
+
+export interface ReviewSectionResult {
+  /** Stored snapshots use zero-based coordinates; progress events remain 1-based. */
+  sectionIndex: number;
+  status: 'pending' | 'running' | 'done' | 'failed';
+  rawMarkdown: string;
+  attempts: number;
+  error: string | null;
+}
+
+export interface ReviewAudit {
+  selectedCount: number;
+  fulltextCount: number;
+  abstractCount: number;
+  unusableCount: number;
+  citedPaperIds: string[];
+  uncitedPaperIds: string[];
+  invalidMarkers: string[];
+  warnings: string[];
+}
+
+export interface ReviewSnapshot {
+  runId: string;
+  status: string;
+  stage: string;
+  question: string;
+  scope: string;
+  language: string;
+  targetWords: number;
+  providerId: string | null;
+  paperIds: string[];
+  sources: ReviewSource[];
+  outline: ReviewSection[];
+  synthesis: ReviewSynthesis | null;
+  sections: ReviewSectionResult[];
+  finalRawMarkdown: string | null;
+  audit: ReviewAudit | null;
+  noteId: string | null;
+  error: string | null;
 }
 
 export interface ReviewProgress {
-  /** outline | section | assemble | done | partial | cancelled | error */
+  runId: string;
+  /** read | synthesis | read_ready | outline | section | revision | assemble | done | partial | cancelled | error */
   stage: string;
-  /** 1-based section coordinate; kept even on failure. */
+  /** 1-based section coordinate; 0 for reading, outline and revision events. */
   sectionIndex: number;
   totalSections: number;
   sectionTitle: string;
@@ -2529,27 +2626,30 @@ export interface ReviewProgress {
   delta?: string;
   /** Reasoning fragment (thinking models), shown dimmed above the content. */
   reasoning?: string;
-  /** running | done | failed — the per-section state the dialog trusts. */
+  /** running | done | failed — a section status, or a paper status when sectionIndex is 0. */
   sectionStatus?: 'running' | 'done' | 'failed';
   /** Failure text for this specific section. */
-  error?: string;
+  error?: string | null;
   /** Retries already performed for this section (0 = first attempt). */
   attempt?: number;
   /** max_tokens in effect for this attempt (doubles per retry). */
   maxTokens?: number;
   /** Sections with content so far. */
   doneSections?: number;
+  paperId?: string | null;
+  donePapers?: number | null;
+  totalPapers?: number | null;
 }
 
-export async function reviewGenerateOutline(
+export async function reviewCreate(
   paperIds: string[],
   question: string,
   scope: string,
   language: string,
   targetWords: number,
   providerId?: string | null
-): Promise<ReviewSection[]> {
-  return invoke<ReviewSection[]>('review_generate_outline', {
+): Promise<ReviewSnapshot> {
+  return invoke<ReviewSnapshot>('review_create', {
     paperIds,
     question,
     scope,
@@ -2559,34 +2659,44 @@ export async function reviewGenerateOutline(
   });
 }
 
-export async function reviewGenerateStart(
-  paperIds: string[],
-  question: string,
-  language: string,
-  targetWords: number,
-  outline: ReviewSection[],
-  providerId?: string | null
-): Promise<void> {
-  return invoke<void>('review_generate_start', {
-    paperIds,
-    question,
-    language,
-    targetWords,
-    outline,
-    providerId: providerId ?? null,
-  });
+export async function reviewGet(runId: string): Promise<ReviewSnapshot> {
+  return invoke<ReviewSnapshot>('review_get', { runId });
 }
 
-/** Retry one failed section (1-based) with a doubled output budget. */
-export async function reviewGenerateRetrySection(sectionIndex: number): Promise<void> {
-  return invoke<void>('review_generate_retry_section', { sectionIndex });
+export async function reviewReadStart(runId: string): Promise<void> {
+  return invoke<void>('review_read_start', { runId });
+}
+
+export async function reviewReadRetry(runId: string, paperId: string): Promise<void> {
+  return invoke<void>('review_read_retry', { runId, paperId });
+}
+
+export async function reviewCardUpdate(
+  runId: string,
+  paperId: string,
+  card: ReviewPaperCard
+): Promise<ReviewSnapshot> {
+  return invoke<ReviewSnapshot>('review_card_update', { runId, paperId, card });
+}
+
+export async function reviewGenerateOutline(runId: string): Promise<ReviewSection[]> {
+  return invoke<ReviewSection[]>('review_generate_outline', { runId });
+}
+
+export async function reviewGenerateStart(runId: string, outline: ReviewSection[]): Promise<void> {
+  return invoke<void>('review_generate_start', { runId, outline });
+}
+
+/** Retry one failed section using its stored zero-based sectionIndex. */
+export async function reviewGenerateRetrySection(runId: string, sectionIndex: number): Promise<void> {
+  return invoke<void>('review_generate_retry_section', { runId, sectionIndex });
+}
+
+export async function reviewGenerateCancel(runId: string): Promise<void> {
+  return invoke<void>('review_generate_cancel', { runId });
 }
 
 /** Save the note from whatever sections exist (placeholders for the gaps). */
-export async function reviewGenerateSave(): Promise<string> {
-  return invoke<string>('review_generate_save');
-}
-
-export async function reviewGenerateCancel(): Promise<void> {
-  return invoke<void>('review_generate_cancel');
+export async function reviewGenerateSave(runId: string): Promise<string> {
+  return invoke<string>('review_generate_save', { runId });
 }

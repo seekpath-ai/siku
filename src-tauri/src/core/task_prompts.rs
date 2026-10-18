@@ -21,7 +21,10 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 
 pub const REVIEW_OUTLINE: &str = "review.outline";
+pub const REVIEW_CARD: &str = "review.card";
+pub const REVIEW_SYNTHESIZE: &str = "review.synthesize";
 pub const REVIEW_SECTION: &str = "review.section";
+pub const REVIEW_REVISION: &str = "review.revision";
 pub const AI_TABLE_EXTRACT: &str = "ai_table.extract";
 pub const AI_TABLE_VERIFY: &str = "ai_table.verify";
 pub const CLASSIFY_DRAFT: &str = "classify.draft";
@@ -74,7 +77,7 @@ pub const GROUPS: &[PromptGroup] = &[
     PromptGroup {
         id: "review",
         name: "AI 综述",
-        description: "每节一次调用的输出预算；实际额度取「按目标字数算出的值」与此值的较大者",
+        description: "阅读、综合、大纲、分节和修订单次调用的输出预算下限；实际额度取各阶段计算值与此值的较大者",
         builtin_default: 7000,
     },
     PromptGroup {
@@ -138,11 +141,29 @@ pub fn setting_key(id: &str) -> String {
 
 pub const PROMPTS: &[TaskPrompt] = &[
     TaskPrompt {
+        id: REVIEW_CARD,
+        group: "AI 综述",
+        name: "逐篇证据卡",
+        description: "每篇可用文献阅读时调用一次",
+        default: "你是严谨的学术文献阅读助手。只依据给定候选原文，为一篇文献生成证据卡。只输出一个 JSON 对象：{\"paperId\":\"给定文献 ID\",\"researchQuestion\":\"研究问题\",\"methods\":\"方法\",\"dataAndSample\":\"数据与样本；没有则说明未报告\",\"findings\":[{\"claim\":\"有原文依据的发现\",\"evidenceIds\":[\"E1\"]}],\"limitations\":\"局限；没有则说明未报告\",\"relevance\":\"与给定研究问题和范围的关系\",\"evidence\":[{\"id\":\"候选原文编号\",\"chunkId\":\"候选原文给出的 chunkId；摘要为 null\",\"page\":候选原文页码或 null,\"quote\":\"原文中逐字复制的短句\",\"content\":\"对应候选原文\"}],\"sourceType\":\"fulltext 或 abstract\",\"edited\":false}。evidence.id 和 findings.evidenceIds 只能使用候选原文编号；不得编造证据、页码、chunkId 或文献之外的事实。摘要来源必须保留 sourceType=abstract、chunkId=null、page=null，不得虚构 PDF 定位。",
+        placeholders: &[],
+        affects_parsing: true,
+    },
+    TaskPrompt {
+        id: REVIEW_SYNTHESIZE,
+        group: "AI 综述",
+        name: "跨文献综合",
+        description: "全部证据卡完成后按批次综合并合并",
+        default: "你是学术综述研究助手。根据给定证据卡提炼跨文献主题、共识、冲突和研究缺口，不得引入卡片之外的事实。只输出一个 JSON 对象：{\"themes\":[{\"title\":\"主题\",\"detail\":\"综合说明\",\"paperIds\":[\"真实 paperId\"]}],\"agreements\":[同结构],\"conflicts\":[同结构],\"gaps\":[同结构]}。每个相关 paperId 必须逐字来自输入，不得编造；没有内容的项目使用空数组。用于合并批次时，保留各批次的重要主题、共识、冲突与缺口并合并重复项。",
+        placeholders: &[],
+        affects_parsing: true,
+    },
+    TaskPrompt {
         id: REVIEW_OUTLINE,
         group: "AI 综述",
         name: "大纲设计",
-        description: "生成综述目录时调用一次",
-        default: "你是学术写作助手，擅长设计文献综述的目录框架。只输出 JSON 数组，每个元素为 {\"title\": \"章节标题\", \"points\": \"该节应覆盖的要点（一句话）\", \"subsections\": [\"小节标题\", ...]}；内容较多的章节设计 2-4 个小节，引言、总结/展望等简短章节的小节数组可为空。不要输出 JSON 以外的内容。",
+        description: "基于综合和证据卡生成综述目录时调用一次",
+        default: "你是学术写作助手，擅长依据跨文献综合和证据卡设计文献综述目录。只输出 JSON 数组，每个元素为 {\"title\":\"章节标题\",\"points\":\"该节应覆盖的要点及论证关系\",\"subsections\":[\"小节标题\",...],\"paperIds\":[\"本节重点使用的真实 paperId\"]}；paperIds 只能来自输入，每节至少分配一篇相关文献。内容较多的章节设计 2-4 个小节，引言、总结/展望等简短章节的小节数组可为空。不要输出 JSON 以外的内容。",
         placeholders: &[],
         affects_parsing: true,
     },
@@ -152,8 +173,8 @@ pub const PROMPTS: &[TaskPrompt] = &[
         name: "分节撰写",
         description: "撰写每一节时调用一次（正文流式输出）",
         default: "你是学术写作助手，正在撰写文献综述的一节。规则：\n\
-1. 只依据「参考段落」写作，不得编造文献中没有的事实；\n\
-2. 引用事实必须在句末标注【证据编号】，格式如 [E3]（E 后面的数字就是「参考段落」前的编号）；同一处事实可引多条证据，写成 [E3][E7]；只能使用「参考段落」中出现过的编号，绝不自行编号或改写编号体系；\n\
+1. 只依据「参考证据」写作，不得编造文献中没有的事实；\n\
+2. 引用事实必须在句末标注【证据编号】，格式如 [E3]（E 后面的数字就是「参考证据」前的编号）；同一处事实可引多条证据，写成 [E3][E7]；只能使用「参考证据」中出现过的编号，绝不自行编号或改写编号体系；\n\
 3. 使用{language}写作，学术语体，篇幅约 {target_words} 字——这只是量级参考，\n\
    写完后系统会统一校准篇幅；你只需把要点写透，不要核对、统计或掂量字数；\n\
 4. 直接输出本节正文，不要输出章节标题，不要解释。{subsection_rule}",
@@ -162,6 +183,15 @@ pub const PROMPTS: &[TaskPrompt] = &[
             Placeholder { name: "target_words", description: "本节的建议字数" },
             Placeholder { name: "subsection_rule", description: "有小节时追加的组织规则；没有小节时为空" },
         ],
+        affects_parsing: false,
+    },
+    TaskPrompt {
+        id: REVIEW_REVISION,
+        group: "AI 综述",
+        name: "全文修订",
+        description: "全部分节完成后对完整原始稿修订一次",
+        default: "你是学术综述全文修订助手。基于研究问题和跨文献综合，对完整原始稿做一次全局修订：减少重复，统一术语，改善章节间过渡，并收紧结论的证据边界。硬性规则：必须按原顺序原样保留所有 [E数字] 引用标记，不得删除、复制、重排或新增；必须保留所有 Markdown 标题及其层级和文字；不得把摘要级证据写成全文已验证的细节；只输出修订后的完整 Markdown 原稿，不要附加解释或参考文献列表。",
+        placeholders: &[],
         affects_parsing: false,
     },
     TaskPrompt {

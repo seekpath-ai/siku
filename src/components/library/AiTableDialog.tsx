@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle, PanelRight, RefreshCw, Search, ChevronDown, ChevronRight } from 'lucide-react';
+import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle, PanelRight, RefreshCw, Search } from 'lucide-react';
 import { useAiTableStore } from '@/stores/aiTableStore';
 import { useDialog } from '@/hooks/useDialog';
 import { ModelOverrideSelect } from './ModelOverrideSelect';
@@ -83,7 +83,7 @@ export function AiTableDialog() {
   const [reasoning, setReasoning] = useState('');
   const [reasoningTitle, setReasoningTitle] = useState('');
   const [showLog, setShowLog] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [setupTab, setSetupTab] = useState<'columns' | 'settings'>('columns');
   const logRef = useRef<HTMLDivElement>(null);
   /** Throttled grid refresh while a run is in progress: cells are written per
    *  paper on the backend, so waiting for `finished` showed "等待" for minutes
@@ -409,14 +409,48 @@ export function AiTableDialog() {
           trapped in a modal because a model call is slow is unacceptable. */}
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={close} />
       <div className="relative w-[94vw] max-w-[1200px] h-[calc(100dvh-3rem)] max-h-[1200px] min-h-0 mx-4 flex bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
-        {/* Left: column definitions + presets */}
+        {/* Left: switch between column definitions and extraction settings */}
         <aside className="w-[280px] shrink-0 border-r border-surface-hover flex flex-col min-h-0">
-          <div className="px-3 py-2.5 border-b border-surface-hover">
-            <span className="text-[13px] font-medium text-text-primary">列定义</span>
-            <p className="text-[11px] text-text-secondary/60 mt-0.5">每列一个提取说明，对每篇文献抽取一次</p>
+          <div
+            role="tablist"
+            aria-label="列定义与提取设置"
+            className="grid grid-cols-2 gap-1 p-1.5 border-b border-surface-hover"
+            onKeyDown={(e) => {
+              if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+              e.preventDefault();
+              const next = setupTab === 'columns' ? 'settings' : 'columns';
+              setSetupTab(next);
+              document.getElementById(`ai-table-tab-${next}`)?.focus();
+            }}
+          >
+            {(['columns', 'settings'] as const).map((tab) => (
+              <button
+                key={tab}
+                id={`ai-table-tab-${tab}`}
+                type="button"
+                role="tab"
+                aria-selected={setupTab === tab}
+                aria-controls={`ai-table-panel-${tab}`}
+                tabIndex={setupTab === tab ? 0 : -1}
+                onClick={() => setSetupTab(tab)}
+                className={`rounded-md px-3 py-2 text-[12px] font-medium transition-colors ${
+                  setupTab === tab
+                    ? 'bg-background text-text-primary shadow-sm'
+                    : 'text-text-secondary/60 hover:bg-surface-hover/60 hover:text-text-primary'
+                }`}
+              >
+                {tab === 'columns' ? '列定义' : '提取设置'}
+              </button>
+            ))}
           </div>
-          <div className="flex-1 min-h-0 overflow-y-auto flex flex-col">
-            <section className="flex-1 min-h-[300px] p-2.5 space-y-2.5">
+          {setupTab === 'columns' ? (
+            <div
+              id="ai-table-panel-columns"
+              role="tabpanel"
+              aria-labelledby="ai-table-tab-columns"
+              className="flex-1 min-h-0 flex flex-col"
+            >
+              <section className="flex-1 min-h-0 overflow-y-auto p-2.5 space-y-2.5">
             {columns.map((col, i) => (
               <div key={i} className="rounded-lg border border-surface-hover/70 p-2 space-y-1.5">
                 <div className="flex items-center gap-1.5">
@@ -539,143 +573,134 @@ export function AiTableDialog() {
               <Plus size={12} />
               添加列
             </button>
-            </section>
-          <div className="shrink-0 p-2.5 border-t border-surface-hover space-y-1.5">
-            <select
-              value=""
-              onChange={(e) => {
-                const b = builtins.find((x) => x.id === e.target.value);
-                if (b) setColumns(b.columns.map((c) => ({ ...c })));
-              }}
-              className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none"
-              title={builtins.map((b) => `${b.name}：${b.description}`).join('\n')}
-            >
-              <option value="">内置学科模板…</option>
-              {builtins.map((b) => (
-                <option key={b.id} value={b.id}>
-                  {b.name}
-                </option>
-              ))}
-            </select>
-            <select
-              value={selectedPreset}
-              onChange={(e) => applyPreset(e.target.value)}
-              className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none"
-            >
-              <option value="">我的模板…</option>
-              {presets.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                </option>
-              ))}
-            </select>
-            <div className="flex gap-1.5">
-              <button
-                onClick={() => void savePreset()}
-                className="flex-1 px-2 py-1.5 rounded-lg border border-surface-hover text-[12px] text-text-secondary hover:bg-surface-hover"
-              >
-                存为模板
-              </button>
-              <button
-                onClick={() => void deletePreset()}
-                disabled={!selectedPreset}
-                className="px-2 py-1.5 rounded-lg border border-surface-hover text-[12px] text-text-secondary hover:bg-surface-hover disabled:opacity-40"
-              >
-                删模板
-              </button>
-            </div>
-          </div>
-          <section className="shrink-0 border-t border-surface-hover">
-            <button
-              type="button"
-              onClick={() => setSettingsOpen((v) => !v)}
-              aria-expanded={settingsOpen}
-              aria-controls="ai-table-extraction-settings"
-              className="w-full flex items-center gap-1.5 px-3 py-2.5 text-left hover:bg-surface-hover/50"
-            >
-              {settingsOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-              <span className="text-[12px] font-medium text-text-primary">提取设置</span>
-              {!settingsOpen && (
-                <span className="ml-auto truncate text-[10px] font-normal text-text-secondary/45">
-                  {depth === 'fast' ? '快速' : depth === 'standard' ? '标准' : depth === 'deep' ? '深入' : '逐列精查'}
-                  {' · '}
-                  {detail === 'brief' ? '简洁' : detail === 'normal' ? '1~2 句' : '3~6 句'}
-                </span>
-              )}
-            </button>
-            {settingsOpen && (
-              <div id="ai-table-extraction-settings" className="px-2.5 pb-2.5 space-y-1.5">
-            <label className="block text-[11px] text-text-secondary/60">提取深度（成本 ↔ 精度）</label>
-            <select
-              value={depth}
-              onChange={(e) => setDepth(e.target.value as AiTableDepth)}
-              disabled={running}
-              className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none disabled:opacity-50"
-            >
-              <option value="fast">快速 · 1 次/篇，3 段/列</option>
-              <option value="standard">标准 · 1 次 + 弱证据补判</option>
-              <option value="deep">深入 · 8 段/列，章节覆盖</option>
-              <option value="per_column">逐列精查 · 每列 1 次</option>
-            </select>
-            <p className="text-[10px] text-text-secondary/45 leading-snug">
-              {depth === 'fast'
-                ? '最省：证据 ≤6000 字，可能漏抽长文里的细节。'
-                : depth === 'standard'
-                  ? '推荐：证据 ≤12000 字；证据不足的格子会再补判一次。'
-                  : depth === 'deep'
-                    ? '证据 ≤24000 字，按章节覆盖检索，适合精读与综述。'
-                    : '每列单独检索并单独调用，最准也最贵（调用次数 ≈ 列数 × 篇数）。'}
-            </p>
-            <p className="text-[10px] text-text-secondary/45">
-              预计调用：{papers.length} 篇 ×{' '}
-              {depth === 'per_column'
-                ? `约 ${Math.max(1, columns.filter((c) => c.key.trim()).length)} 次`
-                : depth === 'standard'
-                  ? '1~2 次'
-                  : '1 次'}
-            </p>
-            <label className="block text-[11px] text-text-secondary/60 pt-1">详细程度</label>
-            <select
-              value={detail}
-              onChange={(e) => setDetail(e.target.value as AiTableDetail)}
-              disabled={running}
-              className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none disabled:opacity-50"
-            >
-              <option value="brief">简洁（≤40 字）</option>
-              <option value="normal">标准（1~2 句）</option>
-              <option value="rich">详细（3~6 句，带数字）</option>
-            </select>
-            <p className="text-[10px] text-text-secondary/45 leading-snug">
-              列说明里写明长度/详略时以列说明为准；已抽取的单元格不会因改这里而重算。
-            </p>
-            <label className="block text-[11px] text-text-secondary/60 pt-1">交叉验证（额外调用）</label>
-            <select
-              value={verify}
-              onChange={(e) => setVerify(e.target.value as AiTableVerify)}
-              disabled={running}
-              className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none disabled:opacity-50"
-            >
-              <option value="off">关闭 · 不额外调用</option>
-              <option value="doubtful">仅存疑格 · 每篇最多 6 格</option>
-              <option value="all">全部已抽取值 · 每篇最多 10 格</option>
-            </select>
-            <p className="text-[10px] text-text-secondary/45 leading-snug">
-              {verify === 'off'
-                ? '只做一次抽取；可疑的格子仍会被标出来，但不复核。'
-                : verify === 'doubtful'
-                  ? '推荐：把无证据/无出处/置信度低的格子重新对照原文核对一次，核对通过即不再存疑。'
-                  : '每篇多一次调用逐格核对，最严也最贵；被判定不支持的值会标为存疑。'}
-            </p>
-            <label className="block text-[11px] text-text-secondary/60 pt-1">模型</label>
-            <ModelOverrideSelect value={providerId} onChange={setProviderId} disabled={running} className="w-full" />
+              </section>
+              <div className="shrink-0 p-2.5 border-t border-surface-hover space-y-1.5">
+                <select
+                  value=""
+                  onChange={(e) => {
+                    const b = builtins.find((x) => x.id === e.target.value);
+                    if (b) setColumns(b.columns.map((c) => ({ ...c })));
+                  }}
+                  className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none"
+                  title={builtins.map((b) => `${b.name}：${b.description}`).join('\n')}
+                >
+                  <option value="">内置学科模板…</option>
+                  {builtins.map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {b.name}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={selectedPreset}
+                  onChange={(e) => applyPreset(e.target.value)}
+                  className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none"
+                >
+                  <option value="">我的模板…</option>
+                  {presets.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+                <div className="flex gap-1.5">
+                  <button
+                    onClick={() => void savePreset()}
+                    className="flex-1 px-2 py-1.5 rounded-lg border border-surface-hover text-[12px] text-text-secondary hover:bg-surface-hover"
+                  >
+                    存为模板
+                  </button>
+                  <button
+                    onClick={() => void deletePreset()}
+                    disabled={!selectedPreset}
+                    className="px-2 py-1.5 rounded-lg border border-surface-hover text-[12px] text-text-secondary hover:bg-surface-hover disabled:opacity-40"
+                  >
+                    删模板
+                  </button>
+                </div>
               </div>
-            )}
-          </section>
-          </div>
+            </div>
+          ) : (
+            <div
+              id="ai-table-panel-settings"
+              role="tabpanel"
+              aria-labelledby="ai-table-tab-settings"
+              className="flex-1 min-h-0 overflow-y-auto"
+            >
+              <div className="p-3 space-y-2">
+                <p className="pb-1 text-[11px] leading-relaxed text-text-secondary/50">
+                  设置本次抽取的深度、内容详略、交叉验证和模型。
+                </p>
+                <label className="block text-[11px] text-text-secondary/60">提取深度（成本 ↔ 精度）</label>
+                <select
+                  value={depth}
+                  onChange={(e) => setDepth(e.target.value as AiTableDepth)}
+                  disabled={running}
+                  className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none disabled:opacity-50"
+                >
+                  <option value="fast">快速 · 1 次/篇，3 段/列</option>
+                  <option value="standard">标准 · 1 次 + 弱证据补判</option>
+                  <option value="deep">深入 · 8 段/列，章节覆盖</option>
+                  <option value="per_column">逐列精查 · 每列 1 次</option>
+                </select>
+                <p className="text-[10px] text-text-secondary/45 leading-snug">
+                  {depth === 'fast'
+                    ? '最省：证据 ≤6000 字，可能漏抽长文里的细节。'
+                    : depth === 'standard'
+                      ? '推荐：证据 ≤12000 字；证据不足的格子会再补判一次。'
+                      : depth === 'deep'
+                        ? '证据 ≤24000 字，按章节覆盖检索，适合精读与综述。'
+                        : '每列单独检索并单独调用，最准也最贵（调用次数 ≈ 列数 × 篇数）。'}
+                </p>
+                <p className="text-[10px] text-text-secondary/45">
+                  预计调用：{papers.length} 篇 ×{' '}
+                  {depth === 'per_column'
+                    ? `约 ${Math.max(1, columns.filter((c) => c.key.trim()).length)} 次`
+                    : depth === 'standard'
+                      ? '1~2 次'
+                      : '1 次'}
+                </p>
+                <label className="block text-[11px] text-text-secondary/60 pt-2">详细程度</label>
+                <select
+                  value={detail}
+                  onChange={(e) => setDetail(e.target.value as AiTableDetail)}
+                  disabled={running}
+                  className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none disabled:opacity-50"
+                >
+                  <option value="brief">简洁（≤40 字）</option>
+                  <option value="normal">标准（1~2 句）</option>
+                  <option value="rich">详细（3~6 句，带数字）</option>
+                </select>
+                <p className="text-[10px] text-text-secondary/45 leading-snug">
+                  列说明里写明长度/详略时以列说明为准；已抽取的单元格不会因改这里而重算。
+                </p>
+                <label className="block text-[11px] text-text-secondary/60 pt-2">交叉验证（额外调用）</label>
+                <select
+                  value={verify}
+                  onChange={(e) => setVerify(e.target.value as AiTableVerify)}
+                  disabled={running}
+                  className="w-full bg-background border border-surface-hover rounded px-2 py-1.5 text-[12px] text-text-primary outline-none disabled:opacity-50"
+                >
+                  <option value="off">关闭 · 不额外调用</option>
+                  <option value="doubtful">仅存疑格 · 每篇最多 6 格</option>
+                  <option value="all">全部已抽取值 · 每篇最多 10 格</option>
+                </select>
+                <p className="text-[10px] text-text-secondary/45 leading-snug">
+                  {verify === 'off'
+                    ? '只做一次抽取；可疑的格子仍会被标出来，但不复核。'
+                    : verify === 'doubtful'
+                      ? '推荐：把无证据/无出处/置信度低的格子重新对照原文核对一次，核对通过即不再存疑。'
+                      : '每篇多一次调用逐格核对，最严也最贵；被判定不支持的值会标为存疑。'}
+                </p>
+                <label className="block text-[11px] text-text-secondary/60 pt-2">模型</label>
+                <ModelOverrideSelect value={providerId} onChange={setProviderId} disabled={running} className="w-full" />
+              </div>
+            </div>
+          )}
         </aside>
 
         {/* Right: toolbar + grid */}
-        <div className="flex-1 min-w-0 min-h-0 flex flex-col">
+        <div id="ai-table-grid-area" className="flex-1 min-w-0 min-h-0 flex flex-col">
           <div className="flex items-center gap-2 px-4 py-2.5 border-b border-surface-hover">
             <span className="text-sm font-medium text-text-primary">AI 表格列</span>
             <span className="text-[11px] text-text-secondary/60">{papers.length} 篇文献</span>
@@ -961,55 +986,58 @@ export function AiTableDialog() {
           </div>
         </div>
 
-        {/* Right drawer: overlays the grid so live details never shrink the table. */}
-        {showLog && (
-          <aside
-            id="ai-table-run-details"
-            aria-label="模型推理与过程日志"
-            className="absolute inset-y-0 right-0 z-10 w-[300px] flex flex-col overflow-hidden border-l border-surface-hover bg-surface shadow-2xl"
-          >
-            <div className="w-full flex flex-col h-full">
-              {/* 模型推理：thinking 模型的绝大部分时间花在这里，不显示就只是一片沉默 */}
-              <div className="flex items-center gap-1.5 px-3 py-2 border-b border-surface-hover/60 text-[11px] text-text-secondary/70">
-                <span className="shrink-0">模型推理</span>
-                {reasoning && reasoningTitle && (
-                  <span className="truncate text-text-secondary/45">· 《{reasoningTitle}》</span>
-                )}
-                {running && reasoning && <Loader2 size={10} className="animate-spin shrink-0" />}
-                <button
-                  onClick={() => setShowLog(false)}
-                  title="收起运行详情"
-                  className="ml-auto shrink-0 p-1 rounded text-text-secondary/60 hover:text-text-primary hover:bg-surface-hover"
-                >
-                  <X size={13} />
-                </button>
-              </div>
-              <div
-                ref={reasoningRef}
-                className={`overflow-y-auto px-3 py-2 whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-text-secondary/50 italic ${
-                  reasoning ? 'basis-[45%] max-h-[45%] border-b border-surface-hover/50' : 'hidden'
-                }`}
+        {/* Right drawer: inline (flex) rather than overlay, so expanding it
+            shrinks the grid and collapsing it returns the space to the grid. */}
+        <aside
+          id="ai-table-run-details"
+          aria-label="模型推理与过程日志"
+          aria-hidden={!showLog}
+          className={`shrink-0 min-h-0 flex flex-col overflow-hidden transition-all duration-200 ${
+            showLog ? 'w-[300px] border-l border-surface-hover opacity-100' : 'w-0 opacity-0 pointer-events-none'
+          }`}
+        >
+          <div className="w-[300px] min-w-[300px] flex flex-col h-full">
+            {/* 模型推理：thinking 模型的绝大部分时间花在这里，不显示就只是一片沉默 */}
+            <div className="flex items-center gap-1.5 px-3 py-2 border-b border-surface-hover/60 text-[11px] text-text-secondary/70">
+              <span className="shrink-0">模型推理</span>
+              {reasoning && reasoningTitle && (
+                <span className="truncate text-text-secondary/45">· 《{reasoningTitle}》</span>
+              )}
+              {running && reasoning && <Loader2 size={10} className="animate-spin shrink-0" />}
+              <button
+                onClick={() => setShowLog(false)}
+                title="收起运行详情"
+                tabIndex={showLog ? 0 : -1}
+                className="ml-auto shrink-0 p-1 rounded text-text-secondary/60 hover:text-text-primary hover:bg-surface-hover"
               >
-                {reasoning}
-              </div>
-              <div className="flex items-center gap-1.5 px-3 py-2 border-b border-surface-hover text-[12px] text-text-secondary">
-                过程日志
-                {running && <Loader2 size={11} className="animate-spin" />}
-                {logs.length > 0 && <span className="text-text-secondary/40">（{logs.length}）</span>}
-              </div>
-              <div
-                ref={logRef}
-                className="flex-1 min-h-0 overflow-y-auto px-3 py-2 font-mono text-[11px] leading-relaxed text-text-secondary/80 space-y-1"
-              >
-                {logs.length === 0 ? (
-                  <span className="text-text-secondary/40">运行后此处逐篇显示抽取结果。</span>
-                ) : (
-                  logs.map((l, i) => <div key={i}>{l}</div>)
-                )}
-              </div>
+                <X size={13} />
+              </button>
             </div>
-          </aside>
-        )}
+            <div
+              ref={reasoningRef}
+              className={`overflow-y-auto px-3 py-2 whitespace-pre-wrap break-words font-mono text-[10px] leading-relaxed text-text-secondary/50 italic ${
+                reasoning ? 'basis-[45%] max-h-[45%] border-b border-surface-hover/50' : 'hidden'
+              }`}
+            >
+              {reasoning}
+            </div>
+            <div className="flex items-center gap-1.5 px-3 py-2 border-b border-surface-hover text-[12px] text-text-secondary">
+              过程日志
+              {running && <Loader2 size={11} className="animate-spin" />}
+              {logs.length > 0 && <span className="text-text-secondary/40">（{logs.length}）</span>}
+            </div>
+            <div
+              ref={logRef}
+              className="flex-1 min-h-0 overflow-y-auto px-3 py-2 font-mono text-[11px] leading-relaxed text-text-secondary/80 space-y-1"
+            >
+              {logs.length === 0 ? (
+                <span className="text-text-secondary/40">运行后此处逐篇显示抽取结果。</span>
+              ) : (
+                logs.map((l, i) => <div key={i}>{l}</div>)
+              )}
+            </div>
+          </div>
+        </aside>
 
         {/* 证据面板：这一格的原文依据。抽取值旁边没有证据可查，表格就只能是"看起来对" */}
         {detailCell && (

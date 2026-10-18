@@ -799,6 +799,11 @@ pub fn run() {
             commands::ai_classify::ai_classify_rule_delete,
             commands::ai_classify::ai_classify_rule_run,
             // AI 综述
+            commands::review::review_create,
+            commands::review::review_get,
+            commands::review::review_read_start,
+            commands::review::review_read_retry,
+            commands::review::review_card_update,
             commands::review::review_generate_outline,
             commands::review::review_generate_start,
             commands::review::review_generate_cancel,

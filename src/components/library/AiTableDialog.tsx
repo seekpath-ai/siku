@@ -60,6 +60,10 @@ export function AiTableDialog() {
   const [reasoningTitle, setReasoningTitle] = useState('');
   const [showLog, setShowLog] = useState(true);
   const logRef = useRef<HTMLDivElement>(null);
+  /** Throttled grid refresh while a run is in progress: cells are written per
+   *  paper on the backend, so waiting for `finished` showed "等待" for minutes
+   *  even though earlier papers were already done. */
+  const reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reasoningRef = useRef<HTMLDivElement>(null);
 
   // Keep the process log pinned to its newest line.
@@ -138,6 +142,13 @@ export function AiTableDialog() {
       }
       if (p.log) {
         setLogs((prev) => [...prev.slice(-99), p.log!]);
+        // A paper just finished: surface its cells now, not at the end.
+        if (reloadTimer.current === null) {
+          reloadTimer.current = setTimeout(() => {
+            reloadTimer.current = null;
+            void reloadCells(columns);
+          }, 700);
+        }
       }
       if (p.finished) {
         setRunning(false);
@@ -146,6 +157,10 @@ export function AiTableDialog() {
     });
     return () => {
       un.then((fn) => fn());
+      if (reloadTimer.current !== null) {
+        clearTimeout(reloadTimer.current);
+        reloadTimer.current = null;
+      }
     };
   }, [open, columns, reloadCells]);
 

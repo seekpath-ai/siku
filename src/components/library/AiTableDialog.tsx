@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle, PanelRight, RefreshCw, Search } from 'lucide-react';
+import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle, PanelRight, PanelLeftClose, PanelLeftOpen, Columns3, SlidersHorizontal, RefreshCw, Search } from 'lucide-react';
 import { useAiTableStore } from '@/stores/aiTableStore';
 import { useDialog } from '@/hooks/useDialog';
 import { ModelOverrideSelect } from './ModelOverrideSelect';
@@ -44,7 +44,7 @@ function fileStamp(): string {
 /** Batch field extraction over a paper set: user-defined columns, one LLM
  *  call per paper, cached cells, editable grid, CSV/Markdown export. */
 export function AiTableDialog() {
-  const { open, paperIds, close } = useAiTableStore();
+  const { open, paperIds, close, sidebarCollapsed, toggleSidebar, autoCollapseSidebar } = useAiTableStore();
   const { alert, confirm, prompt } = useDialog();
 
   const [papers, setPapers] = useState<AiTablePaperBrief[]>([]);
@@ -278,6 +278,8 @@ export function AiTableDialog() {
     setReasoningTitle('');
     try {
       await aiTableExtractStart(ids ?? paperIds, cols, providerId || null, detail, depth, verify, force);
+      // 开抽后表格主体才是重点：收起配置侧栏（用户手动展开过则不打扰）。
+      autoCollapseSidebar();
     } catch (err) {
       setRunning(false);
       await alert(`启动抽取失败: ${err}`);
@@ -411,12 +413,49 @@ export function AiTableDialog() {
           trapped in a modal because a model call is slow is unacceptable. */}
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={close} />
       <div className="relative w-[94vw] max-w-[1200px] h-[calc(100dvh-3rem)] max-h-[1200px] min-h-0 mx-4 flex bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
-        {/* Left: switch between column definitions and extraction settings */}
-        <aside className="w-[280px] shrink-0 border-r border-surface-hover flex flex-col min-h-0">
+        {/* Left: switch between column definitions and extraction settings.
+            Collapses to an icon rail so the grid owns the width once the
+            setup is done. */}
+        <aside
+          className={`shrink-0 border-r border-surface-hover flex flex-col min-h-0 ${
+            sidebarCollapsed ? 'w-9 items-center py-1.5 gap-0.5' : 'w-[280px]'
+          }`}
+        >
+          {sidebarCollapsed ? (
+            <>
+              <button
+                onClick={toggleSidebar}
+                data-testid="ai-table-sidebar-expand"
+                title="展开列定义与提取设置"
+                className="w-7 h-7 rounded flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-hover/60 transition-colors"
+              >
+                <PanelLeftOpen size={15} />
+              </button>
+              <div className="w-5 h-px bg-surface-hover my-1" />
+              {(['columns', 'settings'] as const).map((tab) => (
+                <button
+                  key={tab}
+                  onClick={() => {
+                    setSetupTab(tab);
+                    toggleSidebar();
+                  }}
+                  title={tab === 'columns' ? '列定义' : '提取设置'}
+                  aria-label={tab === 'columns' ? '展开列定义' : '展开提取设置'}
+                  className={`w-7 h-7 rounded flex items-center justify-center transition-colors ${
+                    setupTab === tab
+                      ? 'bg-background text-primary shadow-sm'
+                      : 'text-text-secondary/60 hover:bg-surface-hover/60 hover:text-text-primary'
+                  }`}
+                >
+                  {tab === 'columns' ? <Columns3 size={14} /> : <SlidersHorizontal size={14} />}
+                </button>
+              ))}
+            </>
+          ) : (
           <div
             role="tablist"
             aria-label="列定义与提取设置"
-            className="grid grid-cols-2 gap-1 p-1.5 border-b border-surface-hover"
+            className="flex items-center gap-1 p-1.5 border-b border-surface-hover"
             onKeyDown={(e) => {
               if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
               e.preventDefault();
@@ -425,6 +464,7 @@ export function AiTableDialog() {
               document.getElementById(`ai-table-tab-${next}`)?.focus();
             }}
           >
+            <div className="grid grid-cols-2 gap-1 flex-1">
             {(['columns', 'settings'] as const).map((tab) => (
               <button
                 key={tab}
@@ -444,8 +484,18 @@ export function AiTableDialog() {
                 {tab === 'columns' ? '列定义' : '提取设置'}
               </button>
             ))}
+            </div>
+            <button
+              onClick={toggleSidebar}
+              data-testid="ai-table-sidebar-collapse"
+              title="收起侧栏，表格区域更宽"
+              className="w-7 h-7 shrink-0 rounded flex items-center justify-center text-text-secondary/60 hover:text-text-primary hover:bg-surface-hover/60 transition-colors"
+            >
+              <PanelLeftClose size={14} />
+            </button>
           </div>
-          {setupTab === 'columns' ? (
+          )}
+          {!sidebarCollapsed && (setupTab === 'columns' ? (
             <div
               id="ai-table-panel-columns"
               role="tabpanel"
@@ -698,7 +748,7 @@ export function AiTableDialog() {
                 <ModelOverrideSelect value={providerId} onChange={setProviderId} disabled={running} className="w-full" />
               </div>
             </div>
-          )}
+          ))}
         </aside>
 
         {/* Right: toolbar + grid */}

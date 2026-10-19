@@ -119,4 +119,77 @@ test.describe('AI 表格列设置', () => {
       .poll(async () => Math.abs(((await gridArea.boundingBox())?.width ?? 0) - collapsedWidth))
       .toBeLessThan(1);
   });
+
+  async function openTableDialog(page: import('@playwright/test').Page) {
+    await page.evaluate(async () => {
+      const w = window as unknown as Record<string, unknown>;
+      w.__TAURI_INTERNALS__ = {
+        metadata: { currentWindow: { label: 'main' } },
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+        invoke: async (cmd: string) => {
+          if (cmd === 'plugin:event|listen') return 1;
+          if (cmd === 'llm_provider_list') return [];
+          if (cmd === 'ai_table_papers_info') {
+            return [
+              { id: 'p1', title: '测试文献一', year: 2025 },
+              { id: 'p2', title: '测试文献二', year: 2024 },
+            ];
+          }
+          if (cmd === 'ai_table_extract_status') return { running: false, progress: null };
+          if (cmd === 'ai_table_extract_start') return null;
+          if (
+            cmd === 'ai_table_presets_list' ||
+            cmd === 'ai_table_builtin_presets' ||
+            cmd === 'ai_table_cells_list' ||
+            cmd === 'ai_table_terms_get'
+          ) {
+            return [];
+          }
+          return null;
+        },
+      };
+      const { useAiTableStore } = await import('/src/stores/aiTableStore.ts');
+      useAiTableStore.getState().openWith(['p1', 'p2']);
+    });
+    await expect(page.getByText('AI 表格列', { exact: true })).toBeVisible();
+  }
+
+  test('侧栏可收起为图标栏并恢复，表格区域变宽', async ({ page }) => {
+    await page.goto('/library', { waitUntil: 'networkidle' });
+    await openTableDialog(page);
+
+    const gridArea = page.locator('#ai-table-grid-area');
+    const widthBefore = (await gridArea.boundingBox())?.width ?? 0;
+
+    await page.getByTestId('ai-table-sidebar-collapse').click();
+    await expect(page.getByRole('tab', { name: '列定义', exact: true })).toBeHidden();
+    await expect(page.getByTestId('ai-table-sidebar-expand')).toBeVisible();
+    await expect
+      .poll(async () => ((await gridArea.boundingBox())?.width ?? 0) - widthBefore)
+      .toBeGreaterThan(200);
+
+    // 图标栏点「列定义」：直接展开并切到对应 tab。
+    await page.getByRole('button', { name: '展开列定义', exact: true }).click();
+    await expect(page.getByRole('tab', { name: '列定义', exact: true })).toBeVisible();
+    await expect(page.getByPlaceholder('列名（如：样本量）')).toHaveCount(1);
+  });
+
+  test('开始抽取时自动收起侧栏；手动展开过则不再自动收起', async ({ page }) => {
+    await page.goto('/library', { waitUntil: 'networkidle' });
+    await openTableDialog(page);
+
+    // 未手动碰过侧栏：开始抽取 → 自动收起。
+    await page.getByRole('button', { name: '开始抽取' }).click();
+    await expect(page.getByTestId('ai-table-sidebar-expand')).toBeVisible();
+
+    // 用户手动展开后，再次自动收起请求必须被忽略（尊重用户选择）。
+    const stillExpanded = await page.evaluate(async () => {
+      const { useAiTableStore } = await import('/src/stores/aiTableStore.ts');
+      useAiTableStore.getState().toggleSidebar();
+      useAiTableStore.getState().autoCollapseSidebar();
+      return useAiTableStore.getState().sidebarCollapsed;
+    });
+    expect(stillExpanded).toBe(false);
+  });
 });

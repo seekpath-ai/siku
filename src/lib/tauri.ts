@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
-  Paper, PaperInput, PaperLinkMetadata, PaperImportResult, LinkImportError, ListPapersParams,
+  Paper, PaperInput, PaperLinkMetadata, PaperImportResult, PaperEnrichMetadataResult, LinkImportError, ListPapersParams,
   AgentSession, AgentStep, ChatMessage, ChatAttachment, LlmConfigBlock, ApprovalConfig, Project, CronJob, TaskInfo,
   KnowledgeDomain, KnowledgeItem,
   ResearchTopic, ResearchSource, Note,
@@ -169,8 +169,8 @@ export async function paperReprocessIndex(id: string): Promise<PaperReprocessRes
 }
 
 /** Enrich a paper's bibliographic metadata from CrossRef (DOI/title). */
-export async function paperEnrichMetadata(id: string): Promise<boolean> {
-  return invoke<boolean>('paper_enrich_metadata', { id });
+export async function paperEnrichMetadata(id: string): Promise<PaperEnrichMetadataResult> {
+  return invoke<PaperEnrichMetadataResult>('paper_enrich_metadata', { id });
 }
 
 export async function collectionsList(): Promise<Collection[]> {

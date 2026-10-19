@@ -1,11 +1,19 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import { createPortal } from 'react-dom';
+import {
+  Fragment,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { createPortal } from "react-dom";
 
 export interface ContextMenuItem {
   label: string;
   icon?: ReactNode;
   destructive?: boolean;
   disabled?: boolean;
+  separatorBefore?: boolean;
   onClick: () => void;
 }
 
@@ -15,6 +23,8 @@ interface ContextMenuProps {
   items: ContextMenuItem[];
   onClose: () => void;
 }
+
+const VIEWPORT_MARGIN = 8;
 
 export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
@@ -27,17 +37,17 @@ export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
         onClose();
       }
     };
-    document.addEventListener('click', onClick, true);
-    return () => document.removeEventListener('click', onClick, true);
+    document.addEventListener("click", onClick, true);
+    return () => document.removeEventListener("click", onClick, true);
   }, [onClose]);
 
   // Close on Escape
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === "Escape") onClose();
     };
-    document.addEventListener('keydown', onKeyDown);
-    return () => document.removeEventListener('keydown', onKeyDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
 
   // Measure the menu after it is actually mounted and clamp it inside the
@@ -45,39 +55,61 @@ export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
   // is only attached after the render — so menus near the bottom/right edge
   // overflowed and got clipped by the window.)
   useLayoutEffect(() => {
-    const el = menuRef.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    const nx = Math.min(x, Math.max(0, window.innerWidth - r.width));
-    const ny = Math.min(y, Math.max(0, window.innerHeight - r.height));
-    setPos((prev) => (prev.x === nx && prev.y === ny ? prev : { x: nx, y: ny }));
+    const updatePosition = () => {
+      const el = menuRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const nx = Math.max(
+        VIEWPORT_MARGIN,
+        Math.min(x, window.innerWidth - r.width - VIEWPORT_MARGIN),
+      );
+      const ny = Math.max(
+        VIEWPORT_MARGIN,
+        Math.min(y, window.innerHeight - r.height - VIEWPORT_MARGIN),
+      );
+      setPos((prev) =>
+        prev.x === nx && prev.y === ny ? prev : { x: nx, y: ny },
+      );
+    };
+    updatePosition();
+    window.addEventListener("resize", updatePosition);
+    return () => window.removeEventListener("resize", updatePosition);
   }, [x, y, items]);
 
   return createPortal(
     <div
       ref={menuRef}
-      className="fixed z-50 bg-surface border border-surface-hover rounded-lg shadow-xl py-1 min-w-[160px]"
-      style={{ left: pos.x, top: pos.y }}
+      className="fixed z-50 min-w-[160px] overflow-y-auto rounded-lg border border-surface-hover bg-surface py-1 shadow-xl"
+      style={{
+        left: pos.x,
+        top: pos.y,
+        maxWidth: `calc(100dvw - ${VIEWPORT_MARGIN * 2}px)`,
+        maxHeight: `calc(100dvh - ${VIEWPORT_MARGIN * 2}px)`,
+      }}
       onContextMenu={(e) => e.preventDefault()}
     >
       {items.map((item, i) => (
-        <button
-          key={i}
-          disabled={item.disabled}
-          onClick={(e) => {
-            e.stopPropagation();
-            item.onClick();
-            onClose();
-          }}
-          className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors disabled:opacity-30 ${
-            item.destructive
-              ? 'text-red-400 hover:bg-red-500/10'
-              : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
-          }`}
-        >
-          {item.icon && <span className="shrink-0">{item.icon}</span>}
-          <span>{item.label}</span>
-        </button>
+        <Fragment key={i}>
+          {item.separatorBefore && (
+            <div className="mx-2 my-1 border-t border-surface-hover" />
+          )}
+          <button
+            disabled={item.disabled}
+            onClick={(e) => {
+              e.stopPropagation();
+              item.onClick();
+              onClose();
+            }}
+            className={`flex w-full items-center gap-2 px-3 py-1.5 text-xs transition-colors disabled:opacity-30 ${
+              item.destructive
+                ? "text-red-400 hover:bg-red-500/10"
+                : "text-text-secondary hover:bg-surface-hover hover:text-text-primary"
+            }`}
+          >
+            {item.icon && <span className="shrink-0">{item.icon}</span>}
+            <span>{item.label}</span>
+          </button>
+        </Fragment>
       ))}
     </div>,
     document.body,

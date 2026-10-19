@@ -9,29 +9,63 @@ import {
   ChevronDown,
   Info,
   ArrowLeft,
-  Loader2,
-  RefreshCw,
+  Pencil,
   Link2,
   X,
   Paperclip,
   FileDown,
-} from 'lucide-react';
-import { useLibraryStore } from '@/stores/libraryStore';
-import { getAllUnlockedIds } from '@/stores/noteLockStore';
-import { usePetContextStore } from '@/stores/petContextStore';
-import { usePaper, useUpdatePaper, usePaperNotes, usePaperTags, useTags, useAddTagsToPaper, useRemoveTagsFromPaper, useCreateTag } from '@/hooks/useLibrary';
-import { useDialog } from '@/hooks/useDialog';
-import { useTabStore } from '@/stores/tabStore';
-import { parseJsonArray } from '@/lib/types';
-import { paperListRelated, paperAddRelated, paperRemoveRelated, listPapers, paperGetCollections, paperEnrichMetadata, paperGetCreators, paperSetCreators, paperListAttachments, paperAddAttachment, paperRemoveAttachment, paperOpenAttachment, paperExportAnnotations, notesListAll, notesUpdate, notesDelete, notesGetBacklinks, noteCreateUnderPaper, noteMergeIntoExcerpt, type Creator } from '@/lib/tauri';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { NoteEditor } from '@/components/notes/NoteEditor';
-import type { Paper, Note } from '@/lib/types';
+} from "lucide-react";
+import { useLibraryStore } from "@/stores/libraryStore";
+import { getAllUnlockedIds } from "@/stores/noteLockStore";
+import { usePetContextStore } from "@/stores/petContextStore";
+import {
+  usePaper,
+  useUpdatePaper,
+  usePaperNotes,
+  usePaperTags,
+  useTags,
+  useAddTagsToPaper,
+  useRemoveTagsFromPaper,
+  useCreateTag,
+} from "@/hooks/useLibrary";
+import { useDialog } from "@/hooks/useDialog";
+import { useTabStore } from "@/stores/tabStore";
+import { parseJsonArray } from "@/lib/types";
+import {
+  paperListRelated,
+  paperAddRelated,
+  paperRemoveRelated,
+  listPapers,
+  paperGetCollections,
+  paperGetCreators,
+  paperSetCreators,
+  paperListAttachments,
+  paperAddAttachment,
+  paperRemoveAttachment,
+  paperOpenAttachment,
+  paperExportAnnotations,
+  notesListAll,
+  notesUpdate,
+  notesDelete,
+  notesGetBacklinks,
+  noteCreateUnderPaper,
+  noteMergeIntoExcerpt,
+  type Creator,
+} from "@/lib/tauri";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { NoteEditor } from "@/components/notes/NoteEditor";
+import type { Paper, Note } from "@/lib/types";
 
-type TabKey = 'info' | 'notes' | 'tags';
+type TabKey = "info" | "notes" | "tags";
 
-function SidebarToggleIcon({ collapsed, side = 'left' }: { collapsed: boolean; side?: 'left' | 'right' }) {
-  const isRight = side === 'right';
+function SidebarToggleIcon({
+  collapsed,
+  side = "left",
+}: {
+  collapsed: boolean;
+  side?: "left" | "right";
+}) {
+  const isRight = side === "right";
   return (
     <div className="relative w-4 h-4 border border-current rounded-[3px]">
       <div
@@ -218,12 +252,301 @@ function formatDate(iso: string): string {
   }
 }
 
+function paperToForm(paper: Paper) {
+  return {
+    title: paper.title,
+    authors: parseJsonArray(paper.authors).join("; "),
+    year: paper.year?.toString() ?? "",
+    journal: paper.journal ?? "",
+    doi: paper.doi ?? "",
+    url: paper.url ?? "",
+    abstract: paper.abstract_text ?? "",
+    keywords: parseJsonArray(paper.keywords).join(", "),
+    citationKey: paper.citation_key ?? "",
+    itemType: paper.item_type ?? "journal",
+    volume: paper.volume ?? "",
+    issue: paper.issue ?? "",
+    pages: paper.pages ?? "",
+    conferenceName: paper.conference_name ?? "",
+    publisher: paper.publisher ?? "",
+    place: paper.place ?? "",
+    editor: parseJsonArray(paper.editor).join("; "),
+    series: paper.series ?? "",
+    edition: paper.edition ?? "",
+    isbn: paper.isbn ?? "",
+    issn: paper.issn ?? "",
+    language: paper.language ?? "",
+    numPages: paper.num_pages?.toString() ?? paper.page_count?.toString() ?? "",
+    archiveLocation: paper.archive_location ?? "",
+    callNumber: paper.call_number ?? "",
+    rights: paper.rights ?? "",
+  };
+}
+
+type MetadataField = {
+  key: string;
+  label: string;
+  value: React.ReactNode;
+  empty: boolean;
+  wide?: boolean;
+  pre?: boolean;
+  anywhere?: boolean;
+};
+
+function textField(
+  key: string,
+  label: string,
+  value: string | number | null | undefined,
+  options: Partial<Pick<MetadataField, "wide" | "pre" | "anywhere">> = {},
+): MetadataField {
+  const text = value == null ? "" : String(value);
+  return {
+    key,
+    label,
+    value: text,
+    empty: text.trim().length === 0,
+    ...options,
+  };
+}
+
+function ReadonlySection({
+  title,
+  fields,
+  showEmpty,
+}: {
+  title: string;
+  fields: MetadataField[];
+  showEmpty: boolean;
+}) {
+  const visibleFields = fields.filter((field) => showEmpty || !field.empty);
+  if (visibleFields.length === 0) return null;
+  return (
+    <section className="space-y-2 border-t border-surface-hover/70 pt-3 first:border-t-0 first:pt-0">
+      <h4 className="text-[11px] font-semibold text-text-secondary/60">
+        {title}
+      </h4>
+      <dl className="grid grid-cols-[repeat(auto-fit,minmax(120px,1fr))] gap-x-3 gap-y-3">
+        {visibleFields.map((field) => (
+          <div
+            key={field.key}
+            className={`min-w-0 ${field.wide ? "col-span-full" : ""}`}
+          >
+            {field.label && (
+              <dt className="text-[10px] leading-4 text-text-secondary/55">
+                {field.label}
+              </dt>
+            )}
+            <dd
+              className={`${field.label ? "mt-0.5" : ""} text-xs leading-relaxed text-text-primary ${
+                field.pre ? "whitespace-pre-wrap" : ""
+              } ${field.anywhere ? "[overflow-wrap:anywhere]" : "break-words"}`}
+            >
+              {field.empty ? (
+                <span className="text-text-secondary/30">—</span>
+              ) : (
+                field.value
+              )}
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+  );
+}
+
+function creatorName(creator: Creator): string {
+  return (
+    creator.name ||
+    [creator.first_name, creator.last_name].filter(Boolean).join(" ")
+  );
+}
+
+function MetadataReadView({
+  paper,
+  creators,
+  creatorsLoaded,
+}: {
+  paper: Paper;
+  creators: Creator[];
+  creatorsLoaded: boolean;
+}) {
+  const [authorsExpanded, setAuthorsExpanded] = useState(false);
+  const [showEmpty, setShowEmpty] = useState(false);
+  useEffect(() => {
+    setAuthorsExpanded(false);
+    setShowEmpty(false);
+  }, [paper.id]);
+
+  const fallbackAuthors = parseJsonArray(paper.authors);
+  const authors = creatorsLoaded
+    ? creators
+        .filter((creator) => creator.role === "author")
+        .map(creatorName)
+        .filter(Boolean)
+    : fallbackAuthors;
+  const editors = creatorsLoaded
+    ? creators
+        .filter((creator) => creator.role === "editor")
+        .map(creatorName)
+        .filter(Boolean)
+    : parseJsonArray(paper.editor);
+  const translators = creatorsLoaded
+    ? creators
+        .filter((creator) => creator.role === "translator")
+        .map(creatorName)
+        .filter(Boolean)
+    : [];
+  const visibleAuthors = authorsExpanded ? authors : authors.slice(0, 3);
+  const remainingAuthors = authors.length - visibleAuthors.length;
+  const hiddenFields = new Set(
+    HIDDEN_FIELDS_BY_TYPE[paper.item_type ?? "journal"] ?? [],
+  );
+  const itemType = ITEM_TYPES.find(
+    (type) => type.value === (paper.item_type ?? "journal"),
+  )?.label;
+  const metadataIncomplete =
+    !paper.title.trim() || authors.length === 0 || paper.year == null;
+
+  const authorField: MetadataField = {
+    key: "authors",
+    label: "作者",
+    wide: true,
+    empty: authors.length === 0,
+    value: (
+      <span>
+        {visibleAuthors.join("、")}
+        {authors.length > 3 && (
+          <button
+            onClick={() => setAuthorsExpanded((expanded) => !expanded)}
+            className="ml-1.5 text-[11px] text-primary/80 hover:text-primary"
+          >
+            {authorsExpanded ? "收起" : `还有 ${remainingAuthors} 位`}
+          </button>
+        )}
+      </span>
+    ),
+  };
+  const field = (
+    key: string,
+    label: string,
+    value: string | number | null | undefined,
+    options: Partial<Pick<MetadataField, "wide" | "pre" | "anywhere">> = {},
+  ) => textField(key, label, value, options);
+  const included = (key: string, field: MetadataField) =>
+    hiddenFields.has(key) ? [] : [field];
+
+  const basicFields = [
+    authorField,
+    field("itemType", "文献类型", itemType),
+    field("year", "年份", paper.year),
+    ...included(
+      "journal",
+      field("journal", "期刊", paper.journal, { wide: true }),
+    ),
+    ...included("volume", field("volume", "卷", paper.volume)),
+    ...included("issue", field("issue", "期", paper.issue)),
+    ...included("pages", field("pages", "页码", paper.pages)),
+    ...included(
+      "numPages",
+      field("numPages", "页数", paper.num_pages ?? paper.page_count),
+    ),
+    field("editors", "编者", editors.join("、"), { wide: true }),
+    field("translators", "译者", translators.join("、"), { wide: true }),
+  ];
+  const publicationFields = [
+    ...included(
+      "conferenceName",
+      field("conferenceName", "会议名称", paper.conference_name, {
+        wide: true,
+      }),
+    ),
+    ...included(
+      "publisher",
+      field("publisher", "出版社", paper.publisher, { wide: true }),
+    ),
+    ...included("place", field("place", "出版地", paper.place)),
+    ...included(
+      "series",
+      field("series", "系列", paper.series, { wide: true }),
+    ),
+    ...included("edition", field("edition", "版本", paper.edition)),
+    field("language", "语言", paper.language),
+    ...included("isbn", field("isbn", "ISBN", paper.isbn, { anywhere: true })),
+    ...included("issn", field("issn", "ISSN", paper.issn, { anywhere: true })),
+  ];
+  const identifierFields = [
+    field("doi", "DOI", paper.doi, { wide: true, anywhere: true }),
+    field("url", "URL", paper.url, { wide: true, anywhere: true }),
+    field("citationKey", "引用键", paper.citation_key, {
+      wide: true,
+      anywhere: true,
+    }),
+    field("keywords", "关键词", parseJsonArray(paper.keywords).join("，"), {
+      wide: true,
+    }),
+    ...included(
+      "archiveLocation",
+      field("archiveLocation", "归档位置", paper.archive_location, {
+        wide: true,
+      }),
+    ),
+    ...included("callNumber", field("callNumber", "索书号", paper.call_number)),
+    field("rights", "权利", paper.rights, { wide: true }),
+  ];
+
+  return (
+    <>
+      {metadataIncomplete && (
+        <div className="rounded-lg bg-primary/5 px-2.5 py-2 text-[11px] leading-relaxed text-text-secondary/70">
+          核心元数据不完整，可在文献列表中右键选择“补全元数据…”。
+        </div>
+      )}
+      <ReadonlySection
+        title="基本信息"
+        fields={basicFields}
+        showEmpty={showEmpty}
+      />
+      <ReadonlySection
+        title="出版信息"
+        fields={publicationFields}
+        showEmpty={showEmpty}
+      />
+      <ReadonlySection
+        title="标识与链接"
+        fields={identifierFields}
+        showEmpty={showEmpty}
+      />
+      {!hiddenFields.has("abstract") && (
+        <ReadonlySection
+          title="摘要"
+          fields={[
+            field("abstract", "", paper.abstract_text, {
+              wide: true,
+              pre: true,
+            }),
+          ]}
+          showEmpty={showEmpty}
+        />
+      )}
+      <button
+        onClick={() => setShowEmpty((visible) => !visible)}
+        className="text-[11px] text-text-secondary/55 hover:text-primary"
+      >
+        {showEmpty ? "隐藏空字段" : "显示全部字段"}
+      </button>
+    </>
+  );
+}
+
 function InfoTab({ paper }: { paper: Paper }) {
   const updateMutation = useUpdatePaper();
   const queryClient = useQueryClient();
   const { alert, select } = useDialog();
-  const [enriching, setEnriching] = useState(false);
-  const [collections, setCollections] = useState<{ id: string; name: string }[]>([]);
+  const [isEditing, setIsEditing] = useState(false);
+  const [creatorReloadKey, setCreatorReloadKey] = useState(0);
+  const [collections, setCollections] = useState<
+    { id: string; name: string }[]
+  >([]);
 
   // Related papers (bidirectional links).
   const { data: related = [], isLoading: relatedLoading } = useQuery({
@@ -300,86 +623,16 @@ function InfoTab({ paper }: { paper: Paper }) {
     }
   };
 
-  // Zotero-style: resolve DOI / title via CrossRef and fill blank metadata.
-  const handleEnrich = async () => {
-    if (enriching) return;
-    setEnriching(true);
-    try {
-      const filled = await paperEnrichMetadata(paper.id);
-      await alert(
-        filled ? '已根据 CrossRef 补全文献元数据。' : '未找到可补全的元数据（可能缺少 DOI 或标题未匹配）。',
-        '补充元数据'
-      );
-      queryClient.invalidateQueries({ queryKey: ['paper', paper.id] });
-      queryClient.invalidateQueries({ queryKey: ['papers'] });
-    } catch (err) {
-      await alert(`补充元数据失败：${err}`, '补充元数据');
-    } finally {
-      setEnriching(false);
-    }
-  };
-  const [form, setForm] = useState({
-    title: paper.title,
-    authors: parseJsonArray(paper.authors).join('; '),
-    year: paper.year?.toString() ?? '',
-    journal: paper.journal ?? '',
-    doi: paper.doi ?? '',
-    url: paper.url ?? '',
-    abstract: paper.abstract_text ?? '',
-    keywords: parseJsonArray(paper.keywords).join(', '),
-    citationKey: paper.citation_key ?? '',
-    itemType: paper.item_type ?? 'journal',
-    volume: paper.volume ?? '',
-    issue: paper.issue ?? '',
-    pages: paper.pages ?? '',
-    conferenceName: paper.conference_name ?? '',
-    publisher: paper.publisher ?? '',
-    place: paper.place ?? '',
-    editor: parseJsonArray(paper.editor).join('; '),
-    series: paper.series ?? '',
-    edition: paper.edition ?? '',
-    isbn: paper.isbn ?? '',
-    issn: paper.issn ?? '',
-    language: paper.language ?? '',
-    numPages: paper.num_pages?.toString() ?? paper.page_count?.toString() ?? '',
-    archiveLocation: paper.archive_location ?? '',
-    callNumber: paper.call_number ?? '',
-    rights: paper.rights ?? '',
-  });
-
+  const [form, setForm] = useState(() => paperToForm(paper));
   useEffect(() => {
-    setForm({
-      title: paper.title,
-      authors: parseJsonArray(paper.authors).join('; '),
-      year: paper.year?.toString() ?? '',
-      journal: paper.journal ?? '',
-      doi: paper.doi ?? '',
-      url: paper.url ?? '',
-      abstract: paper.abstract_text ?? '',
-      keywords: parseJsonArray(paper.keywords).join(', '),
-      citationKey: paper.citation_key ?? '',
-      itemType: paper.item_type ?? 'journal',
-      volume: paper.volume ?? '',
-      issue: paper.issue ?? '',
-      pages: paper.pages ?? '',
-      conferenceName: paper.conference_name ?? '',
-      publisher: paper.publisher ?? '',
-      place: paper.place ?? '',
-      editor: parseJsonArray(paper.editor).join('; '),
-      series: paper.series ?? '',
-      edition: paper.edition ?? '',
-      isbn: paper.isbn ?? '',
-      issn: paper.issn ?? '',
-      language: paper.language ?? '',
-      numPages: paper.num_pages?.toString() ?? paper.page_count?.toString() ?? '',
-      archiveLocation: paper.archive_location ?? '',
-      callNumber: paper.call_number ?? '',
-      rights: paper.rights ?? '',
-    });
-  }, [paper]);
+    if (!isEditing) setForm(paperToForm(paper));
+  }, [paper, isEditing]);
+  useEffect(() => {
+    setIsEditing(false);
+  }, [paper.id]);
 
-  // Structured creators: load once per paper; keep the flat authors/editor
-  // form fields (the sync transport) derived from them.
+  // Structured creators: reload after metadata enrichment as well as paper
+  // changes, keeping the flat authors/editor form fields in sync.
   const [creators, setCreators] = useState<Creator[]>([]);
   const [creatorsLoaded, setCreatorsLoaded] = useState(false);
   useEffect(() => {
@@ -397,22 +650,21 @@ function InfoTab({ paper }: { paper: Paper }) {
     return () => {
       cancelled = true;
     };
-  }, [paper.id]);
+  }, [paper.id, paper.authors, paper.editor, creatorReloadKey]);
   useEffect(() => {
     if (!creatorsLoaded) return;
-    const nameOf = (c: Creator) => c.name || [c.first_name, c.last_name].filter(Boolean).join(' ');
     setForm((f) => ({
       ...f,
       authors: creators
-        .filter((c) => c.role === 'author')
-        .map(nameOf)
+        .filter((c) => c.role === "author")
+        .map(creatorName)
         .filter(Boolean)
-        .join('; '),
+        .join("; "),
       editor: creators
-        .filter((c) => c.role === 'editor')
-        .map(nameOf)
+        .filter((c) => c.role === "editor")
+        .map(creatorName)
         .filter(Boolean)
-        .join('; '),
+        .join("; "),
     }));
   }, [creators, creatorsLoaded]);
 
@@ -423,81 +675,58 @@ function InfoTab({ paper }: { paper: Paper }) {
       .catch(() => setCollections([]));
   }, [paper.id]);
 
-  const changed = useMemo(() => {
-    return (
-      form.title !== paper.title ||
-      form.authors !== parseJsonArray(paper.authors).join('; ') ||
-      form.year !== (paper.year?.toString() ?? '') ||
-      form.journal !== (paper.journal ?? '') ||
-      form.doi !== (paper.doi ?? '') ||
-      form.url !== (paper.url ?? '') ||
-      form.abstract !== (paper.abstract_text ?? '') ||
-      form.keywords !== parseJsonArray(paper.keywords).join(', ') ||
-      form.citationKey !== (paper.citation_key ?? '') ||
-      form.itemType !== (paper.item_type ?? 'journal') ||
-      form.volume !== (paper.volume ?? '') ||
-      form.issue !== (paper.issue ?? '') ||
-      form.pages !== (paper.pages ?? '') ||
-      form.conferenceName !== (paper.conference_name ?? '') ||
-      form.publisher !== (paper.publisher ?? '') ||
-      form.place !== (paper.place ?? '') ||
-      form.editor !== parseJsonArray(paper.editor).join('; ') ||
-      form.series !== (paper.series ?? '') ||
-      form.edition !== (paper.edition ?? '') ||
-      form.isbn !== (paper.isbn ?? '') ||
-      form.issn !== (paper.issn ?? '') ||
-      form.language !== (paper.language ?? '') ||
-      form.numPages !== (paper.num_pages?.toString() ?? paper.page_count?.toString() ?? '') ||
-      form.archiveLocation !== (paper.archive_location ?? '') ||
-      form.callNumber !== (paper.call_number ?? '') ||
-      form.rights !== (paper.rights ?? '')
-    );
-  }, [form, paper]);
+  const resetEditing = () => {
+    setForm(paperToForm(paper));
+    setCreatorReloadKey((key) => key + 1);
+  };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     // The 页数 field falls back to the physical PDF page count for display;
     // that fallback must not be persisted into num_pages (it would block
     // CrossRef from filling the true bibliographic value later).
     const numPagesToSave =
-      paper.num_pages == null && form.numPages === (paper.page_count?.toString() ?? '')
+      paper.num_pages == null &&
+      form.numPages === (paper.page_count?.toString() ?? "")
         ? null
         : form.numPages
           ? parseInt(form.numPages, 10) || null
           : null;
-    // Persist structured creators (also regenerates authors/editor columns).
-    paperSetCreators(paper.id, creators).catch((err) =>
-      console.error('保存创作者失败:', err)
-    );
-    updateMutation.mutate({
-      id: paper.id,
-      input: {
-        title: form.title,
-        authors: form.authors.split(/;\s*|，\s*|,\s*/).filter(Boolean),
-        year: form.year ? parseInt(form.year, 10) : null,
-        journal: form.journal || null,
-        doi: form.doi || null,
-        url: form.url || null,
-        abstract_text: form.abstract || null,
-        keywords: form.keywords.split(/,\s*|，\s*/).filter(Boolean),
-        item_type: form.itemType || null,
-        volume: form.volume || null,
-        issue: form.issue || null,
-        pages: form.pages || null,
-        conference_name: form.conferenceName || null,
-        publisher: form.publisher || null,
-        place: form.place || null,
-        editor: form.editor.split(/;\s*|，\s*|,\s*/).filter(Boolean),
-        series: form.series || null,
-        edition: form.edition || null,
-        isbn: form.isbn || null,
-        issn: form.issn || null,
-        language: form.language || null,
-        num_pages: numPagesToSave,
-        archive_location: form.archiveLocation || null,
-        call_number: form.callNumber || null,
-        rights: form.rights || null,
-      },
-    });
+    try {
+      await paperSetCreators(paper.id, creators);
+      await updateMutation.mutateAsync({
+        id: paper.id,
+        input: {
+          title: form.title,
+          authors: form.authors.split(/;\s*|，\s*|,\s*/).filter(Boolean),
+          year: form.year ? parseInt(form.year, 10) : null,
+          journal: form.journal || null,
+          doi: form.doi || null,
+          url: form.url || null,
+          abstract_text: form.abstract || null,
+          keywords: form.keywords.split(/,\s*|，\s*/).filter(Boolean),
+          item_type: form.itemType || null,
+          volume: form.volume || null,
+          issue: form.issue || null,
+          pages: form.pages || null,
+          conference_name: form.conferenceName || null,
+          publisher: form.publisher || null,
+          place: form.place || null,
+          editor: form.editor.split(/;\s*|，\s*|,\s*/).filter(Boolean),
+          series: form.series || null,
+          edition: form.edition || null,
+          isbn: form.isbn || null,
+          issn: form.issn || null,
+          language: form.language || null,
+          num_pages: numPagesToSave,
+          archive_location: form.archiveLocation || null,
+          call_number: form.callNumber || null,
+          rights: form.rights || null,
+        },
+      });
+      setIsEditing(false);
+    } catch (err) {
+      await alert(`保存元数据失败：${err}`, "保存元数据");
+    }
   };
 
   const hiddenFields = useMemo(
@@ -508,85 +737,195 @@ function InfoTab({ paper }: { paper: Paper }) {
   return (
     <div className="flex flex-col h-full">
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
-        <button
-          onClick={handleEnrich}
-          disabled={enriching}
-          className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-primary/10 text-primary text-xs hover:bg-primary/20 disabled:opacity-50 transition-colors"
-          title="通过 DOI 或标题从 CrossRef 自动补全空白的年份、期刊、卷期、页码、摘要等"
-        >
-          {enriching ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-          {enriching ? '正在查询 CrossRef…' : '自动补充元数据'}
-        </button>
-        <Field label="标题" value={form.title} onChange={(v) => setForm((f) => ({ ...f, title: v }))} />
-        <div>
-          <span className="text-[11px] font-medium text-text-secondary/70 uppercase tracking-wider">创作者</span>
-          <div className="mt-1">
-            <CreatorEditor creators={creators} onChange={setCreators} />
-          </div>
-        </div>
-        <SelectField
-          label="文献类型"
-          value={form.itemType}
-          options={ITEM_TYPES}
-          onChange={(v) => setForm((f) => ({ ...f, itemType: v }))}
-        />
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="年份" value={form.year} onChange={(v) => setForm((f) => ({ ...f, year: v }))} />
-          {!hiddenFields.has('journal') && (
-            <Field label="期刊" value={form.journal} onChange={(v) => setForm((f) => ({ ...f, journal: v }))} />
-          )}
-          {!hiddenFields.has('volume') && (
-            <Field label="卷" value={form.volume} onChange={(v) => setForm((f) => ({ ...f, volume: v }))} />
-          )}
-          {!hiddenFields.has('issue') && (
-            <Field label="期" value={form.issue} onChange={(v) => setForm((f) => ({ ...f, issue: v }))} />
-          )}
-          {!hiddenFields.has('pages') && (
-            <Field label="页码" value={form.pages} onChange={(v) => setForm((f) => ({ ...f, pages: v }))} />
-          )}
-          {!hiddenFields.has('numPages') && (
-            <Field label="页数" value={form.numPages} onChange={(v) => setForm((f) => ({ ...f, numPages: v }))} />
-          )}
-          {!hiddenFields.has('conferenceName') && (
-            <Field label="会议名称" value={form.conferenceName} onChange={(v) => setForm((f) => ({ ...f, conferenceName: v }))} />
-          )}
-          {!hiddenFields.has('publisher') && (
-            <Field label="出版社" value={form.publisher} onChange={(v) => setForm((f) => ({ ...f, publisher: v }))} />
-          )}
-          {!hiddenFields.has('place') && (
-            <Field label="出版地" value={form.place} onChange={(v) => setForm((f) => ({ ...f, place: v }))} />
-          )}
-          {!hiddenFields.has('series') && (
-            <Field label="系列" value={form.series} onChange={(v) => setForm((f) => ({ ...f, series: v }))} />
-          )}
-          {!hiddenFields.has('edition') && (
-            <Field label="版本" value={form.edition} onChange={(v) => setForm((f) => ({ ...f, edition: v }))} />
-          )}
-          <Field label="语言" value={form.language} onChange={(v) => setForm((f) => ({ ...f, language: v }))} />
-        </div>
-        <Field label="DOI" value={form.doi} onChange={(v) => setForm((f) => ({ ...f, doi: v }))} />
-        <Field label="URL" value={form.url} onChange={(v) => setForm((f) => ({ ...f, url: v }))} />
-        <div className="grid grid-cols-2 gap-3">
-          {!hiddenFields.has('isbn') && (
-            <Field label="ISBN" value={form.isbn} onChange={(v) => setForm((f) => ({ ...f, isbn: v }))} />
-          )}
-          {!hiddenFields.has('issn') && (
-            <Field label="ISSN" value={form.issn} onChange={(v) => setForm((f) => ({ ...f, issn: v }))} />
-          )}
-        </div>
-        <Field label="引用键" value={form.citationKey} onChange={(v) => setForm((f) => ({ ...f, citationKey: v }))} />
-        <Field label="关键词" value={form.keywords} placeholder="用逗号分隔" onChange={(v) => setForm((f) => ({ ...f, keywords: v }))} />
-        <div className="grid grid-cols-2 gap-3">
-          {!hiddenFields.has('archiveLocation') && (
-            <Field label="归档位置" value={form.archiveLocation} onChange={(v) => setForm((f) => ({ ...f, archiveLocation: v }))} />
-          )}
-          {!hiddenFields.has('callNumber') && (
-            <Field label="索书号" value={form.callNumber} onChange={(v) => setForm((f) => ({ ...f, callNumber: v }))} />
-          )}
-        </div>
-        <Field label="权利" value={form.rights} onChange={(v) => setForm((f) => ({ ...f, rights: v }))} />
-        {!hiddenFields.has('abstract') && (
-          <Field label="摘要" value={form.abstract} multiline placeholder="文献摘要..." onChange={(v) => setForm((f) => ({ ...f, abstract: v }))} />
+        {isEditing ? (
+          <>
+            <div className="text-xs font-semibold text-text-primary">
+              编辑元数据
+            </div>
+            <Field
+              label="标题"
+              value={form.title}
+              onChange={(v) => setForm((f) => ({ ...f, title: v }))}
+            />
+            <div>
+              <span className="text-[11px] font-medium uppercase tracking-wider text-text-secondary/70">
+                创作者
+              </span>
+              <div className="mt-1">
+                <CreatorEditor creators={creators} onChange={setCreators} />
+              </div>
+            </div>
+            <SelectField
+              label="文献类型"
+              value={form.itemType}
+              options={ITEM_TYPES}
+              onChange={(v) => setForm((f) => ({ ...f, itemType: v }))}
+            />
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(120px,1fr))] gap-3">
+              <Field
+                label="年份"
+                value={form.year}
+                onChange={(v) => setForm((f) => ({ ...f, year: v }))}
+              />
+              {!hiddenFields.has("volume") && (
+                <Field
+                  label="卷"
+                  value={form.volume}
+                  onChange={(v) => setForm((f) => ({ ...f, volume: v }))}
+                />
+              )}
+              {!hiddenFields.has("issue") && (
+                <Field
+                  label="期"
+                  value={form.issue}
+                  onChange={(v) => setForm((f) => ({ ...f, issue: v }))}
+                />
+              )}
+              {!hiddenFields.has("pages") && (
+                <Field
+                  label="页码"
+                  value={form.pages}
+                  onChange={(v) => setForm((f) => ({ ...f, pages: v }))}
+                />
+              )}
+              {!hiddenFields.has("numPages") && (
+                <Field
+                  label="页数"
+                  value={form.numPages}
+                  onChange={(v) => setForm((f) => ({ ...f, numPages: v }))}
+                />
+              )}
+              {!hiddenFields.has("place") && (
+                <Field
+                  label="出版地"
+                  value={form.place}
+                  onChange={(v) => setForm((f) => ({ ...f, place: v }))}
+                />
+              )}
+              {!hiddenFields.has("edition") && (
+                <Field
+                  label="版本"
+                  value={form.edition}
+                  onChange={(v) => setForm((f) => ({ ...f, edition: v }))}
+                />
+              )}
+              <Field
+                label="语言"
+                value={form.language}
+                onChange={(v) => setForm((f) => ({ ...f, language: v }))}
+              />
+              {!hiddenFields.has("isbn") && (
+                <Field
+                  label="ISBN"
+                  value={form.isbn}
+                  onChange={(v) => setForm((f) => ({ ...f, isbn: v }))}
+                />
+              )}
+              {!hiddenFields.has("issn") && (
+                <Field
+                  label="ISSN"
+                  value={form.issn}
+                  onChange={(v) => setForm((f) => ({ ...f, issn: v }))}
+                />
+              )}
+              {!hiddenFields.has("callNumber") && (
+                <Field
+                  label="索书号"
+                  value={form.callNumber}
+                  onChange={(v) => setForm((f) => ({ ...f, callNumber: v }))}
+                />
+              )}
+            </div>
+            {!hiddenFields.has("journal") && (
+              <Field
+                label="期刊"
+                value={form.journal}
+                onChange={(v) => setForm((f) => ({ ...f, journal: v }))}
+              />
+            )}
+            {!hiddenFields.has("conferenceName") && (
+              <Field
+                label="会议名称"
+                value={form.conferenceName}
+                onChange={(v) => setForm((f) => ({ ...f, conferenceName: v }))}
+              />
+            )}
+            {!hiddenFields.has("publisher") && (
+              <Field
+                label="出版社"
+                value={form.publisher}
+                onChange={(v) => setForm((f) => ({ ...f, publisher: v }))}
+              />
+            )}
+            {!hiddenFields.has("series") && (
+              <Field
+                label="系列"
+                value={form.series}
+                onChange={(v) => setForm((f) => ({ ...f, series: v }))}
+              />
+            )}
+            <Field
+              label="DOI"
+              value={form.doi}
+              onChange={(v) => setForm((f) => ({ ...f, doi: v }))}
+            />
+            <Field
+              label="URL"
+              value={form.url}
+              onChange={(v) => setForm((f) => ({ ...f, url: v }))}
+            />
+            <Field
+              label="引用键"
+              value={form.citationKey}
+              onChange={(v) => setForm((f) => ({ ...f, citationKey: v }))}
+            />
+            <Field
+              label="关键词"
+              value={form.keywords}
+              placeholder="用逗号分隔"
+              onChange={(v) => setForm((f) => ({ ...f, keywords: v }))}
+            />
+            {!hiddenFields.has("archiveLocation") && (
+              <Field
+                label="归档位置"
+                value={form.archiveLocation}
+                onChange={(v) => setForm((f) => ({ ...f, archiveLocation: v }))}
+              />
+            )}
+            <Field
+              label="权利"
+              value={form.rights}
+              onChange={(v) => setForm((f) => ({ ...f, rights: v }))}
+            />
+            {!hiddenFields.has("abstract") && (
+              <Field
+                label="摘要"
+                value={form.abstract}
+                multiline
+                placeholder="文献摘要..."
+                onChange={(v) => setForm((f) => ({ ...f, abstract: v }))}
+              />
+            )}
+          </>
+        ) : (
+          <>
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-text-primary">
+                文献信息
+              </span>
+              <button
+                onClick={() => setIsEditing(true)}
+                className="flex items-center gap-1 rounded px-2 py-1 text-[11px] text-text-secondary hover:bg-surface-hover hover:text-primary"
+              >
+                <Pencil size={12} /> 编辑
+              </button>
+            </div>
+            <MetadataReadView
+              paper={paper}
+              creators={creators}
+              creatorsLoaded={creatorsLoaded}
+            />
+          </>
         )}
 
         {/* Collections & timestamps (Zotero-style) */}
@@ -696,50 +1035,25 @@ function InfoTab({ paper }: { paper: Paper }) {
         </div>
       </div>
 
-      {changed && (
-        <div className="p-3 border-t border-surface-hover flex items-center justify-end gap-2 bg-surface/50">
+      {isEditing && (
+        <div className="flex items-center justify-end gap-2 border-t border-surface-hover bg-surface/50 p-3">
           <button
-            onClick={() =>
-              setForm({
-                title: paper.title,
-                authors: parseJsonArray(paper.authors).join('; '),
-                year: paper.year?.toString() ?? '',
-                journal: paper.journal ?? '',
-                doi: paper.doi ?? '',
-                url: paper.url ?? '',
-                abstract: paper.abstract_text ?? '',
-                keywords: parseJsonArray(paper.keywords).join(', '),
-                citationKey: paper.citation_key ?? '',
-                itemType: paper.item_type ?? 'journal',
-                volume: paper.volume ?? '',
-                issue: paper.issue ?? '',
-                pages: paper.pages ?? '',
-                conferenceName: paper.conference_name ?? '',
-                publisher: paper.publisher ?? '',
-                place: paper.place ?? '',
-                editor: parseJsonArray(paper.editor).join('; '),
-                series: paper.series ?? '',
-                edition: paper.edition ?? '',
-                isbn: paper.isbn ?? '',
-                issn: paper.issn ?? '',
-                language: paper.language ?? '',
-                numPages: paper.num_pages?.toString() ?? paper.page_count?.toString() ?? '',
-                archiveLocation: paper.archive_location ?? '',
-                callNumber: paper.call_number ?? '',
-                rights: paper.rights ?? '',
-              })
-            }
-            className="px-3 py-1.5 rounded-lg text-xs text-text-secondary hover:bg-surface-hover transition-colors"
+            onClick={() => {
+              resetEditing();
+              setIsEditing(false);
+            }}
+            disabled={updateMutation.isPending}
+            className="rounded-lg px-3 py-1.5 text-xs text-text-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
           >
-            重置
+            取消
           </button>
           <button
             onClick={handleSave}
             disabled={updateMutation.isPending}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-primary/10 text-primary text-xs font-medium hover:bg-primary/20 transition-colors disabled:opacity-50"
+            className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary transition-colors hover:bg-primary/20 disabled:opacity-50"
           >
             <Save size={13} />
-            {updateMutation.isPending ? '保存中...' : '保存'}
+            {updateMutation.isPending ? "保存中..." : "保存"}
           </button>
         </div>
       )}
@@ -1123,10 +1437,13 @@ export function PaperDetailPanel() {
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-surface-hover shrink-0">
-        <FileText size={16} className="text-primary shrink-0" />
-        <h3 className="flex-1 min-w-0 text-sm font-medium text-text-primary truncate" title={paper.title}>
-          {paper.title || '未命名文献'}
+      <div className="flex shrink-0 items-start gap-2 border-b border-surface-hover px-3 py-2">
+        <FileText size={16} className="mt-0.5 shrink-0 text-primary" />
+        <h3
+          className="min-w-0 flex-1 break-words text-sm font-medium leading-snug text-text-primary"
+          title={paper.title}
+        >
+          {paper.title || "未命名文献"}
         </h3>
         <button
           onClick={() => setRightPanelCollapsed(true)}

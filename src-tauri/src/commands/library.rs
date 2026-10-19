@@ -177,13 +177,12 @@ pub async fn paper_get_paragraphs(
 }
 
 /// Enrich a paper's bibliographic metadata from CrossRef (DOI / title).
-/// Returns true when fields were filled.
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn paper_enrich_metadata(
     state: State<'_, AppState>,
     id: String,
-) -> Result<bool, String> {
+) -> Result<paper_service::MetadataEnrichmentResult, String> {
     paper_service::enrich_paper_metadata(&state.db, &state.app_data_dir, &id).await
 }
 

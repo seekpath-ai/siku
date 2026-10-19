@@ -86,6 +86,11 @@ export interface PaperImportResult {
   warning: string | null;
 }
 
+export interface PaperEnrichMetadataResult {
+  updated: boolean;
+  fields: string[];
+}
+
 export interface LinkImportError {
   code: 'unsupported_url' | 'metadata_not_found' | 'network_error' | 'download_failed' | 'finalize_failed' | 'unknown';
   message: string;

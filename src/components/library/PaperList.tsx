@@ -70,6 +70,7 @@ import {
   paperExport,
   notesList,
   paperImportBibtex,
+  paperEnrichMetadata,
   paperReprocessIndex,
   paperFindDuplicates,
   paperMerge,
@@ -458,6 +459,49 @@ function PaperRow({
     () => (isSelected && selectedIds.length > 0 ? selectedIds : [paper.id]),
     [isSelected, selectedIds, paper.id]
   );
+  const [enriching, setEnriching] = useState(false);
+
+  const handleEnrichMetadata = async () => {
+    if (enriching || targetPaperIds.length !== 1) return;
+    setEnriching(true);
+    try {
+      const result = await paperEnrichMetadata(paper.id);
+      await queryClient.invalidateQueries({ queryKey: ["paper", paper.id] });
+      await queryClient.invalidateQueries({ queryKey: ["papers"] });
+      if (result.updated) {
+        const labels: Record<string, string> = {
+          title: "标题",
+          authors: "作者",
+          year: "年份",
+          journal: "期刊",
+          volume: "卷",
+          issue: "期",
+          pages: "页码",
+          publisher: "出版社",
+          abstract_text: "摘要",
+          issn: "ISSN",
+          doi: "DOI",
+          url: "URL",
+        };
+        const fields = result.fields
+          .map((field) => labels[field] ?? field)
+          .join("、");
+        await alert(
+          fields ? `已补全：${fields}` : "元数据已补全。",
+          "补全元数据",
+        );
+      } else {
+        await alert(
+          "未找到可补全的元数据，请检查 DOI 或标题后重试。",
+          "补全元数据",
+        );
+      }
+    } catch (err) {
+      await alert(`补全元数据失败：${err}`, "补全元数据");
+    } finally {
+      setEnriching(false);
+    }
+  };
 
   // Export the target paper(s) as BibTeX / RIS / CSL-JSON, copying to clipboard.
   const handleExportCitation = async () => {
@@ -525,110 +569,138 @@ function PaperRow({
 
   const menuItems: ContextMenuItem[] = [
     {
-      label: '打开 PDF',
+      label: "打开 PDF",
       icon: <File size={14} />,
       onClick: openPdf,
     },
     {
-      label: '在系统中打开',
+      label: "在系统中打开",
       icon: <ExternalLink size={14} />,
       disabled: !hasAttachment,
-      onClick: () => openPaperInSystem(paper.id).catch((err) => console.error('打开失败:', err)),
+      onClick: () =>
+        openPaperInSystem(paper.id).catch((err) =>
+          console.error("打开失败:", err),
+        ),
     },
     {
-      label: '打开文件所在目录',
+      label: "打开文件所在目录",
       icon: <FolderOpen size={14} />,
       disabled: !hasAttachment,
       onClick: handleRevealInSystem,
     },
     {
-      label: '导出引用',
+      label: "导出引用",
       icon: <FileDown size={14} />,
+      separatorBefore: true,
       onClick: handleExportCitation,
     },
     {
-      label: '复制引用键',
+      label: "复制引用键",
       icon: <Copy size={14} />,
       onClick: handleCopyCitationKey,
     },
     {
-      label: paper.is_favorite ? '取消星标' : '星标',
-      icon: <Star size={14} />,
-      onClick: () => onToggleFavorite(targetPaperIds, paper.is_favorite !== 1),
-    },
-    {
-      label: paper.read_status === 'read' ? '标记为未读' : '标记为已读',
-      icon: <BookOpen size={14} />,
-      onClick: () => onSetReadStatus(targetPaperIds, paper.read_status === 'read' ? 'unread' : 'read'),
-    },
-    {
-      label: '导入 BibTeX 元数据',
+      label: "导入 BibTeX 元数据",
       icon: <BookMarked size={14} />,
       onClick: handleImportBibtex,
     },
     {
-      label: '查重（合并重复项）',
+      label: enriching ? "补全元数据中…" : "补全元数据…",
+      icon: enriching ? (
+        <Loader2 size={14} className="animate-spin" />
+      ) : (
+        <RefreshCw size={14} />
+      ),
+      disabled: enriching || targetPaperIds.length !== 1,
+      onClick: handleEnrichMetadata,
+    },
+    {
+      label: "查重（合并重复项）",
       icon: <Copy size={14} />,
       onClick: handleFindDuplicates,
     },
     {
-      label: '导出笔记',
+      label: "导出笔记",
       icon: <Download size={14} />,
       onClick: handleExportNotes,
     },
     {
-      label: reprocessing
-        ? '重建索引中…'
-        : `重建索引${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
-      icon: reprocessing ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />,
-      disabled: reprocessing || !hasAttachment,
-      onClick: handleReprocessIndex,
-    },
-    {
-      label: `AI 表格列${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
+      label: `AI 表格列${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ""}`,
       icon: <Table2 size={14} />,
+      separatorBefore: true,
       onClick: () => useAiTableStore.getState().openWith(targetPaperIds),
     },
     {
-      label: `AI 综述${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
+      label: `AI 综述${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ""}`,
       icon: <Sparkles size={14} />,
       onClick: () => useReviewStore.getState().openWith(targetPaperIds),
     },
     {
-      label: `AI 文献分类${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
+      label: `AI 文献分类${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ""}`,
       icon: <Tags size={14} />,
       onClick: () =>
         useAiClassifyStore.getState().openWith(targetPaperIds, {
-          kind: 'selection',
-          collectionId: activeFilter.type === 'collection' ? activeFilter.id : null,
+          kind: "selection",
+          collectionId:
+            activeFilter.type === "collection" ? activeFilter.id : null,
           label:
-            targetPaperIds.length > 1 ? `所选 ${targetPaperIds.length} 篇` : '所选文献',
+            targetPaperIds.length > 1
+              ? `所选 ${targetPaperIds.length} 篇`
+              : "所选文献",
         }),
     },
     {
-      label: `添加到分类${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
+      label: paper.is_favorite ? "取消星标" : "星标",
+      icon: <Star size={14} />,
+      separatorBefore: true,
+      onClick: () => onToggleFavorite(targetPaperIds, paper.is_favorite !== 1),
+    },
+    {
+      label: paper.read_status === "read" ? "标记为未读" : "标记为已读",
+      icon: <BookOpen size={14} />,
+      onClick: () =>
+        onSetReadStatus(
+          targetPaperIds,
+          paper.read_status === "read" ? "unread" : "read",
+        ),
+    },
+    {
+      label: reprocessing
+        ? "重建索引中…"
+        : `重建索引${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ""}`,
+      icon: reprocessing ? (
+        <Loader2 size={14} className="animate-spin" />
+      ) : (
+        <RefreshCw size={14} />
+      ),
+      disabled: reprocessing || !hasAttachment,
+      onClick: handleReprocessIndex,
+    },
+    {
+      label: `添加到分类${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ""}`,
       icon: <FolderPlus size={14} />,
       disabled: !collections || collections.length === 0,
       onClick: handleAddToCollection,
     },
-    ...(activeFilter.type === 'collection'
+    ...(activeFilter.type === "collection"
       ? [
           {
-            label: `从当前分类移除${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
+            label: `从当前分类移除${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ""}`,
             icon: <FolderMinus size={14} />,
             onClick: handleRemoveFromCurrentCollection,
           } as ContextMenuItem,
         ]
       : []),
-    ...(activeFilter.type === 'trash'
+    ...(activeFilter.type === "trash"
       ? [
           {
-            label: `恢复${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
+            label: `恢复${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ""}`,
             icon: <RotateCcw size={14} />,
+            separatorBefore: true,
             onClick: () => onRestore(targetPaperIds),
           },
           {
-            label: `永久删除${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
+            label: `永久删除${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ""}`,
             icon: <Trash2 size={14} />,
             destructive: true,
             onClick: () => onPurge(targetPaperIds),
@@ -636,9 +708,10 @@ function PaperRow({
         ]
       : [
           {
-            label: `删除文献${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ''}`,
+            label: `删除文献${targetPaperIds.length > 1 ? ` (${targetPaperIds.length})` : ""}`,
             icon: <Trash2 size={14} />,
             destructive: true,
+            separatorBefore: true,
             onClick: () => onDelete(targetPaperIds),
           },
         ]),

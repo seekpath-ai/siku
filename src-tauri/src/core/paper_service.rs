@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -32,8 +32,8 @@ pub struct ImportMetadata {
 }
 
 /// Common finalization step for all import paths: insert the paper record,
-/// create the attachment (if a PDF is available), generate thumbnail, extract
-/// text/chunks, and spawn metadata enrichment.
+/// create the attachment (if a PDF is available), generate thumbnail, and
+/// extract text/chunks.
 #[instrument(skip(db, app_data_dir, metadata), fields(paper_id = %paper_id))]
 pub async fn finalize_paper_import(
     db: &SqlitePool,
@@ -166,18 +166,6 @@ pub async fn finalize_paper_import(
             }
         }
     }
-
-    // Enrich bibliographic metadata from CrossRef in the background
-    let db_clone = db.clone();
-    let app_data_dir = app_data_dir.to_path_buf();
-    let pid = paper_id.clone();
-    tokio::spawn(async move {
-        match enrich_paper_metadata(&db_clone, &app_data_dir, &pid).await {
-            Ok(true) => info!(paper_id = %pid, "metadata enriched from CrossRef"),
-            Ok(false) => info!(paper_id = %pid, "no metadata enrichment available"),
-            Err(e) => warn!(paper_id = %pid, error = %e, "metadata enrichment failed"),
-        }
-    });
 
     info!(
         paper_id = %paper_id,
@@ -651,102 +639,206 @@ pub async fn get_paragraphs(
     Ok(paragraphs)
 }
 
-/// Best-effort bibliographic enrichment (Zotero-style):
-/// resolve a DOI (paper field → PDF Info/XMP/text), query CrossRef, and fill
-/// the blank metadata fields (year/journal/volume/issue/pages/publisher/ISSN/
-/// abstract/authors...). Falls back to a title search when no DOI is found.
-/// Returns true when at least one field was filled.
-#[instrument(skip(db))]
-pub async fn enrich_paper_metadata(
-    db: &SqlitePool,
-    app_data_dir: &Path,
-    paper_id: &str,
-) -> std::result::Result<bool, String> {
-    let paper = get_paper(db, paper_id).await?;
-    let proxy = crate::core::settings_service::get_setting(db, "llm.proxy").await.ok().flatten();
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct MetadataEnrichmentResult {
+    pub updated: bool,
+    pub fields: Vec<String>,
+}
 
-    // 1. Resolve a DOI.
-    let doi = paper
-        .doi
-        .clone()
-        .filter(|d| !d.trim().is_empty())
-        .or_else(|| {
-            paper.file_path.as_deref().and_then(|p| {
-                crate::pdf::parser::extract_doi(&file_store::resolve_blob_path(app_data_dir, p))
-            })
-        });
+async fn find_work_by_title(
+    title: &str,
+    proxy: Option<&str>,
+) -> std::result::Result<Option<crate::ai::scraping::metadata::CrossrefWork>, String> {
+    let results = crate::ai::scraping::metadata::search_works(title, 5, proxy).await?;
+    Ok(results.into_iter().find(|work| {
+        work.title
+            .as_deref()
+            .map(|candidate| title_similar(title, candidate))
+            .unwrap_or(false)
+    }))
+}
 
-    let work = if let Some(d) = &doi {
-        crate::ai::scraping::metadata::fetch_by_doi(d, proxy.as_deref())
-            .await
-            .unwrap_or(None)
-    } else {
-        // 2. No DOI → try a title search, accepting only a close match.
-        let results = crate::ai::scraping::metadata::search_works(&paper.title, 5, proxy.as_deref())
-            .await
-            .unwrap_or_default();
-        results.into_iter().find(|w| {
-            w.title.as_deref().map(|t| title_similar(&paper.title, t)).unwrap_or(false)
-        })
-    };
+fn fill_metadata_field(
+    current: &Option<String>,
+    incoming: &Option<String>,
+    output: &mut Option<String>,
+    key: &str,
+    fields: &mut Vec<String>,
+) {
+    if !current.as_deref().unwrap_or("").trim().is_empty() {
+        return;
+    }
+    if let Some(value) = incoming.as_ref().filter(|value| !value.trim().is_empty()) {
+        *output = Some(value.clone());
+        fields.push(key.to_string());
+    }
+}
 
-    let Some(work) = work else {
-        return Ok(false);
-    };
-
+fn merge_metadata_enrichment(
+    paper: &Paper,
+    work: &crate::ai::scraping::metadata::CrossrefWork,
+) -> (PaperInput, MetadataEnrichmentResult) {
     let current_authors: Vec<String> = serde_json::from_str(&paper.authors).unwrap_or_default();
-    let work_authors = work.authors.clone().filter(|v| !v.is_empty());
-    let authors = if !current_authors.is_empty() {
-        current_authors
-    } else {
-        work_authors.unwrap_or_default()
-    };
-
-    let mut changed = false;
-    let input = crate::core::models::PaperInput {
+    let mut input = PaperInput {
         title: paper.title.clone(),
-        authors,
-        year: paper.year.or(work.year),
-        journal: paper.journal.clone().or_else(|| work.journal.clone()),
-        doi: paper.doi.clone().or_else(|| work.doi.clone()),
-        url: paper.url.clone().or_else(|| work.url.clone()),
-        abstract_text: paper.abstract_text.clone().or_else(|| work.abstract_text.clone()),
+        authors: current_authors.clone(),
+        year: paper.year,
+        journal: paper.journal.clone(),
+        doi: paper.doi.clone(),
+        url: paper.url.clone(),
+        abstract_text: paper.abstract_text.clone(),
         keywords: serde_json::from_str(&paper.keywords).unwrap_or_default(),
         item_type: paper.item_type.clone(),
-        volume: paper.volume.clone().or_else(|| work.volume.clone()),
-        issue: paper.issue.clone().or_else(|| work.issue.clone()),
-        pages: paper.pages.clone().or_else(|| work.pages.clone()),
+        volume: paper.volume.clone(),
+        issue: paper.issue.clone(),
+        pages: paper.pages.clone(),
         conference_name: paper.conference_name.clone(),
-        publisher: paper.publisher.clone().or_else(|| work.publisher.clone()),
+        publisher: paper.publisher.clone(),
         place: paper.place.clone(),
         editor: serde_json::from_str(&paper.editor).unwrap_or_default(),
         series: paper.series.clone(),
         edition: paper.edition.clone(),
         isbn: paper.isbn.clone(),
-        issn: paper.issn.clone().or_else(|| work.issn.clone()),
+        issn: paper.issn.clone(),
         language: paper.language.clone(),
         num_pages: paper.num_pages,
         archive_location: paper.archive_location.clone(),
         call_number: paper.call_number.clone(),
         rights: paper.rights.clone(),
     };
-    if work.year.is_some() && paper.year.is_none() { changed = true; }
-    if work.journal.is_some() && paper.journal.is_none() { changed = true; }
-    if work.volume.is_some() && paper.volume.is_none() { changed = true; }
-    if work.issue.is_some() && paper.issue.is_none() { changed = true; }
-    if work.pages.is_some() && paper.pages.is_none() { changed = true; }
-    if work.abstract_text.is_some() && paper.abstract_text.is_none() { changed = true; }
-    if work.issn.is_some() && paper.issn.is_none() { changed = true; }
-    if work.doi.is_some() && paper.doi.is_none() { changed = true; }
-    if work.url.is_some() && paper.url.is_none() { changed = true; }
-    if work.authors.as_ref().is_some_and(|a| !a.is_empty()) && serde_json::from_str::<Vec<String>>(&paper.authors).unwrap_or_default().is_empty() {
-        changed = true;
+    let mut fields = Vec::new();
+
+    if paper.title.trim().is_empty() {
+        if let Some(title) = work.title.as_ref().filter(|title| !title.trim().is_empty()) {
+            input.title = title.clone();
+            fields.push("title".to_string());
+        }
+    }
+    if current_authors
+        .iter()
+        .all(|author| author.trim().is_empty())
+    {
+        let authors: Vec<String> = work
+            .authors
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|author| !author.trim().is_empty())
+            .collect();
+        if !authors.is_empty() {
+            input.authors = authors;
+            fields.push("authors".to_string());
+        }
+    }
+    if paper.year.is_none() {
+        if let Some(year) = work.year {
+            input.year = Some(year);
+            fields.push("year".to_string());
+        }
     }
 
-    if changed {
+    fill_metadata_field(
+        &paper.journal,
+        &work.journal,
+        &mut input.journal,
+        "journal",
+        &mut fields,
+    );
+    fill_metadata_field(&paper.doi, &work.doi, &mut input.doi, "doi", &mut fields);
+    fill_metadata_field(&paper.url, &work.url, &mut input.url, "url", &mut fields);
+    fill_metadata_field(
+        &paper.abstract_text,
+        &work.abstract_text,
+        &mut input.abstract_text,
+        "abstract_text",
+        &mut fields,
+    );
+    fill_metadata_field(
+        &paper.volume,
+        &work.volume,
+        &mut input.volume,
+        "volume",
+        &mut fields,
+    );
+    fill_metadata_field(
+        &paper.issue,
+        &work.issue,
+        &mut input.issue,
+        "issue",
+        &mut fields,
+    );
+    fill_metadata_field(
+        &paper.pages,
+        &work.pages,
+        &mut input.pages,
+        "pages",
+        &mut fields,
+    );
+    fill_metadata_field(
+        &paper.publisher,
+        &work.publisher,
+        &mut input.publisher,
+        "publisher",
+        &mut fields,
+    );
+    fill_metadata_field(
+        &paper.issn,
+        &work.issn,
+        &mut input.issn,
+        "issn",
+        &mut fields,
+    );
+
+    let result = MetadataEnrichmentResult {
+        updated: !fields.is_empty(),
+        fields,
+    };
+    (input, result)
+}
+
+/// Resolve a DOI (paper field → PDF Info/XMP/text), query CrossRef, and fill
+/// blank metadata fields. A DOI lookup with no result falls back to title
+/// search; request and parsing failures are returned to the caller.
+#[instrument(skip(db))]
+pub async fn enrich_paper_metadata(
+    db: &SqlitePool,
+    app_data_dir: &Path,
+    paper_id: &str,
+) -> std::result::Result<MetadataEnrichmentResult, String> {
+    let paper = get_paper(db, paper_id).await?;
+    let proxy = crate::core::settings_service::get_setting(db, "llm.proxy")
+        .await
+        .ok()
+        .flatten();
+    let doi = paper
+        .doi
+        .clone()
+        .filter(|doi| !doi.trim().is_empty())
+        .or_else(|| {
+            paper.file_path.as_deref().and_then(|path| {
+                crate::pdf::parser::extract_doi(&file_store::resolve_blob_path(app_data_dir, path))
+            })
+        });
+
+    let work = if let Some(doi) = &doi {
+        match crate::ai::scraping::metadata::fetch_by_doi(doi, proxy.as_deref()).await? {
+            Some(work) => Some(work),
+            None => find_work_by_title(&paper.title, proxy.as_deref()).await?,
+        }
+    } else {
+        find_work_by_title(&paper.title, proxy.as_deref()).await?
+    };
+
+    let Some(work) = work else {
+        return Ok(MetadataEnrichmentResult::default());
+    };
+
+    let latest_paper = get_paper(db, paper_id).await?;
+    let (input, result) = merge_metadata_enrichment(&latest_paper, &work);
+    if result.updated {
         update_paper(db, paper_id, input).await?;
     }
-    Ok(changed)
+    Ok(result)
 }
 
 /// Loose title similarity: share ≥50% of significant tokens.
@@ -1747,6 +1839,173 @@ pub async fn set_creators(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_paper() -> Paper {
+        Paper {
+            id: "paper-id".to_string(),
+            title: "Existing title".to_string(),
+            authors: "[]".to_string(),
+            year: None,
+            journal: None,
+            doi: None,
+            url: None,
+            abstract_text: None,
+            keywords: "[]".to_string(),
+            citation_key: None,
+            bibtex: None,
+            file_path: None,
+            file_size: None,
+            page_count: None,
+            language: Some("en".to_string()),
+            item_type: None,
+            volume: None,
+            issue: None,
+            pages: None,
+            conference_name: None,
+            publisher: None,
+            place: None,
+            editor: "[]".to_string(),
+            series: None,
+            edition: None,
+            isbn: None,
+            issn: None,
+            num_pages: None,
+            archive_location: None,
+            call_number: None,
+            rights: None,
+            deleted_at: None,
+            is_favorite: 0,
+            read_status: "unread".to_string(),
+            last_read_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            imported_at: String::new(),
+        }
+    }
+
+    fn empty_work() -> crate::ai::scraping::metadata::CrossrefWork {
+        crate::ai::scraping::metadata::CrossrefWork {
+            title: None,
+            authors: None,
+            year: None,
+            journal: None,
+            doi: None,
+            abstract_text: None,
+            citation_count: None,
+            volume: None,
+            issue: None,
+            pages: None,
+            publisher: None,
+            issn: None,
+            url: None,
+        }
+    }
+
+    #[test]
+    fn metadata_enrichment_preserves_non_empty_fields() {
+        let mut paper = test_paper();
+        paper.authors = r#"["Existing Author"]"#.to_string();
+        paper.year = Some(1999);
+        paper.journal = Some("Existing Journal".to_string());
+        paper.publisher = Some("Existing Publisher".to_string());
+        let mut work = empty_work();
+        work.authors = Some(vec!["Crossref Author".to_string()]);
+        work.year = Some(2024);
+        work.journal = Some("Crossref Journal".to_string());
+        work.publisher = Some("Crossref Publisher".to_string());
+
+        let (input, result) = merge_metadata_enrichment(&paper, &work);
+
+        assert_eq!(input.authors, vec!["Existing Author".to_string()]);
+        assert_eq!(input.year, Some(1999));
+        assert_eq!(input.journal.as_deref(), Some("Existing Journal"));
+        assert_eq!(input.publisher.as_deref(), Some("Existing Publisher"));
+        assert!(!result.updated);
+        assert!(result.fields.is_empty());
+    }
+
+    #[test]
+    fn metadata_enrichment_treats_whitespace_as_missing() {
+        let mut paper = test_paper();
+        paper.authors = r#"["  "]"#.to_string();
+        paper.journal = Some(" \t\n".to_string());
+        paper.abstract_text = Some("  ".to_string());
+        let mut work = empty_work();
+        work.authors = Some(vec!["Crossref Author".to_string()]);
+        work.journal = Some("Crossref Journal".to_string());
+        work.abstract_text = Some("Crossref Abstract".to_string());
+        work.issue = Some("   ".to_string());
+
+        let (input, result) = merge_metadata_enrichment(&paper, &work);
+
+        assert_eq!(input.authors, vec!["Crossref Author".to_string()]);
+        assert_eq!(input.journal.as_deref(), Some("Crossref Journal"));
+        assert_eq!(input.abstract_text.as_deref(), Some("Crossref Abstract"));
+        assert_eq!(input.issue, None);
+        assert_eq!(
+            result.fields,
+            ["authors", "journal", "abstract_text"].map(String::from)
+        );
+        assert!(result.updated);
+    }
+
+    #[test]
+    fn metadata_enrichment_reports_publisher() {
+        let paper = test_paper();
+        let mut work = empty_work();
+        work.publisher = Some("Crossref Publisher".to_string());
+
+        let (input, result) = merge_metadata_enrichment(&paper, &work);
+
+        assert_eq!(input.publisher.as_deref(), Some("Crossref Publisher"));
+        assert!(result.updated);
+        assert_eq!(result.fields, ["publisher"].map(String::from));
+    }
+
+    #[test]
+    fn metadata_enrichment_lists_every_filled_field() {
+        let mut paper = test_paper();
+        paper.title = "  ".to_string();
+        let work = crate::ai::scraping::metadata::CrossrefWork {
+            title: Some("Crossref Title".to_string()),
+            authors: Some(vec!["Crossref Author".to_string()]),
+            year: Some(2024),
+            journal: Some("Crossref Journal".to_string()),
+            doi: Some("10.1000/example".to_string()),
+            abstract_text: Some("Crossref Abstract".to_string()),
+            citation_count: Some(10),
+            volume: Some("12".to_string()),
+            issue: Some("3".to_string()),
+            pages: Some("10-20".to_string()),
+            publisher: Some("Crossref Publisher".to_string()),
+            issn: Some("1234-5678".to_string()),
+            url: Some("https://example.com/work".to_string()),
+        };
+
+        let (input, result) = merge_metadata_enrichment(&paper, &work);
+        let expected_fields = [
+            "title",
+            "authors",
+            "year",
+            "journal",
+            "doi",
+            "url",
+            "abstract_text",
+            "volume",
+            "issue",
+            "pages",
+            "publisher",
+            "issn",
+        ];
+
+        assert_eq!(input.title, "Crossref Title");
+        assert_eq!(result.fields, expected_fields.map(String::from));
+        assert!(result.updated);
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::json!({ "updated": true, "fields": expected_fields })
+        );
+    }
 
     /// Papers indexed before the figure index existed have no `paper_figures`
     /// rows; `paper_snapshot(label=…)` then answered "no figure found" forever.

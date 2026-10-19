@@ -130,6 +130,21 @@ test.describe('全局 AI 任务入口', () => {
     await expect(reviewChip).toHaveText(/综述 2\/5/);
     await expect(classifyChip).toHaveText(/分类判定 8\/20/);
 
+    // 综述写作阶段的 delta/reasoning 流式事件不带计数，不能冲刷 chip 进度。
+    await page.evaluate(() => {
+      window.__aiTasksMock.emit('library:review-progress', {
+        runId: 'r1',
+        stage: 'section',
+        sectionIndex: 2,
+        totalSections: 5,
+        sectionTitle: '研究进展',
+        noteId: null,
+        message: null,
+        delta: '……流式片段……',
+      });
+    });
+    await expect(reviewChip).toHaveText(/综述 2\/5/);
+
     // 切到 /notes 再回 /library：入口和状态不丢。
     await page.keyboard.press('Control+3');
     await expect(page).toHaveURL(/\/notes/);
@@ -220,5 +235,81 @@ test.describe('全局 AI 任务入口', () => {
     await tableChip.click();
     await expect(page.getByText('AI 表格列', { exact: true })).toBeVisible();
     await expect(tableChip).toBeHidden();
+  });
+
+  test('运行中打开再关闭对话框，chip 立即恢复显示最后进度', async ({ page }) => {
+    await setupLibrary(page);
+
+    await page.evaluate(async () => {
+      const { useAiTableStore } = await import('/src/stores/aiTableStore.ts');
+      useAiTableStore.getState().openWith(['p1', 'p2']);
+    });
+    await expect(page.getByText('AI 表格列', { exact: true })).toBeVisible();
+    await page.getByTitle('关闭', { exact: true }).click();
+
+    await page.evaluate(() => {
+      window.__aiTasksMock.emit('library:ai-table-progress', { total: 10, done: 3, failed: 0, currentTitle: '测试文献一', finished: null });
+    });
+    const tableChip = page.getByTestId('ai-task-chip-table');
+    await expect(tableChip).toHaveText(/表格 3\/10/);
+
+    // 打开再关闭：思维链模型可能长时间只发 reasoning 事件，运行中的任务
+    // 记录必须保留，chip 不能干等下一条真实进度。
+    await tableChip.click();
+    await expect(page.getByText('AI 表格列', { exact: true })).toBeVisible();
+    await expect(tableChip).toBeHidden();
+    await page.getByTitle('关闭', { exact: true }).click();
+    await expect(tableChip).toHaveText(/表格 3\/10/);
+  });
+
+  test('重开时后端快照是 reasoning 占位事件也不显示 0/0', async ({ page }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem('siku.onboarding.completed', '1');
+      const w = window as unknown as Record<string, unknown>;
+      w.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => undefined };
+      w.__TAURI_INTERNALS__ = {
+        metadata: { currentWindow: { label: 'main' } },
+        transformCallback: () => 1,
+        unregisterCallback: () => undefined,
+        invoke: async (cmd: string) => {
+          if (cmd === 'settings_get_all') {
+            return [{ key: 'siku.onboarding.completed', value: '1', updated_at: '' }];
+          }
+          if (cmd === 'plugin:event|listen') return 1;
+          if (cmd === 'llm_provider_list') return [];
+          if (cmd === 'ai_table_papers_info') {
+            return [
+              { id: 'p1', title: '测试文献一', year: 2025 },
+              { id: 'p2', title: '测试文献二', year: 2024 },
+            ];
+          }
+          // 思维链抽取途中重开：LAST 快照是 reasoning 占位事件（0/0）。
+          if (cmd === 'ai_table_extract_status') {
+            return {
+              running: true,
+              progress: { total: 0, done: 0, failed: 0, currentTitle: '测试文献一', reasoning: '思考中…', finished: null },
+            };
+          }
+          if (
+            cmd === 'ai_table_presets_list' ||
+            cmd === 'ai_table_builtin_presets' ||
+            cmd === 'ai_table_cells_list' ||
+            cmd === 'ai_table_terms_get'
+          ) {
+            return [];
+          }
+          return null;
+        },
+      };
+    });
+    await page.goto('/library', { waitUntil: 'networkidle' });
+
+    await page.evaluate(async () => {
+      const { useAiTableStore } = await import('/src/stores/aiTableStore.ts');
+      useAiTableStore.getState().openWith(['p1', 'p2']);
+    });
+    await expect(page.getByText('AI 表格列', { exact: true })).toBeVisible();
+    // 进度行绝不能落成「抽取中 0/0」。
+    await expect(page.getByText(/0\/0/)).toHaveCount(0);
   });
 });

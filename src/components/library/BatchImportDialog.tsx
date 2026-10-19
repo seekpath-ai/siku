@@ -4,7 +4,9 @@ import { useBatchImportStore } from '@/stores/batchImportStore';
 /** Progress dialog for batch imports (multi-select files / folder / Zotero).
  *  Driven entirely by useBatchImportStore; the backend streams per-item
  *  progress events. Stays open after completion so the user can review
- *  failures — closing mid-run requires cancelling first. */
+ *  failures. Closing mid-run minimizes the dialog: the backend batch keeps
+ *  going and the store retains the live progress, so the task-center panel
+ *  (or a reopened dialog) shows it as-is. */
 export function BatchImportDialog() {
   const s = useBatchImportStore();
   if (!s.open) return null;
@@ -21,14 +23,13 @@ export function BatchImportDialog() {
         <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-hover">
           <FileStack size={18} className="text-primary" />
           <span className="text-sm font-medium text-text-primary">{s.label}</span>
-          {!s.running && (
-            <button
-              onClick={s.close}
-              className="ml-auto p-1 rounded text-text-secondary/60 hover:text-text-primary hover:bg-surface-hover transition-colors"
-            >
-              <X size={14} />
-            </button>
-          )}
+          <button
+            onClick={s.close}
+            title={s.running ? '最小化（任务继续在后台运行）' : '关闭'}
+            className="ml-auto p-1 rounded text-text-secondary/60 hover:text-text-primary hover:bg-surface-hover transition-colors"
+          >
+            <X size={14} />
+          </button>
         </div>
 
         <div className="px-4 py-4 space-y-3">
@@ -76,12 +77,20 @@ export function BatchImportDialog() {
 
         <div className="flex justify-end gap-2 px-4 py-3 border-t border-surface-hover">
           {s.running ? (
-            <button
-              onClick={s.cancel}
-              className="px-3 py-1.5 rounded-lg text-xs text-red-400 hover:bg-red-500/10 border border-surface-hover transition-colors"
-            >
-              取消（当前篇会完成）
-            </button>
+            <>
+              <button
+                onClick={s.close}
+                className="px-3 py-1.5 rounded-lg text-xs text-text-secondary hover:bg-surface-hover border border-surface-hover transition-colors"
+              >
+                最小化
+              </button>
+              <button
+                onClick={s.cancel}
+                className="px-3 py-1.5 rounded-lg text-xs text-red-400 hover:bg-red-500/10 border border-surface-hover transition-colors"
+              >
+                取消（当前篇会完成）
+              </button>
+            </>
           ) : (
             <button
               onClick={s.close}

@@ -20,6 +20,7 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
 import { navIcon } from '@/lib/tabIcons';
+import { TaskCenterButton } from './TaskCenter';
 
 interface NavItem {
   label: string;
@@ -297,7 +298,8 @@ export function Sidebar() {
         </SortableContext>
       </DndContext>
 
-      <div className="pb-1">
+      <div className="pb-1 flex flex-col items-center">
+        <TaskCenterButton />
         <button
           onClick={() => handleNav(settingsItem)}
           title={settingsItem.label}

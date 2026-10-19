@@ -169,8 +169,12 @@ impl Drop for RunGuard {
 }
 
 fn emit(app: &AppHandle, p: &ExtractProgress) {
-    if let Ok(mut g) = LAST.lock() {
-        *g = Some(p.clone());
+    // Reasoning beats carry placeholder counters (0/0); they must not become
+    // the re-attach snapshot or a reopened dialog shows "抽取中 0/0".
+    if p.reasoning.is_none() {
+        if let Ok(mut g) = LAST.lock() {
+            *g = Some(p.clone());
+        }
     }
     if let Err(e) = app.emit(PROGRESS_EVENT, p) {
         tracing::warn!(error = %e, "failed to emit ai-table progress");

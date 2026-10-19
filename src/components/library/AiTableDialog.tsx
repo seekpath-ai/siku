@@ -189,7 +189,9 @@ export function AiTableDialog() {
         if (!s.running) return;
         setRunning(true);
         const p = s.progress;
-        if (p) {
+        // Belt-and-braces: a reasoning snapshot carries placeholder 0/0
+        // counters and must never become the progress line.
+        if (p && !p.reasoning) {
           setProgress(p);
           setLogs((prev) =>
             prev.length > 0 ? prev : [`↻ 接续进行中的抽取任务（${p.done}/${p.total}）`]

@@ -8,6 +8,7 @@ import { useShellStore } from '@/stores/shellStore';
 import { useTabStore } from '@/stores/tabStore';
 import { notesCreate, bookmarksCreate } from '@/lib/tauri';
 import { openNoteTab } from '@/lib/openNote';
+import { GlobalAiTasks } from './GlobalAiTasks';
 
 function isTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -557,6 +558,9 @@ export function TitleBar() {
           ))}
         </div>
       )}
+
+      {/* Global AI task chips (综述 / 表格列 / 分类) — before window controls */}
+      <GlobalAiTasks />
 
       {/* Right: window controls (Tauri only) */}
       {inTauri && (

@@ -10,6 +10,10 @@ import { GlobalSearch } from '@/components/search/GlobalSearch';
 import { ImportFromLinkDialog } from '@/components/library/ImportFromLinkDialog';
 import { BatchImportDialog } from '@/components/library/BatchImportDialog';
 import { ZoteroImportDialog } from '@/components/library/ZoteroImportDialog';
+import { AiTableDialog } from '@/components/library/AiTableDialog';
+import { ReviewGenDialog } from '@/components/library/ReviewGenDialog';
+import { AiClassifyDialog } from '@/components/library/AiClassifyDialog';
+import { AiClassifyRulesDialog } from '@/components/library/AiClassifyRulesDialog';
 import { runFileBatch, useBatchImportStore } from '@/stores/batchImportStore';
 import { useImportPaper } from '@/hooks/useLibrary';
 import { useShellStore } from '@/stores/shellStore';
@@ -440,6 +444,12 @@ export function AppShell({ children }: AppShellProps) {
       <ImportFromLinkDialog open={importLinkOpen} onClose={() => setImportLinkOpen(false)} />
       <ZoteroImportDialog open={importZoteroOpen} onClose={() => setImportZoteroOpen(false)} />
       <BatchImportDialog />
+      {/* Library AI dialogs are global: their backend runs outlive the
+          library route, so they must not unmount with it. */}
+      <AiTableDialog />
+      <ReviewGenDialog />
+      <AiClassifyDialog />
+      <AiClassifyRulesDialog />
       <Pet />
       <GlobalSearch onImportPdf={selectAndImport} />
     </div>

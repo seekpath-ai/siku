@@ -115,10 +115,22 @@ function countsFor(items: ClassifyItem[], path: string) {
   return { accepted, pending };
 }
 
+/** Where a re-attached run lands. Status alone is not always enough (a
+ *  cancelled/failed reassign still holds a complete draft), so ambiguous
+ *  states fall back to what the snapshot actually contains — never a guess. */
+function stepForRun(run: ClassifyRun): Step {
+  if (run.status === 'applied' || run.appliedAt) return 'result';
+  if (run.status === 'undone' || run.undoneAt) return 'result';
+  if (run.status === 'done') return 'review';
+  if (run.status === 'running') return 'config';
+  // cancelled | error | unknown: review only when a draft snapshot exists.
+  return run.groups.length > 0 ? 'review' : 'config';
+}
+
 /** AI 文献分类: draft a taxonomy → review/edit → write back to collections or
  *  tags, with a one-click undo of everything the run wrote. */
 export function AiClassifyDialog() {
-  const { open, paperIds, scope, close } = useAiClassifyStore();
+  const { open, paperIds, scope, close, runId, setRunId } = useAiClassifyStore();
   const { alert, confirm } = useDialog();
   const queryClient = useQueryClient();
 
@@ -159,8 +171,8 @@ export function AiClassifyDialog() {
   } | null>(null);
 
   const logRef = useRef<HTMLDivElement>(null);
-  // Async handlers (event listener, blur commits) need the latest values.
-  const runIdRef = useRef<string | null>(null);
+  // Async handlers (event listener, blur commits) need the latest values. The
+  // run id itself lives in the store so it survives unmounts.
   const groupsRef = useRef<ClassifyGroup[]>([]);
   const itemsRef = useRef<ClassifyItem[]>([]);
   groupsRef.current = groups;
@@ -186,11 +198,9 @@ export function AiClassifyDialog() {
     }
   }, []);
 
-  // Reset whenever the dialog is (re)opened with a paper set.
-  useEffect(() => {
-    if (!open) return;
+  /** Blank config step — only for a dialog with no run attached. */
+  const resetLocalState = useCallback(() => {
     setStep('config');
-    runIdRef.current = null;
     setRun(null);
     setGroups([]);
     setItems([]);
@@ -203,10 +213,96 @@ export function AiClassifyDialog() {
     setBusy(false);
     setVocabOpen(false);
     setCollapsed(new Set());
+  }, []);
+
+  /** Re-attach to an existing run: snapshot in, step derived from it. */
+  const restoreRun = useCallback(
+    (r: ClassifyRun) => {
+      setRun(r);
+      setGroups(r.groups);
+      setItems(r.items);
+      setTab('all');
+      setApplySummary(null);
+      setUndoSummary(null);
+      setBusy(false);
+      setVocabOpen(false);
+      setCollapsed(new Set());
+      // Config fields mirror the run, so a follow-up batch starts from them
+      // and the header/vocab summary describe what is actually attached.
+      if (DIMENSIONS.includes(r.dimension)) {
+        setDimension(r.dimension);
+        setCustomDimension('');
+      } else {
+        setDimension('自定义');
+        setCustomDimension(r.dimension);
+      }
+      if (r.target === 'collection' || r.target === 'tag' || r.target === 'preview') {
+        setTarget(r.target);
+      }
+      setSampleFirst(r.sampleSize != null);
+      if (r.sampleSize) setSampleSize(r.sampleSize);
+      setThreshold(r.threshold > 0 && r.threshold <= 1 ? r.threshold : 0.75);
+      setTwoLevel(r.twoLevel);
+      setSkipExisting(r.skipExisting);
+      void loadVocab(r.dimension, r.target);
+
+      setStep(stepForRun(r));
+      setLogs([]);
+      if (r.status === 'running') {
+        // Still drafting backend-side: the progress listener re-attaches and
+        // drives the panel from the next event.
+        setRunning(true);
+        setProgress(null);
+      } else {
+        setRunning(false);
+        // Surface a terminal failure on the config panel instead of a mute
+        // form; the logs themselves are gone with the old mount.
+        setProgress(
+          r.status === 'error' || r.status === 'cancelled'
+            ? {
+                stage: r.status,
+                total: 0,
+                done: 0,
+                failed: 0,
+                current: '',
+                groupCount: r.groups.length,
+                finished: r.status,
+              }
+            : null
+        );
+      }
+    },
+    [loadVocab]
+  );
+
+  // (Re)opening attaches to the tracked run when there is one; only a dialog
+  // with no run resets to a blank config.
+  useEffect(() => {
+    if (!open) return;
     aiClassifyCapabilities()
       .then(setCapabilities)
       .catch(() => setCapabilities({ semantic: false }));
-  }, [open, paperIds]);
+    const id = useAiClassifyStore.getState().runId;
+    if (!id) {
+      resetLocalState();
+      return;
+    }
+    let alive = true;
+    aiClassifyRunGet(id)
+      .then((r) => {
+        if (alive) restoreRun(r);
+      })
+      .catch((err) => {
+        console.error('restore classify run:', err);
+        if (!alive) return;
+        // The backend no longer knows this run (DB reset) — drop the stale id.
+        useAiClassifyStore.getState().setRunId(null);
+        resetLocalState();
+      });
+    return () => {
+      alive = false;
+    };
+  }, [open, paperIds, resetLocalState, restoreRun]);
 
   // Progress events drive the run state; a finished draft loads the grid.
   useEffect(() => {
@@ -217,8 +313,11 @@ export function AiClassifyDialog() {
       if (p.log) setLogs((prev) => [...prev.slice(-99), p.log!]);
       if (p.finished) {
         setRunning(false);
-        if (p.finished === 'done' && runIdRef.current) {
-          void loadRun(runIdRef.current).catch((err) => console.error('load classify run:', err));
+        // The payload carries no run_id; the backend runs one classification
+        // at a time, so a finish event belongs to the tracked run.
+        const id = useAiClassifyStore.getState().runId;
+        if (p.finished === 'done' && id) {
+          void loadRun(id).catch((err) => console.error('load classify run:', err));
         }
       }
     });
@@ -302,7 +401,10 @@ export function AiClassifyDialog() {
         engine,
         providerId: providerId || null,
       });
-      runIdRef.current = id;
+      // An explicit new batch is the one place the previous run is dropped —
+      // and only once the new one actually exists (a backend-busy failure
+      // keeps the old run attached).
+      setRunId(id);
       void loadVocab(dim, target);
     } catch (err) {
       setRunning(false);
@@ -313,14 +415,14 @@ export function AiClassifyDialog() {
   /** Push the dialog's current assignments to the DB. `edited` is omitted on
    *  purpose: this is a sync, not a user edit, so rerun protection is kept. */
   const syncItems = async () => {
-    const id = runIdRef.current;
+    const id = runId;
     if (!id) return;
     const rows = itemsRef.current.map((it) => ({ paperId: it.paperId, labels: it.labels }));
     if (rows.length > 0) await aiClassifyItemsSet(id, rows);
   };
 
   const persistGroups = async (next?: ClassifyGroup[]) => {
-    const id = runIdRef.current;
+    const id = runId;
     if (!id) return;
     await aiClassifyGroupsSet(id, next ?? groupsRef.current);
   };
@@ -346,7 +448,7 @@ export function AiClassifyDialog() {
   /** Committing a rename also carries every assignment that referenced the old
    *  path (`父/子` moves with its parent). */
   const commitRename = async (oldPath: string, nextName: string) => {
-    const id = runIdRef.current;
+    const id = runId;
     const trimmed = nextName.trim();
     const segs = splitPath(oldPath);
     const nextPath = joinPath([...segs.slice(0, -1), trimmed]);
@@ -408,7 +510,7 @@ export function AiClassifyDialog() {
         return labels.length === it.labels.length ? it : { ...it, labels, groupName: labels[0] ?? '' };
       })
     );
-    const id = runIdRef.current;
+    const id = runId;
     if (!id) return;
     try {
       await aiClassifyGroupsSet(id, next);
@@ -462,7 +564,7 @@ export function AiClassifyDialog() {
           : it
       )
     );
-    const id = runIdRef.current;
+    const id = runId;
     if (!id) return;
     try {
       await aiClassifyItemsSet(id, [{ paperId, labels: cleaned, edited: true }]);
@@ -473,7 +575,7 @@ export function AiClassifyDialog() {
 
   /** Bulk triage of the review queue: accept the suggestion or clear it. */
   const resolvePending = async (accept: boolean) => {
-    const id = runIdRef.current;
+    const id = runId;
     if (!id) return;
     const targets = pending.filter((it) => it.labels.length > 0);
     if (targets.length === 0) {
@@ -508,7 +610,7 @@ export function AiClassifyDialog() {
   };
 
   const reassign = async (onlyMissing: boolean) => {
-    const id = runIdRef.current;
+    const id = runId;
     if (!id) return;
     if (paths.length === 0) {
       await alert('请先添加至少一个类目');
@@ -536,7 +638,7 @@ export function AiClassifyDialog() {
   };
 
   const apply = async () => {
-    const id = runIdRef.current;
+    const id = runId;
     if (!id || !run) return;
     if (target === 'preview') return;
     if (paths.length === 0) {
@@ -595,7 +697,7 @@ export function AiClassifyDialog() {
   };
 
   const undo = async () => {
-    const id = runIdRef.current;
+    const id = runId;
     if (!id) return;
     if (
       !(await confirm(
@@ -680,6 +782,22 @@ export function AiClassifyDialog() {
     setUndoSummary(null);
     setStep('config');
     await start(nextDimension);
+  };
+
+  /** Explicitly detach the current run and return to a blank config. The run
+   *  itself stays in the backend; this is how the user says "new batch" after
+   *  a re-attached run. Two-step inline confirm: the global Dialog renders
+   *  below this dialog's overlay, so a modal confirm would be unreachable. */
+  const [confirmFresh, setConfirmFresh] = useState(false);
+  const startFresh = () => {
+    if (running) return;
+    if (!confirmFresh) {
+      setConfirmFresh(true);
+      return;
+    }
+    setConfirmFresh(false);
+    setRunId(null);
+    resetLocalState();
   };
 
   const setVocabStatus = async (ids: string[], status: 'active' | 'staged' | 'rejected') => {
@@ -1357,6 +1475,19 @@ export function AiClassifyDialog() {
                     ? `（${vocab.filter((v) => v.status === 'staged').length} 待采纳）`
                     : ''}
                 </button>
+                {!running && (
+                  <button
+                    onClick={startFresh}
+                    onBlur={() => setConfirmFresh(false)}
+                    className={`w-full px-2 py-1 rounded text-[11px] ${
+                      confirmFresh
+                        ? 'text-amber-400 hover:bg-surface-hover'
+                        : 'text-text-secondary/50 hover:text-text-primary'
+                    }`}
+                  >
+                    {confirmFresh ? '确认放弃本轮并重新开始？' : '放弃本轮，开始新一轮分类'}
+                  </button>
+                )}
               </div>
             </aside>
 
@@ -1727,7 +1858,9 @@ export function AiClassifyDialog() {
                 </>
               ) : (
                 <div className="rounded-lg border border-surface-hover p-4 text-[12px] text-text-secondary">
-                  本轮已应用，可关闭对话框。
+                  {run?.status === 'undone'
+                    ? '本轮已撤销，可关闭对话框。'
+                    : '本轮已应用，可关闭对话框。'}
                 </div>
               )}
 

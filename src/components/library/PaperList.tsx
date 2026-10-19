@@ -813,7 +813,7 @@ function PaperRow({
 
       {expanded && <PaperChildren paper={paper} />}
 
-      {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={() => setMenu(null)} />}
+      {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems} maxHeight={360} onClose={() => setMenu(null)} />}
     </>
   );
 }

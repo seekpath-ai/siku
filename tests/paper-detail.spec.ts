@@ -161,6 +161,7 @@ test.describe("文献信息与元数据补全", () => {
     await expect(enrich).toBeVisible();
     const menuBox = await enrich.locator("..").boundingBox();
     expect(menuBox).not.toBeNull();
+    expect(menuBox!.height).toBeLessThanOrEqual(360);
     expect(menuBox!.y).toBeGreaterThanOrEqual(8);
     expect(menuBox!.y + menuBox!.height).toBeLessThanOrEqual(412);
 

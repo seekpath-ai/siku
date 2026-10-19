@@ -22,11 +22,12 @@ interface ContextMenuProps {
   y: number;
   items: ContextMenuItem[];
   onClose: () => void;
+  maxHeight?: number;
 }
 
 const VIEWPORT_MARGIN = 8;
 
-export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
+export function ContextMenu({ x, y, items, onClose, maxHeight }: ContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ x, y });
 
@@ -84,7 +85,10 @@ export function ContextMenu({ x, y, items, onClose }: ContextMenuProps) {
         left: pos.x,
         top: pos.y,
         maxWidth: `calc(100dvw - ${VIEWPORT_MARGIN * 2}px)`,
-        maxHeight: `calc(100dvh - ${VIEWPORT_MARGIN * 2}px)`,
+        maxHeight:
+          maxHeight === undefined
+            ? `calc(100dvh - ${VIEWPORT_MARGIN * 2}px)`
+            : `min(${maxHeight}px, calc(100dvh - ${VIEWPORT_MARGIN * 2}px))`,
       }}
       onContextMenu={(e) => e.preventDefault()}
     >

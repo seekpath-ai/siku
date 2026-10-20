@@ -1192,7 +1192,27 @@ fn citation_groups(text: &str) -> Vec<CitationGroup> {
         }
         i = end + 1;
     }
+    merge_adjacent_groups(&mut groups);
     groups
+}
+
+/// 提示词让模型把同处的多条证据写成 [E3][E7]（独立括号），模型自己偶尔也写
+/// [E3,E7]（单括号逗号）。两种写法语义相同，渲染必须统一成 [3,7]——把零间隙
+/// 相邻的良构组合并成一个组。仅合并良构组：坏标记保持独立，审计照常报告。
+fn merge_adjacent_groups(groups: &mut Vec<CitationGroup>) {
+    let mut merged: Vec<CitationGroup> = Vec::with_capacity(groups.len());
+    for group in groups.drain(..) {
+        if let Some(prev) = merged.last_mut() {
+            if prev.well_formed && group.well_formed && prev.end == group.start {
+                prev.end = group.end;
+                prev.raw.push_str(&group.raw);
+                prev.ids.extend(group.ids);
+                continue;
+            }
+        }
+        merged.push(group);
+    }
+    *groups = merged;
 }
 
 fn citation_sequence(text: &str) -> Vec<String> {
@@ -1708,6 +1728,24 @@ mod tests {
         assert!(output.contains("摘要[2]"), "{output}");
         assert!(!output.contains("siku-reader://p2"), "{output}");
         assert!(!output.contains("E9"), "{output}");
+    }
+
+    #[test]
+    fn adjacent_citation_brackets_render_merged() {
+        let registry = vec![registered("E1", "p1", 1, "fulltext"), registered("E2", "p2", 2, "fulltext")];
+        // 提示词钦定的 [E1][E2] 独立括号写法必须与 [E1,E2] 一样合并成 [1,2]。
+        let output = linkify_citations("结论[E1][E2]成立。", &registry);
+        assert!(output.contains("[[1](siku-reader://p1"), "{output}");
+        assert!(output.contains(",[2](siku-reader://p2"), "{output}");
+        assert!(!output.contains("]]"), "{output}");
+        // 有文字隔开的组不合并。
+        let output = linkify_citations("甲[E1]与乙[E2]。", &registry);
+        assert!(output.contains("[[1]](siku-reader://p1"), "{output}");
+        assert!(output.contains("[[2]](siku-reader://p2"), "{output}");
+        // 相邻但引同一文献：去重为单个编号。
+        let same = vec![registered("E1", "p1", 1, "fulltext"), registered("E3", "p1", 1, "fulltext")];
+        let output = linkify_citations("结论[E1][E3]。", &same);
+        assert_eq!(output.matches("[[1]]").count(), 1, "{output}");
     }
 
     #[test]

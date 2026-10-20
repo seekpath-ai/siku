@@ -194,6 +194,10 @@ fn reader_url(paper_id: &str, page: Option<i32>, exact: &str) -> String {
 
 /// Rewrite `[^n]` markers into `[[k]](siku-reader://…)` where `k` is the
 /// paper's citation number.
+///
+/// Adjacent markers (`[^1][^2]`, zero gap) are one citation cluster and render
+/// merged as `[1,2]` with per-number links — same display convention as the
+/// 综述 converter, which the prompt's multi-evidence guidance relies on.
 fn linkify_reply(body: &str, items: &[Item], default_paper: Option<&str>) -> Linked {
     // Numbering is PER CITATION, not per paper: a single-paper analysis cites
     // one source 20+ times, and re-numbering by paper collapsed all of them to
@@ -205,45 +209,73 @@ fn linkify_reply(body: &str, items: &[Item], default_paper: Option<&str>) -> Lin
     let mut out = String::with_capacity(body.len() + 64);
     let mut i = 0usize;
     while i < chars.len() {
-        if chars[i] == '[' && i + 1 < chars.len() && chars[i + 1] == '^' {
-            let mut j = i + 2;
+        // Collect a run of adjacent [^n] markers starting at i.
+        let mut run: Vec<(usize, Option<String>)> = Vec::new();
+        let mut j = i;
+        while j < chars.len() && chars[j] == '[' && j + 1 < chars.len() && chars[j + 1] == '^' {
+            let mut k = j + 2;
             let mut digits = String::new();
-            while j < chars.len() && chars[j].is_ascii_digit() && digits.len() < 4 {
-                digits.push(chars[j]);
-                j += 1;
+            while k < chars.len() && chars[k].is_ascii_digit() && digits.len() < 4 {
+                digits.push(chars[k]);
+                k += 1;
             }
-            if !digits.is_empty() && j < chars.len() && chars[j] == ']' {
-                if let Ok(n) = digits.parse::<usize>() {
-                    let Some(item) = items.iter().find(|it| it.n == n) else {
-                        // No evidence at all: drop the marker (never a fake citation).
-                        i = j + 1;
-                        continue;
-                    };
-                    let paper = item
-                        .paper
-                        .clone()
-                        .or_else(|| default_paper.map(|p| p.to_string()));
-                    match &paper {
-                        Some(pid) => {
-                            if !papers.iter().any(|p| p == pid) {
-                                papers.push(pid.clone());
-                            }
-                            let url = reader_url(pid, item.page, &item.exact);
-                            out.push_str(&format!("[[{}]]({})", n, url));
-                        }
-                        // Cited but no paper to point at: keep the number only.
-                        None => out.push_str(&format!("[{n}]")),
+            if digits.is_empty() || k >= chars.len() || chars[k] != ']' {
+                break;
+            }
+            let Ok(n) = digits.parse::<usize>() else { break };
+            let Some(item) = items.iter().find(|it| it.n == n) else {
+                // No evidence at all: drop the marker (never a fake citation).
+                j = k + 1;
+                continue;
+            };
+            let paper = item
+                .paper
+                .clone()
+                .or_else(|| default_paper.map(|p| p.to_string()));
+            let url = match &paper {
+                Some(pid) => {
+                    if !papers.iter().any(|p| p == pid) {
+                        papers.push(pid.clone());
                     }
-                    if !citations.iter().any(|(x, _)| *x == n) {
-                        citations.push((n, item.clone()));
-                    }
-                    i = j + 1;
-                    continue;
+                    Some(reader_url(pid, item.page, &item.exact))
                 }
+                None => None,
+            };
+            if !citations.iter().any(|(x, _)| *x == n) {
+                citations.push((n, item.clone()));
             }
+            run.push((n, url));
+            j = k + 1;
         }
-        out.push(chars[i]);
-        i += 1;
+        if run.is_empty() {
+            if j > i {
+                // Markers were consumed but all dropped (no evidence) — emit nothing.
+                i = j;
+            } else {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if run.len() == 1 {
+            let (n, url) = &run[0];
+            match url {
+                Some(url) => out.push_str(&format!("[[{n}]]({url})")),
+                // Cited but no paper to point at: keep the number only.
+                None => out.push_str(&format!("[{n}]")),
+            }
+        } else {
+            let inner = run
+                .iter()
+                .map(|(n, url)| match url {
+                    Some(url) => format!("[{n}]({url})"),
+                    None => n.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            out.push_str(&format!("[{inner}]"));
+        }
+        i = j;
     }
     citations.sort_by_key(|(n, _)| *n);
     Linked { body: out.trim_end().to_string(), citations, papers }
@@ -406,10 +438,28 @@ mod tests {
         let items = [item(1, 4, "片段一", None), item(2, 7, "片段二", None)];
         let linked = linkify_reply(body, &items, Some("ctx"));
         assert_eq!(linked.papers, vec!["ctx".to_string()]);
-        // Same paper twice → one number, two different anchors.
+        // 相邻标记合并为一个引用簇，同一文献的两处证据保留各自页码。
         assert!(linked.body.contains("page=4"), "{}", linked.body);
         assert!(linked.body.contains("page=7"), "{}", linked.body);
-        assert!(linked.body.starts_with("结论[[1]](siku-reader://ctx?page=4"), "{}", linked.body);
+        assert!(linked.body.starts_with("结论[[1](siku-reader://ctx?page=4"), "{}", linked.body);
+        assert!(linked.body.contains(",[2](siku-reader://ctx?page=7"), "{}", linked.body);
+    }
+
+    #[test]
+    fn adjacent_markers_merge_and_dropped_ones_vanish() {
+        let items = [
+            item(1, 3, "证据一", Some("p1")),
+            item(2, 5, "证据二", Some("p2")),
+        ];
+        // 相邻 → 合并 [1,2]；有文字隔开 → 不合并。
+        let linked = linkify_reply("甲[^1][^2]，乙[^1]。[^2]丙", &items, None);
+        assert!(linked.body.contains("[[1](siku-reader://p1"), "{}", linked.body);
+        assert!(linked.body.contains(",[2](siku-reader://p2"), "{}", linked.body);
+        assert!(linked.body.contains("。[[2]](siku-reader://p2"), "{}", linked.body);
+        // 无证据的相邻标记被丢弃，剩下的单独成标。
+        let linked = linkify_reply("结论[^9][^1]成立", &items, None);
+        assert!(linked.body.starts_with("结论[[1]](siku-reader://p1"), "{}", linked.body);
+        assert!(!linked.body.contains('9'), "{}", linked.body);
     }
 
     #[test]

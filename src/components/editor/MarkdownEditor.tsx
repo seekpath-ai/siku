@@ -4,7 +4,7 @@ import { markdown, markdownLanguage } from '@codemirror/lang-markdown';
 import { languages } from '@codemirror/language-data';
 import { oneDark } from '@codemirror/theme-one-dark';
 import { EditorView, Decoration, DecorationSet, WidgetType, ViewPlugin, keymap, type ViewUpdate } from '@codemirror/view';
-import { RangeSetBuilder, StateField, Facet, Prec, type EditorState, type Extension } from '@codemirror/state';
+import { RangeSetBuilder, StateField, Facet, Prec, Annotation, EditorState, type Extension } from '@codemirror/state';
 import { syntaxTree, ensureSyntaxTree } from '@codemirror/language';
 import { autocompletion, completionStatus, type CompletionContext } from '@codemirror/autocomplete';
 import { open as shellOpen } from '@tauri-apps/plugin-shell';
@@ -1220,6 +1220,61 @@ const tableKeymap = Prec.high(
   ])
 );
 
+// ── Code fence auto-close (Obsidian-style) ──
+
+/** Marks the closing-fence transaction dispatched by the filter below, so it
+ *  never reacts to its own expansion. */
+const fenceExpandAnn = Annotation.define<boolean>();
+
+/** Typing the third backtick that completes a ``` fence on an otherwise empty
+ *  line inserts "\n\n```" after it, leaving the caret on the empty content
+ *  line between the fences. The expansion is merged into the typing
+ *  transaction itself (sequential spec), so one Ctrl+Z undoes both.
+ *
+ *  Detected from the final document state (not the keystroke): the caret sits
+ *  at the end of a line that is only whitespace + ``` and this transaction
+ *  inserted the last backtick. The code-block guard looks at the PRE-typing
+ *  state: a caret already inside a FencedCode node means this ``` line closes
+ *  that block rather than opening a new one (checking post-typing is
+ *  ambiguous — the closing fence sits exactly on the node boundary). */
+const fenceAutoClose = EditorState.transactionFilter.of((tr) => {
+  if (!tr.docChanged || !tr.isUserEvent('input.type') || tr.annotation(fenceExpandAnn)) return tr;
+  if (tr.state.selection.ranges.length !== 1) return tr;
+  const sel = tr.state.selection.main;
+  if (!sel.empty) return tr;
+  const line = tr.state.doc.lineAt(sel.head);
+  if (sel.head !== line.to || !/^[ \t]*```$/.test(line.text)) return tr;
+  // This transaction itself must have inserted the backtick at the caret
+  // (rules out transactions that merely move the caret onto a ``` line).
+  let typedBacktick = false;
+  tr.changes.iterChanges((_fromA: number, _toA: number, _fromB: number, toB: number, inserted: { toString(): string }) => {
+    if (toB === sel.head && inserted.toString().endsWith('`')) typedBacktick = true;
+  });
+  if (!typedBacktick) return tr;
+  const start = tr.startState;
+  const tree = ensureSyntaxTree(start, start.doc.length, 50) ?? syntaxTree(start);
+  // side -1: a caret at the very end of an unclosed block still counts as
+  // inside it (the typed fence would close, not open).
+  let node: SyntaxNodeLike | null = tree.resolveInner(start.selection.main.head, -1);
+  while (node) {
+    if (node.name === 'FencedCode') return tr;
+    node = node.parent;
+  }
+  // sequential: the spec's positions are in the post-typing document, and CM
+  // merges both into ONE transaction — a single Ctrl+Z undoes the whole
+  // expansion (typing + closing fence) at once.
+  return [
+    tr,
+    {
+      changes: { from: sel.head, insert: '\n\n```' },
+      selection: { anchor: sel.head + 1 },
+      scrollIntoView: true,
+      sequential: true,
+      annotations: fenceExpandAnn.of(true),
+    },
+  ];
+});
+
 /** Renders markdown semantics inline; syntax markers are hidden unless the
  *  caret is within/adjacent to their content (Obsidian-style live preview).
  *
@@ -2069,6 +2124,9 @@ export function MarkdownEditor({
       // on table source lines — the handlers return false elsewhere — so this
       // is useful in source mode too.
       tableKeymap,
+      // Auto-close a ``` fence when its third backtick is typed (works in
+      // source mode too — no rendering involved).
+      fenceAutoClose,
       oneDark,
       editorTheme,
       fontSizeTheme,

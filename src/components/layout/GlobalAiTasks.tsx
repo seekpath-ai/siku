@@ -67,7 +67,10 @@ export function GlobalAiTasks() {
               : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
           }`}
         >
-          {item.status === 'running' ? <Loader2 size={10} className="animate-spin" /> : <Check size={10} />}
+          {/* No infinite CSS animation here: in a transparent frameless window
+              every spinner frame forces a full-window alpha recomposite, which
+              freezes the Win11 DWM path. Static icon + progress text instead. */}
+          {item.status === 'running' ? <Loader2 size={10} /> : <Check size={10} />}
           {item.label}
         </button>
       ))}

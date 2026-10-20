@@ -506,8 +506,8 @@ pub struct AgentStreamEvent {
 // ============================================================
 
 /// One search engine entry in the ordered web_search fallback chain.
-/// `id`: bing | duckduckgo | tavily | brave | searxng. `api_key` is used by
-/// tavily/brave; `base_url` by searxng.
+/// `id`: bing | duckduckgo | tavily | brave | deepseek | searxng. `api_key` is
+/// used by tavily/brave/deepseek; `base_url` by searxng.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchEngineConfig {
@@ -533,6 +533,7 @@ fn default_search_engines() -> Vec<SearchEngineConfig> {
         SearchEngineConfig::new("duckduckgo", true),
         SearchEngineConfig::new("tavily", false),
         SearchEngineConfig::new("brave", false),
+        SearchEngineConfig::new("deepseek", false),
         SearchEngineConfig::new("searxng", false),
     ]
 }

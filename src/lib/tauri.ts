@@ -575,10 +575,10 @@ export async function getAgentSteps(sessionId: string): Promise<AgentStep[]> {
 
 /** One search engine entry in the ordered web_search fallback chain. */
 export interface SearchEngineConfig {
-  /** bing | duckduckgo | tavily | brave | searxng */
+  /** bing | duckduckgo | tavily | brave | deepseek | searxng */
   id: string;
   enabled: boolean;
-  /** tavily / brave */
+  /** tavily / brave / deepseek（deepseek 留空时回退 LLM 提供商池的 DeepSeek Key） */
   apiKey?: string | null;
   /** searxng */
   baseUrl?: string | null;

@@ -204,6 +204,25 @@ fn parse_json_hits(body: &str, results_path: &[&str], title_key: &str, url_key: 
         .collect()
 }
 
+/// Parse DeepSeek 搜索 API 的 results 数组；摘要优先取 summary，为空回退 snippet。
+fn parse_deepseek_hits(body: &str) -> Vec<Hit> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else { return Vec::new() };
+    let Some(arr) = v.get("results").and_then(|r| r.as_array()) else { return Vec::new() };
+    arr.iter()
+        .filter_map(|r| {
+            let title = r.get("title")?.as_str()?.to_string();
+            let url = r.get("url")?.as_str()?.to_string();
+            let snippet = ["summary", "snippet"]
+                .iter()
+                .find_map(|k| r.get(k).and_then(|c| c.as_str()).filter(|s| !s.is_empty()))
+                .unwrap_or("")
+                .to_string();
+            Some((title, url, snippet))
+        })
+        .take(MAX_RESULTS)
+        .collect()
+}
+
 /// Execute one engine; Ok(vec![]) = reachable but no parseable results
 /// (block page, markup change, …) — the caller falls through to the next.
 async fn run_engine(
@@ -260,6 +279,20 @@ async fn run_engine(
             let body = resp.text().await.map_err(|e| e.to_string())?;
             Ok(parse_json_hits(&body, &["web", "results"], "title", "url", "description"))
         }
+        "deepseek" => {
+            let key = engine.api_key.as_deref().filter(|k| !k.trim().is_empty())
+                .ok_or("未配置 API Key")?;
+            let resp = client
+                .post("https://api.deepseek.com/v1/tools/search")
+                .bearer_auth(key)
+                .json(&serde_json::json!({"query": query, "count": MAX_RESULTS, "need_content": false}))
+                .send().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("HTTP {}", resp.status()));
+            }
+            let body = resp.text().await.map_err(|e| e.to_string())?;
+            Ok(parse_deepseek_hits(&body))
+        }
         "searxng" => {
             let base = engine.base_url.as_deref().filter(|u| !u.trim().is_empty())
                 .ok_or("未配置实例地址")?;
@@ -278,6 +311,7 @@ fn engine_label(id: &str) -> &'static str {
         "duckduckgo" => "DuckDuckGo",
         "tavily" => "Tavily",
         "brave" => "Brave",
+        "deepseek" => "DeepSeek",
         "searxng" => "SearXNG",
         _ => "未知引擎",
     }
@@ -334,7 +368,7 @@ impl Tool for WebSearchTool {
         }
         let max = args["max_results"].as_u64().unwrap_or(DEFAULT_RESULTS as u64).min(MAX_RESULTS as u64) as usize;
 
-        let engines: Vec<_> = crate::core::settings_service::load_app_settings(&self.db)
+        let mut engines: Vec<_> = crate::core::settings_service::load_app_settings(&self.db)
             .await
             .map(|s| s.search_engines)
             .unwrap_or_default()
@@ -343,6 +377,20 @@ impl Tool for WebSearchTool {
             .collect();
         if engines.is_empty() {
             return Err("未启用任何搜索引擎（请在 设置 → 网络搜索 中配置）".to_string());
+        }
+        // DeepSeek 引擎未单独配置 key 时，回退到 LLM 提供商池中的 DeepSeek key。
+        if engines.iter().any(|e| {
+            e.id == "deepseek" && e.api_key.as_deref().map(|k| k.trim().is_empty()).unwrap_or(true)
+        }) {
+            if let Ok(Some(key)) =
+                crate::core::llm_provider_service::deepseek_fallback_key(&self.db).await
+            {
+                for e in engines.iter_mut().filter(|e| e.id == "deepseek") {
+                    if e.api_key.as_deref().map(|k| k.trim().is_empty()).unwrap_or(true) {
+                        e.api_key = Some(key.clone());
+                    }
+                }
+            }
         }
 
         let mut builder = reqwest::Client::builder()
@@ -444,6 +492,23 @@ mod tests {
         let brave = r#"{"web": {"results": [{"title": "B", "url": "https://z", "description": "D"}]}}"#;
         assert_eq!(parse_json_hits(brave, &["web", "results"], "title", "url", "description").len(), 1);
         assert!(parse_json_hits("not json", &["results"], "title", "url", "content").is_empty());
+    }
+
+    #[test]
+    fn deepseek_parser_prefers_summary_over_snippet() {
+        let body = r#"{"results": [
+            {"title": "T", "url": "https://x", "snippet": "短摘要", "summary": "长摘要", "rerank_score": 0.9},
+            {"title": "T2", "url": "https://y", "snippet": "仅 snippet"},
+            {"title": "T3", "url": "https://z", "summary": ""},
+            {"url": "https://no-title", "summary": "S"}
+        ]}"#;
+        let hits = parse_deepseek_hits(body);
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].2, "长摘要");
+        assert_eq!(hits[1].2, "仅 snippet");
+        assert_eq!(hits[2].2, "");
+        assert!(parse_deepseek_hits("not json").is_empty());
+        assert!(parse_deepseek_hits(r#"{"results": "nope"}"#).is_empty());
     }
 
     #[test]

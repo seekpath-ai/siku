@@ -181,6 +181,19 @@ pub async fn get_default_provider(db: &SqlitePool) -> Result<Option<LlmProvider>
     .map_err(|e| format!("db: {e}"))
 }
 
+/// DeepSeek 搜索引擎未单独配置 API Key 时的回退：取 LLM 提供商池中
+/// provider = deepseek 的条目（优先默认项）的 api_key。
+pub async fn deepseek_fallback_key(db: &SqlitePool) -> Result<Option<String>, String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT api_key FROM llm_providers \
+         WHERE lower(provider) = 'deepseek' AND trim(api_key) != '' \
+         ORDER BY is_default DESC, sort_order, created_at LIMIT 1"
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("db: {e}"))
+}
+
 /// Set the default provider.
 #[instrument(skip(db))]
 pub async fn set_default_provider(db: &SqlitePool, id: &str) -> Result<LlmProvider, String> {

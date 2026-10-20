@@ -7,6 +7,8 @@ interface EngineMeta {
   desc: string;
   /** Requires an API key input. */
   key?: boolean;
+  /** API Key 输入框的占位提示（默认「{name} API Key」）。 */
+  keyPlaceholder?: string;
   /** Requires a base URL input. */
   url?: boolean;
 }
@@ -16,10 +18,16 @@ const ENGINE_META: Record<string, EngineMeta> = {
   duckduckgo: { name: 'DuckDuckGo', desc: '需代理或海外网络（网页抓取）' },
   tavily: { name: 'Tavily', desc: '面向 AI 的搜索 API，需 API Key', key: true },
   brave: { name: 'Brave Search', desc: '需 API Key', key: true },
+  deepseek: {
+    name: 'DeepSeek',
+    desc: 'DeepSeek 官方搜索 API，需 API Key',
+    key: true,
+    keyPlaceholder: 'DeepSeek API Key（留空则使用 LLM 提供商中的 DeepSeek Key）',
+  },
   searxng: { name: 'SearXNG', desc: '自托管搜索聚合实例，需地址', url: true },
 };
 
-const ENGINE_ORDER = ['bing', 'duckduckgo', 'tavily', 'brave', 'searxng'];
+const ENGINE_ORDER = ['bing', 'duckduckgo', 'tavily', 'brave', 'deepseek', 'searxng'];
 
 /** 网络搜索设置：web_search 工具的引擎链——启用、排序（自上而下回退）、
  *  密钥/地址。一次工具调用内按序尝试，首个出结果的引擎生效。 */
@@ -139,7 +147,7 @@ export function SearchSettings() {
                     type="password"
                     value={e.apiKey ?? ''}
                     onChange={(ev) => patch(e.id, 'apiKey', ev.target.value)}
-                    placeholder={`${meta.name} API Key`}
+                    placeholder={meta.keyPlaceholder ?? `${meta.name} API Key`}
                     className="mt-2 w-full px-3 py-1.5 bg-background border border-surface-hover rounded-lg text-xs text-text-primary focus:outline-none focus:border-primary/50"
                   />
                 )}

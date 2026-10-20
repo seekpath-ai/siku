@@ -43,7 +43,7 @@ pub struct Device {
     pub refresh_token: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderStatus {
     Pending,
@@ -52,8 +52,9 @@ pub enum OrderStatus {
     Cancelled,
 }
 
-/// A storage upgrade order: the user applies for a plan, pays out-of-band,
-/// and an admin confirms payment via the admin API.
+/// A storage upgrade order: the user applies for a plan, pays either online
+/// (alipay, `channel` set) or out-of-band, and the quota activates on payment
+/// confirmation (async notify or admin API respectively).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Order {
     pub id: String,
@@ -66,6 +67,12 @@ pub struct Order {
     pub created_at: String,
     pub paid_at: Option<String>,
     pub admin_note: Option<String>,
+    /// 支付渠道（如 "alipay"）；None = 线下转账。旧快照无此字段。
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// 第三方交易号（支付宝 trade_no），回调履约时记录。旧快照无此字段。
+    #[serde(default)]
+    pub trade_no: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -377,6 +384,68 @@ impl Db {
         self.persist(&snap);
         Ok(order)
     }
+
+    /// 记录订单的支付渠道（下单后追加，如复用的 pending 订单改用在线支付）。
+    pub fn set_order_channel(&self, id: &str, channel: &str) -> anyhow::Result<()> {
+        let mut snap = self.inner.lock().unwrap();
+        let Some(order) = snap.orders.get_mut(id) else {
+            anyhow::bail!("order not found");
+        };
+        order.channel = Some(channel.to_string());
+        self.persist(&snap);
+        Ok(())
+    }
+
+    /// 原子履约订单：在同一把锁内完成「检查未支付 → 叠加配额 → 置为已支付」，
+    /// 因此并发/重复的支付回调与管理员确认天然幂等，绝不会重复叠加配额。
+    ///
+    /// 当前订阅未过期则新周期叠加到到期日（续期），否则从现在开始。已取消/
+    /// 被拒绝的订单也允许履约（用户真金白银付了款，必须交付），由调用方决定
+    /// 是否允许（管理员确认只允许 pending；支付回调允许任何非已支付状态）。
+    pub fn activate_order(
+        &self,
+        id: &str,
+        trade_no: Option<String>,
+        admin_note: Option<String>,
+    ) -> anyhow::Result<Activation> {
+        let mut snap = self.inner.lock().unwrap();
+        let order = snap.orders.get(id).cloned().context("order not found")?;
+        if order.status == OrderStatus::Paid {
+            return Ok(Activation::AlreadyPaid(order));
+        }
+        let now = chrono::Utc::now();
+        let base = snap
+            .users
+            .get(&order.user_id)
+            .and_then(|u| u.quota_expires_at.as_deref())
+            .and_then(|exp| chrono::DateTime::parse_from_rfc3339(exp).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .filter(|t| *t > now)
+            .unwrap_or(now);
+        let expires_at = (base + chrono::Duration::days(order.duration_days as i64))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let user = snap.users.get_mut(&order.user_id).context("user not found")?;
+        user.storage_quota_bytes = Some(order.quota_bytes);
+        user.quota_expires_at = Some(expires_at);
+        let order = snap.orders.get_mut(id).unwrap();
+        order.status = OrderStatus::Paid;
+        order.paid_at = Some(crate::now_iso());
+        if trade_no.is_some() {
+            order.trade_no = trade_no;
+        }
+        if admin_note.is_some() {
+            order.admin_note = admin_note;
+        }
+        let order = order.clone();
+        self.persist(&snap);
+        Ok(Activation::Fulfilled(order))
+    }
+}
+
+/// 订单履约结果：首次履约（配额已发放）或幂等命中（订单早已支付，未做任何变更）。
+pub enum Activation {
+    Fulfilled(Order),
+    AlreadyPaid(Order),
 }
 
 pub fn init(path: &Path) -> anyhow::Result<Db> {

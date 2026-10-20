@@ -467,6 +467,10 @@ pub struct StorageOrderCreateResult {
     /// 收款说明（relay 的 RELAY_PAYMENT_INFO），前端随订单号一起展示，
     /// 提示用户转账备注填订单号。
     pub payment_info: String,
+    /// 在线支付页 URL（relay 配置了支付宝且下单请求 channel=alipay 时返回）；
+    /// 有值时前端直接跳浏览器打开收银台，无值时走线下转账说明。
+    #[serde(default)]
+    pub pay_url: Option<String>,
 }
 
 /// 扩容订单（GET /api/storage/orders 的数组元素）。
@@ -487,6 +491,9 @@ pub struct StorageOrder {
     /// 收款说明：relay 仅在订单仍为 pending 时返回，其余状态为空。
     #[serde(default)]
     pub payment_info: Option<String>,
+    /// 在线支付页 URL：pending 且选了支付宝渠道时由 relay 返回。
+    #[serde(default)]
+    pub pay_url: Option<String>,
 }
 
 /// 查询当前账号的云端存储用量与配额。
@@ -512,20 +519,22 @@ pub async fn storage_plans(
 }
 
 /// 提交扩容申请（创建 pending 订单）。period 为 "month" 或 "year"；同账号
-/// 已有 pending 订单时 relay 幂等返回原订单，不会重复创建。
+/// 已有 pending 订单时 relay 幂等返回原订单，不会重复创建。channel 传
+/// "alipay" 时若 relay 已配置支付宝，响应带 pay_url 可跳浏览器在线支付。
 #[tauri::command]
 pub async fn storage_order_create(
     state: State<'_, AppState>,
     relay_url: String,
     plan_id: String,
     period: String,
+    channel: Option<String>,
 ) -> Result<StorageOrderCreateResult, String> {
     let (_, text) = auth_request(
         &state,
         &relay_url,
         reqwest::Method::POST,
         "api/storage/orders",
-        Some(serde_json::json!({ "plan_id": plan_id, "period": period })),
+        Some(serde_json::json!({ "plan_id": plan_id, "period": period, "channel": channel })),
     )
     .await?;
     serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
@@ -539,5 +548,23 @@ pub async fn storage_order_list(
 ) -> Result<Vec<StorageOrder>, String> {
     let (_, text) =
         auth_request(&state, &relay_url, reqwest::Method::GET, "api/storage/orders", None).await?;
+    serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
+}
+
+/// 查询单个扩容订单的状态（等待支付结果时轮询用）。
+#[tauri::command]
+pub async fn storage_order_status(
+    state: State<'_, AppState>,
+    relay_url: String,
+    order_id: String,
+) -> Result<StorageOrder, String> {
+    let (_, text) = auth_request(
+        &state,
+        &relay_url,
+        reqwest::Method::GET,
+        &format!("api/storage/orders/{order_id}/status"),
+        None,
+    )
+    .await?;
     serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
 }

@@ -24,6 +24,7 @@ import {
   deviceRemove,
   storageOrderCreate,
   storageOrderList,
+  storageOrderStatus,
   storagePlans,
   storageStatus,
   suggestDeviceName,
@@ -34,6 +35,7 @@ import {
   type StoragePlan,
   type StorageStatus,
 } from '@/lib/tauri';
+import { openInBrowser } from '@/lib/externalLinks';
 import { useDialog } from '@/hooks/useDialog';
 
 /** 用量字节数转人类可读单位（GB/MB/KB）。 */
@@ -71,7 +73,7 @@ function loadServerUrl(): string {
   const host = localStorage.getItem(LEGACY_HOST_KEY);
   const port = localStorage.getItem(LEGACY_PORT_KEY);
   if (host) return `http://${host}${port ? `:${port}` : ''}`;
-  return 'http://192.168.21.100:8080';
+  return 'https://relay.seekpath.com.cn';
 }
 
 interface Props {
@@ -109,6 +111,10 @@ export function AccountSettings({ onLoggedIn }: Props) {
   // 待支付订单的付款方式弹窗 / 历史订单折叠
   const [paymentOrder, setPaymentOrder] = useState<StorageOrder | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
+  // 在线支付：已跳浏览器等待回调 / 轮询超时提示 / 成功提示
+  const [payWaiting, setPayWaiting] = useState(false);
+  const [payTimedOut, setPayTimedOut] = useState(false);
+  const [notice, setNotice] = useState('');
 
   const httpBase = serverUrl.trim();
 
@@ -210,15 +216,55 @@ export function AccountSettings({ onLoggedIn }: Props) {
       setPlanModalOpen(false);
       setOrderResult(null);
       setPaymentOrder(null);
+      setPayWaiting(false);
+      setPayTimedOut(false);
+      setNotice('');
       return;
     }
     refreshStorage();
   }, [auth, refreshStorage]);
 
+  // 成功提示短暂展示后自动消失
+  useEffect(() => {
+    if (!notice) return;
+    const id = window.setTimeout(() => setNotice(''), 6000);
+    return () => window.clearTimeout(id);
+  }, [notice]);
+
+  // 在线支付等待中：每 3s 轮询订单状态，paid 即关闭弹窗并刷新；
+  // 90s 仍无结果则提示稍后在历史订单查看。
+  useEffect(() => {
+    if (!payWaiting || !orderResult?.pay_url) return;
+    const orderId = orderResult.order_id;
+    const startedAt = Date.now();
+    const id = window.setInterval(async () => {
+      try {
+        const o = await storageOrderStatus(httpBase, orderId);
+        if (o.status === 'paid') {
+          window.clearInterval(id);
+          setPayWaiting(false);
+          setPlanModalOpen(false);
+          setOrderResult(null);
+          setNotice('扩容已生效');
+          refreshStorage(false);
+        } else if (Date.now() - startedAt > 90_000) {
+          window.clearInterval(id);
+          setPayWaiting(false);
+          setPayTimedOut(true);
+        }
+      } catch {
+        // 网络抖动时继续轮询，到点由超时分支收尾
+      }
+    }, 3000);
+    return () => window.clearInterval(id);
+  }, [payWaiting, orderResult, httpBase, refreshStorage]);
+
   const openPlanModal = async () => {
     setPlanModalOpen(true);
     setOrderResult(null);
     setSelectedPlanId('');
+    setPayWaiting(false);
+    setPayTimedOut(false);
     setLoadingPlans(true);
     try {
       const list = await storagePlans(httpBase);
@@ -236,8 +282,14 @@ export function AccountSettings({ onLoggedIn }: Props) {
     if (!selectedPlanId) return;
     setOrdering(true);
     try {
-      const result = await storageOrderCreate(httpBase, selectedPlanId, orderPeriod);
+      // 优先走支付宝在线支付；relay 未配置时响应无 pay_url，自动回退线下转账
+      const result = await storageOrderCreate(httpBase, selectedPlanId, orderPeriod, 'alipay');
       setOrderResult(result);
+      if (result.pay_url) {
+        openInBrowser(result.pay_url);
+        setPayWaiting(true);
+        setPayTimedOut(false);
+      }
       await refreshStorage(false);
     } catch (e) {
       setError(`提交扩容申请失败: ${e}`);
@@ -373,10 +425,8 @@ export function AccountSettings({ onLoggedIn }: Props) {
           <div>
             示例：
             <code className="text-text-secondary">wss://relay.seekpath.com.cn</code>（官方）、
-            <code className="text-text-secondary">https://relay.example.com</code>（官方）、
-            <code className="text-text-secondary">ws://192.168.21.100:8080</code>（本地/内网）
-          </div>
-          <div>生产环境用 <code className="text-text-secondary">wss://</code> 或 <code className="text-text-secondary">https://</code> 开头，端口可不填（默认 443）。</div>
+            <code className="text-text-secondary">https://relay.seekpath.com.cn</code>（官方）
+          </div> 
         </div>
       </div>
 
@@ -606,6 +656,7 @@ export function AccountSettings({ onLoggedIn }: Props) {
                 })}
             </div>
           )}
+          {notice && <div className="text-xs text-emerald-400">{notice}</div>}
           {error && <div className="text-xs text-red-400">{error}</div>}
         </div>
       )}
@@ -632,6 +683,45 @@ export function AccountSettings({ onLoggedIn }: Props) {
             </div>
 
             {orderResult ? (
+              orderResult.pay_url ? (
+                /* 在线支付：已跳浏览器打开支付宝收银台，轮询等待回调 */
+                <div className="space-y-3">
+                  {payTimedOut ? (
+                    <div className="flex items-center gap-2 text-sm text-amber-400">
+                      <RefreshCw size={14} /> 仍未收到支付结果，可稍后在历史订单查看
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2 text-sm text-primary">
+                      <Loader2 size={14} className="animate-spin" /> 等待支付…请在浏览器中完成支付宝付款
+                    </div>
+                  )}
+                  <div className="px-3 py-2 border border-surface-hover rounded-lg space-y-1.5">
+                    <div className="text-xs text-text-secondary">
+                      订单号：<span className="font-mono text-text-primary break-all">{orderResult.order_id}</span>
+                    </div>
+                    <div className="text-xs text-text-secondary">
+                      金额：<span className="text-text-primary">¥{orderResult.amount_cny}</span>
+                    </div>
+                  </div>
+                  <div className="text-[11px] text-text-secondary/60">
+                    支付成功后扩容自动生效；30 分钟内未支付订单将自动关闭。
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => openInBrowser(orderResult.pay_url!)}
+                      className="flex-1 px-4 py-2 bg-surface border border-surface-hover text-text-primary text-sm rounded-lg hover:bg-surface-hover transition-colors"
+                    >
+                      重新打开支付页
+                    </button>
+                    <button
+                      onClick={() => setPlanModalOpen(false)}
+                      className="flex-1 px-4 py-2 bg-primary text-white text-sm rounded-lg hover:opacity-90 transition-opacity"
+                    >
+                      完成
+                    </button>
+                  </div>
+                </div>
+              ) : (
               <div className="space-y-3">
                 <div className="flex items-center gap-2 text-sm text-emerald-400">
                   <CheckCircle2 size={14} /> 申请已提交，等待管理员确认收款
@@ -655,6 +745,7 @@ export function AccountSettings({ onLoggedIn }: Props) {
                   完成
                 </button>
               </div>
+              )
             ) : (
               <>
                 {loadingPlans ? (
@@ -721,7 +812,7 @@ export function AccountSettings({ onLoggedIn }: Props) {
                     : '请选择套餐'}
                 </button>
                 <div className="text-[11px] text-text-secondary/60">
-                  提交后按展示的收款信息线下转账，转账时请备注订单号。
+                  提交后将打开支付宝在线支付；服务器未开通在线支付时按展示的收款信息线下转账。
                 </div>
               </>
             )}
@@ -759,8 +850,18 @@ export function AccountSettings({ onLoggedIn }: Props) {
                 {paymentOrder.payment_info || '（收款信息未配置，请联系管理员）'}
               </div>
             </div>
+            {paymentOrder.pay_url && (
+              <button
+                onClick={() => openInBrowser(paymentOrder.pay_url!)}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-primary text-white text-sm rounded-lg hover:opacity-90 transition-opacity"
+              >
+                <Zap size={14} /> 在线支付（支付宝）
+              </button>
+            )}
             <div className="text-[11px] text-amber-400">
-              转账时请备注订单号，管理员确认收款后将自动开通对应套餐。
+              {paymentOrder.pay_url
+                ? '也可线下转账，备注订单号；支付成功后扩容自动生效。'
+                : '转账时请备注订单号，管理员确认收款后将自动开通对应套餐。'}
             </div>
             <button
               onClick={() => setPaymentOrder(null)}

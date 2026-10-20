@@ -2005,12 +2005,16 @@ export interface StorageOrder {
   admin_note?: string | null;
   /** 收款说明：仅 pending 订单由 relay 下发，其他状态为空。 */
   payment_info?: string | null;
+  /** 在线支付页 URL：pending 且选了支付宝渠道时由 relay 下发。 */
+  pay_url?: string | null;
 }
 
 export interface StorageOrderCreateResult {
   order_id: string;
   amount_cny: number;
   payment_info: string;
+  /** 在线支付页 URL（relay 已配置支付宝时）；无则走线下转账说明。 */
+  pay_url?: string | null;
 }
 
 export async function storageStatus(relayUrl: string): Promise<StorageStatus> {
@@ -2024,13 +2028,19 @@ export async function storagePlans(relayUrl: string): Promise<StoragePlan[]> {
 export async function storageOrderCreate(
   relayUrl: string,
   planId: string,
-  period: 'month' | 'year'
+  period: 'month' | 'year',
+  channel?: 'alipay'
 ): Promise<StorageOrderCreateResult> {
-  return invoke<StorageOrderCreateResult>('storage_order_create', { relayUrl, planId, period });
+  return invoke<StorageOrderCreateResult>('storage_order_create', { relayUrl, planId, period, channel });
 }
 
 export async function storageOrderList(relayUrl: string): Promise<StorageOrder[]> {
   return invoke<StorageOrder[]>('storage_order_list', { relayUrl });
+}
+
+/** 查询单个订单状态（等待支付结果时轮询）。 */
+export async function storageOrderStatus(relayUrl: string, orderId: string): Promise<StorageOrder> {
+  return invoke<StorageOrder>('storage_order_status', { relayUrl, orderId });
 }
 
 export async function setSyncConfig(config: SyncConfig): Promise<void> {

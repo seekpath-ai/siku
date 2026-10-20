@@ -6,7 +6,7 @@
 #
 # Environment overrides (create a .env next to this file):
 #   JWT_SECRET=<long random string>   # REQUIRED in production
-#   RELAY_DOMAIN=relay.example.com    # for Caddy TLS (tls profile)
+#   RELAY_DOMAIN=relay.seekpath.com.cn    # for Caddy TLS (tls profile)
 
 services:
   sync-relay:
@@ -24,6 +24,16 @@ services:
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       RELAY_DB_PATH: /data/accounts.json
       RELAY_MAILBOX_DB_PATH: /data/mailbox.sqlite
+      # 支付宝电脑网站支付（alipay.trade.page.pay）——三个 ALIPAY_* 缺一即
+      # 自动降级为纯线下转账流程。沙箱联调时把 ALIPAY_GATEWAY 换成
+      # https://openapi-sandbox.dl.alipaydev.com/gateway.do 并用沙箱密钥。
+      ALIPAY_APP_ID: ${ALIPAY_APP_ID:-}
+      ALIPAY_PRIVATE_KEY: ${ALIPAY_PRIVATE_KEY:-}
+      ALIPAY_PUBLIC_KEY: ${ALIPAY_PUBLIC_KEY:-}
+      ALIPAY_GATEWAY: ${ALIPAY_GATEWAY:-}
+      # 公网可达的 relay 地址（用于支付宝 notify/return 回调），如
+      # https://relay.seekpath.com.cn；不配置则在线支付不可用。
+      RELAY_PUBLIC_BASE: ${RELAY_PUBLIC_BASE:-}
     volumes:
       - siku-relay-data:/data
 

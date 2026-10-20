@@ -1069,6 +1069,7 @@ pub fn run() {
             commands::account::storage_plans,
             commands::account::storage_order_create,
             commands::account::storage_order_list,
+            commands::account::storage_order_status,
             // Sync
             commands::sync::start_auto_sync,
             commands::sync::get_local_ip,

@@ -84,7 +84,7 @@ const DEFAULT_MODE_OPTIONS: { value: NotesDefaultMode; label: string }[] = [
 
 /** 「编辑器」分区：默认打开模式 / 代码块折行 / 严格换行 / 字号。 */
 function EditorSettings() {
-  const { defaultMode, codeBlockWrap, strictLineBreaks, editorFontSize, set } = useNotesSettingsStore();
+  const { defaultMode, codeBlockWrap, strictLineBreaks, editorFontSize, editorLineWrap, set } = useNotesSettingsStore();
   return (
     <div>
       <h2 className="text-sm font-semibold text-text-primary mb-1">编辑器</h2>
@@ -120,6 +120,12 @@ function EditorSettings() {
         desc="开启后阅读视图中单个回车即换行（Obsidian 风格）；关闭后遵循标准 Markdown，单回车合并为空格。"
       >
         <Toggle checked={strictLineBreaks} onChange={(v) => set({ strictLineBreaks: v })} />
+      </SettingRow>
+      <SettingRow
+        label="编辑器软换行"
+        desc="开启后长行在编辑区内折行显示；关闭后横向滚动，视觉行与源文行一一对应——做列选择（Alt+拖选）时建议关闭。"
+      >
+        <Toggle checked={editorLineWrap} onChange={(v) => set({ editorLineWrap: v })} />
       </SettingRow>
       <SettingRow label="编辑器字号" desc="编辑视图与阅读视图正文的字号（12–24px）。">
         <div className="flex items-center gap-1.5">

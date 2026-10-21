@@ -15,6 +15,9 @@ interface NotesSettingsState {
   strictLineBreaks: boolean;
   /** Font size (px) of the note editor and reading view body text. */
   editorFontSize: number;
+  /** Soft-wrap long lines in the editor. Off = horizontal scroll, which keeps
+   *  visual lines == source lines — needed for reliable column selection. */
+  editorLineWrap: boolean;
   set: (patch: Partial<Omit<NotesSettingsState, 'set'>>) => void;
 }
 
@@ -31,6 +34,7 @@ export const useNotesSettingsStore = create<NotesSettingsState>()(
       codeBlockWrap: false,
       strictLineBreaks: true,
       editorFontSize: 16,
+      editorLineWrap: true,
       set: (patch) =>
         set((s) => ({
           ...s,

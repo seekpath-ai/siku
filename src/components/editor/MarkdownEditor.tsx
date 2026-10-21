@@ -3,7 +3,7 @@ import CodeMirror from '@uiw/react-codemirror';
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown';
 import { languages } from '@codemirror/language-data';
 import { oneDark } from '@codemirror/theme-one-dark';
-import { EditorView, Decoration, DecorationSet, WidgetType, ViewPlugin, keymap, type ViewUpdate } from '@codemirror/view';
+import { EditorView, Decoration, DecorationSet, WidgetType, ViewPlugin, keymap, rectangularSelection, crosshairCursor, type ViewUpdate } from '@codemirror/view';
 import { RangeSetBuilder, StateField, Facet, Prec, Annotation, EditorState, type Extension } from '@codemirror/state';
 import { syntaxTree, ensureSyntaxTree } from '@codemirror/language';
 import { autocompletion, completionStatus, type CompletionContext } from '@codemirror/autocomplete';
@@ -1963,6 +1963,9 @@ interface Props {
   attachmentsDir?: string;
   /** Editor font size in px (notes settings). Default 16. */
   fontSize?: number;
+  /** Soft-wrap long lines (notes settings). Default true. Off = horizontal
+   *  scroll with visual lines == source lines, for reliable column selection. */
+  lineWrap?: boolean;
   /** false = source mode: raw markdown without live-preview rendering. */
   livePreview?: boolean;
 }
@@ -1980,6 +1983,7 @@ export function MarkdownEditor({
   vaultId,
   attachmentsDir,
   fontSize = 16,
+  lineWrap = true,
   livePreview = true,
 }: Props) {
   // Ctrl/Cmd+click handling: wiki links navigate (or create); external
@@ -2189,7 +2193,12 @@ export function MarkdownEditor({
       oneDark,
       editorTheme,
       fontSizeTheme,
-      EditorView.lineWrapping,
+      // 列选择（矩形选区）：Alt+拖选 / Shift+Alt+方向键，复制粘贴按行对齐。
+      // 依赖多选区支持；crosshair 光标提示 Alt 按住时可列选。
+      EditorState.allowMultipleSelections.of(true),
+      rectangularSelection(),
+      crosshairCursor(),
+      ...(lineWrap ? [EditorView.lineWrapping] : []),
       EditorView.domEventHandlers({ scroll: () => onEditorScroll?.() }),
       imageOptionsFacet.of(imageOptions),
       linkClick,
@@ -2198,7 +2207,7 @@ export function MarkdownEditor({
     if (imagePasteDropExtension) list.push(imagePasteDropExtension);
     if (extensions) list.push(...extensions);
     return list;
-  }, [notes, currentNoteId, linkClick, onEditorScroll, extensions, imageOptions, imagePasteDropExtension, livePreview, fontSizeTheme]);
+  }, [notes, currentNoteId, linkClick, onEditorScroll, extensions, imageOptions, imagePasteDropExtension, livePreview, fontSizeTheme, lineWrap]);
 
   return (
     <CodeMirror

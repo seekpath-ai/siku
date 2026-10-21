@@ -109,6 +109,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   const aliases = useMemo(() => parseNoteAliases(note), [note]);
   // Global notes settings (device-local): editor/reading font size.
   const editorFontSize = useNotesSettingsStore((s) => s.editorFontSize);
+  const editorLineWrap = useNotesSettingsStore((s) => s.editorLineWrap);
   // Outline panel: per-note state (like the view mode), persisted via
   // noteEditorStore. Notes never opened keep the default (closed).
   const outlineOpen = useNoteEditorStore((s) => s.states[note.id]?.outline ?? false);
@@ -583,6 +584,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
       vaultId={note.vault_id}
       attachmentsDir={attachmentsDir}
       fontSize={editorFontSize}
+      lineWrap={editorLineWrap}
     />
     </div>
   );

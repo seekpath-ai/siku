@@ -16,6 +16,7 @@ interface ReviewReadingPanelProps {
   donePapers: number;
   totalPapers: number;
   synthesisReady: boolean;
+  synthesizing?: boolean;
   progressMessage?: string | null;
   onToggle: (paperId: string) => void;
   onCardChange: (paperId: string, card: ReviewPaperCard) => void;
@@ -75,6 +76,7 @@ export function ReviewReadingPanel({
   donePapers,
   totalPapers,
   synthesisReady,
+  synthesizing = false,
   progressMessage,
   onToggle,
   onCardChange,
@@ -109,7 +111,13 @@ export function ReviewReadingPanel({
           <div className="h-full bg-primary/70 transition-all" style={{ width: `${progressPercent}%` }} />
         </div>
         {!settled && <p className="text-[11px] text-text-secondary/55">{progressMessage || '正在预检来源并提取证据卡…'}</p>}
-        {settled && successCount > 0 && !synthesisReady && (
+        {settled && synthesizing && !synthesisReady && (
+          <p className="flex items-center gap-1.5 text-[11px] text-primary/90">
+            <Loader2 size={11} className="animate-spin" />
+            证据卡已完成，正在生成跨文献综合，完成后即可进入大纲…
+          </p>
+        )}
+        {settled && !synthesizing && successCount > 0 && !synthesisReady && (
           <p className="text-[11px] text-amber-400">证据卡已保留，但跨文献综合尚未完成；请继续生成综合后再进入大纲。</p>
         )}
         {settled && synthesisReady && failedCount === 0 && successCount > 0 && (

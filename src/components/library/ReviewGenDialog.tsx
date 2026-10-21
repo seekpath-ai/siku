@@ -89,7 +89,7 @@ function stepFromSnapshot(snapshot: ReviewSnapshot): Step {
   ) {
     return 'run';
   }
-  if (snapshot.outline.length > 0 || snapshot.synthesis || stage === 'outline' || stage === 'synthesize') {
+  if (snapshot.outline.length > 0 || snapshot.synthesis || stage === 'outline') {
     return 'outline';
   }
   return 'reading';
@@ -272,7 +272,7 @@ function AuditReport({ audit, sources }: { audit: ReviewAudit; sources: ReviewSo
 }
 
 export function ReviewGenDialog() {
-  const { open, paperIds, runId, setRunId, resetRun, close } = useReviewStore();
+  const { open, paperIds, runId, lastRunId, setRunId, resetRun, restoreRun, close } = useReviewStore();
   const { alert } = useDialog();
   const navigate = useNavigate();
 
@@ -489,10 +489,13 @@ export function ReviewGenDialog() {
   const totalPapers = progress?.totalPapers ?? (sources.length || activePaperIds.length);
   const donePapers = Math.min(totalPapers, Math.max(progress?.donePapers ?? 0, derivedDonePapers));
   const canEnterOutline = settledReading && usableCardCount > 0 && Boolean(snapshot?.synthesis);
+  // 后端综合阶段的 stage 是 synthesize（ReviewGenDialog 曾经错写成 synthesis，
+  // 导致综合进行中“生成跨文献综合”按钮仍可点，重复触发后端 RunGuard 冲突）。
+  const synthesizing = snapshot?.stage === 'synthesize' || progress?.stage === 'synthesize';
   const canContinueReading =
     sources.length === 0 ||
     (!settledReading && snapshot?.status !== 'reading' && !sources.some((source) => source.status === 'running')) ||
-    (settledReading && usableCardCount > 0 && !snapshot?.synthesis && snapshot?.stage !== 'synthesis');
+    (settledReading && usableCardCount > 0 && !snapshot?.synthesis && !synthesizing);
   const doneCount = sections.filter((section) => section.status === 'done').length;
   const failedCount = sections.filter((section) => section.status === 'failed').length;
 
@@ -810,6 +813,21 @@ export function ReviewGenDialog() {
             <>
               {step === 'form' && (
                 <div className="flex-1 min-h-0 overflow-y-auto space-y-3">
+                  {lastRunId && (
+                    <div className="flex items-center gap-2 rounded-lg border border-primary/25 bg-primary/5 px-3 py-2">
+                      <p className="flex-1 text-[12px] text-text-secondary">
+                        上一个综述任务仍保留在后台，可随时返回查看证据卡与生成进度。
+                      </p>
+                      <button
+                        type="button"
+                        onClick={restoreRun}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg border border-primary/40 text-[12px] text-primary hover:bg-primary/10 shrink-0"
+                      >
+                        <ArrowLeft size={12} />
+                        返回该综述
+                      </button>
+                    </div>
+                  )}
                   <div className="space-y-1.5">
                     <label className="text-xs text-text-secondary">研究问题</label>
                     <textarea
@@ -876,6 +894,7 @@ export function ReviewGenDialog() {
                   donePapers={donePapers}
                   totalPapers={totalPapers}
                   synthesisReady={Boolean(snapshot.synthesis)}
+                  synthesizing={synthesizing}
                   progressMessage={progress?.message}
                   onToggle={(paperId) => setExpandedPaperId((current) => (current === paperId ? null : paperId))}
                   onCardChange={changeCard}

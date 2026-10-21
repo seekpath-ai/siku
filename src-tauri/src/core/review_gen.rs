@@ -264,6 +264,12 @@ pub async fn prepare_read_retry(db: &SqlitePool, run_id: &str, paper_id: &str) -
 pub async fn run_reading(app: AppHandle, db: SqlitePool, run_id: String) {
     if let Err(e) = run_reading_inner(Some(&app), &db, &run_id, None).await {
         if e != CANCELLED {
+            // RunGuard 冲突说明同一 run 已有任务在执行，本次只是重复触发；
+            // 不能把别人正在跑的任务标成 failed。guard 在本任务自己的 inner
+            // 返回时已释放，所以此时 is_active 为真必属另一执行体。
+            if is_active(&run_id) {
+                return;
+            }
             tracing::warn!(run_id, error = %e, "review reading failed");
             let _ = review_store::set_run_status(&db, &run_id, "failed", "read", Some(&e)).await;
             emit(Some(&app), &ReviewProgress {
@@ -685,6 +691,11 @@ pub async fn prepare_section_retry(db: &SqlitePool, run_id: &str, section_index:
 pub async fn run_generation(app: AppHandle, db: SqlitePool, run_id: String) {
     if let Err(e) = run_generation_inner(Some(&app), &db, &run_id, None).await {
         if e != CANCELLED {
+            // 与 run_reading 同理：RunGuard 冲突 = 同一 run 已有执行体在跑，
+            // 静默退出，不覆盖运行中任务的状态。
+            if is_active(&run_id) {
+                return;
+            }
             tracing::warn!(run_id, error = %e, "review generation failed");
             let _ = review_store::set_run_status(&db, &run_id, "failed", "section", Some(&e)).await;
             emit(Some(&app), &ReviewProgress {

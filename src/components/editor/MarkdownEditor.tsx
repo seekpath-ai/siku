@@ -1141,6 +1141,185 @@ function deleteTableColumnChanges(state: EditorState, table: TableInfo, colIndex
   return changes;
 }
 
+// ── Extended structural edits for the table right-click menu ──
+
+/** Insert an empty body row above/below the given source row. */
+function insertTableRowAt(table: TableInfo, srcRow: number, below: boolean): TableChange[] {
+  const cols = table.rows[0]?.cells.length ?? 1;
+  const empty = emptyTableRowSource(cols);
+  const row = table.rows[srcRow];
+  if (!row) return [];
+  return below ? [{ from: row.to, insert: '\n' + empty }] : [{ from: row.from, insert: empty + '\n' }];
+}
+
+/** Swap a body row with its neighbor (dir=-1 up / 1 down). */
+function moveTableRowChanges(state: EditorState, table: TableInfo, srcRow: number, dir: -1 | 1): TableChange[] {
+  const row = table.rows[srcRow];
+  const other = table.rows[srcRow + dir];
+  if (!row || !other || row.kind !== 'body' || other.kind !== 'body') return [];
+  const a = dir === -1 ? other : row;
+  const b = dir === -1 ? row : other;
+  const aText = state.doc.sliceString(a.from, a.to);
+  const bText = state.doc.sliceString(b.from, b.to);
+  return [{ from: a.from, to: b.to, insert: bText + '\n' + aText }];
+}
+
+/** Duplicate a body row right below itself. */
+function duplicateTableRowChanges(state: EditorState, table: TableInfo, srcRow: number): TableChange[] {
+  const row = table.rows[srcRow];
+  if (!row || row.kind !== 'body') return [];
+  return [{ from: row.to, insert: '\n' + state.doc.sliceString(row.from, row.to) }];
+}
+
+/** Insert an empty column to the left (dir=-1) or right (dir=1) of colIndex. */
+function insertTableColumnAt(state: EditorState, table: TableInfo, colIndex: number, dir: -1 | 1): TableChange[] {
+  if (dir === 1 && colIndex >= (table.rows[0]?.cells.length ?? 0) - 1) {
+    return addTableColumnChanges(state, table);
+  }
+  const target = dir === -1 ? colIndex : colIndex + 1;
+  const changes: TableChange[] = [];
+  for (const row of table.rows) {
+    const cell = row.cells[target];
+    if (!cell) continue; // ragged row: leave it short rather than misplacing the pipe
+    const fill = row.kind === 'delimiter' ? ' --- |' : '  |';
+    changes.push({ from: cell.rawFrom, insert: fill });
+  }
+  return changes;
+}
+
+/** Swap a column with its neighbor (dir=-1 left / 1 right). Raw spans keep
+ *  each cell's padding; the delimiter row swaps too so alignment follows. */
+function moveTableColumnChanges(state: EditorState, table: TableInfo, colIndex: number, dir: -1 | 1): TableChange[] {
+  const other = colIndex + dir;
+  if (other < 0 || other >= (table.rows[0]?.cells.length ?? 0)) return [];
+  const changes: TableChange[] = [];
+  for (const row of table.rows) {
+    const a = row.cells[colIndex];
+    const b = row.cells[other];
+    if (!a || !b) continue;
+    const aText = state.doc.sliceString(a.rawFrom, a.rawTo);
+    const bText = state.doc.sliceString(b.rawFrom, b.rawTo);
+    changes.push({ from: a.rawFrom, to: a.rawTo, insert: bText });
+    changes.push({ from: b.rawFrom, to: b.rawTo, insert: aText });
+  }
+  return changes;
+}
+
+/** Duplicate a column right after itself. */
+function duplicateTableColumnChanges(state: EditorState, table: TableInfo, colIndex: number): TableChange[] {
+  const changes: TableChange[] = [];
+  for (const row of table.rows) {
+    const cell = row.cells[colIndex];
+    if (!cell) continue;
+    const raw = state.doc.sliceString(cell.rawFrom, cell.rawTo);
+    // rawTo is the pipe position following the cell: insert "| raw" before it.
+    changes.push({ from: cell.rawTo, insert: `|${raw}` });
+  }
+  return changes;
+}
+
+/** Sort body rows by a column's cell text (numeric-aware, stable-ish). */
+function sortTableByColumnChanges(state: EditorState, table: TableInfo, colIndex: number, dir: -1 | 1): TableChange[] {
+  const bodyRows = table.rows.filter((r) => r.kind === 'body');
+  if (bodyRows.length < 2) return [];
+  const key = (r: TableRowInfo) => r.cells[colIndex]?.text ?? '';
+  const sorted = [...bodyRows].sort(
+    (a, b) => dir * key(a).localeCompare(key(b), undefined, { numeric: true, sensitivity: 'base' })
+  );
+  if (sorted.every((r, i) => r === bodyRows[i])) return [];
+  const from = bodyRows[0].from;
+  const to = bodyRows[bodyRows.length - 1].to;
+  const insert = sorted.map((r) => state.doc.sliceString(r.from, r.to)).join('\n');
+  return [{ from, to, insert }];
+}
+
+export type TableMenuActionId =
+  | 'insert-row-above' | 'insert-row-below' | 'move-row-up' | 'move-row-down' | 'duplicate-row' | 'delete-row'
+  | 'insert-col-left' | 'insert-col-right' | 'move-col-left' | 'move-col-right' | 'duplicate-col' | 'delete-col'
+  | 'sort-asc' | 'sort-desc';
+
+export interface TableMenuContext {
+  /** Source row: 0 = header, 1 = delimiter (never rendered), 2+ = body. */
+  row: number;
+  col: number;
+  kind: 'header' | 'delimiter' | 'body';
+  rows: number;
+  cols: number;
+}
+
+/** Map a rendered table cell element back to its source coordinates. The
+ *  delimiter row is not rendered, so tbody indices shift by 2. */
+export function getTableMenuContext(
+  view: EditorView,
+  wrapEl: HTMLElement,
+  cellEl: HTMLTableCellElement
+): TableMenuContext | null {
+  const tr = cellEl.parentElement as HTMLTableRowElement | null;
+  if (!tr) return null;
+  const row = tr.parentElement?.tagName === 'THEAD' ? 0 : tr.sectionRowIndex + 2;
+  const pos = view.posAtDOM(wrapEl);
+  const table = findTables(view.state).find((t) => pos >= t.from && pos <= t.to);
+  if (!table) return null;
+  const rowInfo = table.rows[row];
+  if (!rowInfo) return null;
+  return { row, col: cellEl.cellIndex, kind: rowInfo.kind, rows: table.rows.length, cols: table.rows[0]?.cells.length ?? 0 };
+}
+
+/** Apply a table context-menu action. A still-open cell editor inside the
+ *  table is committed into the SAME dispatch (single undo step) unless the
+ *  action removes its row/column, in which case the edit is dropped. */
+export function applyTableMenuAction(
+  view: EditorView,
+  wrapEl: HTMLElement,
+  ctx: TableMenuContext,
+  action: TableMenuActionId
+): void {
+  const pos = view.posAtDOM(wrapEl);
+  const table = findTables(view.state).find((t) => pos >= t.from && pos <= t.to);
+  if (!table) return;
+  const { row, col } = ctx;
+  let changes: TableChange[] = [];
+  switch (action) {
+    case 'insert-row-above': changes = insertTableRowAt(table, row, false); break;
+    case 'insert-row-below': changes = insertTableRowAt(table, row === 0 ? 1 : row, true); break;
+    case 'move-row-up': changes = moveTableRowChanges(view.state, table, row, -1); break;
+    case 'move-row-down': changes = moveTableRowChanges(view.state, table, row, 1); break;
+    case 'duplicate-row': changes = duplicateTableRowChanges(view.state, table, row); break;
+    case 'delete-row': changes = deleteTableRowChanges(view.state, table, row); break;
+    case 'insert-col-left': changes = insertTableColumnAt(view.state, table, col, -1); break;
+    case 'insert-col-right': changes = insertTableColumnAt(view.state, table, col, 1); break;
+    case 'move-col-left': changes = moveTableColumnChanges(view.state, table, col, -1); break;
+    case 'move-col-right': changes = moveTableColumnChanges(view.state, table, col, 1); break;
+    case 'duplicate-col': changes = duplicateTableColumnChanges(view.state, table, col); break;
+    case 'delete-col': changes = deleteTableColumnChanges(view.state, table, col); break;
+    case 'sort-asc': changes = sortTableByColumnChanges(view.state, table, col, 1); break;
+    case 'sort-desc': changes = sortTableByColumnChanges(view.state, table, col, -1); break;
+  }
+  // Commit the open cell editor (if any) into the same transaction so the
+  // menu action and the pending edit stay one undo step, mirroring the
+  // widget's runStructural. The widget's later blur-commit finds the source
+  // already changed and drops its duplicate write.
+  const input = wrapEl.querySelector<HTMLInputElement>('.cm-live-table-input');
+  if (input) {
+    const cellEl = input.closest('td, th') as HTMLTableCellElement | null;
+    const editCtx = cellEl ? getTableMenuContext(view, wrapEl, cellEl) : null;
+    const dropEdit =
+      editCtx != null &&
+      ((action === 'delete-row' && editCtx.row === row) || (action === 'delete-col' && editCtx.col === col));
+    if (editCtx && !dropEdit) {
+      const cell = table.rows[editCtx.row]?.cells[editCtx.col];
+      if (cell && table.rows[editCtx.row]?.kind !== 'delimiter') {
+        const insert = sanitizeCellSource(input.value);
+        if (view.state.doc.sliceString(cell.from, cell.to) !== insert) {
+          changes.push({ from: cell.from, to: cell.to, insert });
+        }
+      }
+    }
+  }
+  if (changes.length === 0) return;
+  view.dispatch({ changes: changes.sort(byChangeFrom) });
+}
+
 // ── In-table key bindings (Tab / Shift-Tab / Enter) ──
 
 /** Move the caret one cell forward (dir=1) or backward (dir=-1). Tab past the

@@ -21,6 +21,12 @@ import {
   KeyRound,
   List,
   Image as ImageIcon,
+  Plus,
+  ArrowUp,
+  ArrowDown,
+  Copy,
+  ArrowDownAZ,
+  ArrowDownZA,
 } from 'lucide-react';
 import { WikiMarkdown } from './WikiMarkdown';
 import { PrintNotePortal } from './PrintNotePortal';
@@ -30,13 +36,13 @@ import { BacklinksPanel } from './BacklinksPanel';
 import { OutlinePanel } from './OutlinePanel';
 import { VersionHistoryDialog } from './VersionHistoryDialog';
 import { LockedNoteCover } from './LockPasswordDialog';
-import { ContextMenu } from '@/components/ui/ContextMenu';
+import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
 import { escapePw } from '@/lib/passwordToken';
 import { scanHeadings, mapHeadingsToEls, type HeadingItem } from '@/lib/headings';
 import { readClipboardShot, shotStamp, base64ToBytes } from '@/lib/clipboardImage';
 import { saveTextFile, fileBrowserRevealInSystem, noteVersionRestore, vaultAttachmentsDir, saveAttachmentBytes } from '@/lib/tauri';
 import { EditorView } from '@codemirror/view';
-import { MarkdownEditor } from '@/components/editor/MarkdownEditor';
+import { MarkdownEditor, getTableMenuContext, applyTableMenuAction, type TableMenuContext, type TableMenuActionId } from '@/components/editor/MarkdownEditor';
 import type { Note, NoteVersion } from '@/lib/types';
 import { parseNoteTags, parseNoteAliases } from '@/lib/types';
 import { useNoteEditorStore, type NoteViewMode } from '@/stores/noteEditorStore';
@@ -482,7 +488,16 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   // becomes the token's content — escaped first (`\\` `\]` `|`, see
   // @/lib/passwordToken) — so existing plaintext can be masked by selecting
   // it and right-clicking.
-  const [editorMenu, setEditorMenu] = useState<{ x: number; y: number } | null>(null);
+  //
+  // Rendered tables get a structural menu instead (add/move/duplicate/delete
+  // rows & columns, sort by column — see MarkdownEditor.applyTableMenuAction);
+  // the password conversion is a menu item there, applied to the open cell
+  // editor's selection.
+  const [editorMenu, setEditorMenu] = useState<{
+    x: number;
+    y: number;
+    table?: { wrapEl: HTMLElement; ctx: TableMenuContext; input: HTMLInputElement | null };
+  } | null>(null);
   const insertPasswordField = useCallback(() => {
     const view = viewRef.current;
     if (!view) return;
@@ -536,6 +551,64 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   }, [syncScroll]);
   const editorExtensions = useMemo(() => [cursorListener], [cursorListener]);
 
+  // Right-click menu for rendered tables: row/column structure ops (see
+  // image4-style Obsidian menu). The password-token conversion used to be the
+  // DEFAULT right-click action on a cell editor; it is now an explicit item.
+  const tableMenuItems = (t: { wrapEl: HTMLElement; ctx: TableMenuContext; input: HTMLInputElement | null }): ContextMenuItem[] => {
+    const { ctx } = t;
+    const view = viewRef.current;
+    const run = (action: TableMenuActionId) => () => {
+      if (view) applyTableMenuAction(view, t.wrapEl, t.ctx, action);
+    };
+    const isHeader = ctx.kind !== 'body';
+    const lastRow = ctx.rows - 1;
+    const lastCol = ctx.cols - 1;
+    const items: ContextMenuItem[] = [];
+    if (t.input) {
+      items.push({
+        label: '转为密码字段',
+        icon: <KeyRound size={13} />,
+        onClick: () => {
+          const input = t.input!;
+          const start = input.selectionStart ?? input.value.length;
+          const end = input.selectionEnd ?? start;
+          const selected = input.value.slice(start, end);
+          input.setRangeText(`!pw[${escapePw(selected)}]`, start, end, selected ? 'end' : 'start');
+          if (!selected) input.setSelectionRange(start + 4, start + 4); // caret inside the brackets
+        },
+      });
+    }
+    items.push(
+      {
+        label: '行',
+        icon: <Rows2 size={13} />,
+        children: [
+          { label: '在上方新增行', icon: <Plus size={13} />, disabled: isHeader, onClick: run('insert-row-above') },
+          { label: '在下方新增行', icon: <Plus size={13} />, onClick: run('insert-row-below') },
+          { label: '向上移动行', icon: <ArrowUp size={13} />, disabled: isHeader || ctx.row <= 2, separatorBefore: true, onClick: run('move-row-up') },
+          { label: '向下移动行', icon: <ArrowDown size={13} />, disabled: isHeader || ctx.row >= lastRow, onClick: run('move-row-down') },
+          { label: '复制行', icon: <Copy size={13} />, disabled: isHeader, separatorBefore: true, onClick: run('duplicate-row') },
+          { label: '删除行', icon: <Trash2 size={13} />, disabled: isHeader, destructive: true, onClick: run('delete-row') },
+        ],
+      },
+      {
+        label: '列',
+        icon: <Columns2 size={13} />,
+        children: [
+          { label: '在左侧新增列', icon: <Plus size={13} />, onClick: run('insert-col-left') },
+          { label: '在右侧新增列', icon: <Plus size={13} />, onClick: run('insert-col-right') },
+          { label: '向左移动列', icon: <ArrowUp size={13} className="-rotate-90" />, disabled: ctx.col === 0, separatorBefore: true, onClick: run('move-col-left') },
+          { label: '向右移动列', icon: <ArrowDown size={13} className="-rotate-90" />, disabled: ctx.col >= lastCol, onClick: run('move-col-right') },
+          { label: '复制列', icon: <Copy size={13} />, separatorBefore: true, onClick: run('duplicate-col') },
+          { label: '删除列', icon: <Trash2 size={13} />, disabled: ctx.cols <= 1, destructive: true, onClick: run('delete-col') },
+        ],
+      },
+      { label: '按列升序 (A–Z)', icon: <ArrowDownAZ size={13} />, separatorBefore: true, onClick: run('sort-asc') },
+      { label: '按列降序 (Z–A)', icon: <ArrowDownZA size={13} />, onClick: run('sort-desc') },
+    );
+    return items;
+  };
+
   const saveIndicator = {
     saved: { icon: Check, text: '已保存', class: 'text-accent' },
     saving: { icon: Loader2, text: '保存中', class: 'text-primary animate-spin' },
@@ -548,24 +621,22 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
       onContextMenu={(e) => {
         e.preventDefault();
         const target = e.target as HTMLElement;
-        // Rendered table cell editor: its selection lives in the cell's own
-        // HTML input, not in CodeMirror's selection, so the caret-based menu
-        // would insert at a stale position. Wrap the input's selection in
-        // place instead (the normal blur-commit path writes it back). No menu
-        // is shown here: opening one blurs the input and the blur-commit
-        // would race ahead of the click, losing the conversion.
-        const cellInput = target.closest<HTMLInputElement>('.cm-live-table-input');
-        if (cellInput) {
-          const start = cellInput.selectionStart ?? cellInput.value.length;
-          const end = cellInput.selectionEnd ?? start;
-          const selected = cellInput.value.slice(start, end);
-          cellInput.setRangeText(`!pw[${escapePw(selected)}]`, start, end, selected ? 'end' : 'start');
-          if (!selected) cellInput.setSelectionRange(start + 4, start + 4); // caret inside the brackets
+        const view = viewRef.current;
+        // Rendered table: structural menu (rows/columns/sort). The ContextMenu
+        // preventDefaults mousedown, so an open cell editor keeps focus and its
+        // selection while the menu is up — the password item can therefore wrap
+        // the input's selection in place and structural actions commit the
+        // pending edit in the same dispatch (see applyTableMenuAction).
+        const tableWrap = target.closest<HTMLElement>('.cm-live-table');
+        if (tableWrap && view) {
+          const cellInput = target.closest<HTMLInputElement>('.cm-live-table-input');
+          const cellEl = (cellInput?.closest('td, th') ?? target.closest('td, th')) as HTMLTableCellElement | null;
+          if (!cellEl) return; // table chrome outside any cell: no menu
+          const ctx = getTableMenuContext(view, tableWrap, cellEl);
+          if (!ctx) return;
+          setEditorMenu({ x: e.clientX, y: e.clientY, table: { wrapEl: tableWrap, ctx, input: cellInput } });
           return;
         }
-        // Rendered table chrome outside the cell editor: no menu, the caret
-        // position has no meaningful relation to the clicked cell.
-        if (target.closest('.cm-live-table')) return;
         setEditorMenu({ x: e.clientX, y: e.clientY });
       }}
     >
@@ -996,7 +1067,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
           x={editorMenu.x}
           y={editorMenu.y}
           onClose={() => setEditorMenu(null)}
-          items={[
+          items={editorMenu.table ? tableMenuItems(editorMenu.table) : [
             {
               label: '插入密码字段',
               icon: <KeyRound size={13} />,

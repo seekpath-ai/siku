@@ -1754,8 +1754,14 @@ function buildLivePreview(view: EditorView): DecorationSet {
   const near = (from: number, to: number) =>
     ranges.some((r) => r.from <= to && r.to >= from);
 
-  const markerNear = (n: { from: number; to: number }) =>
-    near(n.from - 1, n.to + 1);
+  // ±1 adjacency is clamped to the marker's own line: an unclamped
+  // near(from-1, to+1) bleeds across line boundaries, so a caret at the end
+  // of the line above (or on an empty line above) would wrongly reveal the
+  // marker's source.
+  const markerNear = (n: { from: number; to: number }) => {
+    const line = state.doc.lineAt(n.from);
+    return near(Math.max(n.from - 1, line.from), Math.min(n.to + 1, line.to));
+  };
 
   // Obsidian-style behaviour: only the line(s) that contain the cursor show raw
   // markdown markers; block-level elements that span multiple lines do not force
@@ -1900,7 +1906,7 @@ function buildLivePreview(view: EditorView): DecorationSet {
             } else {
               adds.push(replaceItem(n.from, n.to, {}));
             }
-          } else if (parent?.name !== 'Link' && !near(n.from - 1, n.to + 1)) {
+          } else if (parent?.name !== 'Link' && !markerNear(n)) {
             // Bare URL or <autolink>: keep it visible as a styled link while
             // the caret is away; plain text while editing.
             adds.push(markItem(n.from, n.to, 'cm-live-link'));
@@ -2024,7 +2030,7 @@ function buildLivePreview(view: EditorView): DecorationSet {
       const from = base + m.index;
       const to = from + m[0].length;
       if (inCode(from, to)) continue;
-      if (near(from - 1, to + 1)) continue;
+      if (markerNear({ from, to })) continue;
       adds.push(replaceItem(from, to, { widget: new PasswordWidget(unescapePw(m[1])) }));
     }
 
@@ -2046,7 +2052,11 @@ function buildLivePreview(view: EditorView): DecorationSet {
       const to = from + m[0].length;
       if (inCode(from, to)) continue;
       if (blockMathRanges.some((r) => from >= r.from && to <= r.to)) continue;
-      if (near(from - 5, to + 5)) continue; // caret inside/adjacent → keep source
+      // Caret inside/adjacent → keep source. The ±5 tolerance is clamped to
+      // the math's own line (inline math never spans lines) so a caret on the
+      // line above/below doesn't count as "adjacent".
+      const mathLine = state.doc.lineAt(from);
+      if (near(Math.max(from - 5, mathLine.from), Math.min(to + 5, mathLine.to))) continue;
       adds.push(replaceItem(from, to, { widget: new MathWidget(m[1].trim(), false) }));
     }
   }

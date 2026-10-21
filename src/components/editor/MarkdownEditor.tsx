@@ -8,12 +8,30 @@ import { RangeSetBuilder, StateField, Facet, Prec, Annotation, EditorState, type
 import { syntaxTree, ensureSyntaxTree } from '@codemirror/language';
 import { autocompletion, completionStatus, type CompletionContext } from '@codemirror/autocomplete';
 import { open as shellOpen } from '@tauri-apps/plugin-shell';
+import { emit } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import katex from 'katex';
 import { saveAttachmentBytes } from '@/lib/tauri';
 import { pwTokenRe, unescapePw } from '@/lib/passwordToken';
 import { readClipboardShot, shotStamp, base64ToBytes } from '@/lib/clipboardImage';
 import { resolveImageUrl, resolveLocalImageUrl, type ResolveImageOptions } from '@/lib/imageCache';
+import { parseReaderUrl, type ReaderLinkTarget } from '@/lib/evidence';
+import { useEvidenceStore } from '@/stores/evidenceStore';
 import type { Note } from '@/lib/types';
+
+/** Open a siku-reader:// deep link from the editor's live preview. Same
+ *  dual-channel as WikiMarkdown: main window navigates straight to the
+ *  reader; slim note windows have no router, so they forward the request
+ *  to the main window via the pet evidence-highlight event. */
+function openReaderLink(target: ReaderLinkTarget) {
+  if (getCurrentWindow().label === 'main') {
+    useEvidenceStore.getState().requestHighlight(target);
+    const router = (window as Window & { __sikuRouter?: { navigate: (o: { to: string; params?: Record<string, unknown> }) => Promise<unknown> } }).__sikuRouter;
+    router?.navigate({ to: '/reader/$paperId', params: { paperId: target.paperId } }).catch(() => {});
+  } else {
+    emit('pet:evidence-highlight', { paperId: target.paperId, page: target.page, exact: target.exact }).catch(() => {});
+  }
+}
 
 // ── Obsidian-style Live Preview extensions ─────────────────────────────
 
@@ -1482,6 +1500,16 @@ function buildLivePreview(view: EditorView): DecorationSet {
         } else if (styleMarks[n.name]) {
           adds.push(markItem(n.from, n.to, styleMarks[n.name]));
         } else if (markerMarks.has(n.name) || n.name === 'CodeInfo') {
+          // Citation link [[2]](siku-reader://…): lezer parses the inner [2]
+          // as a shortcut-ref Link; keep ITS brackets visible so the citation
+          // renders as [2] (matching the reading view). The outer [ and the
+          // ](url) tail are hidden by the citation branch in the wiki pass.
+          const citationInnerMark = n.name === 'LinkMark' && parent?.name === 'Link'
+            && state.doc.sliceString(Math.max(0, parent.from - 1), parent.from) === '['
+            && state.doc.sliceString(parent.to, parent.to + 16).startsWith('](siku-reader://');
+          if (citationInnerMark) {
+            adds.push(markItem(n.from, n.to, 'cm-live-marker'));
+          } else {
           const inline = parent && INLINE_PARENTS.has(parent.name);
           // Inline markers keep their parent scope so both delimiters of a
           // wrapped emphasis/link stay visible while editing it. Fence markers
@@ -1501,6 +1529,7 @@ function buildLivePreview(view: EditorView): DecorationSet {
               ? n.to + 1
               : n.to;
             adds.push(replaceItem(n.from, hideTo, {}));
+          }
           }
         } else if (n.name === 'URL') {
           // Inside a Link, a URL node is usually the destination `(url)` part —
@@ -1593,6 +1622,17 @@ function buildLivePreview(view: EditorView): DecorationSet {
       const from = base + m.index;
       const to = from + m[0].length;
       if (inCode(from, to)) continue;
+      // Citation link [[2]](siku-reader://…): lezer parses the inner [2] as a
+      // shortcut-ref Link and leaves the destination as plain text, so the
+      // generic URL-hiding never reaches it — hide the wrapper here instead.
+      // Renders as [2], matching the reading view.
+      const citeM = /^\(siku-reader:\/\/[^)\s]+\)/.exec(state.doc.sliceString(to, to + 1000));
+      if (citeM) {
+        if (onSelectedLine(from) || near(from, to + citeM[0].length)) continue;
+        adds.push(replaceItem(from, from + 1, {})); // outer [
+        adds.push(replaceItem(to - 1, to + citeM[0].length, {})); // outer ] + (url)
+        continue;
+      }
       if (onSelectedLine(from) || near(from, to)) {
         adds.push(markItem(from, to, 'cm-live-wiki'));
         continue;
@@ -1961,6 +2001,9 @@ export function MarkdownEditor({
           const re = /\[\[([^\]\n]+)\]\]/g;
           let m: RegExpExecArray | null;
           while ((m = re.exec(text))) {
+            // Citation links [[2]](siku-reader://…) only look like wiki links;
+            // leave them to the Link branch below.
+            if (text.slice(m.index + m[0].length, m.index + m[0].length + 14).startsWith('(siku-reader://')) continue;
             if (pos >= m.index && pos < m.index + m[0].length) {
               event.preventDefault();
               const { id, title } = resolveTarget(m[1], notes);
@@ -1978,6 +2021,22 @@ export function MarkdownEditor({
           if (node.name === 'Link') {
             const seg = view.state.doc.sliceString(node.from, node.to);
             const um = /\(([^)\s]+)(?:\s+"[^"]*")?\)/.exec(seg);
+            // Citation link [[2]](siku-reader://…): lezer parses the inner
+            // [2] as a shortcut-ref Link and leaves the destination outside
+            // the Link node — look right past it for the ](url) tail.
+            const citationUm = um ?? /^\]\((siku-reader:\/\/[^)\s]+)\)/.exec(
+              view.state.doc.sliceString(node.to, node.to + 1000)
+            );
+            const url = um?.[1] ?? citationUm?.[1];
+            if (url?.startsWith('siku-reader://')) {
+              const target = parseReaderUrl(url);
+              if (target) {
+                event.preventDefault();
+                openReaderLink(target);
+                return true;
+              }
+              return false;
+            }
             if (um && isRemoteImageSrc(um[1])) {
               event.preventDefault();
               openExternal(um[1]);

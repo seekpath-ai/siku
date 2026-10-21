@@ -1320,6 +1320,181 @@ export function applyTableMenuAction(
   view.dispatch({ changes: changes.sort(byChangeFrom) });
 }
 
+// ── Context-menu editing actions (note editor right-click menu) ──
+
+/** Toggle an inline marker (`**` `*` `~~` `==` `` ` `` `$`) around the main
+ *  selection: wrapped → unwrap, bare → wrap. Empty selection inserts a marker
+ *  pair and parks the caret inside. */
+export function toggleInlineMark(view: EditorView, marker: string) {
+  const { from, to } = view.state.selection.main;
+  const doc = view.state.doc;
+  const m = marker.length;
+  const before = doc.sliceString(Math.max(0, from - m), from);
+  const after = doc.sliceString(to, to + m);
+  // Guard `*` against matching inside `**`: refuse when the char beyond the
+  // candidate marker is also `*`.
+  const guarded = marker === '*'
+    && (doc.sliceString(Math.max(0, from - m - 1), from - m) === '*' || doc.sliceString(to + m, to + m + 1) === '*');
+  if (before === marker && after === marker && !guarded) {
+    view.dispatch({
+      changes: [
+        { from: to, to: to + m },
+        { from: from - m, to: from },
+        // No-op insert keeps the selection mapping stable.
+      ].sort(byChangeFrom),
+      selection: { anchor: from - m, head: to - m },
+    });
+  } else {
+    view.dispatch({
+      changes: [
+        { from, insert: marker },
+        { from: to, insert: marker },
+      ],
+      selection: { anchor: from + m, head: to + m },
+    });
+  }
+  view.focus();
+}
+
+export type LineBlockAction = 'ul' | 'ol' | 'task' | 'quote' | 'body' | 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
+
+const LINE_PREFIX_RE = /^(\s*)((?:>\s*)*)(#{1,6}\s+)?((?:[-*+]|\d+\.)\s+(?:\[[ xX]\]\s+)?)?/;
+
+/** Apply a paragraph-level block type to every selected line: lists, quote,
+ *  headings, or 正文 (strip all prefixes). Re-selecting the same type on a
+ *  fully-typed range removes it (toggle). */
+export function applyLineBlock(view: EditorView, action: LineBlockAction) {
+  const { state } = view;
+  const sel = state.selection.main;
+  const startLine = state.doc.lineAt(sel.from);
+  const endLine = state.doc.lineAt(sel.to);
+  const prefixFor: Record<LineBlockAction, string> = {
+    ul: '- ', ol: '1. ', task: '- [ ] ', quote: '> ', body: '',
+    h1: '# ', h2: '## ', h3: '### ', h4: '#### ', h5: '##### ', h6: '###### ',
+  };
+  const wanted = prefixFor[action];
+
+  interface Parsed { indent: string; quotes: string; rest: string; current: string }
+  const parse = (text: string): Parsed => {
+    const m = LINE_PREFIX_RE.exec(text)!;
+    const current = [m[3], m[4]].filter(Boolean).join('');
+    return { indent: m[1], quotes: m[2], rest: text.slice(m[0].length), current };
+  };
+  // 引用单独切换（一级 > 的增减），其余类型是「设置+再点取消」。
+  if (action === 'quote') {
+    const changes: TableChange[] = [];
+    let allQuoted = true;
+    for (let ln = startLine.number; ln <= endLine.number; ln++) {
+      const t = state.doc.line(ln).text;
+      if (t.trim() === '') continue;
+      if (!/^\s*>/.test(t)) { allQuoted = false; break; }
+    }
+    for (let ln = startLine.number; ln <= endLine.number; ln++) {
+      const line = state.doc.line(ln);
+      if (line.text.trim() === '') continue;
+      const next = allQuoted
+        ? line.text.replace(/^(\s*)>\s?/, '$1')
+        : line.text.replace(/^(\s*)/, '$1> ');
+      if (next !== line.text) changes.push({ from: line.from, to: line.to, insert: next });
+    }
+    if (changes.length > 0) view.dispatch({ changes });
+    view.focus();
+    return;
+  }
+  // Toggle-off only when EVERY selected line already carries exactly the
+  // wanted prefix (and nothing else to strip for 正文).
+  let allMatch = true;
+  for (let ln = startLine.number; ln <= endLine.number; ln++) {
+    const p = parse(state.doc.line(ln).text);
+    if (action === 'body' ? p.current === '' : p.current !== wanted) { allMatch = false; break; }
+  }
+  const toggleOff = action !== 'body' && allMatch;
+
+  const changes: TableChange[] = [];
+  for (let ln = startLine.number; ln <= endLine.number; ln++) {
+    const line = state.doc.line(ln);
+    if (line.text.trim() === '') continue; // blank lines stay blank
+    const p = parse(line.text);
+    const next = toggleOff ? p.indent + p.quotes + p.rest : p.indent + p.quotes + wanted + p.rest;
+    if (next !== line.text) changes.push({ from: line.from, to: line.to, insert: next });
+  }
+  if (changes.length > 0) view.dispatch({ changes });
+  view.focus();
+}
+
+export type BlockTemplate = 'table' | 'code' | 'math' | 'hr' | 'callout';
+
+/** Insert a block template at the caret (replacing any selection), parked on
+ *  blank lines so the block parses. The caret lands at the edit point. */
+export function insertBlockTemplate(view: EditorView, kind: BlockTemplate) {
+  const { state } = view;
+  const sel = state.selection.main;
+  const line = state.doc.lineAt(sel.from);
+  // Non-empty line: move to its end and open two blank lines first.
+  const at = line.text.trim() !== '' ? line.to : sel.from;
+  const head = line.text.trim() !== '' ? '\n\n' : '';
+  let body: string;
+  let caretOffset: number; // from insertion start
+  switch (kind) {
+    case 'table':
+      body = `|  |  |\n| --- | --- |\n|  |  |\n`;
+      caretOffset = head.length + 2;
+      break;
+    case 'code':
+      body = `\`\`\`\n\n\`\`\`\n`;
+      caretOffset = head.length + 4;
+      break;
+    case 'math':
+      body = `$$\n\n$$\n`;
+      caretOffset = head.length + 3;
+      break;
+    case 'hr':
+      body = `---\n`;
+      caretOffset = head.length + 4;
+      break;
+    case 'callout':
+      body = `> [!note] \n> \n`;
+      caretOffset = head.length + 11;
+      break;
+  }
+  view.dispatch({
+    changes: { from: at, to: at === sel.from ? sel.to : at, insert: head + body },
+    selection: { anchor: at + caretOffset },
+    scrollIntoView: true,
+  });
+  view.focus();
+}
+
+/** Wrap the selection as a [[wiki link]]; empty selection gets an empty pair
+ *  with the caret inside (autocomplete kicks in). */
+export function insertWikiLink(view: EditorView) {
+  const { from, to } = view.state.selection.main;
+  view.dispatch({
+    changes: [
+      { from, insert: '[[' },
+      { from: to, insert: ']]' },
+    ],
+    selection: { anchor: from + 2, head: to + 2 },
+  });
+  view.focus();
+}
+
+/** Wrap the selection as [text](url); when `url` is empty the caret lands
+ *  between the parens ready for a paste. */
+export function insertExternalLink(view: EditorView, url: string) {
+  const { from, to } = view.state.selection.main;
+  view.dispatch({
+    changes: [
+      { from, insert: '[' },
+      { from: to, insert: `](${url})` },
+    ],
+    selection: url
+      ? { anchor: to + 3 + url.length }
+      : { anchor: to + 3 },
+  });
+  view.focus();
+}
+
 // ── In-table key bindings (Tab / Shift-Tab / Enter) ──
 
 /** Move the caret one cell forward (dir=1) or backward (dir=-1). Tab past the

@@ -42,7 +42,7 @@ import { scanHeadings, mapHeadingsToEls, type HeadingItem } from '@/lib/headings
 import { readClipboardShot, shotStamp, base64ToBytes } from '@/lib/clipboardImage';
 import { saveTextFile, fileBrowserRevealInSystem, noteVersionRestore, vaultAttachmentsDir, saveAttachmentBytes } from '@/lib/tauri';
 import { EditorView } from '@codemirror/view';
-import { MarkdownEditor, getTableMenuContext, applyTableMenuAction, type TableMenuContext, type TableMenuActionId } from '@/components/editor/MarkdownEditor';
+import { MarkdownEditor, getTableMenuContext, applyTableMenuAction, toggleInlineMark, applyLineBlock, insertBlockTemplate, insertWikiLink, insertExternalLink, type TableMenuContext, type TableMenuActionId, type LineBlockAction, type BlockTemplate } from '@/components/editor/MarkdownEditor';
 import type { Note, NoteVersion } from '@/lib/types';
 import { parseNoteTags, parseNoteAliases } from '@/lib/types';
 import { useNoteEditorStore, type NoteViewMode } from '@/stores/noteEditorStore';
@@ -496,6 +496,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
   const [editorMenu, setEditorMenu] = useState<{
     x: number;
     y: number;
+    hasSelection?: boolean;
     table?: { wrapEl: HTMLElement; ctx: TableMenuContext; input: HTMLInputElement | null };
   } | null>(null);
   const insertPasswordField = useCallback(() => {
@@ -609,6 +610,105 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
     return items;
   };
 
+  // Full-featured editor context menu (outside tables). Clipboard actions use
+  // navigator.clipboard directly — the webview has clipboard permission.
+  const editorMenuItems = (hasSelection: boolean): ContextMenuItem[] => {
+    const view = viewRef.current;
+    if (!view) return [];
+    const cut = async () => {
+      const { from, to } = view.state.selection.main;
+      if (from === to) return;
+      await navigator.clipboard.writeText(view.state.doc.sliceString(from, to));
+      view.dispatch({ changes: { from, to }, selection: { anchor: from } });
+      view.focus();
+    };
+    const copy = async () => {
+      const { from, to } = view.state.selection.main;
+      if (from === to) return;
+      await navigator.clipboard.writeText(view.state.doc.sliceString(from, to));
+      view.focus();
+    };
+    const pasteText = async () => {
+      const text = await navigator.clipboard.readText();
+      if (!text) return;
+      const { from, to } = view.state.selection.main;
+      view.dispatch({ changes: { from, to, insert: text }, selection: { anchor: from + text.length } });
+      view.focus();
+    };
+    const externalLink = async () => {
+      let url = '';
+      try {
+        const clip = (await navigator.clipboard.readText()).trim();
+        if (/^https?:\/\/\S+$/.test(clip)) url = clip;
+      } catch { /* clipboard unavailable: caret lands in the parens */ }
+      insertExternalLink(view, url);
+    };
+    const fmt = (marker: string) => () => toggleInlineMark(view, marker);
+    const block = (action: LineBlockAction) => () => applyLineBlock(view, action);
+    const tpl = (kind: BlockTemplate) => () => insertBlockTemplate(view, kind);
+    return [
+      { label: '新增链接', icon: <Link2 size={13} />, onClick: () => insertWikiLink(view) },
+      { label: '新增外部链接', icon: <ExternalLink size={13} />, onClick: () => void externalLink() },
+      {
+        label: '文本格式',
+        icon: <Pen size={13} />,
+        separatorBefore: true,
+        children: [
+          { label: '加粗', onClick: fmt('**') },
+          { label: '倾斜', onClick: fmt('*') },
+          { label: '删除线', onClick: fmt('~~') },
+          { label: '高亮', onClick: fmt('==') },
+          { label: '代码', onClick: fmt('`') },
+          { label: '数学', onClick: fmt('$') },
+        ],
+      },
+      {
+        label: '段落设置',
+        icon: <List size={13} />,
+        children: [
+          { label: '无序列表', onClick: block('ul') },
+          { label: '有序列表', onClick: block('ol') },
+          { label: '任务列表', onClick: block('task') },
+          { label: '1 级标题', separatorBefore: true, onClick: block('h1') },
+          { label: '2 级标题', onClick: block('h2') },
+          { label: '3 级标题', onClick: block('h3') },
+          { label: '4 级标题', onClick: block('h4') },
+          { label: '5 级标题', onClick: block('h5') },
+          { label: '6 级标题', onClick: block('h6') },
+          { label: '正文', separatorBefore: true, onClick: block('body') },
+          { label: '引用', onClick: block('quote') },
+        ],
+      },
+      {
+        label: '插入',
+        icon: <Plus size={13} />,
+        children: [
+          { label: '表格', onClick: tpl('table') },
+          { label: '代码块', onClick: tpl('code') },
+          { label: '数学块', onClick: tpl('math') },
+          { label: '分隔线', onClick: tpl('hr') },
+          { label: '标注', onClick: tpl('callout') },
+        ],
+      },
+      { label: '剪切', disabled: !hasSelection, separatorBefore: true, onClick: () => void cut() },
+      { label: '复制', disabled: !hasSelection, onClick: () => void copy() },
+      { label: '粘贴', onClick: () => void pasteText() },
+      { label: '以纯文本形式粘贴', onClick: () => void pasteText() },
+      { label: '全选', onClick: () => { view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } }); view.focus(); } },
+      {
+        label: '插入密码字段',
+        icon: <KeyRound size={13} />,
+        separatorBefore: true,
+        onClick: insertPasswordField,
+      },
+      {
+        label: '粘贴图片',
+        icon: <ImageIcon size={13} />,
+        onClick: () => void pasteClipboardImage(),
+      },
+    ];
+  };
+
   const saveIndicator = {
     saved: { icon: Check, text: '已保存', class: 'text-accent' },
     saving: { icon: Loader2, text: '保存中', class: 'text-primary animate-spin' },
@@ -637,7 +737,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
           setEditorMenu({ x: e.clientX, y: e.clientY, table: { wrapEl: tableWrap, ctx, input: cellInput } });
           return;
         }
-        setEditorMenu({ x: e.clientX, y: e.clientY });
+        setEditorMenu({ x: e.clientX, y: e.clientY, hasSelection: !!view && !view.state.selection.main.empty });
       }}
     >
       <MarkdownEditor
@@ -1067,18 +1167,7 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
           x={editorMenu.x}
           y={editorMenu.y}
           onClose={() => setEditorMenu(null)}
-          items={editorMenu.table ? tableMenuItems(editorMenu.table) : [
-            {
-              label: '插入密码字段',
-              icon: <KeyRound size={13} />,
-              onClick: insertPasswordField,
-            },
-            {
-              label: '粘贴图片',
-              icon: <ImageIcon size={13} />,
-              onClick: () => void pasteClipboardImage(),
-            },
-          ]}
+          items={editorMenu.table ? tableMenuItems(editorMenu.table) : editorMenuItems(!!editorMenu.hasSelection)}
         />
       )}
     </div>

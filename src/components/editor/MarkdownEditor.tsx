@@ -2557,10 +2557,14 @@ export function MarkdownEditor({
       oneDark,
       editorTheme,
       fontSizeTheme,
-      // 列选择（矩形选区）：Alt+拖选 / Shift+Alt+方向键，复制粘贴按行对齐。
-      // 依赖多选区支持；crosshair 光标提示 Alt 按住时可列选。
+      // 列选择（矩形选区）：Alt+左键拖选 / 中键（滚轴按压）拖选 /
+      // Shift+Alt+方向键，复制粘贴按行对齐。依赖多选区支持；crosshair
+      // 光标提示 Alt 按住时可列选。中键拖选复用同一套矩形逻辑，CM 接管
+      // 拖拽后 preventDefault，WebView 的自动滚动不会触发。
       EditorState.allowMultipleSelections.of(true),
-      rectangularSelection(),
+      rectangularSelection({
+        eventFilter: (e) => (e.altKey && e.button === 0) || e.button === 1,
+      }),
       crosshairCursor(),
       ...(lineWrap ? [EditorView.lineWrapping] : []),
       EditorView.domEventHandlers({ scroll: () => onEditorScroll?.() }),

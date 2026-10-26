@@ -16,7 +16,8 @@ struct ScoringCandidate {
 /// and persist them. Returns the number of NEW sources added. Existing
 /// sources (matched by arXiv id or DOI, across ALL topics) are skipped —
 /// global dedup. New sources then get a batch LLM relevance score
-/// (best-effort: any failure leaves scores NULL).
+/// (best-effort: any failure leaves scores NULL and is surfaced via a
+/// `scoring_failed` progress event).
 ///
 /// When `app` is provided, progress and per-source events are emitted for
 /// incremental display:
@@ -194,7 +195,20 @@ pub async fn discover_for_topic(
     // 4. LLM relevance scoring over just-inserted sources (best-effort).
     if !candidates.is_empty() {
         emit("scoring", added);
-        score_candidates(db, &topic.name, &keywords, &candidates).await;
+        if let Err(e) = score_candidates(db, &topic.name, &keywords, &candidates).await {
+            warn!(topic_id, error = %e, "relevance scoring failed; sources left unscored");
+            if let Some(a) = app {
+                let _ = a.emit(
+                    "research:discover_progress",
+                    serde_json::json!({
+                        "topic_id": topic_id,
+                        "phase": "scoring_failed",
+                        "found": added,
+                        "error": e,
+                    }),
+                );
+            }
+        }
     }
 
     emit("done", added);
@@ -203,22 +217,16 @@ pub async fn discover_for_topic(
 }
 
 /// Batch-score new sources against the topic with the configured LLM.
-/// One completion per scan (not per paper); any failure is swallowed so a
-/// broken/slow model never breaks discovery — scores simply stay NULL and
-/// the UI shows the sources unscored.
+/// One completion per scan (not per paper); an LLM failure is returned so the
+/// caller can surface it, while per-row store failures are logged and skipped
+/// — scores simply stay NULL and the UI shows the sources unscored.
 async fn score_candidates(
     db: &SqlitePool,
     topic_name: &str,
     keywords: &[String],
     candidates: &[ScoringCandidate],
-) {
-    let scored = match score_candidates_llm(db, topic_name, keywords, candidates).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, "relevance scoring failed; sources left unscored");
-            return;
-        }
-    };
+) -> Result<(), String> {
+    let scored = score_candidates_llm(db, topic_name, keywords, candidates).await?;
     for (id, score, reason) in scored {
         if let Err(e) = sqlx::query(
             "UPDATE research_sources SET relevance_score = ?, relevance_reason = ? WHERE id = ?",
@@ -232,6 +240,7 @@ async fn score_candidates(
             warn!(error = %e, "failed to store relevance score");
         }
     }
+    Ok(())
 }
 
 /// The raw LLM call behind score_candidates. Returns (source_id, score, reason).

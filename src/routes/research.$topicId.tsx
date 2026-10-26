@@ -12,7 +12,7 @@ import { SourceTable } from '@/components/research/SourceTable';
 import { researchImportSource, researchUpdateSourceStatus } from '@/lib/tauri';
 import type { ResearchSource } from '@/lib/types';
 import { TopicForm } from '@/components/research/TopicForm';
-import { ArrowLeft, Loader2, Pencil } from 'lucide-react';
+import { ArrowLeft, AlertTriangle, Loader2, Pencil, X } from 'lucide-react';
 
 function ResearchTopicPage() {
   const { topicId } = Route.useParams();
@@ -25,6 +25,7 @@ function ResearchTopicPage() {
   } = useResearch();
   const [importingId, setImportingId] = useState<string | null>(null);
   const [discoverHint, setDiscoverHint] = useState<string | null>(null);
+  const [scoringError, setScoringError] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
 
   useEffect(() => {
@@ -41,11 +42,13 @@ function ResearchTopicPage() {
     let cancelled = false;
     let unlisten: (() => void)[] = [];
     const setup = async () => {
-      const u1 = await listen<{ topic_id: string; phase: string; found: number }>(
+      const u1 = await listen<{ topic_id: string; phase: string; found: number; error?: string }>(
         'research:discover_progress',
         (e) => {
           if (cancelled || e.payload.topic_id !== topicId) return;
           const p = e.payload.phase;
+          if (p === 'arxiv') setScoringError(null);
+          if (p === 'scoring_failed') setScoringError(e.payload.error ?? '未知错误');
           setDiscoverHint(
             p === 'arxiv'
               ? '正在搜索 arXiv…'
@@ -55,7 +58,9 @@ function ResearchTopicPage() {
                   ? '正在搜索 Semantic Scholar…'
                   : p === 'scoring'
                     ? '正在评估相关性…'
-                    : `发现完成，新增 ${e.payload.found} 条`
+                    : p === 'scoring_failed'
+                      ? '相关性评估失败，本轮文献未打分'
+                      : `发现完成，新增 ${e.payload.found} 条`
           );
         }
       );
@@ -184,6 +189,20 @@ function ResearchTopicPage() {
         onDiscover={() => discoverSources(topicId)}
         hint={discoverHint}
       />
+
+      {scoringError && (
+        <div className="flex items-start gap-2 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+          <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+          <span className="flex-1">相关性评估失败，本轮文献未打分：{scoringError}</span>
+          <button
+            onClick={() => setScoringError(null)}
+            className="shrink-0 rounded p-0.5 hover:bg-amber-500/20"
+            title="关闭"
+          >
+            <X size={12} />
+          </button>
+        </div>
+      )}
 
       <SourceTable sources={sources} importingId={importingId} onImport={handleImport} onMarkRead={handleMarkRead} />
 

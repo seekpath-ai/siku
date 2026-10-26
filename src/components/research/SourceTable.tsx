@@ -48,6 +48,12 @@ function SourceRow({ src, importingId, onImport, onMarkRead }: { src: ResearchSo
   const importing = importingId === src.id;
   const canImport = (src.status === 'discovered' || src.status === 'downloaded') && !!onImport;
   const canMarkRead = src.status === 'imported' && !!onMarkRead;
+  // url 兜底：老数据/同步残留里 url 可能为空（S2 曾把空字符串当有效值写入），
+  // 按 doi 或渠道主页合成可打开的链接。
+  const linkUrl = src.url
+    || (src.doi ? `https://doi.org/${src.doi}` : null)
+    || (src.source_type === 'arxiv' && src.source_id ? `https://arxiv.org/abs/${src.source_id}` : null)
+    || (src.source_type === 'scholar' && src.source_id ? `https://www.semanticscholar.org/paper/${src.source_id}` : null);
   return (
     <div className="flex items-center gap-3 p-3 bg-surface border border-surface-hover rounded-lg text-sm">
       <div className="flex-1 min-w-0">
@@ -93,8 +99,8 @@ function SourceRow({ src, importingId, onImport, onMarkRead }: { src: ResearchSo
             <CheckCheck size={14} />
           </button>
         )}
-        {src.url && (
-          <a href={src.url} target="_blank" rel="noreferrer" className="p-1.5 rounded hover:bg-surface-hover">
+        {linkUrl && (
+          <a href={linkUrl} target="_blank" rel="noreferrer" className="p-1.5 rounded hover:bg-surface-hover">
             <ExternalLink size={14} className="text-text-secondary" />
           </a>
         )}

@@ -111,19 +111,22 @@ pub async fn search(
                 Some(ids) => (ids.doi, ids.arxiv),
                 None => (None, None),
             };
+            // S2 对部分记录返回空字符串而不是缺字段：空串必须当缺失处理，
+            // 否则空 url 写入 research_sources 后前端没有可渲染的链接。
             let landing = p
                 .url
+                .filter(|u| !u.trim().is_empty())
                 .unwrap_or_else(|| format!("https://www.semanticscholar.org/paper/{}", p.paper_id));
             S2Paper {
                 s2_id: p.paper_id,
-                title: p.title.unwrap_or_else(|| "未命名文献".into()),
+                title: p.title.filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "未命名文献".into()),
                 authors: p.authors.into_iter().filter_map(|a| a.name).collect(),
                 abstract_text: p.abstract_text,
                 year: p.year,
                 citation_count: p.citation_count,
-                doi,
+                doi: doi.filter(|d| !d.trim().is_empty()),
                 arxiv_id,
-                pdf_url: p.open_access_pdf.and_then(|o| o.url),
+                pdf_url: p.open_access_pdf.and_then(|o| o.url).filter(|u| !u.trim().is_empty()),
                 url: landing,
             }
         })

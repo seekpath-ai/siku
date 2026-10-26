@@ -191,6 +191,13 @@ User → UI (React) → Tauri IPC → Commands → Services → SQLite / File St
 
 **流式通信**：后端 `Window::emit("agent:event", payload)` → 前端 `listen("agent:event", ...)`，事件类型包括 `thinking`、`tool_call`、`tool_approval_required`、`tool_result`、`delta`、`done`、`cancelled`、`ask_user`、`error`。
 
+**对话记忆机制**：每会话对话逐字持久化在独立的 JSONL 文件（追加写入），加载时按「最大记忆轮数」取尾部窗口（默认 10 轮，0 = 全量）。窗外的旧对话不是简单丢弃，而是走"清单 + 回查"两层：
+
+- **截断清单**：有旧对话未加载时，直接从存储记录拼出一份清单注入系统提示词——轮数、时间范围、每条 user 消息首行（截 60 字符，最多列最近 30 条）。全程零 LLM 调用，内容全部源自存储记录，不存在摘要幻觉
+- **回查工具**：清单末尾告知模型可用 `memory_recall` 工具按需捞回原文——对 `chat_messages` 做关键词 AND + 时间范围查询，逐字返回（单条限 1200 字符、总计 8000），`include_steps` 可同时带出当时的工具调用详情。上下文预算截断时同样注入回查提示
+
+这套设计与「长期记忆」互补：`memory_recall` 查的是逐字历史，`memory_read`/`memory_write` 维护的是 Agent 自己整理的长期记忆文档。
+
 ## 配置
 
 ### LLM Provider

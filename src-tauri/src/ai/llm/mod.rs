@@ -51,6 +51,11 @@ pub struct LlmConfig {
     /// `None` = auto (see `passes_reasoning_back`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_passthrough: Option<bool>,
+    /// 合并进请求体顶层的 provider 扩展参数（JSON 对象），如 `reasoning_effort`、
+    /// `thinking`。仅 OpenAI 兼容客户端（openai.rs）消费；messages/stream 等核心
+    /// 字段以代码构造为准，不允许被覆盖。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_body: Option<serde_json::Value>,
 }
 
 impl LlmConfig {
@@ -98,10 +103,15 @@ impl Default for LlmConfig {
             // 127.0.0.1:7890 default) silently broke requests whenever that
             // proxy was not running. Proxy must come from explicit config.
             proxy: None,
-            max_tokens: 4096,
+            // 思考模型的推理 token 与正文共享该额度：4096 对思考模型过低
+            // （推理即可耗尽全部额度导致正文为空）。默认取 32768——上限而非
+            // 目标，给足不浪费；不取更高是因为部分 provider 校验它不超过
+            // 模型输出硬上限（Claude Sonnet 4 为 64000、Kimi 部分模型 32768）。
+            max_tokens: 32768,
             temperature: 0.7,
             is_vision: false,
             reasoning_passthrough: None,
+            extra_body: None,
         }
     }
 }
@@ -269,6 +279,11 @@ pub struct LlmResponse {
     pub tokens_in: u32,
     pub tokens_out: u32,
     pub model: String,
+    /// 统一的结束原因语义（对齐 OpenAI 的字符串）：`"length"` 表示输出被
+    /// max_tokens 截断（思考模型的推理 token 也占用该额度），`"stop"` 等表示
+    /// 正常终态。Anthropic 的 stop_reason=max_tokens 在此映射为 "length"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 /// Streaming event emitted during LLM response

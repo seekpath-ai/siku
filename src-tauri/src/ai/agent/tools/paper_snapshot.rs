@@ -690,6 +690,14 @@ impl PaperSnapshotTool {
             )
             .await
             .map_err(|e| format!("vision location request failed: {e}"))?;
+        // 空 content 直接报错：思考模型的推理可能耗尽 max_tokens（finish_reason=
+        // "length"），此时没有任何 JSON 可解析，不能把空串送进解析器拿误导性错误。
+        if response.content.trim().is_empty() {
+            return Err(format!(
+                "vision location returned no content (finish_reason={})：可能是思考模型的推理耗尽了输出额度，请调高该视觉模型的 max_tokens 后重试",
+                response.finish_reason.as_deref().unwrap_or("未知"),
+            ));
+        }
         let (location, confidence) = parse_vision_location(&response.content)?;
         let rect = normalized_vision_rect(&location, page_w, page_h, caption_bbox)?;
         Ok((rect, confidence))
@@ -744,6 +752,13 @@ impl PaperSnapshotTool {
             )
             .await
         {
+            // 空 content 视为失败：思考模型的推理会耗尽 max_tokens（finish_reason=
+            // "length"），正文为空；绝不能把空串（或旧实现回退出的思考文本）当图片
+            // 解读交给 agent。本函数以错误文案字符串返回（与下方调用失败分支一致）。
+            Ok(resp) if resp.content.trim().is_empty() => format!(
+                "\n\n[图像理解] 视觉模型未返回内容（finish_reason={}）：可能是思考模型的推理耗尽了输出额度，请调高该视觉模型的 max_tokens 后重试（图片本身已保存，仍可展示）",
+                resp.finish_reason.as_deref().unwrap_or("未知"),
+            ),
             Ok(resp) => format!("\n\n[视觉模型解读]\n{}", resp.content),
             Err(e) => format!("\n\n[图像理解] 视觉模型调用失败: {e}（图片本身已保存，仍可展示）"),
         }

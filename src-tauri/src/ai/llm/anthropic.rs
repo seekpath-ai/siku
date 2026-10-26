@@ -210,6 +210,17 @@ impl LlmClient for AnthropicClient {
         let tokens_in = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
         let tokens_out = usage["output_tokens"].as_u64().unwrap_or(0) as u32;
 
+        // 统一 finish 语义（对齐 OpenAI 的字符串）：max_tokens 截断 → "length"，
+        // 其余正常终态（end_turn/stop_sequence/tool_use）→ "stop"。思考模型的
+        // 推理 token 与正文共享 max_tokens，耗尽时正文为空且 stop_reason=max_tokens。
+        let finish_reason = json["stop_reason"].as_str().map(|sr| {
+            if sr == "max_tokens" {
+                "length".to_string()
+            } else {
+                "stop".to_string()
+            }
+        });
+
         info!(
             provider = "anthropic",
             model = %self.config.model,
@@ -224,6 +235,7 @@ impl LlmClient for AnthropicClient {
             tokens_in,
             tokens_out,
             model: self.config.model.clone(),
+            finish_reason,
         })
     }
 
@@ -283,12 +295,21 @@ impl LlmClient for AnthropicClient {
         }
         let tokens_in = json["usage"]["input_tokens"].as_u64().unwrap_or(0) as u32;
         let tokens_out = json["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32;
+        // 与非流式 chat 一致：max_tokens → "length"，其余正常终态 → "stop"
+        let finish_reason = json["stop_reason"].as_str().map(|sr| {
+            if sr == "max_tokens" {
+                "length".to_string()
+            } else {
+                "stop".to_string()
+            }
+        });
         Ok(LlmResponse {
             content,
             tool_calls: None,
             tokens_in,
             tokens_out,
             model: self.config.model.clone(),
+            finish_reason,
         })
     }
 
@@ -429,6 +450,20 @@ impl LlmClient for AnthropicClient {
                                         content: None,
                                         tool_call: None,
                                         usage: Some(super::LlmUsage { tokens_in, tokens_in_hit, tokens_out }),
+                                    });
+                                }
+                                // 结束原因：映射成与 OpenAI 一致的 finish 语义——
+                                // max_tokens → "length"（输出额度被截断，思考模型
+                                // 的推理也占用该额度），其余正常终态 → "stop"。
+                                // 下游 agent 引擎靠 "length" 区分「模型选择沉默」
+                                // 和「额度耗尽未产出正文」。
+                                if let Some(sr) = json["delta"]["stop_reason"].as_str() {
+                                    let finish = if sr == "max_tokens" { "length" } else { "stop" };
+                                    let _ = sender.send(StreamEvent {
+                                        event_type: "finish".to_string(),
+                                        content: Some(finish.to_string()),
+                                        tool_call: None,
+                                        usage: None,
                                     });
                                 }
                             }

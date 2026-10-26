@@ -213,7 +213,10 @@ export function useStreamingChat() {
             id: messageId,
             session_id: e.session_id,
             role: 'assistant',
-            content: finalContent,
+            // 与「⏹ 已停止生成」同理：被 max_tokens 截断的回答追加可见标记。
+            content: e.truncated
+              ? `${finalContent}\n\n> ⚠️ 输出达到长度上限，内容可能被截断`
+              : finalContent,
             reasoning_content: null,
             tool_calls: null,
             citations: null,

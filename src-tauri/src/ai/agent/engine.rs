@@ -83,6 +83,10 @@ pub enum AgentEvent {
         tokens_in_hit: Option<i32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tokens_out: Option<i32>,
+        /// 最终回答被输出额度（max_tokens）截断：续写次数用尽后 finish 仍为
+        /// "length"，或思考耗尽额度未产出正文。前端据此追加可见截断标记。
+        #[serde(default)]
+        truncated: bool,
     },
     Cancelled {
         session_id: String,
@@ -365,7 +369,7 @@ impl AgentEngine {
         // RFC3339 timestamps parallel to `history` (memory records carry
         // them; ChatMessage does not). Used only for the context snapshot.
         history_times: &[String],
-    ) -> Result<(String, Vec<AgentStep>, bool, crate::ai::llm::LlmUsage, Option<String>), String> {
+    ) -> Result<(String, Vec<AgentStep>, bool, crate::ai::llm::LlmUsage, Option<String>, bool), String> {
         let span = info_span!("agent_turn", session_id = %self.session_id);
         let _guard = span.enter();
         let sid = self.session_id.clone();
@@ -487,6 +491,9 @@ impl AgentEngine {
         // the completion budget was exhausted (thinking models count reasoning
         // tokens toward max_tokens) before any content was produced.
         let mut truncated_empty = false;
+        // 最终回答被输出额度截断（续写用尽后 finish 仍为 "length"，或思考耗尽
+        // 额度且重试被拒/失败）。随 Done 事件发给前端追加截断标记。
+        let mut truncated = false;
         // Set when the LLM call itself fails mid-turn (e.g. a context-size
         // 400 after several tool rounds). The turn then ends gracefully —
         // accumulated steps/text/usage are returned so the caller can
@@ -992,6 +999,11 @@ impl AgentEngine {
             // No tool calls => this is the final answer.
             if tool_calls.is_empty() {
                 final_content = stream_text;
+                // 走到这里说明没有（或无法再）续写：finish 仍为 "length" 时最终
+                // 回答是被额度截断的半截内容，标记给前端提示用户。
+                if round_finish.as_deref() == Some("length") {
+                    truncated = true;
+                }
                 // Persist the final round's reasoning even when no tools were called,
                 // so it survives session switches.
                 let final_step = AgentStep {
@@ -1536,6 +1548,8 @@ impl AgentEngine {
         } else if !final_content.trim().is_empty() {
             final_content
         } else if truncated_empty {
+            // 思考耗尽额度且用户未（或无法）调大重试：最终兜底，同样标记截断。
+            truncated = true;
             format!("输出被截断：模型的思考过程占满了单轮输出额度（max_tokens={output_cap}），没有生成正文。请调大该智能体的 max_tokens（会话设置）或模型的 max_tokens（设置 → 模型）后重试。")
         } else {
             final_content
@@ -1548,7 +1562,7 @@ impl AgentEngine {
             info!(content_len = reply.len(), "agent turn complete");
         }
 
-        Ok((reply, steps, cancelled, usage, turn_error))
+        Ok((reply, steps, cancelled, usage, turn_error, truncated))
     }
 }
 

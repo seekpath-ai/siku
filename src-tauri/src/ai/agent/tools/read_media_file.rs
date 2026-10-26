@@ -109,6 +109,15 @@ impl Tool for ReadMediaFileTool {
             .await
             .map_err(|e| format!("vision request failed: {e}"))?;
 
+        // 空 content 报错而不是把空描述交给 agent：思考模型（若被误配为视觉模型）
+        // 的推理会耗尽 max_tokens，正文为空（finish_reason="length"）。
+        if resp.content.trim().is_empty() {
+            return Err(format!(
+                "vision model returned no description (finish_reason={})：可能是思考模型的推理耗尽了输出额度，请调高该视觉模型的 max_tokens 后重试",
+                resp.finish_reason.as_deref().unwrap_or("未知"),
+            ));
+        }
+
         Ok(format!("[Image: {path}]\n{}", resp.content))
     }
 }

@@ -23,7 +23,7 @@ function emptyForm(): Partial<LlmProvider> & { provider: string } {
     api_key: '',
     base_url: block.base_url,
     proxy: '',
-    max_tokens: 4096,
+    max_tokens: 32768,
     temperature: 0.7,
     extra_body: '',
     is_vision: false,
@@ -69,7 +69,7 @@ export function LlmProviderSettings() {
       api_key: p.api_key,
       base_url: p.base_url,
       proxy: p.proxy ?? '',
-      max_tokens: p.max_tokens ?? 4096,
+      max_tokens: p.max_tokens ?? 32768,
       temperature: p.temperature ?? 0.7,
       extra_body: p.extra_body ?? '',
       is_vision: p.is_vision ?? false,
@@ -105,7 +105,7 @@ export function LlmProviderSettings() {
         api_key: form.api_key?.trim() ?? '',
         base_url: form.base_url?.trim() || findPreset(form.provider)?.baseURL || '',
         proxy: form.proxy?.trim() || null,
-        max_tokens: form.max_tokens ?? 4096,
+        max_tokens: form.max_tokens ?? 32768,
         temperature: form.temperature ?? 0.7,
         extra_body: form.extra_body?.trim() || null,
         is_default: editingId ? undefined : providers.length === 0,
@@ -308,7 +308,7 @@ export function LlmProviderSettings() {
             <label className="text-xs text-text-secondary">Max Tokens</label>
             <input
               type="number"
-              value={form.max_tokens ?? 4096}
+              value={form.max_tokens ?? 32768}
               onChange={(e) => setForm((prev) => ({ ...prev, max_tokens: parseInt(e.target.value) || 0 }))}
               className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
             />

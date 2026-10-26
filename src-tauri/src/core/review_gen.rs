@@ -1851,6 +1851,7 @@ mod tests {
                 tokens_in: 1,
                 tokens_out: 1,
                 model: "scripted".into(),
+                finish_reason: Some("stop".into()),
             }
         }
     }

@@ -83,10 +83,16 @@ impl LlmConfigBlock {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             proxy: self.proxy.clone(),
-            max_tokens: self.max_tokens.unwrap_or(4096) as u32,
+            // 思考模型的推理 token 与正文共享该额度：4096 对思考模型过低
+            // （推理即可耗尽全部额度导致正文为空）。默认取 32768——max_tokens
+            // 是上限而非目标，给足不浪费；不取更高是因为部分 provider 会校验
+            // 它不超过模型输出硬上限（Claude Sonnet 4 为 64000、Kimi 部分
+            // 模型 32768），超限直接 400。
+            max_tokens: self.max_tokens.unwrap_or(32768) as u32,
             temperature: self.temperature.unwrap_or(0.7),
             is_vision: self.is_vision.unwrap_or(false),
             reasoning_passthrough: self.reasoning_passthrough,
+            extra_body: self.extra_body.clone(),
         }
     }
 }

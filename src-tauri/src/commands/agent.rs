@@ -242,9 +242,9 @@ pub async fn agent_memory_review(
         return Err("API key not configured. Please set it in Settings.".to_string());
     }
     // The revised document must fit in one completion: a user-tuned low output
-    // cap would silently truncate it into a broken document. 4096 tokens is
-    // comfortably above the recommended 2000-char memory size.
-    llm_config.max_tokens = llm_config.max_tokens.max(4096);
+    // cap would silently truncate it into a broken document. 思考模型的推理与
+    // 正文共享该额度，下限随全局默认取 32768。
+    llm_config.max_tokens = llm_config.max_tokens.max(32768);
     let client = crate::ai::llm::client::create_llm_client(&llm_config)
         .map_err(|e| format!("failed to create LLM client: {e}"))?;
 
@@ -1413,7 +1413,7 @@ pub(crate) async fn run_agent_turn(
 
         let mem = MemoryStore::new(spawn_memory_path);
         match result {
-            Ok((final_content, steps, cancelled, total_tokens, turn_error)) => {
+            Ok((final_content, steps, cancelled, total_tokens, turn_error, truncated)) => {
                 // The turn's chain of thought, replayed on later turns so the
                 // model continues its earlier reasoning instead of starting
                 // over (and so DeepSeek's thinking models do not 400 on a
@@ -1446,6 +1446,11 @@ pub(crate) async fn run_agent_turn(
                     } else {
                         format!("{final_content}\n\n> ⏹ 已停止生成")
                     }
+                } else if truncated {
+                    // 与停止标记同理：截断标记也持久化，否则 done 后的历史重载
+                    // 会把前端临时追加的标记抹掉。终端事件保持未标记原文，由前端
+                    // done 处理器自行追加。
+                    format!("{display_content}\n\n> ⚠️ 输出达到长度上限，内容可能被截断")
                 } else {
                     display_content.clone()
                 };
@@ -1521,6 +1526,7 @@ pub(crate) async fn run_agent_turn(
                         tokens_in,
                         tokens_in_hit,
                         tokens_out,
+                        truncated,
                     }
                 };
                 let _ = done_tx.send(terminal);
@@ -2119,6 +2125,7 @@ pub async fn settings_validate_llm(
         temperature: 0.0,
         is_vision: false,
         reasoning_passthrough: None,
+        extra_body: None,
     };
 
     settings_service::validate_llm_config(&config).await

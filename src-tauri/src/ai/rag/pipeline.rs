@@ -34,5 +34,14 @@ pub async fn rag_query(
     let resp = client.chat_completion(&messages, &[]).await
         .map_err(|e| format!("generation: {e}"))?;
 
+    // 空回答直接报错：思考模型可能把 max_tokens 全部用于推理（finish_reason="length"），
+    // 此时 content 为空，不能把空串当答案交给上层。
+    if resp.content.trim().is_empty() {
+        return Err(format!(
+            "模型未返回答案（finish_reason={}）：可能是思考模型的推理耗尽了输出额度，请调高该模型的 max_tokens 后重试",
+            resp.finish_reason.as_deref().unwrap_or("未知"),
+        ));
+    }
+
     Ok(resp.content)
 }

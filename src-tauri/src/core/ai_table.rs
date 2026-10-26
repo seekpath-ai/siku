@@ -832,6 +832,7 @@ async fn model_call(
     let title2 = title.to_string();
     let drain = tokio::spawn(async move {
         let mut text = String::new();
+        let mut finish: Option<String> = None;
         while let Some(ev) = rx.recv().await {
             match ev.event_type.as_str() {
                 "delta" => {
@@ -844,19 +845,32 @@ async fn model_call(
                         emit_reasoning(&app2, &title2, &c);
                     }
                 }
+                "finish" => {
+                    if let Some(c) = ev.content {
+                        finish = Some(c);
+                    }
+                }
                 _ => {}
             }
         }
-        text
+        (text, finish)
     });
     let call = tokio::select! {
         r = llm.chat_completion_stream(&messages, &[], tx) => r,
         _ = cancelled_now() => Err("已取消".to_string()),
     };
-    let text = drain.await.map_err(|e| format!("stream drain: {e}"))?;
+    let (text, finish) = drain.await.map_err(|e| format!("stream drain: {e}"))?;
     call?;
 
-    let values = parse_values(&text)?;
+    // finish=="length" 时 JSON 很可能被 max_tokens 截成半截（思考模型的推理也
+    // 占用该额度），解析失败的文案要指出这一点，否则用户只会看到「未返回 JSON」。
+    let values = parse_values(&text).map_err(|e| {
+        if finish.as_deref() == Some("length") {
+            format!("{e}：输出可能被 max_tokens 截断，请在设置中调高该功能的输出额度")
+        } else {
+            e
+        }
+    })?;
     let mut out = std::collections::HashMap::new();
     for col in columns {
         if let Some(entry) = lookup_entry(&values, &col.key) {
@@ -900,6 +914,7 @@ async fn verify_call(
     let title2 = title.to_string();
     let drain = tokio::spawn(async move {
         let mut text = String::new();
+        let mut finish: Option<String> = None;
         while let Some(ev) = rx.recv().await {
             match ev.event_type.as_str() {
                 "delta" => {
@@ -912,16 +927,21 @@ async fn verify_call(
                         emit_reasoning(&app2, &title2, &c);
                     }
                 }
+                "finish" => {
+                    if let Some(c) = ev.content {
+                        finish = Some(c);
+                    }
+                }
                 _ => {}
             }
         }
-        text
+        (text, finish)
     });
     let call = tokio::select! {
         r = llm.chat_completion_stream(&messages, &[], tx) => r,
         _ = cancelled_now() => Err("已取消".to_string()),
     };
-    let text = drain.await.map_err(|e| format!("stream drain: {e}"))?;
+    let (text, finish) = drain.await.map_err(|e| format!("stream drain: {e}"))?;
     call?;
 
     let mut out: Vec<(usize, (String, String))> = Vec::new();
@@ -934,6 +954,14 @@ async fn verify_call(
             }
             out.push((pos, (verdict, note)));
         }
+    }
+    // 复核结果被截断（finish=="length"，半截 JSON 解析不出任何条目）时只记
+    // 日志：复核失败按「未复核」处理，不能因此丢掉已有的抽取结果。
+    if out.is_empty() && finish.as_deref() == Some("length") && !items.is_empty() {
+        tracing::warn!(
+            title,
+            "复核输出疑似被 max_tokens 截断（finish_reason=length），未解析出复核条目；可在设置中调高该功能的输出额度"
+        );
     }
     Ok(out)
 }

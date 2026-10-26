@@ -71,8 +71,9 @@ pub fn builtin_domains() -> Vec<DomainAgent> {
             prompt_setting: "pet.note_organizer.prompt",
             enabled_setting: "pet.note_organizer.enabled",
             default_prompt: NOTE_ORGANIZER_PROMPT,
-            // Rewrites whole notes — needs room for long outputs.
-            default_max_tokens: Some(8192),
+            // Rewrites whole notes — needs room for long outputs. 与全局默认
+            // 一致取 32768：思考模型的推理与正文共享该额度。
+            default_max_tokens: Some(32768),
         },
         DomainAgent {
             id: "literature_analyzer",
@@ -81,8 +82,8 @@ pub fn builtin_domains() -> Vec<DomainAgent> {
             enabled_setting: "pet.literature_analyzer.enabled",
             default_prompt: LITERATURE_ANALYZER_PROMPT,
             // Long summary + evidence JSON + thinking share one round's
-            // budget; the model-level 4096 default truncates this badly.
-            default_max_tokens: Some(16384),
+            // budget; 与全局默认一致取 32768。
+            default_max_tokens: Some(32768),
         },
         DomainAgent {
             id: "research_tracker",
@@ -90,7 +91,7 @@ pub fn builtin_domains() -> Vec<DomainAgent> {
             prompt_setting: "pet.research_tracker.prompt",
             enabled_setting: "pet.research_tracker.enabled",
             default_prompt: RESEARCH_TRACKER_PROMPT,
-            default_max_tokens: Some(8192),
+            default_max_tokens: Some(32768),
         },
         DomainAgent {
             id: "knowledge_curator",
@@ -114,7 +115,7 @@ pub fn builtin_domains() -> Vec<DomainAgent> {
             prompt_setting: "pet.skill_reviewer.prompt",
             enabled_setting: "pet.skill_reviewer.enabled",
             default_prompt: SKILL_REVIEWER_PROMPT,
-            default_max_tokens: Some(8192),
+            default_max_tokens: Some(32768),
         },
     ]
 }

@@ -106,6 +106,13 @@ impl LlmClient for OllamaClient {
 
         let content = msg["content"].as_str().unwrap_or("").to_string();
 
+        // OpenAI 兼容形状直接给出 finish_reason；空正文 + "length" 即思考模型
+        // 耗尽输出额度的典型信号。
+        let finish_reason = choice["finish_reason"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
         let tool_calls: Option<Vec<ToolCall>> = msg
             .get("tool_calls")
             .and_then(|tc| serde_json::from_value(tc.clone()).ok());
@@ -119,6 +126,7 @@ impl LlmClient for OllamaClient {
             model = %self.config.model,
             tokens_in,
             tokens_out,
+            finish_reason = ?finish_reason,
             "Ollama completion finished"
         );
 
@@ -128,6 +136,7 @@ impl LlmClient for OllamaClient {
             tokens_in,
             tokens_out,
             model: self.config.model.clone(),
+            finish_reason,
         })
     }
 
@@ -178,6 +187,10 @@ impl LlmClient for OllamaClient {
             serde_json::from_str(&body_text).map_err(|e| format!("parse response: {e}"))?;
         let choice = &json["choices"][0];
         let content = choice["message"]["content"].as_str().unwrap_or("").to_string();
+        let finish_reason = choice["finish_reason"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         let tokens_in = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
         let tokens_out = json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
         Ok(LlmResponse {
@@ -186,6 +199,7 @@ impl LlmClient for OllamaClient {
             tokens_in,
             tokens_out,
             model: self.config.model.clone(),
+            finish_reason,
         })
     }
 
@@ -203,6 +217,8 @@ impl LlmClient for OllamaClient {
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
             "stream": true,
+            // 让最后一个 chunk 携带 usage（OpenAI 兼容形状，Ollama ≥ v0.5 支持）
+            "stream_options": { "include_usage": true },
         });
 
         let resp = self
@@ -242,6 +258,19 @@ impl LlmClient for OllamaClient {
                             if let Some(choice) = choices.first() {
                                 let delta = &choice["delta"];
 
+                                // 思考模型的推理增量（DeepSeek-R1 / qwq 等经
+                                // OpenAI 兼容接口输出 reasoning_content）
+                                if let Some(reasoning) = delta["reasoning_content"].as_str() {
+                                    if !reasoning.is_empty() {
+                                        let _ = sender.send(StreamEvent {
+                                            event_type: "reasoning".to_string(),
+                                            content: Some(reasoning.to_string()),
+                                            tool_call: None,
+                                            usage: None,
+                                        });
+                                    }
+                                }
+
                                 if let Some(content) = delta["content"].as_str() {
                                     let _ = sender.send(StreamEvent {
                                         event_type: "delta".to_string(),
@@ -272,13 +301,33 @@ impl LlmClient for OllamaClient {
                                         });
                                     }
                                 }
+
+                                // finish_reason：下游引擎靠 "length" 区分额度截断
+                                if let Some(fr) = choice["finish_reason"].as_str() {
+                                    if !fr.is_empty() {
+                                        let _ = sender.send(StreamEvent {
+                                            event_type: "finish".to_string(),
+                                            content: Some(fr.to_string()),
+                                            tool_call: None,
+                                            usage: None,
+                                        });
+                                    }
+                                }
                             }
                         }
 
-                        // Ollama's final streaming chunk carries usage stats.
-                        if json["done"].as_bool().unwrap_or(false) {
-                            let tokens_in = json["prompt_eval_count"].as_u64().unwrap_or(0) as u32;
-                            let tokens_out = json["eval_count"].as_u64().unwrap_or(0) as u32;
+                        // OpenAI 兼容形状的 usage：请求里开了 stream_options.
+                        // include_usage 后由最后一个 chunk 携带；旧版本 Ollama
+                        // 不发该字段时放弃（不硬编默认值）。
+                        if let Some(usage) = json["usage"].as_object() {
+                            let tokens_in = usage
+                                .get("prompt_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u32;
+                            let tokens_out = usage
+                                .get("completion_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u32;
                             if tokens_in > 0 || tokens_out > 0 {
                                 let _ = sender.send(StreamEvent {
                                     event_type: "usage".to_string(),

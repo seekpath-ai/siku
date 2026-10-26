@@ -377,6 +377,9 @@ export interface AgentStreamEvent {
   tokens_in?: number | null;
   tokens_in_hit?: number | null;
   tokens_out?: number | null;
+  /** Only sent with `done`: the final answer hit the max_tokens cap
+   *  (continuations exhausted or reasoning ate the whole budget). */
+  truncated?: boolean;
 }
 
 // ============================================================

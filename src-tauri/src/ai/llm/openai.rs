@@ -74,6 +74,26 @@ fn parse_stream_usage(usage: &serde_json::Map<String, serde_json::Value>) -> (u3
     (tokens_in, tokens_in_hit, tokens_out)
 }
 
+/// 把 `LlmConfig.extra_body`（JSON 对象）的键值合并进请求体顶层——用户可用它
+/// 传 `reasoning_effort`、`thinking` 等 provider 扩展参数。允许覆盖默认字段
+/// （如 temperature），但 messages/stream/stream_options/tools 是代码构造的
+/// 核心字段，冲突时以代码构造的为准（对应键被跳过）。
+fn apply_extra_body(body: &mut serde_json::Value, extra: &Option<serde_json::Value>) {
+    const PROTECTED: [&str; 4] = ["messages", "stream", "stream_options", "tools"];
+    let Some(extra_obj) = extra.as_ref().and_then(|v| v.as_object()) else {
+        return;
+    };
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    for (k, v) in extra_obj {
+        if PROTECTED.contains(&k.as_str()) {
+            continue;
+        }
+        obj.insert(k.clone(), v.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{message_to_openai_json, parse_stream_usage};
@@ -194,7 +214,7 @@ impl LlmClient for OpenAiClient {
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse, String> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.config.model,
             "messages": messages.iter()
                 .map(|m| message_to_openai_json(m, self.config.passes_reasoning_back()))
@@ -203,6 +223,7 @@ impl LlmClient for OpenAiClient {
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
         });
+        apply_extra_body(&mut body, &self.config.extra_body);
 
         let resp = self
             .http
@@ -228,11 +249,14 @@ impl LlmClient for OpenAiClient {
         let msg = &choice["message"];
         let usage = &json["usage"];
 
-        // Some models (e.g. DeepSeek reasoning) put output in reasoning_content
-        let mut content = msg["content"].as_str().unwrap_or("").to_string();
-        if content.is_empty() {
-            content = msg["reasoning_content"].as_str().unwrap_or("").to_string();
-        }
+        // content 为空就返回空：思考模型的 reasoning_content 不是正文，回退到它
+        // 会让翻译/问答等调用方把思考过程当结果用。空正文 + finish_reason="length"
+        // 即推理耗尽输出额度的典型信号，由调用方据此报错。
+        let content = msg["content"].as_str().unwrap_or("").to_string();
+        let finish_reason = choice["finish_reason"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         // Log raw message keys for debugging
         if let Some(obj) = msg.as_object() {
             let keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
@@ -275,6 +299,7 @@ impl LlmClient for OpenAiClient {
             tokens_in,
             tokens_out,
             model: self.config.model.clone(),
+            finish_reason,
         })
     }
 
@@ -300,12 +325,13 @@ impl LlmClient for OpenAiClient {
         }
         messages.push(serde_json::json!({"role": "user", "content": content}));
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.config.model,
             "messages": messages,
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
         });
+        apply_extra_body(&mut body, &self.config.extra_body);
 
         let resp = self
             .http
@@ -326,10 +352,13 @@ impl LlmClient for OpenAiClient {
             serde_json::from_str(&body_text).map_err(|e| format!("parse response: {e}"))?;
         let choice = &json["choices"][0];
         let msg = &choice["message"];
-        let mut content = msg["content"].as_str().unwrap_or("").to_string();
-        if content.is_empty() {
-            content = msg["reasoning_content"].as_str().unwrap_or("").to_string();
-        }
+        // 同上：content 为空就返回空，不回退到 reasoning_content——否则调用方
+        // 会把思考过程当成图片描述。
+        let content = msg["content"].as_str().unwrap_or("").to_string();
+        let finish_reason = choice["finish_reason"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
         let tokens_in = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
         let tokens_out = json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
         Ok(LlmResponse {
@@ -338,6 +367,7 @@ impl LlmClient for OpenAiClient {
             tokens_in,
             tokens_out,
             model: self.config.model.clone(),
+            finish_reason,
         })
     }
 
@@ -348,7 +378,7 @@ impl LlmClient for OpenAiClient {
         tools: &[ToolDefinition],
         sender: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<(), String> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.config.model,
             "messages": messages.iter()
                 .map(|m| message_to_openai_json(m, self.config.passes_reasoning_back()))
@@ -359,6 +389,7 @@ impl LlmClient for OpenAiClient {
             "stream": true,
             "stream_options": { "include_usage": true },
         });
+        apply_extra_body(&mut body, &self.config.extra_body);
 
         let resp = self
             .http

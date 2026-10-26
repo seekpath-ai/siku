@@ -282,10 +282,12 @@ async fn ensure_seeded(db: &SqlitePool) -> Result<(), String> {
         .await?
         .unwrap_or_else(|| default_model(&provider));
     let proxy = settings_service::get_setting(db, "llm.proxy").await?;
+    // 与 LlmConfig::default / agent config 一致的默认额度：思考模型推理与
+    // 正文共享该额度，4096 过低；32768 是多数 provider 校验能容纳的上限。
     let max_tokens: i32 = settings_service::get_setting(db, &format!("{prefix}max_tokens"))
         .await?
         .and_then(|v| v.parse().ok())
-        .unwrap_or(4096);
+        .unwrap_or(32768);
     let temperature: f64 = settings_service::get_setting(db, &format!("{prefix}temperature"))
         .await?
         .and_then(|v| v.parse().ok())

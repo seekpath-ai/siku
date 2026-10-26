@@ -79,6 +79,15 @@ pub async fn translate_text(
         .await
         .map_err(|e| format!("translation failed: {e}"))?;
 
+    // 空译文不得写入缓存：思考模型的推理 token 与正文共享 max_tokens，耗尽时
+    // content 为空（finish_reason="length"）。半截/空结果入缓存会毒化后续命中。
+    if resp.content.trim().is_empty() {
+        return Err(format!(
+            "translation produced no content (finish_reason={})：可能是思考模型的推理耗尽了输出额度，请调高该模型的 max_tokens 后重试",
+            resp.finish_reason.as_deref().unwrap_or("未知"),
+        ));
+    }
+
     // Cache the result
     let _ = cache::store(db, text, target, &resp.content, &model).await;
 
@@ -144,7 +153,13 @@ pub async fn translate_text_stream(
     let rid = request_id.to_string();
     let accumulator = tokio::spawn(async move {
         let mut full = String::new();
+        let mut finish: Option<String> = None;
         while let Some(event) = rx.recv().await {
+            // finish 事件只记录不转发：结束原因在下方统一判定。
+            if event.event_type == "finish" {
+                finish = event.content;
+                continue;
+            }
             let kind = match event.event_type.as_str() {
                 "delta" => "delta",
                 "reasoning" => "reasoning",
@@ -164,7 +179,7 @@ pub async fn translate_text_stream(
                 );
             }
         }
-        full
+        (full, finish)
     });
 
     if let Err(e) = client.chat_completion_stream(&messages, &[], tx).await {
@@ -175,7 +190,20 @@ pub async fn translate_text_stream(
         return Err(format!("translation stream failed: {e}"));
     }
 
-    let full = accumulator.await.unwrap_or_default();
+    let (full, finish) = accumulator.await.unwrap_or_default();
+    // 输出被额度截断（finish_reason="length"）：半截译文不能缓存也不能当结果。
+    if finish.as_deref() == Some("length") {
+        let msg = "译文被输出额度截断：模型的 max_tokens 已用尽（思考模型的推理也占用该额度），请调高该模型的 max_tokens 后重试";
+        let _ = app_handle.emit(
+            "translation:event",
+            serde_json::json!({
+                "request_id": request_id,
+                "type": "error",
+                "content": msg,
+            }),
+        );
+        return Err(msg.to_string());
+    }
     if full.is_empty() {
         let _ = app_handle.emit(
             "translation:event",

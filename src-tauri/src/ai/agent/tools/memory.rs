@@ -188,14 +188,14 @@ impl Tool for MemoryRecallTool {
         "memory_recall"
     }
     fn description(&self) -> &str {
-        "Search this conversation's raw history (verbatim past messages, optionally with the tool calls made then). Use it when earlier turns are no longer in your context — e.g. the system prompt says older rounds were not loaded — or when you need details of a previous discussion or tool result. Different from memory_read, which reads the curated long-term memory document."
+        "Search this conversation's raw history (verbatim past messages, optionally with the tool calls made then). Use it when earlier turns are no longer in your context — e.g. the system prompt says older rounds were not loaded — or when you need details of a previous discussion or tool result. Matching is keyword-based, so when a query finds nothing, retry with synonyms / translations / abbreviations instead of giving up: pass query as an ARRAY of alternative phrasings (AND within each, OR across) to cover several directions in one call, e.g. [\"transformer\", \"attention 注意力\"]. Different from memory_read, which reads the curated long-term memory document."
     }
     fn parameters(&self) -> Vec<ToolParameter> {
         vec![
             ToolParameter {
                 name: "query".into(),
                 param_type: "string".into(),
-                description: "Keywords, space-separated (AND match, case-insensitive). Omit to browse by time range alone.".into(),
+                description: "Keywords, space-separated (AND match, case-insensitive). For synonym expansion pass an array of alternative phrasings instead — words AND within each element, elements OR. Omit to browse by time range alone.".into(),
                 required: false,
             },
             ToolParameter {
@@ -235,12 +235,22 @@ impl Tool for MemoryRecallTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
-        let keywords: Vec<String> = args["query"]
-            .as_str()
-            .unwrap_or("")
-            .split_whitespace()
-            .map(|k| k.to_lowercase())
-            .collect();
+        // query accepts a string ("a b" = a AND b) or an array of strings for
+        // synonym expansion in one call: words AND within each group, groups
+        // OR — e.g. ["transformer", "注意力机制", "attention"].
+        let groups: Vec<Vec<String>> = match &args["query"] {
+            serde_json::Value::String(s) => {
+                let g: Vec<String> = s.split_whitespace().map(|k| k.to_lowercase()).collect();
+                if g.is_empty() { Vec::new() } else { vec![g] }
+            }
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|g| g.split_whitespace().map(|k| k.to_lowercase()).collect::<Vec<_>>())
+                .filter(|g| !g.is_empty())
+                .collect(),
+            _ => Vec::new(),
+        };
         let role = args["role"]
             .as_str()
             .filter(|r| matches!(*r, "user" | "assistant"));
@@ -259,9 +269,13 @@ impl Tool for MemoryRecallTool {
         let limit = args["limit"].as_i64().unwrap_or(20).clamp(1, 50);
 
         // LIKE-escape %, _ and the escape char itself.
-        let escaped: Vec<String> = keywords
+        let escaped: Vec<Vec<String>> = groups
             .iter()
-            .map(|k| k.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+            .map(|g| {
+                g.iter()
+                    .map(|k| k.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+                    .collect()
+            })
             .collect();
 
         let mut sql = String::from(
@@ -276,8 +290,22 @@ impl Tool for MemoryRecallTool {
         if to.is_some() {
             sql.push_str(" AND created_at <= ?");
         }
-        for _ in &escaped {
-            sql.push_str(" AND LOWER(content) LIKE ? ESCAPE '\\'");
+        if !escaped.is_empty() {
+            sql.push_str(" AND (");
+            for (i, g) in escaped.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" OR ");
+                }
+                sql.push('(');
+                for (j, _) in g.iter().enumerate() {
+                    if j > 0 {
+                        sql.push_str(" AND ");
+                    }
+                    sql.push_str("LOWER(content) LIKE ? ESCAPE '\\'");
+                }
+                sql.push(')');
+            }
+            sql.push(')');
         }
         sql.push_str(" ORDER BY created_at DESC LIMIT ?");
 
@@ -292,8 +320,10 @@ impl Tool for MemoryRecallTool {
         if let Some(t) = to {
             q = q.bind(t);
         }
-        for k in &escaped {
-            q = q.bind(format!("%{k}%"));
+        for g in &escaped {
+            for k in g {
+                q = q.bind(format!("%{k}%"));
+            }
         }
         q = q.bind(limit);
 
@@ -306,7 +336,7 @@ impl Tool for MemoryRecallTool {
         rows.reverse();
 
         if rows.is_empty() {
-            return Ok("没有匹配的历史消息。可放宽关键词或时间范围后重试。".to_string());
+            return Ok("没有匹配的历史消息。换同义词/中英文/缩写（query 传数组，组间为 OR）或放宽时间范围后重试。".to_string());
         }
 
         let mut out = format!("匹配到 {} 条历史消息（按时间正序）：\n", rows.len());

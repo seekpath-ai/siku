@@ -61,10 +61,10 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
   const [approvalMode, setApprovalMode] = useState<ApprovalConfig['mode']>('auto');
   const [expireSec, setExpireSec] = useState(60);
   const [whitelist, setWhitelist] = useState('');
-  const [maxLoops, setMaxLoops] = useState(10);
+  const [maxLoops, setMaxLoops] = useState(100);
   /** Per-round output cap; '' = follow the model config. */
   const [maxTokens, setMaxTokens] = useState('');
-  const [contextBudget, setContextBudget] = useState(28000);
+  const [contextBudget, setContextBudget] = useState(0);
   const [maxMemoryRounds, setMaxMemoryRounds] = useState(10);
   const [memoryDir, setMemoryDir] = useState('');
   const [skillsDir, setSkillsDir] = useState('');

@@ -124,10 +124,6 @@ export function DomainAgentSettings() {
     <div className="max-w-[900px] space-y-8">
       <div>
         <h2 className="text-base font-semibold text-text-primary">领域智能体</h2>
-        <p className="text-xs text-text-secondary/70 mt-1.5 leading-relaxed">
-          AI 综述、AI 表格列、AI 文献分类、科研追踪背后的系统提示词。留空即使用内置默认（灰色占位文本）；
-          修改后立即生效，无需重启。值会随「设置」同步到你的其他设备。
-        </p>
         <p className="text-[11px] text-amber-400/80 mt-2 leading-relaxed flex items-start gap-1.5">
           <AlertTriangle size={12} className="mt-0.5 shrink-0" />
           标有「影响解析」的提示词里包含 JSON 输出约定；删改它会让该功能解析失败（多数功能会降级而不是丢数据，但会消耗额度）。改坏了用「恢复默认」。
@@ -173,12 +169,9 @@ export function DomainAgentSettings() {
                     {savingBudget === meta.id ? <Loader2 size={11} className="animate-spin" /> : '保存'}
                   </button>
                   <span className="text-[11px] text-text-secondary/50">
-                    当前生效 {meta.effective}，留空=自动
+                    当前生效 {meta.effective}
                   </span>
                 </label>
-                <p className="text-[11px] text-text-secondary/50 leading-relaxed">
-                  {meta.description}。只提高不降低——这里填小于自动值的数字不会生效（否则会把正文截断）；上限 32768。
-                </p>
               </div>
             );
           })()}

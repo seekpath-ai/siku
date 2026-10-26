@@ -94,7 +94,7 @@ export function SearchSettings() {
         ) : null}
       </div>
       <p className="text-xs text-text-secondary leading-relaxed">
-        智能体的 web_search 工具按下列顺序依次尝试已启用的引擎，首个返回结果的引擎生效（一次调用内自动回退，不会浪费对话轮次）。
+        智能体的 web_search 工具按下列顺序依次尝试已启用的引擎，首个返回结果的引擎生效。
         网页抓取类引擎走系统网络；需要密钥的引擎配置后才会被尝试。
       </p>
       {loading ? (

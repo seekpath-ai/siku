@@ -220,7 +220,7 @@ impl AgentConfig {
     /// but we cap it at a hard ceiling to prevent runaway executions.
     pub fn effective_max_loops(&self) -> usize {
         const HARD_LIMIT: i32 = 1000;
-        let v = self.max_loops.unwrap_or(10);
+        let v = self.max_loops.unwrap_or(100);
         if v == 0 {
             return HARD_LIMIT as usize;
         }
@@ -235,6 +235,6 @@ impl AgentConfig {
     /// Token budget for the conversation context. `0` means do not truncate.
     /// Never sent to the LLM API — the per-round output cap is `max_tokens`.
     pub fn effective_context_budget(&self) -> usize {
-        self.context_budget.unwrap_or(28000).max(0) as usize
+        self.context_budget.unwrap_or(0).max(0) as usize
     }
 }

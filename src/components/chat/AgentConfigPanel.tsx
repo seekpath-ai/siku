@@ -76,10 +76,10 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
   const [approvalMode, setApprovalMode] = useState<ApprovalConfig['mode']>(agent.approval_config?.mode || 'auto');
   const [expireSec, setExpireSec] = useState(agent.approval_config?.expire_sec ?? 60);
   const [whitelist, setWhitelist] = useState((agent.approval_config?.whitelist || []).join(', '));
-  const [maxLoops, setMaxLoops] = useState(agent.max_loops ?? 10);
+  const [maxLoops, setMaxLoops] = useState(agent.max_loops ?? 100);
   /** Per-round output cap; '' = follow the model config. */
   const [maxTokens, setMaxTokens] = useState(agent.max_tokens?.toString() ?? '');
-  const [contextBudget, setContextBudget] = useState(agent.context_budget ?? 28000);
+  const [contextBudget, setContextBudget] = useState(agent.context_budget ?? 0);
   const [maxMemoryRounds, setMaxMemoryRounds] = useState(agent.max_memory_rounds ?? 10);
   const [memoryDir, setMemoryDir] = useState(agent.memory_dir ?? '');
   const [skillsDir, setSkillsDir] = useState(agent.skills_dir ?? '');
@@ -137,9 +137,9 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
     setApprovalMode(agent.approval_config?.mode || 'auto');
     setExpireSec(agent.approval_config?.expire_sec ?? 60);
     setWhitelist((agent.approval_config?.whitelist || []).join(', '));
-    setMaxLoops(agent.max_loops ?? 10);
+    setMaxLoops(agent.max_loops ?? 100);
     setMaxTokens(agent.max_tokens?.toString() ?? '');
-    setContextBudget(agent.context_budget ?? 28000);
+    setContextBudget(agent.context_budget ?? 0);
     setMaxMemoryRounds(agent.max_memory_rounds ?? 10);
     setMemoryDir(agent.memory_dir ?? '');
     setSkillsDir(agent.skills_dir ?? '');

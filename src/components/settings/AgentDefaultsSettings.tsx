@@ -21,8 +21,8 @@ export function AgentDefaultsSettings() {
   const [providers, setProviders] = useState<LlmProvider[]>([]);
   const [defaultProviderId, setDefaultProviderId] = useState<string>('');
   const [approval, setApproval] = useState<ApprovalConfig>({ mode: 'auto' });
-  const [maxLoops, setMaxLoops] = useState(10);
-  const [contextBudget, setContextBudget] = useState(28000);
+  const [maxLoops, setMaxLoops] = useState(100);
+  const [contextBudget, setContextBudget] = useState(0);
   const [maxMemoryRounds, setMaxMemoryRounds] = useState(10);
   const [memoryDir, setMemoryDir] = useState('');
   const [skillsDir, setSkillsDir] = useState('');
@@ -117,7 +117,6 @@ export function AgentDefaultsSettings() {
             onChange={(e) => setMaxLoops(parseInt(e.target.value) || 0)}
             className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
           />
-          <p className="text-xs text-text-secondary/60">0 表示不限制（硬上限 1000）</p>
         </div>
         <div className="space-y-2">
           <label className="block text-sm text-text-secondary">上下文限制</label>
@@ -137,7 +136,6 @@ export function AgentDefaultsSettings() {
             onChange={(e) => setMaxMemoryRounds(parseInt(e.target.value) || 0)}
             className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
           />
-          <p className="text-xs text-text-secondary/60">0 表示加载全部</p>
         </div>
       </div>
 

@@ -51,8 +51,8 @@ const TOOL_FIELDS: LimitField[] = [
 
 const DEFAULT_VALUES: AppSettings = {
   default_approval: { mode: 'auto' },
-  default_max_loops: 10,
-  default_context_budget: 28000,
+  default_max_loops: 100,
+  default_context_budget: 0,
   default_max_memory_rounds: 10,
   log_max_size_mb: 10,
   log_max_files: 5,
@@ -206,7 +206,7 @@ export function AdvancedSettings() {
       </div>
 
       <p className="text-xs text-text-secondary">
-        修改以下截断/限制数值会立即在后台生效（日志文件大小需重启后生效）。数值为 0 表示禁用对应限制，但不建议设置为 0。
+        修改以下截断/限制数值会立即生效。数值为 0 表示禁用对应限制，但不建议设置为 0。
       </p>
 
       <section className="space-y-3">
@@ -223,9 +223,6 @@ export function AdvancedSettings() {
               {exportingDiag ? <Loader2 size={14} className="animate-spin" /> : <FileDown size={14} />}
               导出诊断包
             </button>
-            <span className="text-xs text-text-secondary/70">
-              打包日志与运行环境信息（不含账号密码、API Key），反馈问题时请附上。
-            </span>
           </div>
           {diagResult && (
             <p className="text-xs text-emerald-400">
@@ -259,8 +256,6 @@ export function AdvancedSettings() {
       <section className="space-y-3">
         <h3 className="text-sm font-medium text-text-primary">语义搜索（可选）</h3>
         <p className="text-xs text-text-secondary">
-          关键词检索始终可用，不需要任何配置。填入下面的服务地址后会额外启用语义召回——两者按名次融合，
-          不是二选一。地址留空即关闭语义搜索，关键词检索不受影响。
         </p>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -273,10 +268,6 @@ export function AdvancedSettings() {
               placeholder="http://127.0.0.1:8899/v1"
               className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
             />
-            <p className="text-xs text-text-secondary/70">
-              留空 = 不启用。需包含 <code>/v1</code>，OpenAI 兼容服务皆可：本项目脚本
-              <code>http://127.0.0.1:8899/v1</code>、Ollama <code>http://127.0.0.1:11434/v1</code>。
-            </p>
           </div>
           <div className="space-y-1.5">
             <label className="block text-sm text-text-secondary">模型名</label>
@@ -287,10 +278,6 @@ export function AdvancedSettings() {
               placeholder="BAAI/bge-small-zh-v1.5"
               className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
             />
-            <p className="text-xs text-text-secondary/70">
-              填服务端实际的模型名：本项目脚本为 <code>BAAI/bge-small-zh-v1.5</code>，云端为
-              <code>text-embedding-3-small</code> 等。改了名字，已有向量会按新模型重算。
-            </p>
           </div>
         </div>
 
@@ -305,7 +292,6 @@ export function AdvancedSettings() {
                 placeholder="如有"
                 className="w-full bg-surface border border-surface-hover rounded-lg px-3 py-2 text-sm text-text-primary focus:outline-none focus:border-primary"
               />
-              <p className="text-xs text-text-secondary/70">本地服务不需要；云端服务填自己的 Key。</p>
             </div>
 
             <div className="space-y-2 rounded-lg border border-surface-hover p-3">
@@ -319,7 +305,6 @@ export function AdvancedSettings() {
                   {testing ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
                   测试连接
                 </button>
-                <span className="text-xs text-text-secondary/70">用上面填的值直接测，不必先保存。</span>
               </div>
 
               {probe &&
@@ -407,7 +392,7 @@ export function AdvancedSettings() {
       <section className="space-y-3">
         <h3 className="text-sm font-medium text-text-primary">科研追踪</h3>
         <p className="text-xs text-text-secondary">
-          自动发现间隔设为 0 可关闭定时扫描。修改后下轮扫描生效。
+          自动发现间隔设为 0 可关闭定时扫描。
         </p>
         {renderFields(RESEARCH_FIELDS)}
       </section>

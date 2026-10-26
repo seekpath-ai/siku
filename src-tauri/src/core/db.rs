@@ -682,7 +682,7 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     add_column_if_missing(&db, "chat_sessions", "approval_config", "TEXT")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.approval_config: {}", e))?;
-    add_column_if_missing(&db, "chat_sessions", "max_loops", "INTEGER DEFAULT 10")
+    add_column_if_missing(&db, "chat_sessions", "max_loops", "INTEGER")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.max_loops: {}", e))?;
     add_column_if_missing(&db, "chat_sessions", "max_tokens", "INTEGER DEFAULT 28000")
@@ -694,7 +694,7 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // context_budget column, then clear max_tokens. Runs only when the column
     // is first added — otherwise every restart would wipe user-set caps.
     let had_context_budget = column_exists(&db, "chat_sessions", "context_budget").await?;
-    add_column_if_missing(&db, "chat_sessions", "context_budget", "INTEGER DEFAULT 28000")
+    add_column_if_missing(&db, "chat_sessions", "context_budget", "INTEGER")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.context_budget: {}", e))?;
     if !had_context_budget {
@@ -709,6 +709,22 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         .execute(&db)
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions max_tokens resemantic: {}", e))?;
+    }
+    // Migration: legacy column defaults (max_loops 10 / context_budget 28000)
+    // were hard-stored into every session row, shadowing the global defaults.
+    // NULL means "follow the global default" (now 100 / 0 = unlimited), so
+    // clear rows still carrying exactly the legacy defaults; user-tuned
+    // values survive.
+    {
+        refresh_stale_crr_triggers(&db, "chat_sessions").await?;
+        sqlx::query("UPDATE chat_sessions SET max_loops = NULL WHERE max_loops = 10")
+            .execute(&db)
+            .await
+            .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.max_loops legacy default: {}", e))?;
+        sqlx::query("UPDATE chat_sessions SET context_budget = NULL WHERE context_budget = 28000")
+            .execute(&db)
+            .await
+            .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions.context_budget legacy default: {}", e))?;
     }
     add_column_if_missing(&db, "chat_sessions", "max_memory_rounds", "INTEGER DEFAULT 10")
         .await

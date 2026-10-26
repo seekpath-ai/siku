@@ -1663,11 +1663,11 @@ pub async fn pet_create_session(
     let llm_models_json = serde_json::to_string(&llm_models).map_err(|e| format!("json: {e}"))?;
 
     sqlx::query(
-        // max_tokens bound explicitly as NULL: existing DBs carry a legacy
-        // column DEFAULT of 28000, which under the new semantics (per-round
-        // output cap) must not leak in — domain caps resolve at runtime.
-        "INSERT INTO chat_sessions (id, title, mode, paper_ids, agent_mode, tools_enabled, system_prompt, domain, context, llm_provider_ids, llm_models, approval_config, max_tokens, created_at, updated_at) \
-         VALUES (?, ?, 'qa', '[]', 'chat', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)"
+        // max_tokens / max_loops / context_budget bound explicitly as NULL:
+        // legacy column DEFAULTs must not leak in — NULL follows the global
+        // defaults (output cap resolves per model; context unlimited; loops 100).
+        "INSERT INTO chat_sessions (id, title, mode, paper_ids, agent_mode, tools_enabled, system_prompt, domain, context, llm_provider_ids, llm_models, approval_config, max_tokens, max_loops, context_budget, created_at, updated_at) \
+         VALUES (?, ?, 'qa', '[]', 'chat', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)"
     )
     .bind(&id)
     .bind(&title)

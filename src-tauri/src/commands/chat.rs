@@ -55,11 +55,11 @@ pub async fn create_chat_session(
         .map_err(|e| format!("json error: {e}"))?;
 
     sqlx::query(
-        // max_tokens bound explicitly: existing DBs carry a legacy column
-        // DEFAULT of 28000, which under the new semantics (per-round output
-        // cap) must not leak into fresh sessions — NULL = follow the model.
-        "INSERT INTO chat_sessions (id, title, mode, agent_mode, tools_enabled, system_prompt, project_id, paper_ids, max_tokens, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, '[]', NULL, ?, ?)"
+        // max_tokens / max_loops / context_budget bound explicitly: existing DBs
+        // carry legacy column DEFAULTs that must not leak into fresh sessions —
+        // NULL = follow the global defaults (context unlimited, loops 100).
+        "INSERT INTO chat_sessions (id, title, mode, agent_mode, tools_enabled, system_prompt, project_id, paper_ids, max_tokens, max_loops, context_budget, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, '[]', NULL, NULL, NULL, ?, ?)"
     )
     .bind(&id)
     .bind(&title)

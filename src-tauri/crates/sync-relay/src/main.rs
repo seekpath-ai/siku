@@ -1126,7 +1126,14 @@ fn bearer_claims(
         .auth
         .validate(token)
         .map_err(|e| (StatusCode::UNAUTHORIZED, format!("invalid token: {e}")))?;
-    Ok(claims)
+    // Same device gate as the websocket connect path: with long-lived tokens
+    // the device row is the only access control, so it must apply to every
+    // authenticated endpoint, not just the socket.
+    match state.db.get_device(&claims.device_id) {
+        Some(d) if d.revoked_at.is_none() => Ok(claims),
+        Some(_) => Err((StatusCode::UNAUTHORIZED, "device revoked".to_string())),
+        None => Err((StatusCode::UNAUTHORIZED, "unknown device".to_string())),
+    }
 }
 
 #[derive(Serialize)]
@@ -2491,6 +2498,32 @@ mod tests {
 
         // Unauthenticated requests are rejected.
         let (status, _) = http_json(state.clone(), "GET", "/api/storage", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn bearer_endpoints_reject_removed_devices_and_tokens_are_long_lived() {
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let state = Arc::new(AppState::new());
+        seed_account(&state);
+        let token = state.auth.issue_device_token("user-1", "device-a").unwrap();
+
+        // Zotero-style: the token itself is effectively permanent (~100y)…
+        let claims = decode_token(&token).unwrap();
+        assert!(
+            claims.exp as i64 - chrono::Utc::now().timestamp() > 10 * 365 * 24 * 3600,
+            "device token should be long-lived; revocation, not expiry, is the control"
+        );
+        // …and a registered device's token works on HTTP APIs.
+        let (status, _) = http_json(state.clone(), "GET", "/api/devices", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Once the device is removed, the still-valid token must stop working
+        // everywhere, not just on the websocket connect path.
+        assert!(state.db.delete_device("user-1", "device-a"));
+        let (status, _) = http_json(state.clone(), "GET", "/api/devices", Some(&token), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = http_json(state.clone(), "GET", "/api/storage", Some(&token), None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 

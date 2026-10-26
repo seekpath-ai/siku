@@ -36,10 +36,17 @@ impl Auth {
         Ok(token_data.claims)
     }
 
-    /// Issue a device access token (7 days).
+    /// Issue a device access token. Zotero-style: effectively permanent
+    /// (100 years) — the device row (removal / `revoked_at`) is the access
+    /// control, checked on every websocket connect and every authenticated
+    /// API call. Short-lived access tokens made a running client silently
+    /// lose sync when the token expired mid-session (the reconnect loop kept
+    /// reusing the dead token); a long-lived credential removes that whole
+    /// failure class. The refresh-token flow stays as a legacy path for
+    /// clients still holding pre-change 7-day tokens.
     pub fn issue_device_token(&self, user_id: &str, device_id: &str) -> anyhow::Result<String> {
         let exp = Utc::now()
-            .checked_add_signed(Duration::days(7))
+            .checked_add_signed(Duration::days(36500))
             .expect("valid exp")
             .timestamp() as usize;
         let claims = Claims {

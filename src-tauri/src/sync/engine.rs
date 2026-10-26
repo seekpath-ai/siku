@@ -108,6 +108,19 @@ pub fn note_synced_now() {
     *LAST_SYNC_AT.write().unwrap() = Some(crate::core::time::now_iso());
 }
 
+/// 进程级同步认证错误（设备令牌被拒：已移除/吊销）。auto-sync proxy 在
+/// 认证失败后设置；`get_sync_status` 在会话没有 last_error 时并入，让
+/// 同步设置页显示「重新登录」引导而不是静默断同步。
+static SYNC_AUTH_ERROR: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+pub fn sync_auth_error() -> Option<String> {
+    SYNC_AUTH_ERROR.read().unwrap().clone()
+}
+
+pub fn set_sync_auth_error(error: Option<String>) {
+    *SYNC_AUTH_ERROR.write().unwrap() = error;
+}
+
 /// Wire message envelope exchanged over the sync DataChannel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]

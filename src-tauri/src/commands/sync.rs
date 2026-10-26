@@ -432,7 +432,8 @@ pub async fn spawn_auto_sync_proxy(
         );
         return;
     }
-    let token = token.to_string();
+    // 可变：重连循环会在旧式 7 天令牌过期时原地刷新它（见循环顶部）。
+    let mut token = token.to_string();
     let room_id = match jwt_sub(&token) {
         Ok(r) => r,
         Err(e) => {
@@ -474,6 +475,7 @@ pub async fn spawn_auto_sync_proxy(
     info!(device_id = %self_id, room = %room_id, "auto-sync proxy starting");
 
     tokio::spawn(async move {
+        let mut auth_retried = false;
         loop {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 info!("auto-sync proxy stopped");
@@ -483,15 +485,54 @@ pub async fn spawn_auto_sync_proxy(
                 info!("auto-sync proxy superseded by a newer one");
                 break;
             }
+            // 每轮重连前确保令牌新鲜：早期 7 天短令牌会在应用运行期间过期，
+            // 不刷新的话下面的重连会拿着死令牌每 3 秒撞一次 relay 直到重启
+            // （relay 日志里的 ExpiredSignature 风暴即来源于此）。新版长寿命
+            // 设备令牌下这是廉价 no-op。
+            if !crate::commands::account::access_token_is_fresh(&db).await {
+                match crate::commands::account::refresh_access_token(&db, &relay_url).await {
+                    Ok(new_token) => {
+                        token = new_token;
+                        crate::sync::engine::set_sync_auth_error(None);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "auto-sync: token refresh failed");
+                    }
+                }
+            }
             let relay = match crate::sync::relay_client::RelayClient::connect(&relay_url, &token).await
             {
                 Ok(r) => r,
                 Err(e) => {
+                    if crate::sync::relay_client::is_auth_rejection(&e) {
+                        // 401：令牌被拒。先试一次刷新（覆盖存储令牌刚过期、
+                        // 本地副本未更新的窗口）；仍被拒则设备已被移除/吊销，
+                        // 同一令牌重试永远不会成功——转入慢速退避并把状态透传
+                        // 到 UI（get_sync_status → last_error）。
+                        if !auth_retried {
+                            auth_retried = true;
+                            if let Ok(new_token) =
+                                crate::commands::account::refresh_access_token(&db, &relay_url).await
+                            {
+                                token = new_token;
+                                continue;
+                            }
+                        }
+                        auth_retried = false;
+                        crate::sync::engine::set_relay_connected(false);
+                        crate::sync::engine::set_sync_auth_error(Some(
+                            "同步授权失效（设备可能已在其它端被移除），请在「设置 → 账号」重新登录".to_string(),
+                        ));
+                        tracing::warn!("auto-sync: relay rejected credentials; slow backoff (re-login may be required)");
+                        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                        continue;
+                    }
                     tracing::warn!(error = %e, "auto-sync relay connect failed; retrying");
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
                 }
             };
+            auth_retried = false;
             if relay
                 .send(crate::sync::types::RelayClientMsg::Join {
                     payload: crate::sync::types::JoinPayload {
@@ -512,6 +553,7 @@ pub async fn spawn_auto_sync_proxy(
             // 进程级 relay 连接状态：前端据此显示「已连接，同步中…/已同步」，
             // 与是否有 P2P engine 会话无关。
             crate::sync::engine::set_relay_connected(true);
+            crate::sync::engine::set_sync_auth_error(None);
 
             // Register this connection so a logout/disconnect can shut it down
             // directly (a stop-check race in this loop must never leave the
@@ -1389,6 +1431,12 @@ pub async fn get_sync_status(
     // relay 连接是进程级状态（auto-sync proxy 的 discovery 连接维护），与
     // engine 会话独立，始终并入：无 P2P 会话时纯邮箱路径也在同步。
     status.relay_connected = crate::sync::engine::relay_connected();
+    // 同步认证失败（设备令牌被 relay 拒绝）同样是进程级状态——此时通常
+    // 没有 engine 会话，last_error 为空，必须在这里并入，UI 才能显示
+    // 「重新登录」引导而不是静默断同步。
+    if status.last_error.is_none() {
+        status.last_error = crate::sync::engine::sync_auth_error();
+    }
     // 会话没有 last_sync_at（或没有会话）时，用进程级最近同步时间兜底；
     // 有会话时优先会话值。
     if status.last_sync_at.is_none() {

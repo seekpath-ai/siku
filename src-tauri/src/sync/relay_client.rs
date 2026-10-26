@@ -12,6 +12,19 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{info, warn};
 
+/// Whether a [`RelayClient::connect`] failure is the relay rejecting the
+/// token (HTTP 401: expired legacy token / device removed / revoked) rather
+/// than a network problem — retrying with the same token will never succeed.
+pub fn is_auth_rejection(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<tokio_tungstenite::tungstenite::Error>(),
+            Some(tokio_tungstenite::tungstenite::Error::Http(resp))
+                if resp.status() == http::StatusCode::UNAUTHORIZED
+        )
+    })
+}
+
 /// Outcome of a `MailboxDeposit` sent through [`RelayClient::deposit_await_ack`].
 #[derive(Debug, Clone)]
 pub enum AckError {

@@ -478,6 +478,12 @@ body.in-tauri {
   /* Absolute px: 0.4em would compute against font-size: 0 and collapse to 0. */
   line-height: 2px;
 }
+/* The gutter element of a collapsed fence line is only 2px high (CodeMirror
+   syncs gutter height to line height) but its number text keeps the full font
+   size and overflows onto the next line's number. Clip it. */
+.cm-lineNumbers .cm-gutterElement {
+  overflow: hidden;
+}
 .cm-live-code-header {
   float: right;
   display: inline-flex;

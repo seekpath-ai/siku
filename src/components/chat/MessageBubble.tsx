@@ -1,5 +1,5 @@
 import ReactMarkdown from 'react-markdown';
-import { User, Copy, Check, Paperclip, ChevronDown, ChevronUp, Tag, Download } from 'lucide-react';
+import { User, Copy, Check, Paperclip, ChevronDown, ChevronUp, Tag, Download, Layers } from 'lucide-react';
 import { memo, useEffect, useMemo, useState } from 'react';
 import type { AgentStep, ChatMessage } from '@/lib/types';
 import { parseToolCalls, stepsToPhases } from '@/lib/agentPhases';
@@ -21,6 +21,7 @@ import {
   markdownUrlTransform,
 } from './markdownConfig';
 import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
+import { ContextMenu } from '@/components/ui/ContextMenu';
 
 interface Props {
   message: ChatMessage;
@@ -33,7 +34,16 @@ interface Props {
 
 function formatTime(iso: string): string {
   try {
-    return new Date(iso).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    const d = new Date(iso);
+    const time = d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    const now = new Date();
+    const sameDay =
+      d.getFullYear() === now.getFullYear() &&
+      d.getMonth() === now.getMonth() &&
+      d.getDate() === now.getDate();
+    if (sameDay) return time;
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${time}`;
   } catch {
     return '';
   }
@@ -441,21 +451,18 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
       {content}
 
       {ctxMenu && (
-        <div
-          className="fixed z-[6000] min-w-[150px] py-1 rounded-lg border border-codex-border bg-codex-surface shadow-xl"
-          style={{ left: ctxMenu.x, top: ctxMenu.y }}
-          onMouseDown={(e) => e.stopPropagation()}
-        >
-          <button
-            onClick={() => {
-              setCtxMenu(null);
-              setCtxOpen(true);
-            }}
-            className="w-full px-3 py-2 text-left text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
-          >
-            查看本轮上下文
-          </button>
-        </div>
+        <ContextMenu
+          x={ctxMenu.x}
+          y={ctxMenu.y}
+          onClose={() => setCtxMenu(null)}
+          items={[
+            {
+              label: '查看本轮上下文',
+              icon: <Layers size={13} />,
+              onClick: () => setCtxOpen(true),
+            },
+          ]}
+        />
       )}
 
       {ctxOpen && <TurnContextDialog message={message} onClose={() => setCtxOpen(false)} />}

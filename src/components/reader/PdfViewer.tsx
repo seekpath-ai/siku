@@ -35,6 +35,17 @@ export interface SnippetRect {
   heightRatio: number;
 }
 
+/** A highlight on one page. `rects` are pre-measured (snippets); `range`
+ *  addresses the joined text-layer string and is measured AT PAINT TIME —
+ *  measuring inside an async locate (evidence citations) races the initial
+ *  layout/zoom pass on a cold reader and produced degenerate page-sized
+ *  boxes. */
+export interface HighlightTargetEntry {
+  pageIndex: number;
+  rects: SnippetRect[];
+  range?: { start: number; end: number };
+}
+
 /** W3C Web Annotation style text quote selector: enough context to
  * re-locate the selected text within the page's text content. */
 export interface TextQuote {
@@ -100,7 +111,7 @@ export interface PdfViewerProps {
   onSelectionClear?: () => void;
   /** When set, shows blue highlight overlay(s) at the given page+positions.
    * Multiple targets highlight a multi-segment snippet across pages. */
-  highlightTarget?: { pageIndex: number; rects: SnippetRect[] }[] | null;
+  highlightTarget?: HighlightTargetEntry[] | null;
   /** Reports where the top of the viewport sits, in display-frame PDF points
    *  (y-up), so the dual-pane text view can follow the scroll instead of only
    *  following page changes. */
@@ -141,7 +152,7 @@ export interface PdfViewerHandle {
   jumpToPage: (page: number) => void;
   /** Locate a verbatim quote near a page hint and return overlay rects
    *  (probes the hinted page and its neighbors). Null when not found. */
-  locateQuote: (pageNum: number, exact: string) => Promise<{ pageIndex: number; rects: SnippetRect[] } | null>;
+  locateQuote: (pageNum: number, exact: string) => Promise<HighlightTargetEntry | null>;
   /** Run rule-based region detection on a page (fast, offline). Never calls LLM. */
   detectRegions: (pageNum: number) => Promise<PageRegionResult | null>;
   /** Refine detection for a page using LLM (requires API key). Returns null on failure. */
@@ -2342,34 +2353,14 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
         const items: string[] = tl.textContentItemsStr;
         const joined = items.join('');
         // Same normalisation as the page scan; the returned range addresses the
-        // RAW text-layer string so the rectangles below stay exact.
+        // RAW text-layer string. Rectangles are intentionally NOT measured
+        // here: on a cold reader this async gap races the initial layout/zoom
+        // pass, and stale measurements collapsed into degenerate page-sized
+        // boxes. The overlay effect measures the live text layer at paint time
+        // (see `range` in the highlight effect).
         const hit = findQuote(joined, needles);
         if (!hit) continue;
-        const { start: rawStart, end: rawEnd } = hit;
-
-        const wrapperRect = wrapper.getBoundingClientRect();
-        const rects: SnippetRect[] = [];
-        const textDivs = tl.textDivs as HTMLElement[];
-        let acc = 0;
-        for (let i = 0; i < items.length; i++) {
-          const itemStart = acc;
-          acc += items[i].length;
-          if (acc <= rawStart || itemStart >= rawEnd) continue;
-          const div = textDivs[i];
-          if (!(div instanceof HTMLElement)) continue;
-          const r = div.getBoundingClientRect();
-          if (r.width <= 0 || r.height <= 0) continue;
-          rects.push({
-            xRatio: Math.max(0, Math.min(1, (r.left + r.width / 2 - wrapperRect.left) / wrapperRect.width)),
-            yRatio: Math.max(0, Math.min(1, (r.top + r.height / 2 - wrapperRect.top) / wrapperRect.height)),
-            widthRatio: Math.max(0, Math.min(1, r.width / wrapperRect.width)),
-            heightRatio: Math.max(0, Math.min(1, r.height / wrapperRect.height)),
-          });
-        }
-        if (rects.length > 0) {
-          rects.sort((a, b) => a.yRatio - b.yRatio || a.xRatio - b.xRatio);
-          return { pageIndex: pn, rects };
-        }
+        return { pageIndex: pn, rects: [], range: { start: hit.start, end: hit.end } };
       }
       return null;
     },
@@ -2400,8 +2391,50 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
   useEffect(() => {
     if (!highlightTarget || highlightTarget.length === 0) return;
 
+    /** Measure a text-layer range against the CURRENT layout. This must run
+     *  at paint time: the async locate (locateQuote) can finish while the
+     *  initial fit/scale pass is still settling on a cold reader, and
+     *  rectangles measured then painted a garbage full-page block. */
+    const measureRange = (pageIndex: number, start: number, end: number): SnippetRect[] => {
+      const tl = textLayerMapRef.current.get(pageIndex);
+      const wrapper = wrapperMapRef.current.get(pageIndex);
+      if (!tl || !wrapper) return [];
+      const items: string[] = tl.textContentItemsStr;
+      const textDivs = tl.textDivs as HTMLElement[];
+      const wrapperRect = wrapper.getBoundingClientRect();
+      if (wrapperRect.width < 10 || wrapperRect.height < 10) return [];
+      const rects: SnippetRect[] = [];
+      let acc = 0;
+      for (let i = 0; i < items.length; i++) {
+        const itemStart = acc;
+        acc += items[i].length;
+        if (acc <= start || itemStart >= end) continue;
+        const div = textDivs[i];
+        if (!(div instanceof HTMLElement)) continue;
+        const r = div.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        const widthRatio = r.width / wrapperRect.width;
+        const heightRatio = r.height / wrapperRect.height;
+        // A "text item" covering nearly the whole page is a mid-relayout
+        // artifact, never a real passage — drop it.
+        if (widthRatio > 0.95 && heightRatio > 0.95) continue;
+        rects.push({
+          xRatio: Math.max(0, Math.min(1, (r.left + r.width / 2 - wrapperRect.left) / wrapperRect.width)),
+          yRatio: Math.max(0, Math.min(1, (r.top + r.height / 2 - wrapperRect.top) / wrapperRect.height)),
+          widthRatio: Math.max(0, Math.min(1, widthRatio)),
+          heightRatio: Math.max(0, Math.min(1, heightRatio)),
+        });
+      }
+      rects.sort((a, b) => a.yRatio - b.yRatio || a.xRatio - b.xRatio);
+      return rects;
+    };
+
+    const resolve = (t: HighlightTargetEntry): SnippetRect[] =>
+      t.range ? measureRange(t.pageIndex, t.range.start, t.range.end) : t.rects;
+
+    let resolved: SnippetRect[] = resolve(highlightTarget[0]);
     const first = highlightTarget[0];
-    const firstRect = first.rects[0];
+    const firstRect = resolved[0];
 
     // Bring the passage itself into view, about a third down the viewport, and
     // hold it there while the pages around it finish laying out. A plain
@@ -2422,13 +2455,27 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
         showTimer = setTimeout(paint, 150);
         return;
       }
+      // A range target whose text layer is still settling resolves to nothing
+      // yet — retry like the canvas wait instead of painting nothing.
+      if (first.range && resolved.length === 0 && attempts < 12) {
+        attempts += 1;
+        resolved = resolve(first);
+        // The passage position is only known once the range resolves — move
+        // the reveal target off the page top.
+        if (resolved.length > 0) revealPoint(first.pageIndex, resolved[0].yRatio);
+        applyReveal();
+        showTimer = setTimeout(paint, 150);
+        return;
+      }
 
       // Remove previous overlays wherever they were
       for (const el of overlayRef.current) el.remove();
       overlayRef.current = [];
 
-      for (const { pageIndex, rects } of highlightTarget) {
-        const w = wrapperMapRef.current.get(pageIndex);
+      for (const entry of highlightTarget) {
+        const rects = entry === first ? resolved : resolve(entry);
+        if (rects.length === 0) continue;
+        const w = wrapperMapRef.current.get(entry.pageIndex);
         if (!w) continue;
 
         const wRect = w.getBoundingClientRect();

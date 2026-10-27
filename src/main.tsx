@@ -13,9 +13,15 @@ import { PetMenuWindow } from './components/pet/PetMenuWindow';
 import { PetChatWindow } from './components/pet/PetChatWindow';
 import { NoteWindow } from './components/notes/NoteWindow';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { initTheme } from './lib/theme';
 import 'katex/dist/katex.min.css';
 import 'pdfjs-dist/legacy/web/pdf_viewer.css';
 import './index.css';
+
+// Apply the cached theme before the first render so there is no flash of
+// the default palette; the persisted settings then take over (and live
+// updates follow `app:settings_changed`).
+initTheme();
 
 // App-wide link guard, installed before anything renders: a click on a link
 // that leaves the app opens in the system browser instead of navigating the
@@ -218,11 +224,11 @@ function App() {
       {!backendReady && initStalled && (
         <div style={{
           display: 'flex', flexDirection: 'column', alignItems: 'center',
-          justifyContent: 'center', height: '100vh', background: '#1A1A1E',
-          color: '#F5F5F5', fontFamily: 'sans-serif', gap: 8,
+          justifyContent: 'center', height: '100vh', background: 'rgb(var(--background))',
+          color: 'rgb(var(--text-primary))', fontFamily: 'sans-serif', gap: 8,
         }}>
           <div>正在初始化数据库…</div>
-          <div style={{ fontSize: 12, color: '#9CA3AF' }}>
+          <div style={{ fontSize: 12, color: 'rgb(var(--text-secondary))' }}>
             首次启动或数据较多时可能需要更长时间
           </div>
         </div>
@@ -263,12 +269,12 @@ class ErrorFallback extends React.Component<
       return (
         <div style={{
           display: 'flex', flexDirection: 'column', alignItems: 'center',
-          justifyContent: 'center', height: '100vh', background: '#1A1A1E',
-          color: '#F5F5F5', fontFamily: 'sans-serif', padding: 40,
+          justifyContent: 'center', height: '100vh', background: 'rgb(var(--background))',
+          color: 'rgb(var(--text-primary))', fontFamily: 'sans-serif', padding: 40,
         }}>
-          <h1 style={{ color: '#E67E22', marginBottom: 16 }}>思库</h1>
-          <p style={{ color: '#9CA3AF', marginBottom: 24 }}>应用加载失败，请重启。</p>
-          <pre style={{ color: '#E74C3C', fontSize: 12, maxWidth: 480, overflow: 'auto' }}>
+          <h1 style={{ color: 'rgb(var(--primary))', marginBottom: 16 }}>思库</h1>
+          <p style={{ color: 'rgb(var(--text-secondary))', marginBottom: 24 }}>应用加载失败，请重启。</p>
+          <pre style={{ color: 'rgb(var(--codex-danger))', fontSize: 12, maxWidth: 480, overflow: 'auto' }}>
             {this.state.error?.message}
           </pre>
         </div>

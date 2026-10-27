@@ -1119,7 +1119,7 @@ export function NoteList({
                 : isSelected
                   ? 'bg-primary/10 text-text-primary'
                   : isActive
-                    ? 'bg-[#353842] text-text-primary'
+                    ? 'bg-surface-hover text-text-primary'
                     : 'text-text-secondary hover:bg-surface-hover'
           } ${isDraggingSource ? 'opacity-40' : ''} ${isJustMoved ? 'flash-success' : ''} ${isFlashing ? 'flash-match' : ''}`}
           style={{ paddingLeft: `${12 + depth * 16}px` }}
@@ -1402,7 +1402,7 @@ export function NoteList({
                   onClick={() => onSelect(r.id)}
                   className={`w-full text-left px-2 py-1.5 rounded transition-colors ${
                     activeNoteId === r.id
-                      ? 'bg-[#353842] text-text-primary'
+                      ? 'bg-surface-hover text-text-primary'
                       : 'text-text-secondary hover:bg-surface-hover hover:text-text-primary'
                   }`}
                 >

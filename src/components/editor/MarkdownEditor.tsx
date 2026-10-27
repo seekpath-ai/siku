@@ -2301,7 +2301,7 @@ const editorTheme = EditorView.theme({
     color: 'rgba(255,255,255,0.18)',
     paddingRight: '2px',
   },
-  '.cm-content': { caretColor: '#F5F5F5', padding: '1rem 0.75rem' },
+  '.cm-content': { caretColor: 'rgb(var(--text-primary))', padding: '1rem 0.75rem' },
   '&.cm-focused': { outline: 'none' },
 });
 

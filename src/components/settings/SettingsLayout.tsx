@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ArrowLeft, HardDrive, Bot, Cpu, SlidersHorizontal, Cat, RefreshCw, Search, Layers } from 'lucide-react';
+import { ArrowLeft, HardDrive, Bot, Cpu, SlidersHorizontal, Cat, RefreshCw, Search, Layers, Palette } from 'lucide-react';
 import { Link } from '@tanstack/react-router';
 
 interface Section {
@@ -64,6 +64,7 @@ export function SettingsLayout({ sections }: Props) {
 }
 
 export function GeneralIcon() { return <HardDrive size={16} />; }
+export function AppearanceIcon() { return <Palette size={16} />; }
 export function LlmIcon() { return <Cpu size={16} />; }
 export function AgentIcon() { return <Bot size={16} />; }
 export function PetIcon() { return <Cat size={16} />; }

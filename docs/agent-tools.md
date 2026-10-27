@@ -1,6 +1,6 @@
 # Agent 工具清单
 
-思库（Siku）的 Agent 基于 ReAct 循环，通过 **Tool Registry** 动态注册可用工具。默认注册表包含 26 个内置工具，此外每个会话可挂载若干 `skill_<name>` 技能工具（见[技能工具](#技能工具)）。
+思库（Siku）的 Agent 基于 ReAct 循环，通过 **Tool Registry** 动态注册可用工具。默认注册表包含 27 个内置工具，此外每个会话可挂载若干 `skill_<name>` 技能工具（见[技能工具](#技能工具)）。
 
 > 本文档对应版本：`v1.1.4`
 
@@ -56,6 +56,7 @@
 | `task_output` | 任务 | ✅ | 查看后台任务输出 |
 | `task_stop` | 任务 | ❌ | 停止后台任务 |
 | `ask_user` | 交互 | ✅ | 向用户发起结构化选择/填空 |
+| `set_app_theme` | 系统 | ✅ | 切换应用 UI 主题（预设或单色调覆盖），即时生效 |
 | `read_media_file` | 视觉 | ✅ | 用视觉模型分析图片 |
 | `memory_read` | 长期记忆 | ✅ | 读取本会话的长期记忆文档 |
 | `memory_write` | 长期记忆 | ❌ | 追加或覆盖写入长期记忆 |
@@ -354,6 +355,16 @@
 |------|------|------|------|
 | `path` | string | ✅ | 图片文件路径 |
 | `prompt` | string | ❌ | 分析提示词，默认“详细描述图片” |
+
+### `set_app_theme`
+
+切换应用 UI 主题，立即生效且可完全撤销，因此免审批。写入 `AppSettings.theme_preset` / `theme_overrides` 并广播 `app:settings_changed`，前端各窗口热应用（见 `src/lib/theme.ts`）。正文/背景对比度低于 3:1 的组合会被拒绝。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `preset` | string | ❌ | 预设：`default-dark`（深色）/ `light`（浅色）/ `eye-care`（护眼绿）/ `ocean`（深蓝） |
+| `reset` | boolean | ❌ | `true` 恢复默认深色并清空全部覆盖 |
+| `accent` 等 | string | ❌ | 单色调覆盖（hex）：`accent`、`accent_hover`、`background`、`surface`、`hover`、`border`、`text`、`text_secondary`、`muted`、`primary_brand`、`warning`、`danger`、`code_bg` |
 
 ---
 

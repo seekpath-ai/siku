@@ -86,7 +86,7 @@ export function GraphPanel({ activeNoteId, nodes, edges, lockedIds, onNodeClick,
             graphData={data}
             nodeId="id"
             nodeLabel="label"
-            nodeColor={(n: unknown) => ((n as ForceNode).color) || '#9CA3AF'}
+            nodeColor={(n: unknown) => ((n as ForceNode).color) || 'rgb(var(--text-secondary))'}
             nodeVal={(n: unknown) => ((n as ForceNode).val) || 5}
             linkColor={() => 'rgba(158, 163, 172, 0.25)'}
             linkDirectionalArrowLength={4}

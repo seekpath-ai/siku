@@ -141,13 +141,14 @@ test.describe('思库 E2E', () => {
   test('暗色主题 CSS 变量正确', async ({ page }) => {
     await page.goto(BASE_URL, { waitUntil: 'networkidle' });
 
+    // Theme variables hold RGB triplets consumed as `rgb(var(--x))`.
     const bgColor = await page.evaluate(() =>
       getComputedStyle(document.documentElement).getPropertyValue('--background').trim());
-    expect(bgColor).toBe('#1A1A1E');
+    expect(bgColor).toBe('26 26 30');
 
     const primary = await page.evaluate(() =>
       getComputedStyle(document.documentElement).getPropertyValue('--primary').trim());
-    expect(primary).toBe('#E67E22');
+    expect(primary).toBe('230 126 34');
   });
 
   // ===== 截图 =====

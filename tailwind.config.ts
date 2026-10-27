@@ -1,32 +1,38 @@
 import type { Config } from 'tailwindcss'
 import typography from '@tailwindcss/typography'
 
+// Colors are CSS variables (RGB triplets, e.g. `--codex-accent: 25 195 125`)
+// so the UI theme can be switched at runtime — see src/lib/theme.ts. The
+// `<alpha-value>` placeholder keeps opacity modifiers (`bg-codex-accent/15`)
+// working. Default values live in src/index.css `:root`.
+const v = (name: string) => `rgb(var(${name}) / <alpha-value>)`
+
 export default {
   content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
   theme: {
     extend: {
       colors: {
-        background: '#1A1A1E',
-        surface: '#24242B',
-        'surface-hover': '#2E2E36',
-        primary: '#E67E22',
-        accent: '#27AE60',
-        'text-primary': '#F5F5F5',
-        'text-secondary': '#9CA3AF',
+        background: v('--background'),
+        surface: v('--surface'),
+        'surface-hover': v('--surface-hover'),
+        primary: v('--primary'),
+        accent: v('--accent'),
+        'text-primary': v('--text-primary'),
+        'text-secondary': v('--text-secondary'),
         codex: {
-          bg: '#0d0d0d',
-          surface: '#141414',
-          hover: '#1a1a1a',
-          border: '#262626',
-          'border-light': '#333333',
-          primary: '#f5f5f5',
-          secondary: '#a3a3a3',
-          muted: '#737373',
-          accent: '#19c37d',
-          'accent-hover': '#15a76a',
-          warning: '#f59e0b',
-          danger: '#ef4444',
-          code: '#0a0a0a',
+          bg: v('--codex-bg'),
+          surface: v('--codex-surface'),
+          hover: v('--codex-hover'),
+          border: v('--codex-border'),
+          'border-light': v('--codex-border-light'),
+          primary: v('--codex-primary'),
+          secondary: v('--codex-secondary'),
+          muted: v('--codex-muted'),
+          accent: v('--codex-accent'),
+          'accent-hover': v('--codex-accent-hover'),
+          warning: v('--codex-warning'),
+          danger: v('--codex-danger'),
+          code: v('--codex-code'),
         },
       },
       fontFamily: {

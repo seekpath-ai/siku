@@ -603,6 +603,10 @@ export interface AppSettings {
   search_engines?: SearchEngineConfig[];
   sidebar_order?: string[] | null;
   homepage?: string | null;
+  /** UI theme preset id; absent = default dark. */
+  theme_preset?: string | null;
+  /** Semantic color overrides on top of the preset, e.g. { accent: "#e67e22" }. */
+  theme_overrides?: Record<string, string> | null;
 
   // Advanced truncation / limits
   log_max_size_mb: number;

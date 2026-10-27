@@ -13,14 +13,14 @@ export function SkeletonShell() {
         flex: 1,
         height: '100%',
         overflow: 'hidden',
-        background: '#1A1A1E',
+        background: 'rgb(var(--background))',
       }}
     >
       {/* Sidebar skeleton */}
       <div
         style={{
           width: 56,
-          background: '#1E1E24',
+          background: 'rgb(var(--surface))',
           padding: 12,
           display: 'flex',
           flexDirection: 'column',
@@ -35,7 +35,7 @@ export function SkeletonShell() {
               width: `${w * 100}%`,
               height: 20,
               borderRadius: 4,
-              background: '#2E2E36',
+              background: 'rgb(var(--surface-hover))',
             }}
           />
         ))}
@@ -56,7 +56,7 @@ export function SkeletonShell() {
             width: '40%',
             height: 28,
             borderRadius: 4,
-            background: '#2E2E36',
+            background: 'rgb(var(--surface-hover))',
           }}
         />
         <div
@@ -64,7 +64,7 @@ export function SkeletonShell() {
             width: '60%',
             height: 16,
             borderRadius: 4,
-            background: '#2E2E36',
+            background: 'rgb(var(--surface-hover))',
           }}
         />
         <div style={{ height: 24 }} />
@@ -75,7 +75,7 @@ export function SkeletonShell() {
               width: `${w * 100}%`,
               height: 48,
               borderRadius: 8,
-              background: '#24242B',
+              background: 'rgb(var(--surface))',
             }}
           />
         ))}

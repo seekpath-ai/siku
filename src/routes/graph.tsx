@@ -161,7 +161,7 @@ function GraphPage() {
             if (hoveredId && (s === hoveredId || t === hoveredId)) return 'rgba(230,126,34,0.6)';
             return hoveredId ? 'rgba(158,163,172,0.08)' : 'rgba(158,163,172,0.25)';
           }}
-          backgroundColor="#1A1A1E"
+          backgroundColor="rgb(var(--background))"
           onNodeClick={handleNodeClick}
           onNodeHover={(node) => {
             setHoveredId(nodeIdOf(node));

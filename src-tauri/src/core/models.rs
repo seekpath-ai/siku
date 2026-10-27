@@ -565,6 +565,14 @@ pub struct AppSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub homepage: Option<String>,
 
+    // ── Appearance ──
+    /// UI theme preset id (e.g. "default-dark", "light"); None/absent = default dark.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme_preset: Option<String>,
+    /// Semantic color overrides on top of the preset, e.g. {"accent": "#e67e22"}.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme_overrides: Option<std::collections::HashMap<String, String>>,
+
     // ── Web search ──
     /// Ordered search engines for the web_search tool; the tool tries them
     /// in order within one call until one returns results.
@@ -832,6 +840,8 @@ impl Default for AppSettings {
             search_engines: default_search_engines(),
             sidebar_order: None,
             homepage: None,
+            theme_preset: None,
+            theme_overrides: None,
             log_max_size_mb: default_log_max_size_mb(),
             log_max_files: default_log_max_files(),
             log_llm_response_preview_max_chars: default_log_llm_response_preview_max_chars(),

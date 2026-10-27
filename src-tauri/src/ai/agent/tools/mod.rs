@@ -5,6 +5,7 @@ pub mod paper_snapshot;
 pub mod paper_import;
 pub mod note_read;
 pub mod note_write;
+pub mod theme;
 pub mod web_fetch;
 pub mod web_search;
 pub mod translation;

@@ -461,7 +461,9 @@ body.in-tauri {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.88em;
   color: #E5E7EB;
-  background: rgba(0, 0, 0, 0.32);
+  /* Same fixed dark surface as .cm-live-codeblock: rgba(0,0,0,.32) over a
+     light theme's white page was a mid-gray behind light-gray code text. */
+  background: #20202A;
   padding-left: 10px;
   padding-right: 10px;
 }
@@ -565,7 +567,9 @@ body.in-tauri {
   border-collapse: collapse;
   width: 100%;
   font-size: 0.875em;
-  color: #D1D5DB;
+  /* Theme-relative (≈ #D1D5DB on dark): a hard-coded light gray was
+     unreadable on the light theme's white background. */
+  color: rgb(var(--text-primary) / 0.85);
 }
 .cm-live-table th,
 .cm-live-table td {

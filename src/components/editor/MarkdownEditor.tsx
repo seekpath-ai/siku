@@ -754,6 +754,18 @@ class ImageWidget extends WidgetType {
     wrap.appendChild(img);
     return wrap;
   }
+  // Clicking the widget places the caret on the image's line: the live
+  // preview then expands the markdown source so the link can be edited.
+  // (Previously the widget swallowed the click and a broken image line was
+  // only editable from the very start of the line.)
+  eventHandlers = {
+    mousedown: (event: MouseEvent, view: EditorView) => {
+      event.preventDefault();
+      const pos = view.posAtDOM(event.target as HTMLElement);
+      view.dispatch({ selection: { anchor: pos } });
+      view.focus();
+    },
+  };
   // No updateDOM override: eq() equality already reuses the DOM (so a stable
   // image is not re-fetched); the default (false) redraws a changed one.
   eq(other: ImageWidget) {

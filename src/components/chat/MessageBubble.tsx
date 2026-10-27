@@ -27,6 +27,8 @@ interface Props {
   agentSteps?: AgentStep[];
   /** Nearest user message before this one — exported together for context. */
   prevUserMessage?: ChatMessage;
+  /** Search-jump flash: transient ring around the bubble. */
+  highlighted?: boolean;
 }
 
 function formatTime(iso: string): string {
@@ -115,7 +117,7 @@ function UserText({ content }: { content: string }) {
 // and each history bubble re-parses ReactMarkdown/KaTeX on re-render. Props
 // (message object, steps array from the memoized map) are referentially
 // stable, so history bubbles skip those renders entirely.
-function MessageBubbleInner({ message, agentSteps = [], prevUserMessage }: Props) {
+function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlighted = false }: Props) {
   const agentName = useActiveAgentName();
   const [copied, setCopied] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -430,9 +432,10 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage }: Props
 
   return (
     <div
-      className={`flex gap-3 group/bubble animate-in fade-in slide-in-from-bottom-1.5 duration-200 ${
+      data-msg-id={message.id}
+      className={`flex gap-3 group/bubble animate-in fade-in slide-in-from-bottom-1.5 duration-200 rounded-lg transition-shadow ${
         isUser ? 'flex-row-reverse' : 'flex-row'
-      }`}
+      } ${highlighted ? 'ring-2 ring-codex-accent/70 bg-codex-accent/5' : ''}`}
     >
       {avatar}
       {content}

@@ -18,6 +18,8 @@ import {
   Download,
   ChevronDown,
   ChevronRight,
+  Search,
+  X,
 } from 'lucide-react';
 import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
@@ -29,12 +31,14 @@ import {
   agentPinSession,
   agentArchiveSession,
   agentSessionWorkspace,
+  chatSearchMessages,
   fileBrowserRevealInSystem,
   getAgentSteps,
   getChatMessages,
   revealInFileManager,
   saveTextFile,
 } from '@/lib/tauri';
+import type { ChatMessageHit } from '@/lib/tauri';
 import { buildSessionMarkdown, sessionExportFileName } from '@/lib/exportTurn';
 import { useDialog } from '@/hooks/useDialog';
 import { ConfirmButton } from '@/components/ui/ConfirmButton';
@@ -153,6 +157,11 @@ export function AgentList() {
     projectId: '',
   });
   const [organizeOpen, setOrganizeOpen] = useState(false);
+  /** Sidebar conversation search: non-empty query swaps the projects/chats
+   * lists for a combined title + message-content result view. */
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchHits, setSearchHits] = useState<ChatMessageHit[]>([]);
+  const [searching, setSearching] = useState(false);
   /** Collapsed-state toggles for the archived sections. */
   const [showArchivedChats, setShowArchivedChats] = useState(false);
   const [showArchivedProjects, setShowArchivedProjects] = useState(false);
@@ -166,6 +175,41 @@ export function AgentList() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Debounced message-content search while the sidebar search box is non-empty.
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (!q) {
+      setSearchHits([]);
+      setSearching(false);
+      return;
+    }
+    setSearching(true);
+    const t = setTimeout(() => {
+      chatSearchMessages(q, undefined, 30)
+        .then((hits) => setSearchHits(hits))
+        .catch((err) => {
+          console.error('search chat messages failed:', err);
+          setSearchHits([]);
+        })
+        .finally(() => setSearching(false));
+    }, 300);
+    return () => clearTimeout(t);
+  }, [searchQuery]);
+
+  const searchActive = searchQuery.trim().length > 0;
+  const searchTitleMatches = useMemo(() => {
+    if (!searchActive) return [];
+    const q = searchQuery.trim().toLowerCase();
+    return sessions.filter((s) => s.title.toLowerCase().includes(q));
+  }, [searchActive, searchQuery, sessions]);
+
+  // Open a message hit: switch session (no-op when already active) and queue
+  // the scroll-and-flash jump, which MessageList resolves once history loads.
+  const openSearchHit = (hit: ChatMessageHit) => {
+    setActiveSession(hit.session_id);
+    useChatStore.getState().setJumpTarget(hit.message_id);
+  };
 
   // Load all sessions; select the first when none is active.
   // Pet/domain sessions (built-in per-page agents) stay hidden from this list.
@@ -534,6 +578,29 @@ export function AgentList() {
 
   return (
     <aside className="w-full bg-background flex flex-col h-full">
+      {/* Conversation search: title matches + message-content hits */}
+      <div className="px-2 pt-2">
+        <div className="relative">
+          <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-codex-muted pointer-events-none" />
+          <input
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={(e) => e.key === 'Escape' && setSearchQuery('')}
+            placeholder="搜索对话"
+            className="w-full bg-codex-surface border border-codex-border rounded-lg pl-7 pr-7 py-1.5 text-[12px] text-codex-primary placeholder:text-codex-muted/70 outline-none focus:border-codex-accent/50"
+          />
+          {searchQuery && (
+            <button
+              onClick={() => setSearchQuery('')}
+              aria-label="清空搜索"
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-codex-muted hover:text-codex-primary"
+            >
+              <X size={12} />
+            </button>
+          )}
+        </div>
+      </div>
+
       {/* Top menu */}
       <nav className="px-2 pt-2 space-y-0.5">
         <MenuRow
@@ -567,6 +634,63 @@ export function AgentList() {
           onClick={() => setShowPlugins(true)}
         />
       </nav>
+
+      {searchActive ? (
+        /* Search results replace the projects/chats lists while typing. */
+        <section className="flex-1 min-h-0 overflow-y-auto px-2 pb-3 mt-2 space-y-0.5">
+          {searchTitleMatches.length > 0 && (
+            <>
+              <div className="px-3 pt-1 pb-0.5 text-[11px] font-semibold text-codex-muted uppercase tracking-wide">
+                会话
+              </div>
+              {searchTitleMatches.map((s) => (
+                <div
+                  key={s.id}
+                  onClick={() => setActiveSession(s.id)}
+                  className="flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary transition-colors"
+                >
+                  <AgentAvatar name={s.title} color={s.color} size={22} />
+                  <span className="flex-1 truncate">{s.title}</span>
+                </div>
+              ))}
+            </>
+          )}
+          {searchHits.length > 0 && (
+            <>
+              <div className="px-3 pt-2 pb-0.5 text-[11px] font-semibold text-codex-muted uppercase tracking-wide">
+                消息
+              </div>
+              {searchHits.map((h) => (
+                <button
+                  key={h.message_id}
+                  onClick={() => openSearchHit(h)}
+                  className="w-full text-left px-2 py-1.5 rounded-md hover:bg-codex-hover transition-colors"
+                >
+                  <div className="flex items-center gap-1.5 text-[12px] text-codex-primary">
+                    <span className="truncate font-medium">{h.session_title}</span>
+                    <span className="shrink-0 text-[10px] text-codex-muted">
+                      {h.created_at.slice(5, 16).replace('T', ' ')}
+                    </span>
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-codex-muted leading-snug line-clamp-2">
+                    {h.snippet}
+                  </div>
+                </button>
+              ))}
+            </>
+          )}
+          {searching && (
+            <div className="flex items-center gap-1.5 px-2 py-2 text-[12px] text-codex-muted">
+              <Loader2 size={12} className="animate-spin" />
+              搜索中…
+            </div>
+          )}
+          {!searching && searchTitleMatches.length === 0 && searchHits.length === 0 && (
+            <div className="px-2 py-2 text-[12px] text-codex-muted">无匹配结果</div>
+          )}
+        </section>
+      ) : (
+      <>
 
       {/* Projects */}
       <section className="mt-4">
@@ -747,6 +871,8 @@ export function AgentList() {
           )}
         </div>
       </section>
+      </>
+      )}
 
       {/* Agent context menu */}
       {contextMenu.visible && (

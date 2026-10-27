@@ -900,6 +900,7 @@ pub fn run() {
             commands::chat::create_chat_session,
             commands::chat::delete_chat_session,
             commands::chat::get_chat_messages,
+            commands::chat::search_chat_messages,
             commands::chat::chat_message_tag,
             commands::skills::skills_list,
             commands::skills::skills_get,

@@ -759,6 +759,29 @@ export async function chatMessageTag(
   return invoke<ChatMessage>('chat_message_tag', { messageId, tag });
 }
 
+export interface ChatMessageHit {
+  message_id: string;
+  session_id: string;
+  session_title: string;
+  role: string;
+  snippet: string;
+  created_at: string;
+}
+
+/** Search chat message content across conversations (or one session when
+ *  sessionId is passed). Whitespace-split keywords are ANDed. */
+export async function chatSearchMessages(
+  query: string,
+  sessionId?: string,
+  limit?: number,
+): Promise<ChatMessageHit[]> {
+  return invoke<ChatMessageHit[]>('search_chat_messages', {
+    query,
+    sessionId: sessionId ?? null,
+    limit: limit ?? null,
+  });
+}
+
 // ---- Plugins (skills) ----
 
 export interface SkillReviewBadge {

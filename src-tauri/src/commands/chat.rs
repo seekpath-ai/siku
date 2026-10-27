@@ -269,6 +269,91 @@ pub async fn get_chat_messages(
     Ok(ChatMessagePage { messages, has_more })
 }
 
+/// One message-content search hit, with a snippet centered on the first
+/// keyword occurrence.
+#[derive(serde::Serialize)]
+pub struct ChatMessageHit {
+    pub message_id: String,
+    pub session_id: String,
+    pub session_title: String,
+    pub role: String,
+    pub snippet: String,
+    pub created_at: String,
+}
+
+/// Search chat message content (LIKE, whitespace-split keywords ANDed).
+/// Domain/pet sessions are excluded — their chatter is internal machinery,
+/// not user conversations. Passing `session_id` scopes the search to one
+/// conversation (in-session find).
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn search_chat_messages(
+    state: State<'_, AppState>,
+    query: String,
+    session_id: Option<String>,
+    limit: Option<i64>,
+) -> Result<Vec<ChatMessageHit>, String> {
+    let keywords: Vec<String> = query.split_whitespace().map(|k| k.to_lowercase()).collect();
+    if keywords.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = limit.unwrap_or(20).clamp(1, 50);
+
+    let mut sql = String::from(
+        "SELECT m.id, m.session_id, s.title, m.role, m.content, m.created_at \
+         FROM chat_messages m JOIN chat_sessions s ON s.id = m.session_id \
+         WHERE s.domain IS NULL",
+    );
+    if session_id.is_some() {
+        sql.push_str(" AND m.session_id = ?");
+    }
+    for _ in &keywords {
+        sql.push_str(" AND LOWER(m.content) LIKE ? ESCAPE '\\'");
+    }
+    sql.push_str(" ORDER BY m.created_at DESC, m.id DESC LIMIT ?");
+
+    let mut q = sqlx::query_as::<_, (String, String, String, String, String, String)>(&sql);
+    if let Some(sid) = &session_id {
+        q = q.bind(sid);
+    }
+    for k in &keywords {
+        let esc = k.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        q = q.bind(format!("%{esc}%"));
+    }
+    q = q.bind(limit);
+
+    let rows = q
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
+
+    const SNIPPET_BEFORE: usize = 30;
+    const SNIPPET_LEN: usize = 120;
+    let hits = rows
+        .into_iter()
+        .map(|(message_id, session_id, session_title, role, content, created_at)| {
+            let lower = content.to_lowercase();
+            let char_pos = keywords
+                .iter()
+                .filter_map(|k| lower.find(k))
+                .min()
+                .map(|b| lower[..b].chars().count())
+                .unwrap_or(0);
+            let start = char_pos.saturating_sub(SNIPPET_BEFORE);
+            let total = content.chars().count();
+            let body: String = content.chars().skip(start).take(SNIPPET_LEN).collect();
+            let snippet = format!(
+                "{}{}{}",
+                if start > 0 { "…" } else { "" },
+                body.trim(),
+                if start + SNIPPET_LEN < total { "…" } else { "" },
+            );
+            ChatMessageHit { message_id, session_id, session_title, role, snippet, created_at }
+        })
+        .collect();
+    Ok(hits)
+}
+
 /// Tag a message from the bubble action bar ("打标即搬运"):
 /// - "experience": content appended to the session's long-term memory
 /// - "knowledge": content saved as a knowledge item (notes domain)

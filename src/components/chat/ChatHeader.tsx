@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Pencil, FolderOpen, CalendarClock } from 'lucide-react';
+import { Pencil, FolderOpen, CalendarClock, Search } from 'lucide-react';
 import type { AgentSession } from '@/lib/types';
 import { AgentAvatar } from './AgentAvatar';
 import { SessionModelBadge } from './SessionModelBadge';
@@ -12,11 +12,13 @@ interface Props {
   onRename: (title: string) => void;
   /** Switch the session to a global (provider-pool) model, next turn on. */
   onModelChange: (providerId: string) => void;
+  /** Toggle the in-conversation search bar. */
+  onToggleSearch: () => void;
 }
 
 /** Chat panel header: editable thread title + project chip + model badge.
  *  The badge doubles as a model switcher over the global provider pool. */
-export function ChatHeader({ session, projectName, projectPath, onRename, onModelChange }: Props) {
+export function ChatHeader({ session, projectName, projectPath, onRename, onModelChange, onToggleSearch }: Props) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(session.title);
   const [taskCenterOpen, setTaskCenterOpen] = useState(false);
@@ -84,6 +86,14 @@ export function ChatHeader({ session, projectName, projectPath, onRename, onMode
       </div>
 
       <div className="flex-1" />
+
+      <button
+        onClick={onToggleSearch}
+        title="搜索对话（Ctrl+F）"
+        className="p-1.5 rounded hover:bg-surface-hover text-text-secondary hover:text-text-primary"
+      >
+        <Search size={14} />
+      </button>
 
       <button
         onClick={() => setTaskCenterOpen(true)}

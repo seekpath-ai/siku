@@ -27,15 +27,16 @@ import {
   listChatSessions,
   notesCreate,
   bookmarksList,
+  chatSearchMessages,
 } from '@/lib/tauri';
-import type { NoteSearchResult } from '@/lib/tauri';
+import type { NoteSearchResult, ChatMessageHit } from '@/lib/tauri';
 import type { Paper, KnowledgeItem, AgentSession, Bookmark as BookmarkType } from '@/lib/types';
 import { useChatStore } from '@/stores/chatStore';
 import { getAllUnlockedIds } from '@/stores/noteLockStore';
 
 interface SearchItem {
   id: string;
-  type: 'command' | 'note' | 'paper' | 'knowledge' | 'chat' | 'bookmark';
+  type: 'command' | 'note' | 'paper' | 'knowledge' | 'chat' | 'message' | 'bookmark';
   title: string;
   subtitle?: string;
   icon: React.ReactNode;
@@ -249,11 +250,12 @@ export function GlobalSearch({ onImportPdf }: GlobalSearchProps) {
       setLoading(true);
       try {
         const limit = 8;
-        const [notes, papers, knowledge, chats] = await Promise.allSettled([
+        const [notes, papers, knowledge, chats, messages] = await Promise.allSettled([
           notesSearch(trimmed, limit, getAllUnlockedIds()).catch(() => [] as NoteSearchResult[]),
           listPapers({ search: trimmed, limit }).catch(() => [] as Paper[]),
           knowledgeListItems(undefined, trimmed, undefined, limit).catch(() => [] as KnowledgeItem[]),
           listChatSessions().catch(() => [] as AgentSession[]),
+          chatSearchMessages(trimmed, undefined, limit).catch(() => [] as ChatMessageHit[]),
         ]);
 
         if (cancelled) return;
@@ -319,6 +321,24 @@ export function GlobalSearch({ onImportPdf }: GlobalSearchProps) {
               action: () => {
                 openRoute('/chat', { title: c.title || '未命名会话', icon: 'chat' });
                 useChatStore.getState().setActiveSession(c.id);
+                navigate({ to: '/chat' });
+              },
+            }))
+          );
+        }
+
+        if (messages.status === 'fulfilled') {
+          results.push(
+            ...messages.value.map((h) => ({
+              id: `msg-${h.message_id}`,
+              type: 'message' as const,
+              title: h.session_title || '未命名会话',
+              subtitle: h.snippet,
+              icon: <MessageSquare size={16} className="text-cyan-400" />,
+              action: () => {
+                openRoute('/chat', { title: h.session_title || '未命名会话', icon: 'chat' });
+                useChatStore.getState().setActiveSession(h.session_id);
+                useChatStore.getState().setJumpTarget(h.message_id);
                 navigate({ to: '/chat' });
               },
             }))
@@ -407,6 +427,7 @@ export function GlobalSearch({ onImportPdf }: GlobalSearchProps) {
     { type: 'paper', label: '论文' },
     { type: 'knowledge', label: '知识库' },
     { type: 'chat', label: '对话' },
+    { type: 'message', label: '对话消息' },
   ];
 
   return (

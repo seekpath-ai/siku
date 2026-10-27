@@ -30,6 +30,9 @@ interface ChatState {
    * created and the message fires once its (empty) history has loaded —
    * sending earlier would race the load and wipe the optimistic bubble. */
   pendingFirst: { sessionId: string; text: string } | null;
+  /** Search-result jump: scroll this message into view and flash it. The
+   * nonce lets repeat jumps to the same message retrigger. */
+  jumpTarget: { messageId: string; nonce: number } | null;
 
   setSessions: (sessions: AgentSession[]) => void;
   setActiveSession: (id: string | null) => void;
@@ -60,6 +63,7 @@ interface ChatState {
   removeSession: (id: string) => void;
   setPendingQuestions: (q: AskQuestion[] | null, sessionId?: string | null) => void;
   setPendingFirst: (p: { sessionId: string; text: string } | null) => void;
+  setJumpTarget: (messageId: string | null) => void;
 }
 
 export const useChatStore = create<ChatState>((set) => ({
@@ -78,6 +82,7 @@ export const useChatStore = create<ChatState>((set) => ({
   pendingQuestions: null,
   pendingQuestionsSessionId: null,
   pendingFirst: null,
+  jumpTarget: null,
 
   setSessions: (sessions) => set({ sessions }),
   setActiveSession: (id) =>
@@ -244,4 +249,8 @@ export const useChatStore = create<ChatState>((set) => ({
     ),
 
   setPendingFirst: (p) => set({ pendingFirst: p }),
+  setJumpTarget: (messageId) =>
+    set((s) => ({
+      jumpTarget: messageId ? { messageId, nonce: (s.jumpTarget?.nonce ?? 0) + 1 } : null,
+    })),
 }));

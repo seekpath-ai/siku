@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { useChatStore } from '@/stores/chatStore';
 import type { AgentStep, ChatMessage } from '@/lib/types';
 import { streamingToPhases } from '@/lib/agentPhases';
@@ -21,9 +21,11 @@ const assistantAvatar = (
 const HistoryMessages = memo(function HistoryMessages({
   messages,
   stepsByMessageId,
+  highlightId,
 }: {
   messages: ChatMessage[];
   stepsByMessageId: Map<string, AgentStep[]>;
+  highlightId?: string | null;
 }) {
   // Each assistant message gets the nearest preceding user message — the
   // bubble's turn export includes it for context.
@@ -45,6 +47,7 @@ const HistoryMessages = memo(function HistoryMessages({
           message={msg}
           agentSteps={msg.role === 'assistant' ? stepsByMessageId.get(msg.id) : undefined}
           prevUserMessage={msg.role === 'assistant' ? prevUserById.get(msg.id) : undefined}
+          highlighted={msg.id === highlightId}
         />
       ))}
     </>
@@ -115,12 +118,20 @@ export function MessageList({
   const streamingSteps = useChatStore((s) => s.streamingSteps);
   const currentStreamingStep = useChatStore((s) => s.currentStreamingStep);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
+  const jumpTarget = useChatStore((s) => s.jumpTarget);
   const containerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const prevSessionIdRef = useRef<string | null>(null);
   const lastMessageIdRef = useRef<string | null>(null);
   const justSwitchedRef = useRef(false);
   const isNearBottomRef = useRef(true);
+  /** Search-jump bookkeeping: the nonce already completed, the nonce last
+   * seen (resets the page-pull counter), and how many older pages the
+   * current jump has pulled while hunting the message. */
+  const jumpDoneNonceRef = useRef(0);
+  const jumpPrevNonceRef = useRef(0);
+  const jumpAttemptsRef = useRef(0);
+  const [highlightId, setHighlightId] = useState<string | null>(null);
   /** scrollHeight captured when an older-page fetch starts; the prepend
    * shifts content down, and restoring scrollTop = newHeight - oldHeight
    * keeps the viewport pinned to the same message. */
@@ -208,6 +219,38 @@ export function MessageList({
     }
   }, [messages, streamContent, streamingSteps, currentStreamingStep, activeSessionId]);
 
+  // Search-jump: scroll the target message into view and flash it. When the
+  // message predates the loaded window, pull older pages until it appears
+  // (bounded — a deleted message must not loop forever).
+  useEffect(() => {
+    if (!jumpTarget) return;
+    if (jumpDoneNonceRef.current === jumpTarget.nonce) return;
+    if (jumpPrevNonceRef.current !== jumpTarget.nonce) {
+      jumpPrevNonceRef.current = jumpTarget.nonce;
+      jumpAttemptsRef.current = 0;
+    }
+    const el = containerRef.current?.querySelector(`[data-msg-id="${jumpTarget.messageId}"]`);
+    if (el) {
+      jumpDoneNonceRef.current = jumpTarget.nonce;
+      jumpAttemptsRef.current = 0;
+      requestAnimationFrame(() => el.scrollIntoView({ block: 'center' }));
+      setHighlightId(jumpTarget.messageId);
+      return;
+    }
+    if (hasMoreMessages && onLoadOlder && !loadingOlder && jumpAttemptsRef.current < 50) {
+      jumpAttemptsRef.current += 1;
+      onLoadOlder();
+    }
+  }, [jumpTarget, messages, hasMoreMessages, loadingOlder, onLoadOlder]);
+
+  // The flash fades on its own; the target stays marked in the store so the
+  // in-session search bar can show "current match" state.
+  useEffect(() => {
+    if (!highlightId) return;
+    const t = setTimeout(() => setHighlightId(null), 2400);
+    return () => clearTimeout(t);
+  }, [highlightId]);
+
   return (
     <div
       ref={containerRef}
@@ -222,7 +265,7 @@ export function MessageList({
             </span>
           </div>
         )}
-        <HistoryMessages messages={messages} stepsByMessageId={stepsByMessageId} />
+        <HistoryMessages messages={messages} stepsByMessageId={stepsByMessageId} highlightId={highlightId} />
         <StreamingBubble />
         <div ref={bottomRef} />
       </div>

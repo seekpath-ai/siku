@@ -3,6 +3,7 @@ import { Bot, Loader2, ArrowUp } from 'lucide-react';
 import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';
 import { ChatHeader } from './ChatHeader';
+import { ChatSearchBar } from './ChatSearchBar';
 import { AskUserDialog } from './AskUserDialog';
 import { useChatStore, MESSAGE_PAGE_SIZE } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
@@ -130,6 +131,19 @@ export function ChatPanel() {
   const { projects } = useProjectStore();
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+
+  // Ctrl+F opens the in-conversation search bar.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f' && activeSessionId) {
+        e.preventDefault();
+        setSearchOpen(true);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [activeSessionId]);
 
   const activeSession = sessions.find((s) => s.id === activeSessionId) ?? null;
 
@@ -281,7 +295,9 @@ export function ChatPanel() {
         projectPath={sessionProject?.path}
         onRename={handleRename}
         onModelChange={handleModelChange}
+        onToggleSearch={() => setSearchOpen((v) => !v)}
       />
+      {searchOpen && <ChatSearchBar onClose={() => setSearchOpen(false)} />}
       <div className="flex-1 overflow-hidden relative">
         <MessageList onLoadOlder={loadOlderMessages} loadingOlder={loadingOlder} />
         {loadingMessages && (

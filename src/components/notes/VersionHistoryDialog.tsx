@@ -35,6 +35,16 @@ function formatTime(iso: string): string {
 const READONLY = [
   lineNumbers(),
   oneDark,
+  // oneDark's neutral colors assume a dark surface; structural colors follow
+  // the app theme so the light theme stays readable.
+  EditorView.theme({
+    '.cm-content': { color: 'rgb(var(--text-primary))' },
+    '.cm-gutters': {
+      backgroundColor: 'transparent',
+      color: 'rgb(var(--codex-primary) / 0.25)',
+      border: 'none',
+    },
+  }),
   EditorState.readOnly.of(true),
   EditorView.editable.of(false),
   EditorView.lineWrapping,

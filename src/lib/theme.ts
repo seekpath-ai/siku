@@ -78,6 +78,8 @@ const LIGHT: ThemePreset = {
     'codex-warning': '217 119 6',
     'codex-danger': '220 38 38',
     'codex-code': '244 244 245',
+    // Inline code: the default pink (#F0ABFC) is unreadable on white.
+    'prose-code': '190 24 93',
   },
 };
 
@@ -174,19 +176,39 @@ export function getPreset(id: string | null | undefined): ThemePreset {
   return THEME_PRESETS.find((p) => p.id === id) ?? DEFAULT_DARK;
 }
 
+/** Every variable any preset or override can set — used to undo the previous
+ *  theme fully: an inline var left over from the last preset would otherwise
+ *  survive a switch (e.g. light's --prose-code sticking on dark). */
+const KNOWN_THEME_VARS: string[] = (() => {
+  const set = new Set<string>();
+  for (const preset of THEME_PRESETS) {
+    for (const key of Object.keys(preset.vars)) set.add(key);
+  }
+  for (const vars of Object.values(THEME_SEMANTIC_VARS)) {
+    for (const v of vars) set.add(v);
+  }
+  return [...set];
+})();
+
 /** Apply preset + overrides to the live document. */
 export function applyTheme(presetId: string | null | undefined, overrides?: ThemeOverrides | null): void {
   const preset = getPreset(presetId);
   const root = document.documentElement;
+  const next = new Set<string>();
   for (const [name, value] of Object.entries(preset.vars)) {
     root.style.setProperty(`--${name}`, value);
+    next.add(name);
   }
   for (const [key, hex] of Object.entries(overrides ?? {})) {
     const triplet = hexToRgbTriplet(hex);
     if (!triplet) continue;
     for (const varName of THEME_SEMANTIC_VARS[key] ?? []) {
       root.style.setProperty(`--${varName}`, triplet);
+      next.add(varName);
     }
+  }
+  for (const name of KNOWN_THEME_VARS) {
+    if (!next.has(name)) root.style.removeProperty(`--${name}`);
   }
 }
 

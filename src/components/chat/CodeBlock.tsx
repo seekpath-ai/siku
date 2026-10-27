@@ -85,12 +85,12 @@ export function CodeBlock({ code, language = 'text', inline }: CodeBlockProps) {
     // visually continuous — by default (slice) the wrapped fragments lose
     // their inner padding and the line gap shows no background, so a single
     // span reads as two separate code chips. Base styling matches the
-    // editor's live preview (.cm-live-code): flat white/8 chip, no border.
+    // editor's live preview (.cm-live-code): flat theme-tinted chip, no border.
     return (
       <code
         onClick={handleCopy}
         title="点击复制"
-        className="not-prose relative group box-decoration-clone rounded-[3px] px-1.5 py-1 bg-white/[0.08] text-codex-primary font-mono text-[0.9em] cursor-pointer hover:bg-white/[0.14] transition-colors"
+        className="not-prose relative group box-decoration-clone rounded-[3px] px-1.5 py-1 bg-codex-primary/[0.08] text-codex-primary font-mono text-[0.9em] cursor-pointer hover:bg-codex-primary/[0.14] transition-colors"
       >
         {code}
         <span
@@ -110,7 +110,7 @@ export function CodeBlock({ code, language = 'text', inline }: CodeBlockProps) {
   // flat translucent background, no border, no header bar; language label +
   // copy button float at the top-right and fade in on hover.
   return (
-    <div className="not-prose group relative my-3.5 rounded-md bg-black/30 overflow-hidden">
+    <div className="not-prose group relative my-3.5 rounded-md bg-[#20202A] overflow-hidden">
       <div className="absolute top-1.5 right-2.5 z-10 flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity select-none">
         <span className="font-mono text-[10px] text-text-secondary">{language}</span>
         {/* Both buttons share one box: icon-only gets a square, the labelled one

@@ -181,20 +181,6 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
     };
   }, [tagMenuOpen]);
 
-  useEffect(() => {
-    if (!ctxMenu) return;
-    const close = () => setCtxMenu(null);
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') close();
-    };
-    window.addEventListener('mousedown', close);
-    window.addEventListener('keydown', onKey);
-    return () => {
-      window.removeEventListener('mousedown', close);
-      window.removeEventListener('keydown', onKey);
-    };
-  }, [ctxMenu]);
-
   // LLMs commonly emit \(...\) / \[...\] math; remark-math only reads $..$.
   // Normalize before render (code spans/blocks are left intact). Hook stays
   // above the early return below.

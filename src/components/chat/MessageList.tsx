@@ -235,6 +235,10 @@ export function MessageList({
       jumpAttemptsRef.current = 0;
       requestAnimationFrame(() => el.scrollIntoView({ block: 'center' }));
       setHighlightId(jumpTarget.messageId);
+      // Consume the jump: leaving it in the store would re-trigger the scroll
+      // + flash every time this list remounts (e.g. switching back to the
+      // chat tab). The 2.4s flash runs off local highlightId, unaffected.
+      useChatStore.getState().setJumpTarget(null);
       return;
     }
     if (hasMoreMessages && onLoadOlder && !loadingOlder && jumpAttemptsRef.current < 50) {
@@ -243,8 +247,7 @@ export function MessageList({
     }
   }, [jumpTarget, messages, hasMoreMessages, loadingOlder, onLoadOlder]);
 
-  // The flash fades on its own; the target stays marked in the store so the
-  // in-session search bar can show "current match" state.
+  // The flash fades on its own.
   useEffect(() => {
     if (!highlightId) return;
     const t = setTimeout(() => setHighlightId(null), 2400);

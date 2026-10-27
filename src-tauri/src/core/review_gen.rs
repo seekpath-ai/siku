@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 use sqlx::SqlitePool;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::ai::llm::{ChatMessage, LlmClient};
 use crate::core::review_sources;
@@ -1354,6 +1354,11 @@ async fn save_review_inner(app: Option<&AppHandle>, db: &SqlitePool, run_id: &st
     state = review_store::load_state(db, run_id).await?;
     emit(app, &base_progress(run_id, "assemble"));
     let markdown = render_note_markdown(&raw, &state, &audit);
+    // Snapshot 截图引用搬进 blob 存储，随笔记同步（app 为空仅发生在测试里）。
+    let markdown = match app.and_then(|a| a.path().app_data_dir().ok()) {
+        Some(dir) => crate::file_store::ingest_snapshot_image_refs(&markdown, &dir),
+        None => markdown,
+    };
     let note_title = format!("综述：{}", state.run.question.chars().take(40).collect::<String>());
     let note_id = match state.run.note_id.clone() {
         Some(id) => {

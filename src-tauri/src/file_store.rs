@@ -141,3 +141,119 @@ pub fn parse_blob_path(rel_path: &str) -> Option<(String, String)> {
     let (hash, ext) = stripped.rsplit_once('.')?;
     Some((hash.to_string(), ext.to_string()))
 }
+
+/// Minimal percent-decoder for image destinations written by tools (hast and
+/// markdown editors may percent-encode Windows path separators and spaces).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| (b as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Rewrite image refs that point at absolute paths inside the app's
+/// `snapshots/` directory (what `paper_snapshot` returns and analysis notes
+/// embed) into content-addressed `blobs/<sha256>.<ext>` refs, copying the
+/// file into the blob store. Blob refs render identically (the blob dir IS
+/// the attachments base) and — the point — travel with note sync; absolute
+/// paths die on any other machine. Missing files and non-snapshot refs
+/// (remote URLs, attachments/, blobs/, other absolute paths) pass through
+/// unchanged.
+pub fn ingest_snapshot_image_refs(content: &str, app_data_dir: &Path) -> String {
+    let re = regex::Regex::new(r"!\[[^\]]*\]\(\s*<?([^<>\)\s]+)").unwrap();
+    let snapshots = app_data_dir.join("snapshots");
+    let snap_prefix = format!(
+        "{}/",
+        snapshots.to_string_lossy().replace('\\', "/").trim_end_matches('/')
+    )
+    .to_lowercase();
+
+    let mut out = String::with_capacity(content.len());
+    let mut last = 0;
+    for caps in re.captures_iter(content) {
+        let m = caps.get(1).unwrap();
+        let dest = m.as_str();
+        let decoded = percent_decode(dest).replace('\\', "/");
+        // Only rewrite paths that live under OUR snapshots dir — other
+        // absolute paths are user references we must not swallow.
+        if !decoded.to_lowercase().starts_with(&snap_prefix) {
+            continue;
+        }
+        let source = Path::new(&decoded);
+        if !source.exists() {
+            continue;
+        }
+        let Ok(blob_ref) = copy_file_to_blob(app_data_dir, source) else {
+            continue;
+        };
+        out.push_str(&content[last..m.start()]);
+        out.push_str(&blob_ref);
+        last = m.end();
+    }
+    if last == 0 {
+        return content.to_string();
+    }
+    out.push_str(&content[last..]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_refs_become_blob_refs() {
+        let dir = std::env::temp_dir().join(format!("siku-ingest-{}", std::process::id()));
+        let snap = dir.join("snapshots");
+        std::fs::create_dir_all(&snap).unwrap();
+        let png = snap.join("fig1.png");
+        std::fs::write(&png, b"fake-png-bytes").unwrap();
+
+        let abs = png.to_string_lossy().replace('\\', "/");
+        let content = format!("前文 ![]({abs}) 后文 ![](blobs/{0}aabb.png) 和 ![](https://x.com/a.png)", "cc".repeat(32));
+        let out = ingest_snapshot_image_refs(&content, &dir);
+
+        assert!(!out.contains("snapshots/"), "absolute path must be rewritten: {out}");
+        assert!(out.contains("blobs/"), "blob ref expected: {out}");
+        // Existing blob refs and remote URLs untouched.
+        assert!(out.contains("https://x.com/a.png"));
+        // The blob file exists with the same bytes.
+        let blob_ref = out
+            .split("](")
+            .nth(1)
+            .and_then(|s| s.split(')').next())
+            .unwrap()
+            .to_string();
+        let (hash, ext) = parse_blob_path(&blob_ref).unwrap();
+        assert_eq!(ext, "png");
+        assert_eq!(std::fs::read(dir.join("blobs").join(format!("{hash}.png"))).unwrap(), b"fake-png-bytes");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_snapshot_file_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("siku-ingest-miss-{}", std::process::id()));
+        let abs = dir.join("snapshots").join("gone.png").to_string_lossy().replace('\\', "/");
+        let content = format!("![]({abs})");
+        assert_eq!(ingest_snapshot_image_refs(&content, &dir), content);
+    }
+
+    #[test]
+    fn non_snapshot_absolute_path_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("siku-ingest-other-{}", std::process::id()));
+        let content = "![](/home/user/pictures/cat.png)";
+        assert_eq!(ingest_snapshot_image_refs(content, &dir), content);
+    }
+}

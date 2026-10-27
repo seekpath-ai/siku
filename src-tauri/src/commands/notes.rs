@@ -18,6 +18,7 @@ pub async fn notes_create(
             crate::core::note_service::SYSTEM_LIBRARY_NAME
         ));
     }
+    let content = crate::file_store::ingest_snapshot_image_refs(&content, &state.app_data_dir);
     let vault_id = crate::core::vault_service::get_current_vault_id(&state.db).await?;
     crate::core::note_service::create_note(&state.db, &title, &content, paper_id.as_deref(), parent_id.as_deref(), &vault_id, is_folder.unwrap_or(false)).await
 }
@@ -45,6 +46,7 @@ pub async fn note_create_from_reply(
 ) -> Result<Note, String> {
     let markdown =
         crate::core::evidence_note::convert(&state.db, &content, paper_id.as_deref()).await?;
+    let markdown = crate::file_store::ingest_snapshot_image_refs(&markdown, &state.app_data_dir);
     let vault_id = crate::core::vault_service::get_current_vault_id(&state.db).await?;
     match paper_id.as_deref().filter(|p| !p.is_empty()) {
         Some(pid) => {
@@ -67,6 +69,7 @@ pub async fn note_create_under_paper(
     title: String,
     content: String,
 ) -> Result<Note, String> {
+    let content = crate::file_store::ingest_snapshot_image_refs(&content, &state.app_data_dir);
     let vault_id = crate::core::vault_service::get_current_vault_id(&state.db).await?;
     crate::core::note_service::create_note_under_paper(&state.db, &paper_id, &title, &content, &vault_id).await
 }
@@ -80,6 +83,7 @@ pub async fn note_add_excerpt(
     paper_id: String,
     content: String,
 ) -> Result<Note, String> {
+    let content = crate::file_store::ingest_snapshot_image_refs(&content, &state.app_data_dir);
     let vault_id = crate::core::vault_service::get_current_vault_id(&state.db).await?;
     crate::core::note_service::add_excerpt_to_paper(&state.db, &paper_id, &content, &vault_id).await
 }
@@ -109,6 +113,7 @@ pub async fn notes_update(
     content: Option<String>, paper_id: Option<String>, aliases: Option<String>, is_favorite: Option<i32>,
     touch: Option<bool>,
 ) -> Result<Note, String> {
+    let content = content.as_deref().map(|c| crate::file_store::ingest_snapshot_image_refs(c, &state.app_data_dir));
     crate::core::note_service::update_note(&state.db, &id, title.as_deref(), content.as_deref(), paper_id.as_deref(), aliases.as_deref(), is_favorite, touch).await
 }
 

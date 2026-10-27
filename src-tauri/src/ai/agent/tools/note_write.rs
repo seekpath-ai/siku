@@ -8,10 +8,14 @@ pub struct NoteWriteTool {
     db: SqlitePool,
     /// 写入成功后向前端广播 `note:changed`,让打开的笔记编辑器即时刷新。
     app: Option<tauri::AppHandle>,
+    /// Snapshot 截图绝对路径引用在入库前搬进 blob 存储（随笔记同步）。
+    app_data_dir: std::path::PathBuf,
 }
 
 impl NoteWriteTool {
-    pub fn new(db: SqlitePool, app: Option<tauri::AppHandle>) -> Self { Self { db, app } }
+    pub fn new(db: SqlitePool, app: Option<tauri::AppHandle>, app_data_dir: std::path::PathBuf) -> Self {
+        Self { db, app, app_data_dir }
+    }
 
     fn emit_changed(&self, note_id: &str) {
         if let Some(app) = &self.app {
@@ -73,6 +77,7 @@ impl Tool for NoteWriteTool {
         let content = crate::core::evidence_note::convert(&self.db, raw, default_paper.as_deref())
             .await
             .map_err(|e| format!("引用格式转换失败: {e}"))?;
+        let content = crate::file_store::ingest_snapshot_image_refs(content.as_str(), &self.app_data_dir);
         let content = content.as_str();
 
         if let Some(note_id) = args["note_id"].as_str() {

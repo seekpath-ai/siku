@@ -280,7 +280,7 @@ impl ToolRegistry {
 
         // Note tools
         registry.register(crate::ai::agent::tools::note_read::NoteReadTool::new(db.clone()));
-        registry.register(crate::ai::agent::tools::note_write::NoteWriteTool::new(db.clone(), app_handle.clone()));
+        registry.register(crate::ai::agent::tools::note_write::NoteWriteTool::new(db.clone(), app_handle.clone(), app_data_dir.to_path_buf()));
 
         // UI theme switching from chat (writes AppSettings, emits
         // app:settings_changed; the frontend re-applies CSS vars live).

@@ -722,10 +722,23 @@ class ImageWidget extends WidgetType {
     super();
   }
   toDOM() {
+    // Wrapper stays the widget root; on load failure the img is swapped for a
+    // visible chip — hiding it (old behaviour) left a blank line indistinguishable
+    // from the background, while the reading view shows [图片加载失败].
+    const wrap = document.createElement('span');
+    wrap.className = 'cm-live-image-wrap';
     const img = document.createElement('img');
     img.className = 'cm-live-image';
     img.alt = this.alt;
     if (this.title) img.title = this.title;
+    const showFailed = () => {
+      const chip = document.createElement('span');
+      chip.className = 'cm-live-image-failed';
+      chip.textContent = `[图片加载失败] ${this.alt || this.src}`;
+      chip.title = this.src;
+      img.remove();
+      wrap.appendChild(chip);
+    };
     if (this.isRemote) {
       // Remote images must be cached by the Rust backend and loaded through
       // the asset protocol to comply with the CSP.
@@ -733,16 +746,13 @@ class ImageWidget extends WidgetType {
         .then((url) => {
           img.src = url;
         })
-        .catch(() => {
-          img.style.display = 'none';
-        });
+        .catch(showFailed);
     } else {
       img.src = this.src;
     }
-    img.onerror = () => {
-      img.style.display = 'none';
-    };
-    return img;
+    img.onerror = showFailed;
+    wrap.appendChild(img);
+    return wrap;
   }
   // No updateDOM override: eq() equality already reuses the DOM (so a stable
   // image is not re-fetched); the default (false) redraws a changed one.
@@ -2297,11 +2307,32 @@ const editorTheme = EditorView.theme({
   '.cm-scroller': { fontFamily: 'inherit', lineHeight: '1.65' },
   '.cm-gutters': {
     backgroundColor: 'transparent',
-    borderRight: '1px solid rgba(255,255,255,0.06)',
-    color: 'rgba(255,255,255,0.18)',
+    borderRight: '1px solid rgb(var(--codex-primary) / 0.06)',
+    color: 'rgb(var(--codex-primary) / 0.25)',
     paddingRight: '2px',
   },
-  '.cm-content': { caretColor: 'rgb(var(--text-primary))', padding: '1rem 0.75rem' },
+  // oneDark is always applied (below) for its syntax palette; its neutral
+  // colors assume a dark background, so anything structural follows the app
+  // theme vars instead — otherwise the light theme gets #abb2bf body text
+  // on white.
+  '.cm-content': {
+    caretColor: 'rgb(var(--text-primary))',
+    color: 'rgb(var(--text-primary))',
+    padding: '1rem 0.75rem',
+  },
+  '.cm-cursor': { borderLeftColor: 'rgb(var(--text-primary))' },
+  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection': {
+    backgroundColor: 'rgb(var(--codex-accent) / 0.28)',
+  },
+  '.cm-panels': {
+    backgroundColor: 'rgb(var(--surface))',
+    color: 'rgb(var(--text-primary))',
+  },
+  '.cm-tooltip': {
+    backgroundColor: 'rgb(var(--surface))',
+    color: 'rgb(var(--text-primary))',
+    border: '1px solid rgb(var(--surface-hover))',
+  },
   '&.cm-focused': { outline: 'none' },
 });
 

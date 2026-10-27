@@ -451,7 +451,10 @@ body.in-tauri {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.9em;
   color: #E5E7EB;
-  background: rgba(0, 0, 0, 0.32);
+  /* Fixed dark surface in every theme: the oneDark syntax palette needs it
+     (rgba(0,0,0,.32) over a light theme's white background was a mid-gray
+     with light-gray text — unreadable). */
+  background: #20202A;
 }
 /* Fenced code block (Obsidian style): full-width lines + collapsed fences */
 .cm-live-codeblock-line {
@@ -533,6 +536,25 @@ body.in-tauri {
   vertical-align: middle;
   cursor: text;
 }
+.cm-live-image-wrap {
+  display: inline-block;
+  max-width: 100%;
+}
+/* Broken-image placeholder: mirrors the reading view's [图片加载失败] chip
+   (WikiMarkdown MdImage) so a missing file never collapses into a blank line. */
+.cm-live-image-failed {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgb(var(--surface-hover));
+  color: rgb(var(--text-secondary) / 0.6);
+  font-size: 0.75em;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
 .cm-live-table table {
   border-collapse: collapse;
   width: 100%;
@@ -560,7 +582,7 @@ body.in-tauri {
 
 /* ── Typography (prose) — map app theme into prose-invert variables ── */
 .prose.prose-invert {
-  --tw-prose-body: #D1D5DB;
+  --tw-prose-body: rgb(var(--text-primary) / 0.85);
   --tw-prose-headings: rgb(var(--text-primary));
   --tw-prose-lead: rgb(var(--text-secondary));
   --tw-prose-links: rgb(var(--primary));
@@ -571,9 +593,13 @@ body.in-tauri {
   --tw-prose-quotes: rgb(var(--text-primary));
   --tw-prose-quote-borders: rgb(var(--codex-primary) / 0.18);
   --tw-prose-captions: rgb(var(--text-secondary));
-  --tw-prose-code: #F0ABFC;
+  /* Inline code hue: pink reads well on dark; the light preset overrides
+     --prose-code with a darker pink (src/lib/theme.ts). */
+  --tw-prose-code: rgb(var(--prose-code, 240 171 252));
+  /* Code blocks stay dark in every theme: the syntax palette (oneDark) is
+     tuned for a dark surface, matching the editor's live preview. */
   --tw-prose-pre-code: #E5E7EB;
-  --tw-prose-pre-bg: #0d0d0d;
+  --tw-prose-pre-bg: #20202A;
   --tw-prose-th-borders: color-mix(in srgb, rgb(var(--codex-border-light)) 75%, white);
   --tw-prose-td-borders: rgb(var(--codex-border-light));
 }

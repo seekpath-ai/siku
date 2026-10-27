@@ -721,7 +721,7 @@ class ImageWidget extends WidgetType {
   ) {
     super();
   }
-  toDOM() {
+  toDOM(view: EditorView) {
     // Wrapper stays the widget root; on load failure the img is swapped for a
     // visible chip — hiding it (old behaviour) left a blank line indistinguishable
     // from the background, while the reading view shows [图片加载失败].
@@ -752,20 +752,18 @@ class ImageWidget extends WidgetType {
     }
     img.onerror = showFailed;
     wrap.appendChild(img);
-    return wrap;
-  }
-  // Clicking the widget places the caret on the image's line: the live
-  // preview then expands the markdown source so the link can be edited.
-  // (Previously the widget swallowed the click and a broken image line was
-  // only editable from the very start of the line.)
-  eventHandlers = {
-    mousedown: (event: MouseEvent, view: EditorView) => {
+    // Clicking the widget places the caret on the image's line: the live
+    // preview then expands the markdown source so the link can be edited.
+    // (WidgetType has no eventHandlers support; a broken image line was only
+    // editable from the very start/end of the link.)
+    wrap.addEventListener('mousedown', (event) => {
       event.preventDefault();
-      const pos = view.posAtDOM(event.target as HTMLElement);
+      const pos = view.posAtDOM(wrap);
       view.dispatch({ selection: { anchor: pos } });
       view.focus();
-    },
-  };
+    });
+    return wrap;
+  }
   // No updateDOM override: eq() equality already reuses the DOM (so a stable
   // image is not re-fetched); the default (false) redraws a changed one.
   eq(other: ImageWidget) {

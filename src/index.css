@@ -500,18 +500,20 @@ body.in-tauri {
 .cm-live-code-lang {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 10px;
-  color: rgb(var(--text-secondary));
+  /* Fixed light-on-dark: the header floats over the code block's fixed dark
+     surface (#20202A), where the light theme's dark --text-secondary vanishes. */
+  color: #9AA0AB;
 }
 .cm-live-code-copy {
   font-size: 10px;
-  color: rgb(var(--text-secondary));
-  border: 1px solid rgb(var(--codex-primary) / 0.14);
+  color: #9AA0AB;
+  border: 1px solid rgb(255 255 255 / 0.18);
   border-radius: 4px;
   padding: 0 5px;
   cursor: pointer;
   background: transparent;
 }
-.cm-live-code-copy:hover { color: rgb(var(--text-primary)); border-color: rgb(var(--codex-primary) / 0.3); }
+.cm-live-code-copy:hover { color: #E5E7EB; border-color: rgb(255 255 255 / 0.35); }
 .cm-live-bullet {
   color: rgb(var(--primary));
   margin-right: 2px;

@@ -112,7 +112,7 @@ export function CodeBlock({ code, language = 'text', inline }: CodeBlockProps) {
   return (
     <div className="not-prose group relative my-3.5 rounded-md bg-[#20202A] overflow-hidden">
       <div className="absolute top-1.5 right-2.5 z-10 flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity select-none">
-        <span className="font-mono text-[10px] text-text-secondary">{language}</span>
+        <span className="font-mono text-[10px] text-[#9AA0AB]">{language}</span>
         {/* Both buttons share one box: icon-only gets a square, the labelled one
             keeps the same height. `leading-none` matters — `text-[10px]` only sets
             the font size, so without it the labelled button was stretched to the
@@ -123,14 +123,14 @@ export function CodeBlock({ code, language = 'text', inline }: CodeBlockProps) {
           className={`flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded border leading-none transition-colors ${
             wrapped
               ? 'border-primary/40 text-primary'
-              : 'border-white/15 text-text-secondary hover:text-text-primary hover:border-white/30'
+              : 'border-white/15 text-[#9AA0AB] hover:text-gray-200 hover:border-white/30'
           }`}
         >
           <WrapText size={11} />
         </button>
         <button
           onClick={handleCopy}
-          className="flex h-[18px] shrink-0 items-center gap-1 rounded border border-white/15 px-1.5 text-[10px] leading-none text-text-secondary hover:text-text-primary hover:border-white/30 transition-colors"
+          className="flex h-[18px] shrink-0 items-center gap-1 rounded border border-white/15 px-1.5 text-[10px] leading-none text-[#9AA0AB] hover:text-gray-200 hover:border-white/30 transition-colors"
         >
           {copied ? <Check size={11} className="text-accent" /> : <Copy size={11} />}
           <span>{copied ? '已复制' : '复制'}</span>

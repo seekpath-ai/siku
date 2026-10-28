@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { createRoute, useNavigate } from '@tanstack/react-router';
 import { Route as RootRoute } from './__root';
-import { Loader2, Search, CircleDashed } from 'lucide-react';
+import { Loader2, Search, CircleDashed, X, ExternalLink, Crosshair, Undo2 } from 'lucide-react';
 import ForceGraph2D from 'react-force-graph-2d';
-import { graphGet, notesListAll } from '@/lib/tauri';
+import { graphGet, graphGetLocal, notesListAll } from '@/lib/tauri';
 import { openNoteTab } from '@/lib/openNote';
 import { useAllUnlockedSet } from '@/stores/noteLockStore';
 import { computeHiddenSet } from '@/lib/noteLock';
@@ -44,6 +44,10 @@ function GraphPage() {
   // null = auto (hidden when the graph is large)
   const [showOrphans, setShowOrphans] = useState<boolean | null>(null);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
+  // Single click selects a node → detail sidebar + persistent focus.
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Double click drills into a local graph centered on that node.
+  const [drill, setDrill] = useState<{ centerId: string; label: string; depth: number; data: GraphData | null } | null>(null);
 
   // Size the canvas from the real container (re-layouts on resize), which also
   // guarantees a non-zero canvas on first paint.
@@ -90,13 +94,15 @@ function GraphPage() {
   const unlockedSet = useAllUnlockedSet();
   const hiddenIds = useMemo(() => computeHiddenSet(allNotes, unlockedSet), [allNotes, unlockedSet]);
 
-  // Pipeline: locked-note filter → type filter → orphan filter.
+  // Pipeline: locked-note filter → type filter → orphan filter. Drilled local
+  // graphs flow through the same pipeline (locked notes stay hidden there too).
+  const baseData = drill?.data ?? data;
   const visibleData = useMemo(() => {
-    if (!data) return null;
-    let nodes = data.nodes.filter((n) => !(n.node_type === 'note' && hiddenIds.has(n.id)));
+    if (!baseData) return null;
+    let nodes = baseData.nodes.filter((n) => !(n.node_type === 'note' && hiddenIds.has(n.id)));
     nodes = nodes.filter((n) => !hiddenTypes.has(n.node_type));
     let ids = new Set(nodes.map((n) => n.id));
-    let links = data.links.filter((l) => ids.has(linkEndId(l.source)) && ids.has(linkEndId(l.target)));
+    let links = baseData.links.filter((l) => ids.has(linkEndId(l.source)) && ids.has(linkEndId(l.target)));
 
     const large = nodes.length > LARGE_GRAPH_NODES;
     const orphansVisible = showOrphans ?? !large;
@@ -111,7 +117,7 @@ function GraphPage() {
       links = links.filter((l) => ids.has(linkEndId(l.source)) && ids.has(linkEndId(l.target)));
     }
     return { nodes, links, large, orphansVisible };
-  }, [data, hiddenIds, hiddenTypes, showOrphans]);
+  }, [baseData, hiddenIds, hiddenTypes, showOrphans]);
 
   // Canvas colors resolve CSS variables — re-resolved when the theme changes.
   const palette = useMemo(() => {
@@ -128,16 +134,43 @@ function GraphPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [themeVersion]);
 
-  const handleNodeClick = (node: unknown) => {
-    const n = node as GraphNode;
-    if (!n?.id) return;
+  const openNode = (n: GraphNode) => {
     if (n.node_type === 'note') {
       openNoteTab(navigate, { id: n.id, title: n.label });
-    } else if (n.node_type === 'paper' || n.node_type === 'tag') {
-      navigate({ to: '/library' });
+    } else if (n.node_type === 'paper') {
+      navigate({ to: '/reader/$paperId', params: { paperId: n.id } });
     } else if (n.node_type === 'knowledge_item') {
       navigate({ to: '/knowledge' });
     }
+  };
+
+  const drillInto = (n: GraphNode, depth = 1) => {
+    setSelectedId(n.id);
+    setDrill({ centerId: n.id, label: n.label, depth, data: null });
+    graphGetLocal(n.id, depth)
+      .then((raw) => setDrill({ centerId: n.id, label: n.label, depth, data: { nodes: raw.nodes, links: raw.edges } }))
+      .catch((err) => {
+        console.error(err);
+        setDrill(null);
+      });
+  };
+
+  const exitDrill = () => setDrill(null);
+
+  // react-force-graph-2d has no onNodeDblClick — detect the second click of a
+  // double-click on the same node ourselves.
+  const lastClick = useRef<{ id: string; time: number }>({ id: '', time: 0 });
+  const handleNodeClick = (node: unknown) => {
+    const n = node as GraphNode;
+    if (!n?.id) return;
+    const now = Date.now();
+    if (lastClick.current.id === n.id && now - lastClick.current.time < 350) {
+      lastClick.current = { id: '', time: 0 };
+      drillInto(n, drill?.depth ?? 1);
+      return;
+    }
+    lastClick.current = { id: n.id, time: now };
+    setSelectedId((prev) => (prev === n.id ? null : n.id));
   };
 
   // Give nodes deterministic initial positions (circular layout) so the first
@@ -156,19 +189,37 @@ function GraphPage() {
     };
   }, [visibleData]);
 
-  // Focus set: hovered node + its neighbors win; otherwise search matches.
-  // Everything outside the focus set fades — Obsidian-style behavior.
-  const hoverFocus = useMemo(() => {
-    if (!hoveredId || !visibleData) return null;
-    const set = new Set<string>([hoveredId]);
+  // Focus set: hovered node + its neighbors win; then the selected node; then
+  // search matches. Everything outside the focus set fades — Obsidian-style.
+  const neighborSet = (centerId: string | null): Set<string> | null => {
+    if (!centerId || !visibleData) return null;
+    const set = new Set<string>([centerId]);
     for (const l of visibleData.links) {
       const s = linkEndId(l.source);
       const t = linkEndId(l.target);
-      if (s === hoveredId) set.add(t);
-      if (t === hoveredId) set.add(s);
+      if (s === centerId) set.add(t);
+      if (t === centerId) set.add(s);
     }
     return set;
-  }, [hoveredId, visibleData]);
+  };
+  const hoverFocus = useMemo(() => neighborSet(hoveredId), [hoveredId, visibleData]); // eslint-disable-line react-hooks/exhaustive-deps
+  const selectedFocus = useMemo(() => neighborSet(selectedId), [selectedId, visibleData]); // eslint-disable-line react-hooks/exhaustive-deps
+  const selectedNode = useMemo(
+    () => visibleData?.nodes.find((n) => n.id === selectedId) ?? null,
+    [visibleData, selectedId]
+  );
+  const selectedNeighbors = useMemo(() => {
+    if (!selectedId || !visibleData) return [];
+    const byId = new Map(visibleData.nodes.map((n) => [n.id, n]));
+    const out: GraphNode[] = [];
+    for (const l of visibleData.links) {
+      const s = linkEndId(l.source);
+      const t = linkEndId(l.target);
+      if (s === selectedId && byId.has(t)) out.push(byId.get(t)!);
+      else if (t === selectedId && byId.has(s)) out.push(byId.get(s)!);
+    }
+    return out.sort((a, b) => a.label.localeCompare(b.label));
+  }, [selectedId, visibleData]);
 
   const searchFocus = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -180,7 +231,7 @@ function GraphPage() {
     return set;
   }, [query, visibleData]);
 
-  const focusSet = hoverFocus ?? searchFocus;
+  const focusSet = hoverFocus ?? selectedFocus ?? searchFocus;
   const isFocused = (id: string) => !focusSet || focusSet.has(id);
 
   const toggleType = (t: GraphNodeType) => {
@@ -236,6 +287,25 @@ function GraphPage() {
           <CircleDashed size={13} />
           孤立节点
         </button>
+        {drill && (
+          <div className="flex items-center gap-1 h-7 px-2 rounded-md text-xs bg-surface border border-primary/50 text-text-primary">
+            <button onClick={exitDrill} className="flex items-center gap-1 hover:text-primary" title="返回全局图谱">
+              <Undo2 size={12} />
+              局部：{drill.label}
+            </button>
+            <span className="text-text-secondary mx-1">|</span>
+            {[1, 2].map((d) => (
+              <button
+                key={d}
+                onClick={() => drill.depth !== d && drillInto({ id: drill.centerId, label: drill.label } as GraphNode, d)}
+                className={`px-1 rounded ${drill.depth === d ? 'text-primary font-medium' : 'text-text-secondary hover:text-text-primary'}`}
+                title={`${d} 跳深度`}
+              >
+                {d}跳
+              </button>
+            ))}
+          </div>
+        )}
         {visibleData?.large && showOrphans === null && (
           <span className="text-xs text-text-secondary">
             节点较多，已自动隐藏孤立节点
@@ -250,7 +320,7 @@ function GraphPage() {
 
       {/* Canvas */}
       <div ref={containerRef} className="flex-1 min-h-0 relative">
-        {loading ? (
+        {loading || (drill && !drill.data) ? (
           <div className="flex items-center justify-center h-full">
             <Loader2 size={32} className="animate-spin text-text-secondary" />
           </div>
@@ -279,6 +349,7 @@ function GraphPage() {
               }}
               backgroundColor="rgb(var(--background))"
               onNodeClick={handleNodeClick}
+              onBackgroundClick={() => setSelectedId(null)}
               onNodeHover={(node) => {
                 setHoveredId(((node as GraphNode)?.id) ?? null);
                 const el = containerRef.current;
@@ -311,6 +382,70 @@ function GraphPage() {
                 </div>
               ))}
             </div>
+            {/* Node detail sidebar */}
+            {selectedNode && (
+              <div className="absolute right-3 top-3 bottom-3 w-64 rounded-lg bg-surface/95 backdrop-blur border border-surface-hover flex flex-col overflow-hidden">
+                <div className="flex items-start justify-between gap-2 px-3 py-2.5 border-b border-surface-hover">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5 text-[11px] text-text-secondary">
+                      <span
+                        className="w-2 h-2 rounded-full shrink-0"
+                        style={{ backgroundColor: palette.byType[selectedNode.node_type] ?? palette.fallback }}
+                      />
+                      {GRAPH_TYPE_LABELS[selectedNode.node_type as GraphNodeType] ?? selectedNode.node_type}
+                    </div>
+                    <div className="text-sm text-text-primary mt-0.5 break-words">{selectedNode.label}</div>
+                  </div>
+                  <button
+                    onClick={() => setSelectedId(null)}
+                    className="p-1 rounded text-text-secondary hover:bg-surface-hover hover:text-text-primary shrink-0"
+                    title="取消选中"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+                <div className="flex items-center gap-1 px-3 py-2 border-b border-surface-hover">
+                  {selectedNode.node_type !== 'tag' && (
+                    <button
+                      onClick={() => openNode(selectedNode)}
+                      className="flex items-center gap-1 h-6 px-2 rounded-md text-xs bg-primary/15 text-primary hover:bg-primary/25"
+                    >
+                      <ExternalLink size={11} />
+                      打开
+                    </button>
+                  )}
+                  <button
+                    onClick={() => drillInto(selectedNode, drill?.depth ?? 1)}
+                    className="flex items-center gap-1 h-6 px-2 rounded-md text-xs bg-surface-hover text-text-primary hover:brightness-110"
+                  >
+                    <Crosshair size={11} />
+                    以此为局部中心
+                  </button>
+                </div>
+                <div className="flex-1 min-h-0 overflow-y-auto px-2 py-2">
+                  <div className="text-[11px] text-text-secondary px-1 mb-1">
+                    邻居（{selectedNeighbors.length}）
+                  </div>
+                  {selectedNeighbors.map((n) => (
+                    <button
+                      key={n.id}
+                      onClick={() => setSelectedId(n.id)}
+                      className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-xs text-left text-text-primary hover:bg-surface-hover"
+                      title={`${GRAPH_TYPE_LABELS[n.node_type as GraphNodeType] ?? n.node_type}：${n.label}`}
+                    >
+                      <span
+                        className="w-2 h-2 rounded-full shrink-0"
+                        style={{ backgroundColor: palette.byType[n.node_type] ?? palette.fallback }}
+                      />
+                      <span className="truncate">{n.label}</span>
+                    </button>
+                  ))}
+                  {selectedNeighbors.length === 0 && (
+                    <div className="text-xs text-text-secondary px-2 py-1">无关联节点</div>
+                  )}
+                </div>
+              </div>
+            )}
           </>
         ) : null}
       </div>

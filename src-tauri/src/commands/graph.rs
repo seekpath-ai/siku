@@ -13,8 +13,8 @@ pub async fn graph_get(state: State<'_, AppState>) -> Result<GraphData, String> 
 #[instrument(skip(state))]
 pub async fn graph_get_local(
     state: State<'_, AppState>,
-    note_id: String,
+    center_id: String,
     depth: Option<i32>,
 ) -> Result<GraphData, String> {
-    crate::core::graph_service::build_local_graph(&state.db, &note_id, depth.unwrap_or(1)).await
+    crate::core::graph_service::build_local_graph(&state.db, &center_id, depth.unwrap_or(1)).await
 }

@@ -1794,8 +1794,8 @@ export async function graphGet(): Promise<GraphData> {
   return invoke<GraphData>('graph_get');
 }
 
-export async function graphGetLocal(noteId: string, depth?: number): Promise<GraphData> {
-  return invoke<GraphData>('graph_get_local', { noteId, depth });
+export async function graphGetLocal(centerId: string, depth?: number): Promise<GraphData> {
+  return invoke<GraphData>('graph_get_local', { centerId, depth });
 }
 
 // ============================================================

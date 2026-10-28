@@ -460,6 +460,11 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
   // lets a stale async render detect that a layout rebuild replaced it.
   const renderingRef = useRef<Map<number, HTMLDivElement>>(new Map());
   const renderTaskMapRef = useRef<Map<number, any>>(new Map()); // in-flight pdf.js RenderTasks
+  /** Bumped on every layout rebuild. Async renders capture it and bail before
+   *  registering results when it changed — otherwise a stale in-flight build
+   *  (old scale / detached wrapper) can finish last and leave find-match
+   *  highlights mapped onto superseded text-layer divs. */
+  const layoutGenRef = useRef(0);
   const zoomRef = useRef(initialZoom ?? 1);
   const zoomModeRef = useRef<'fit-width' | 'fit-page' | 'actual' | 'custom'>('fit-width');
   const pagesRotationRef = useRef(0);
@@ -851,6 +856,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     renderingRef.current.clear();
     for (const [, tl] of textLayerMapRef.current) tl.cancel?.();
     textLayerMapRef.current.clear();
+    for (const [, h] of highlighterMapRef.current) h.disable();
     highlighterMapRef.current.clear();
     for (const [, b] of annotationBuilderMapRef.current) b.cancel?.();
     annotationBuilderMapRef.current.clear();
@@ -995,11 +1001,16 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     const slots: PageSlot[] = [];
 
     // Clear old wrappers, text layers, drawing overlays, annotations and pending renders
+    layoutGenRef.current += 1;
     for (const [, task] of renderTaskMapRef.current) { try { task.cancel(); } catch { /* ignore */ } }
     renderTaskMapRef.current.clear();
     renderingRef.current.clear();
     for (const [, tl] of textLayerMapRef.current) tl.cancel?.();
     textLayerMapRef.current.clear();
+    // Disable each highlighter (unsubscribes its event listener) before
+    // dropping the map — a bare clear() leaked live highlighters that kept
+    // drawing into detached text-layer divs.
+    for (const [, h] of highlighterMapRef.current) h.disable();
     highlighterMapRef.current.clear();
     for (const [, b] of annotationBuilderMapRef.current) b.cancel?.();
     annotationBuilderMapRef.current.clear();
@@ -1165,6 +1176,9 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
 
       // Text layer (best-effort, async)
       await buildTextLayer(pageNum, page, viewport, wrapper).catch(() => {});
+      // A rebuild during the async text-layer build replaced this wrapper —
+      // stop before annotations land in it.
+      if (wrapperMapRef.current.get(pageNum) !== wrapper) return;
 
       // Annotation layer (placed above text layer so links are clickable).
       // AnnotationLayerBuilder renders into its own internally-created div,
@@ -1481,8 +1495,17 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
     const svg = svgMapRef.current.get(pageNum);
     if (svg) wrapper.appendChild(svg);
 
+    // Generation guard: a layout rebuild (zoom/resize/rotation) cancels and
+    // clears all text-layer state while this async build is in flight. Without
+    // bailing, the stale build would finish LAST — overwriting the fresh
+    // build's map entries and wiring the find highlighter to superseded divs,
+    // which is how match highlights ended up painted on empty space.
+    const gen = layoutGenRef.current;
+    const isCurrent = () => gen === layoutGenRef.current && wrapperMapRef.current.get(pageNum) === wrapper;
+
     try {
       const textContent = await page.getTextContent();
+      if (!isCurrent()) { textLayerDiv.remove(); return; }
       if (!textContent?.items?.length) return;
 
       const textLayer = new pdfjsRef.current.TextLayer({
@@ -1491,6 +1514,11 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
         viewport,
       });
       await textLayer.render();
+      if (!isCurrent()) {
+        textLayer.cancel?.();
+        textLayerDiv.remove();
+        return;
+      }
       textLayerMapRef.current.set(pageNum, textLayer);
 
       // Set up find-match highlighting for this page. pdfjs-dist does not
@@ -1537,7 +1565,9 @@ export const PdfViewer = forwardRef<PdfViewerHandle, PdfViewerProps>(
       };
       textLayerDiv.addEventListener('copy', onCopy);
     } catch {
-      textLayerMapRef.current.delete(pageNum);
+      // Only clean up our own generation's entry — a stale build that threw
+      // late must not delete the fresh layer registered after a rebuild.
+      if (gen === layoutGenRef.current) textLayerMapRef.current.delete(pageNum);
     }
     // A (re)built text layer wiped the page's selection overlay; repaint any
     // stored multi-range segments that live on this page.

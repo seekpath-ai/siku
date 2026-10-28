@@ -4,11 +4,7 @@ use crate::ai::agent::tool_registry::{Tool, ToolParameter};
 /// Build an FTS5 MATCH expression from a free-text query: each token becomes
 /// a quoted prefix term (`"token"*`), joined by spaces (implicit AND).
 fn fts_query(query: &str) -> String {
-    query
-        .split_whitespace()
-        .map(|t| format!("\"{}\"*", t.trim_matches('"').trim_matches('"')))
-        .collect::<Vec<_>>()
-        .join(" ")
+    crate::core::fts::prefix_match_expr(query, " ")
 }
 
 /// Search papers in the user's library

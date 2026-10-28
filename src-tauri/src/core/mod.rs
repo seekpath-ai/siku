@@ -18,6 +18,7 @@ pub mod evidence_note;
 pub mod git_host;
 pub mod file_item_service;
 pub mod file_service;
+pub mod fts;
 pub mod graph_service;
 pub mod knowledge;
 pub mod link_import;

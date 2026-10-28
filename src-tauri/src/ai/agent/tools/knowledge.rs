@@ -51,9 +51,7 @@ impl Tool for KnowledgeQueryTool {
 
         // Full-text search with optional domain filter; LIKE fallback. Each
         // branch also fetches the total match count for the 共 N 条 footer.
-        let match_expr = query.split_whitespace()
-            .map(|t| format!("\"{}\"*", t.trim_matches('"')))
-            .collect::<Vec<_>>().join(" ");
+        let match_expr = crate::core::fts::prefix_match_expr(query, " ");
 
         let (items, total): (Vec<(String, String, Option<String>, String)>, i64) = if query.trim().is_empty() {
             (Vec::new(), 0)

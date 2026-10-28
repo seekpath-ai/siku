@@ -421,11 +421,7 @@ pub async fn search_notes(
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let match_expr = query
-        .split_whitespace()
-        .map(|t| format!("\"{}\"*", t.trim_matches('"')))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let match_expr = crate::core::fts::prefix_match_expr(query, " ");
 
     let excluded = excluded_locked_ids(db, vault_id, unlocked_ids).await?;
 

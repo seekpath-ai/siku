@@ -106,9 +106,7 @@ impl Tool for NoteReadTool {
             q.bind(limit).bind(offset).fetch_all(&self.db).await
                 .map_err(|e| format!("db error: {e}"))?
         } else {
-            let match_expr = search.split_whitespace()
-                .map(|t| format!("\"{}\"*", t.trim_matches('"')))
-                .collect::<Vec<_>>().join(" ");
+            let match_expr = crate::core::fts::prefix_match_expr(search, " ");
             let fts_sql = format!(
                 "SELECT n.id, n.title, n.content_plain FROM notes_fts f JOIN notes n ON n.rowid = f.rowid \
                  WHERE notes_fts MATCH ?{} ORDER BY bm25(notes_fts) LIMIT ? OFFSET ?",

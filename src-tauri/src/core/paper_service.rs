@@ -926,9 +926,10 @@ pub async fn list_papers(db: &SqlitePool, params: ListPapersParams) -> Result<Ve
         .search
         .as_ref()
         .map(|s| {
-            s.split_whitespace()
+            crate::core::fts::tokenize(s)
+                .into_iter()
                 .filter(|w| w.chars().count() >= 3)
-                .map(|w| format!("{w}*"))
+                .map(|w| format!("\"{w}\"*"))
                 .collect::<Vec<_>>()
                 .join(" OR ")
         })

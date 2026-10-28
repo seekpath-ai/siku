@@ -56,7 +56,7 @@ pub async fn search_knowledge(
     limit: usize,
 ) -> Result<Vec<KnowledgeSearchResult>, String> {
     let pattern = format!("%{}%", query);
-    let fts_query = query.split_whitespace().map(|w| format!("{}*", w)).collect::<Vec<_>>().join(" OR ");
+    let fts_query = crate::core::fts::prefix_match_expr(query, " OR ");
 
     let rows: Vec<(String, String, String, String, String, String)> = if domain_id.is_some() {
         sqlx::query_as(

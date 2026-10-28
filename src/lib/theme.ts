@@ -51,6 +51,10 @@ const DEFAULT_DARK: ThemePreset = {
     'codex-warning': '245 158 11',
     'codex-danger': '239 68 68',
     'codex-code': '10 10 10',
+    'graph-paper': '96 165 250',
+    'graph-note': '74 222 128',
+    'graph-tag': '250 204 21',
+    'graph-knowledge': '192 132 252',
   },
 };
 
@@ -80,6 +84,10 @@ const LIGHT: ThemePreset = {
     'codex-code': '244 244 245',
     // Inline code: the default pink (#F0ABFC) is unreadable on white.
     'prose-code': '190 24 93',
+    'graph-paper': '37 99 235',
+    'graph-note': '21 128 61',
+    'graph-tag': '161 98 7',
+    'graph-knowledge': '126 34 206',
   },
 };
 
@@ -107,6 +115,10 @@ const EYE_CARE: ThemePreset = {
     'codex-warning': '245 158 11',
     'codex-danger': '239 68 68',
     'codex-code': '18 24 20',
+    'graph-paper': '96 165 250',
+    'graph-note': '74 222 128',
+    'graph-tag': '250 204 21',
+    'graph-knowledge': '192 132 252',
   },
 };
 
@@ -134,6 +146,10 @@ const OCEAN: ThemePreset = {
     'codex-warning': '245 158 11',
     'codex-danger': '239 68 68',
     'codex-code': '8 14 26',
+    'graph-paper': '96 165 250',
+    'graph-note': '74 222 128',
+    'graph-tag': '250 204 21',
+    'graph-knowledge': '192 132 252',
   },
 };
 

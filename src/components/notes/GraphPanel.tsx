@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, useMemo } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
 import { X } from 'lucide-react';
+import { graphCssColor, graphLinkAlpha, graphNodeColor, useThemeVersion } from '@/lib/graphColors';
 
 interface GraphNode {
   id: string;
@@ -32,6 +33,7 @@ interface Props {
 export function GraphPanel({ activeNoteId, nodes, edges, lockedIds, onNodeClick, onClose }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
+  const themeVersion = useThemeVersion();
 
   useEffect(() => {
     const el = containerRef.current;
@@ -64,6 +66,12 @@ export function GraphPanel({ activeNoteId, nodes, edges, lockedIds, onNodeClick,
     };
   }, [nodes, edges, activeNoteId, lockedIds]);
 
+  const palette = useMemo(() => ({
+    active: graphCssColor('--primary', '230 126 34'),
+    link: graphLinkAlpha(0.25),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [themeVersion]);
+
   return (
     <div ref={containerRef} className="w-64 border-l border-surface-hover flex flex-col bg-background">
       <div className="flex items-center justify-between px-3 py-2 border-b border-surface-hover">
@@ -86,9 +94,12 @@ export function GraphPanel({ activeNoteId, nodes, edges, lockedIds, onNodeClick,
             graphData={data}
             nodeId="id"
             nodeLabel="label"
-            nodeColor={(n: unknown) => ((n as ForceNode).color) || 'rgb(var(--text-secondary))'}
+            nodeColor={(n: unknown) => {
+              const fn = n as ForceNode;
+              return fn.id === activeNoteId ? palette.active : graphNodeColor(fn.node_type);
+            }}
             nodeVal={(n: unknown) => ((n as ForceNode).val) || 5}
-            linkColor={() => 'rgba(158, 163, 172, 0.25)'}
+            linkColor={() => palette.link}
             linkDirectionalArrowLength={4}
             linkDirectionalArrowRelPos={1}
             backgroundColor="transparent"

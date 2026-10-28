@@ -29,7 +29,7 @@ pub async fn build_graph(db: &SqlitePool) -> Result<GraphData, String> {
 
     // Papers
     let papers = sqlx::query_as::<_, (String, String)>(
-        "SELECT id, title FROM papers ORDER BY imported_at DESC LIMIT 100"
+        "SELECT id, title FROM papers ORDER BY imported_at DESC"
     ).fetch_all(db).await.map_err(|e| format!("db: {e}"))?;
     let settings = crate::core::settings_service::cached_settings();
     let label_max = settings.graph_node_label_max_chars.max(1) as usize;
@@ -39,7 +39,7 @@ pub async fn build_graph(db: &SqlitePool) -> Result<GraphData, String> {
 
     // Notes
     let notes = sqlx::query_as::<_, (String, String, Option<String>)>(
-        "SELECT id, title, paper_id FROM notes LIMIT 100"
+        "SELECT id, title, paper_id FROM notes"
     ).fetch_all(db).await.map_err(|e| format!("db: {e}"))?;
     for (id, title, paper_id) in &notes {
         nodes.push(GraphNode { id: id.clone(), label: title.clone(), node_type: "note".into(), color: "#27ae60".into() });
@@ -58,7 +58,7 @@ pub async fn build_graph(db: &SqlitePool) -> Result<GraphData, String> {
 
     // Knowledge items (cross-domain)
     let items = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
-        "SELECT id, title, source_type, source_id FROM knowledge_items WHERE source_type = 'paper' LIMIT 50"
+        "SELECT id, title, source_type, source_id FROM knowledge_items WHERE source_type = 'paper'"
     ).fetch_all(db).await.map_err(|e| format!("db: {e}"))?;
     for (id, title, _, source_id) in &items {
         nodes.push(GraphNode { id: id.clone(), label: title.clone(), node_type: "knowledge_item".into(), color: "#8e44ad".into() });

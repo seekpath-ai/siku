@@ -2338,12 +2338,87 @@ const editorTheme = EditorView.theme({
     backgroundColor: 'rgb(var(--surface))',
     color: 'rgb(var(--text-primary))',
   },
+  // Search/replace panel (basicSetup's @codemirror/search): CM's default
+  // styling is a light gray box with gradient buttons — replace it with the
+  // app theme vars. Text fields/buttons/checkboxes use CM's own class names
+  // (cm-textfield / cm-button / cm-checkbox), so the goto-line panel gets the
+  // same treatment for free.
+  '.cm-panel': {
+    fontFamily: 'inherit',
+    fontSize: '12px',
+  },
+  '.cm-panel.cm-search': {
+    padding: '6px 10px',
+    borderTop: '1px solid rgb(var(--surface-hover))',
+  },
+  '.cm-panel .cm-textfield': {
+    backgroundColor: 'rgb(var(--background))',
+    color: 'rgb(var(--text-primary))',
+    border: '1px solid rgb(var(--surface-hover))',
+    borderRadius: '6px',
+    padding: '3px 8px',
+    outline: 'none',
+  },
+  '.cm-panel .cm-textfield:focus': {
+    borderColor: 'rgb(var(--primary))',
+  },
+  '.cm-panel .cm-button': {
+    backgroundImage: 'none',
+    backgroundColor: 'rgb(var(--surface-hover))',
+    color: 'rgb(var(--text-primary))',
+    border: 'none',
+    borderRadius: '6px',
+    padding: '3px 10px',
+    margin: '0 2px',
+    cursor: 'pointer',
+  },
+  '.cm-panel .cm-button:hover': {
+    filter: 'brightness(1.15)',
+  },
+  '.cm-panel label': {
+    color: 'rgb(var(--text-secondary))',
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '3px',
+    margin: '0 4px',
+    whiteSpace: 'nowrap',
+  },
+  '.cm-panel .cm-checkbox': {
+    accentColor: 'rgb(var(--primary))',
+  },
+  '.cm-panel.cm-search [name=close]': {
+    color: 'rgb(var(--text-secondary))',
+    cursor: 'pointer',
+  },
   '.cm-tooltip': {
     backgroundColor: 'rgb(var(--surface))',
     color: 'rgb(var(--text-primary))',
     border: '1px solid rgb(var(--surface-hover))',
   },
   '&.cm-focused': { outline: 'none' },
+});
+
+/** Chinese labels for the built-in search/replace and goto-line panels
+ *  (basicSetup's @codemirror/search) — CodeMirror's i18n hook is
+ *  EditorState.phrases; keys must match the library's English source strings. */
+const zhPanelPhrases = EditorState.phrases.of({
+  'Find': '查找',
+  'Replace': '替换',
+  'next': '下一个',
+  'previous': '上一个',
+  'all': '全部',
+  'match case': '区分大小写',
+  'regexp': '正则',
+  'by word': '全词匹配',
+  'replace': '替换',
+  'replace all': '全部替换',
+  'close': '关闭',
+  'current match': '当前匹配',
+  'replaced $ matches': '已替换 $ 处',
+  'replaced match on line $': '已替换第 $ 行的匹配',
+  'on line': '所在行',
+  'go to line': '跳转到行',
+  'go': '跳转',
 });
 
 // ── Component ──────────────────────────────────────────────────────────
@@ -2592,6 +2667,8 @@ export function MarkdownEditor({
       // on table source lines — the handlers return false elsewhere — so this
       // is useful in source mode too.
       tableKeymap,
+      // Chinese labels for the search/replace panel (and goto-line).
+      zhPanelPhrases,
       // Auto-close a ``` fence when its third backtick is typed (works in
       // source mode too — no rendering involved).
       fenceAutoClose,

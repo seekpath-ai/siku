@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "siku",
+  "productName": "思库",
   "version": "1.4.2",
   "identifier": "com.siku.reader",
   "build": {

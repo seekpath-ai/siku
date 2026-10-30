@@ -16,7 +16,9 @@ jobs:
           - platform: macos-latest
             args: --target universal-apple-darwin
           - platform: ubuntu-22.04
-            args: ''
+            # deb/rpm package names must be ASCII — the Chinese productName
+            # 思库 would be stripped to an empty name ("-1.5.0-1.x86_64.rpm").
+            args: --config src-tauri/tauri.linux.conf.json
           - platform: windows-latest
             args: ''
 

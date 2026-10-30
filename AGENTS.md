@@ -24,6 +24,8 @@ pnpm tauri build --target x86_64-pc-windows-gnu
 
 顺序要点：**先改版本号再打 tag 最后编译**，保证 tag、仓库、二进制三者一致。
 
+CI Linux 产物说明：deb/rpm 包名规范要求 ASCII，中文 productName 会被剥成空名（出现 `-1.5.0-1.x86_64.rpm` 这类文件），故 CI 的 ubuntu 任务用 `--config src-tauri/tauri.linux.conf.json` 把 productName 覆盖为 `siku`；该文件不含版本号，发版无需改动。
+
 ## 验证命令
 
 - 前端：`npx tsc --noEmit` + `npx eslint <改动文件>`

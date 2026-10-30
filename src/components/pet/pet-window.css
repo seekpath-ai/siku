@@ -184,3 +184,32 @@ body,
   -webkit-box-orient: vertical;
   white-space: normal;
 }
+
+/* ── Idle liveliness: blink + gentle float (idle state only, so the state
+   mirror animations on the same element never fight) ── */
+
+.pet-state-idle {
+  animation: pet-float 3.6s ease-in-out infinite;
+}
+
+.pet-eye {
+  animation: pet-blink 4.2s ease-in-out infinite;
+  transform-origin: center;
+}
+
+@keyframes pet-blink {
+  0%, 92%, 100% { transform: scaleY(1); }
+  95% { transform: scaleY(0.12); }
+}
+
+@keyframes pet-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-2px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-state-idle,
+  .pet-eye {
+    animation: none;
+  }
+}

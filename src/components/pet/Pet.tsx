@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { listen, emit } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useNavigate } from '@tanstack/react-router';
@@ -19,11 +19,6 @@ export function Pet() {
   const [panelPos, setPanelPos] = useState<{ x: number; y: number } | null>(null);
   const [maximized, setMaximized] = useState(false);
   const panelDragRef = useRef<{ dx: number; dy: number } | null>(null);
-
-  // Show a speech bubble next to the floating pet ball (separate window).
-  const notify = useCallback(async (body: string) => {
-    emit('pet:bubble', body).catch(() => {});
-  }, []);
 
   // Drag the panel by its header (DOM-level, no OS window involved).
   useEffect(() => {
@@ -57,7 +52,6 @@ export function Pet() {
   const handleClose = () => {
     store.setOpen(false);
     store.reset();
-    notify('对话面板已关闭');
   };
 
   // Pop the conversation out into its own always-draggable OS window (like
@@ -131,16 +125,27 @@ export function Pet() {
         // Only the main window shows the pet panel — pet:click is broadcast
         // to every webview (e.g. "open in new window" note windows).
         if (getCurrentWindow().label !== 'main') return;
-        // Bring the main window to the front so the panel is visible.
-        getCurrentWindow().setFocus().catch(() => {});
-        const st = usePetStore.getState();
-        const ctx = usePetContextStore.getState().context;
-        if (ctx && !st.session) {
-          st.start(ctx);
-        } else {
-          st.setOpen(true);
-        }
-        notify('已为您打开对话面板');
+        (async () => {
+          const win = getCurrentWindow();
+          // If the user was in another app, the panel opening may go
+          // unnoticed (Windows also blocks focus-stealing from background
+          // apps) — confirm through the ball's speech bubble. When the main
+          // window is already focused the panel itself is the feedback.
+          const focused = await win.isFocused().catch(() => true);
+          const minimized = await win.isMinimized().catch(() => false);
+          // Bring the main window to the front so the panel is visible.
+          win.setFocus().catch(() => {});
+          const st = usePetStore.getState();
+          const ctx = usePetContextStore.getState().context;
+          if (ctx && !st.session) {
+            st.start(ctx);
+          } else {
+            st.setOpen(true);
+          }
+          if (!focused || minimized) {
+            emit('pet:bubble', '已为你打开对话面板').catch(() => {});
+          }
+        })();
       });
     };
     setup();
@@ -148,7 +153,7 @@ export function Pet() {
       cancelled = true;
       unlisten?.();
     };
-  }, [notify]);
+  }, []);
 
   // Rebind the panel when the page context changes while it is open. Without
   // this, a session-less panel (opened on a page with no domain agent) stays
@@ -190,7 +195,7 @@ export function Pet() {
         </span>
         {/* Window-style controls (match the main TitleBar) */}
         <div className="flex items-center gap-0.5 shrink-0 ml-auto -mr-1">
-          <PetSessionMenu onCleared={() => notify('会话记录已清空')} />
+          <PetSessionMenu onCleared={() => {}} />
           <button
             onClick={handlePopOut}
             disabled={!store.session}

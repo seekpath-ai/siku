@@ -1,34 +1,28 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { PhysicalPosition } from '@tauri-apps/api/dpi';
+import { placeNearBall } from './overlayPlacement';
+import type { BallPlacement } from './overlayPlacement';
 import './pet-window.css';
 
 const BUBBLE_MS = 3200;
 
-/** Ephemeral click-through speech bubble shown below the pet ball. Lives in
- *  its own always-on-top transparent window (created by PetBallWindow on
- *  `pet:bubble`) so the ball window itself never has to resize — a resized
- *  transparent window keeps swallowing mouse events over the enlarged,
- *  invisible area. Positions itself under the ball, goes click-through,
- *  shows, and closes itself after a few seconds. */
+/** Ephemeral click-through speech bubble anchored to the pet ball like the
+ *  pet is talking: the tail points at the ball, and the whole bubble flips
+ *  above the ball when there is no room below (ball near the screen bottom).
+ *  Lives in its own always-on-top transparent window (created by
+ *  PetBallWindow on `pet:bubble`) so the ball window itself never has to
+ *  resize — a resized transparent window keeps swallowing mouse events over
+ *  the enlarged, invisible area. */
 export function PetBubbleWindow() {
   const text = new URLSearchParams(window.location.search).get('text') ?? '';
+  const [placement, setPlacement] = useState<BallPlacement | null>(null);
 
-  // Anchor below the ball and go click-through before becoming visible.
+  // Anchor next to the ball and go click-through before becoming visible.
   useEffect(() => {
     (async () => {
-      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const self = getCurrentWindow();
-      const ball = await WebviewWindow.getByLabel('pet');
-      if (ball) {
-        const pos = await ball.outerPosition();
-        const ballSize = await ball.innerSize();
-        const scale = await ball.scaleFactor();
-        // Place the bubble just below the ball.
-        await self.setPosition(
-          new PhysicalPosition(pos.x, pos.y + ballSize.height + Math.round(4 * scale))
-        );
-      }
+      const p = await placeNearBall().catch(() => null);
+      setPlacement(p);
       await self.setIgnoreCursorEvents(true).catch(() => {});
       await self.show();
     })().catch(() => {});
@@ -45,10 +39,14 @@ export function PetBubbleWindow() {
   }, []);
 
   if (!text) return null;
+  const above = placement?.side === 'above';
+  // Tail points at the ball's center, clamped inside the bubble.
+  const tailX = Math.max(12, Math.min(placement?.tailX ?? 20, 248));
   return (
-    <div className="pet-bubble pet-bubble-window">
+    <div className={`pet-bubble pet-bubble-window${above ? ' pet-bubble-above' : ''}`}>
+      {!above && <div className="pet-bubble-arrow" style={{ left: tailX - 4 }} />}
       <span>{text}</span>
-      <div className="pet-bubble-arrow" />
+      {above && <div className="pet-bubble-arrow pet-bubble-arrow-down" style={{ left: tailX - 4 }} />}
     </div>
   );
 }

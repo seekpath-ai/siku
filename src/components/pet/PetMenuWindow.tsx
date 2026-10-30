@@ -1,8 +1,8 @@
 import { useEffect } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { PhysicalPosition } from '@tauri-apps/api/dpi';
 import { EyeOff } from 'lucide-react';
 import { settingsAppGet, settingsAppSave } from '@/lib/tauri';
+import { placeNearBall } from './overlayPlacement';
 import './pet-window.css';
 
 /** The pet ball's right-click menu as its OWN ephemeral window. The ball
@@ -13,20 +13,12 @@ import './pet-window.css';
  *  This window closes on blur, which is exactly how a context menu should
  *  behave. */
 export function PetMenuWindow() {
-  // Anchor below the ball, then show focused (needed for blur/Esc semantics).
+  // Anchor next to the ball (flipped above it near the screen bottom), then
+  // show focused (needed for blur/Esc semantics).
   useEffect(() => {
     (async () => {
-      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const self = getCurrentWindow();
-      const ball = await WebviewWindow.getByLabel('pet');
-      if (ball) {
-        const pos = await ball.outerPosition();
-        const ballSize = await ball.innerSize();
-        const scale = await ball.scaleFactor();
-        await self.setPosition(
-          new PhysicalPosition(pos.x, pos.y + ballSize.height + Math.round(4 * scale))
-        );
-      }
+      await placeNearBall().catch(() => null);
       await self.show();
       await self.setFocus();
     })().catch(() => {});

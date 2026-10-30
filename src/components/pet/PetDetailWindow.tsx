@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { PhysicalPosition } from '@tauri-apps/api/dpi';
 import { listen } from '@tauri-apps/api/event';
 import { petCurrentStatus } from '@/lib/tauri';
 import type { PetStatusInfo } from '@/lib/tauri';
+import { placeNearBall } from './overlayPlacement';
 import './pet-window.css';
 
 const STATE_LABEL: Record<string, string> = {
@@ -41,20 +41,12 @@ export function PetDetailWindow() {
     };
   }, []);
 
-  // Anchor below the ball and go click-through before becoming visible.
+  // Anchor next to the ball (flipped above it near the screen bottom) and go
+  // click-through before becoming visible.
   useEffect(() => {
     (async () => {
-      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const self = getCurrentWindow();
-      const ball = await WebviewWindow.getByLabel('pet');
-      if (ball) {
-        const pos = await ball.outerPosition();
-        const ballSize = await ball.innerSize();
-        const scale = await ball.scaleFactor();
-        await self.setPosition(
-          new PhysicalPosition(pos.x, pos.y + ballSize.height + Math.round(4 * scale))
-        );
-      }
+      await placeNearBall().catch(() => null);
       await self.setIgnoreCursorEvents(true).catch(() => {});
       await self.show();
     })().catch(() => {});

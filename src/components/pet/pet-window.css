@@ -56,8 +56,8 @@ body,
   bottom: auto;
 }
 
-/* Arrow at the bubble's top pointing up at the ball (ball center is at
-   window x=24, bubble starts at left=8 → arrow at 16px). */
+/* Arrow at the bubble's top pointing up at the ball; dynamically offset to
+   the ball's center via inline style. */
 .pet-bubble-arrow {
   position: absolute;
   top: -5px;
@@ -68,6 +68,23 @@ body,
   background: var(--surface, #24242B);
   border-left: 1px solid #3a3a44;
   border-top: 1px solid #3a3a44;
+}
+
+/* Flipped placement: bubble above the ball — hug the window's bottom edge so
+   the tail stays on the ball, arrow points down. (Defined after
+   .pet-bubble-window so its `top: auto` wins at equal specificity.) */
+.pet-bubble-above {
+  top: auto;
+  bottom: 2px;
+}
+
+.pet-bubble-arrow-down {
+  top: auto;
+  bottom: -5px;
+  border-left: none;
+  border-top: none;
+  border-right: 1px solid #3a3a44;
+  border-bottom: 1px solid #3a3a44;
 }
 
 /* ── Agent state mirror (pet:state events from the backend) ── */

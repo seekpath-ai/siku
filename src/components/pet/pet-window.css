@@ -69,3 +69,58 @@ body,
   border-left: 1px solid #3a3a44;
   border-top: 1px solid #3a3a44;
 }
+
+/* ── Agent state mirror (pet:state events from the backend) ── */
+
+.pet-ball {
+  transition: transform 0.2s ease;
+}
+
+/* running: slow breathing pulse */
+.pet-state-running {
+  animation: pet-breathe 1.6s ease-in-out infinite;
+}
+
+/* waiting (approval / question pending): amber, faster pulse */
+.pet-state-waiting {
+  background: linear-gradient(to bottom right, #f59e0b, #b45309) !important;
+  animation: pet-breathe 0.9s ease-in-out infinite;
+}
+
+/* done: brief green pop, decays to idle on the frontend timer */
+.pet-state-done {
+  background: linear-gradient(to bottom right, #34d399, #047857) !important;
+  animation: pet-pop 0.5s ease;
+}
+
+/* failed: red shiver, decays to idle on the frontend timer */
+.pet-state-failed {
+  background: linear-gradient(to bottom right, #f87171, #b91c1c) !important;
+  animation: pet-shiver 0.4s ease;
+}
+
+@keyframes pet-breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.08); }
+}
+
+@keyframes pet-pop {
+  0% { transform: scale(1); }
+  40% { transform: scale(1.18); }
+  100% { transform: scale(1); }
+}
+
+@keyframes pet-shiver {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-2px); }
+  75% { transform: translateX(2px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-state-running,
+  .pet-state-waiting,
+  .pet-state-done,
+  .pet-state-failed {
+    animation: none;
+  }
+}

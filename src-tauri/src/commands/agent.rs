@@ -1556,11 +1556,45 @@ pub(crate) async fn run_agent_turn(
     // agent_approve_tool can resolve the tool_call id from context.
     let app_clone2 = app_handle.clone();
     let fwd_sid = session_id.clone();
+    // Pet ball state: domain-agent (pet) sessions additionally emit a coarse
+    // "pet:state" so the always-on-top ball reflects what the agent is doing
+    // even with every chat panel closed. skill_reviewer is an internal
+    // background agent and stays excluded.
+    let is_pet_session: bool = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT domain FROM chat_sessions WHERE id = ?",
+    )
+    .bind(&session_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .map(|d| d != "skill_reviewer" && crate::ai::agent::domain::get_domain(&d).is_some())
+    .unwrap_or(false);
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             if let AgentEvent::ToolApprovalRequired { tool_call_id, .. } = &event {
                 if let Ok(mut m) = pending_approvals().lock() {
                     m.insert(fwd_sid.clone(), tool_call_id.clone());
+                }
+            }
+            if is_pet_session {
+                let state = match &event {
+                    AgentEvent::Thinking { .. }
+                    | AgentEvent::Delta { .. }
+                    | AgentEvent::Reasoning { .. }
+                    | AgentEvent::ToolCall { .. }
+                    | AgentEvent::ToolResult { .. }
+                    | AgentEvent::StepComplete { .. } => Some("running"),
+                    AgentEvent::ToolApprovalRequired { .. } | AgentEvent::AskUser { .. } => {
+                        Some("waiting")
+                    }
+                    AgentEvent::Done { .. } => Some("done"),
+                    AgentEvent::Cancelled { .. } => Some("idle"),
+                    AgentEvent::Error { .. } => Some("failed"),
+                };
+                if let Some(s) = state {
+                    let _ = app_clone2.emit("pet:state", s);
                 }
             }
             let _ = app_clone2.emit("agent:event", &event);

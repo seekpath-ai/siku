@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import './pet-window.css';
@@ -83,6 +83,33 @@ export function PetBallWindow() {
     };
   }, []);
 
+  // Agent state mirror (emitted by the backend for pet-domain sessions):
+  // running = breathing pulse, waiting = amber + fast pulse, done/failed are
+  // brief flashes that decay back to idle on a timer.
+  const [agentState, setAgentState] = useState<'idle' | 'running' | 'waiting' | 'done' | 'failed'>('idle');
+  const decayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<string>('pet:state', (event) => {
+      const s = event.payload;
+      if (s !== 'idle' && s !== 'running' && s !== 'waiting' && s !== 'done' && s !== 'failed') return;
+      if (decayTimerRef.current) {
+        clearTimeout(decayTimerRef.current);
+        decayTimerRef.current = null;
+      }
+      setAgentState(s);
+      if (s === 'done' || s === 'failed') {
+        decayTimerRef.current = setTimeout(() => setAgentState('idle'), s === 'done' ? 3000 : 5000);
+      }
+    }).then((u) => {
+      unlisten = u;
+    });
+    return () => {
+      unlisten?.();
+      if (decayTimerRef.current) clearTimeout(decayTimerRef.current);
+    };
+  }, []);
+
   // Start the window drag only after the pointer actually moves past a small
   // threshold, so a plain click still fires and isn't swallowed by dragging.
   useEffect(() => {
@@ -143,7 +170,7 @@ export function PetBallWindow() {
       onContextMenu={handleContextMenu}
       title="点击打开智能体，右键可隐藏"
     >
-      <div className="pet-ball pet-ball-fixed w-10 h-10 rounded-full bg-gradient-to-br from-primary to-amber-700 flex items-center justify-center shadow-lg cursor-pointer">
+      <div className={`pet-ball pet-ball-fixed pet-state-${agentState} w-10 h-10 rounded-full bg-gradient-to-br from-primary to-amber-700 flex items-center justify-center shadow-lg cursor-pointer`}>
         <div className="relative w-6 h-6">
           <div className="pet-eye absolute top-1 left-0 w-2 h-2 rounded-full bg-background" />
           <div className="pet-eye absolute top-1 right-0 w-2 h-2 rounded-full bg-background" />

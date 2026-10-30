@@ -22,9 +22,12 @@ export function PetBubbleWindow() {
       const ball = await WebviewWindow.getByLabel('pet');
       if (ball) {
         const pos = await ball.outerPosition();
+        const ballSize = await ball.innerSize();
         const scale = await ball.scaleFactor();
-        // Ball is 48px tall (logical); place the bubble just below it.
-        await self.setPosition(new PhysicalPosition(pos.x, pos.y + Math.round(52 * scale)));
+        // Place the bubble just below the ball.
+        await self.setPosition(
+          new PhysicalPosition(pos.x, pos.y + ballSize.height + Math.round(4 * scale))
+        );
       }
       await self.setIgnoreCursorEvents(true).catch(() => {});
       await self.show();

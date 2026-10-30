@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Loader2, Check } from 'lucide-react';
-import { settingsGet, settingsSet, petDomains, petListSkins, petGetSkinSelection, petSetSkinSelection } from '@/lib/tauri';
+import { settingsGet, settingsSet, petDomains, petListSkins, petGetSkinSelection, petSetSkinSelection, petGetSize, petSetSize } from '@/lib/tauri';
 import type { PetSkinSummary } from '@/lib/tauri';
 
 interface DomainConfig {
@@ -37,6 +37,8 @@ export function PetSettings() {
   /** Installed .codex-pet skins + the selected one ('' = built-in ball). */
   const [skins, setSkins] = useState<PetSkinSummary[]>([]);
   const [skinId, setSkinId] = useState('');
+  /** Ball edge length in px. */
+  const [ballSize, setBallSize] = useState(48);
 
   useEffect(() => {
     let cancelled = false;
@@ -53,10 +55,11 @@ export function PetSettings() {
         console.error('load pet domains:', e);
       }
       try {
-        const [list, selected] = await Promise.all([petListSkins(), petGetSkinSelection()]);
+        const [list, selected, size] = await Promise.all([petListSkins(), petGetSkinSelection(), petGetSize()]);
         if (!cancelled) {
           setSkins(list);
           setSkinId(selected);
+          setBallSize(size);
         }
       } catch (e) {
         console.error('load pet skins:', e);
@@ -152,6 +155,25 @@ export function PetSettings() {
         {skinId && !skins.some((s) => s.id === skinId) && (
           <div className="text-xs text-amber-500 mt-2">当前选择的皮肤已不存在，已回退为内置球显示；请重新选择。</div>
         )}
+        <div className="flex items-center gap-3 mt-3 pt-3 border-t border-surface-hover">
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-medium text-text-primary">桌宠大小</div>
+          </div>
+          <select
+            value={ballSize}
+            onChange={async (e) => {
+              const size = Number(e.target.value);
+              setBallSize(size);
+              await petSetSize(size).catch((err) => console.error('save pet size:', err));
+            }}
+            className="h-8 rounded-lg bg-background border border-surface-hover text-sm text-text-primary px-2 focus:outline-none focus:border-primary/50"
+          >
+            <option value={48}>小</option>
+            <option value={72}>中</option>
+            <option value={96}>大</option>
+            <option value={128}>超大</option>
+          </select>
+        </div>
       </div>
 
       {DOMAINS.map((d) => {

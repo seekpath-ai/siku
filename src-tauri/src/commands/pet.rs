@@ -14,13 +14,76 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tauri::State;
+use tauri::{Manager, State};
 
 use crate::AppState;
 
 const SKIN_SETTING_KEY: &str = "pet.skin";
+const SIZE_SETTING_KEY: &str = "pet.size";
 /// Refuse pathological sheets before base64'ing them into the webview.
 const MAX_SHEET_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Selectable ball edge lengths (logical px).
+pub const PET_SIZES: [u32; 4] = [48, 72, 96, 128];
+
+/// Configured ball edge length. Read by `create_pet_window` and the resize
+/// self-heal clamp in lib.rs; written at startup (from the device setting)
+/// and by `pet_set_size`.
+static PET_WINDOW_SIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(48);
+
+pub fn pet_window_size() -> u32 {
+    PET_WINDOW_SIZE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_pet_window_size(size: u32) {
+    PET_WINDOW_SIZE.store(size, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Load the persisted size into the global. Called at startup before the
+/// pet window is created.
+pub async fn load_pet_size(db: &sqlx::SqlitePool) {
+    if let Ok(Some(s)) = crate::core::settings_service::get_device_setting(db, SIZE_SETTING_KEY)
+        .await
+    {
+        if let Ok(n) = s.parse::<u32>() {
+            if PET_SIZES.contains(&n) {
+                set_pet_window_size(n);
+            }
+        }
+    }
+}
+
+/// Current ball edge length (ball window asks on startup).
+#[tauri::command]
+pub async fn pet_get_size() -> u32 {
+    pet_window_size()
+}
+
+/// Resize the ball. The window itself is rebuilt at the same edge length so
+/// the transparent hit region always matches the visible ball exactly —
+/// growing the rectangle beyond the ball is the click-trap bug this whole
+/// design exists to avoid.
+#[tauri::command]
+pub async fn pet_set_size(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    size: u32,
+) -> Result<(), String> {
+    if !PET_SIZES.contains(&size) {
+        return Err(format!("invalid pet size: {size}"));
+    }
+    crate::core::settings_service::set_device_setting(&state.db, SIZE_SETTING_KEY, &size.to_string())
+        .await?;
+    set_pet_window_size(size);
+    if let Some(pet) = app_handle.get_webview_window("pet") {
+        let edge = size as f64;
+        let _ = pet.set_size(tauri::Size::Logical(tauri::LogicalSize::new(edge, edge)));
+    }
+    // The ball window listens and re-renders at the new scale.
+    use tauri::Emitter;
+    let _ = app_handle.emit("pet:size_changed", size);
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

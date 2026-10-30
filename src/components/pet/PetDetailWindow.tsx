@@ -13,8 +13,8 @@ const STATE_LABEL: Record<string, string> = {
 
 /** Ephemeral hover detail card shown below the pet ball (created by
  *  PetBallWindow on mouse-enter, closed on mouse-leave). Same pattern as the
- *  speech bubble: own always-on-top transparent window so the 48×48 ball
- *  window never resizes; click-through so it never steals pointer events. */
+ *  speech bubble: own always-on-top transparent window so the ball window
+ *  stays exactly ball-sized; click-through so it never steals pointer events. */
 export function PetDetailWindow() {
   const q = new URLSearchParams(window.location.search);
   const state = q.get('state') ?? 'idle';
@@ -31,8 +31,11 @@ export function PetDetailWindow() {
       const ball = await WebviewWindow.getByLabel('pet');
       if (ball) {
         const pos = await ball.outerPosition();
+        const ballSize = await ball.innerSize();
         const scale = await ball.scaleFactor();
-        await self.setPosition(new PhysicalPosition(pos.x, pos.y + Math.round(52 * scale)));
+        await self.setPosition(
+          new PhysicalPosition(pos.x, pos.y + ballSize.height + Math.round(4 * scale))
+        );
       }
       await self.setIgnoreCursorEvents(true).catch(() => {});
       await self.show();

@@ -22,7 +22,7 @@ body,
 }
 
 /* Ball pinned to the window's top-left corner. The ball window is always
-   48×48 and never resizes — overlays (bubble, menu) live in their own
+   exactly the configured ball size — overlays (bubble, menu) live in their own
    ephemeral windows so this one's hit region always matches the ball. */
 .pet-ball-fixed {
   position: absolute;

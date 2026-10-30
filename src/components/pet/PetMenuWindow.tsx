@@ -21,8 +21,11 @@ export function PetMenuWindow() {
       const ball = await WebviewWindow.getByLabel('pet');
       if (ball) {
         const pos = await ball.outerPosition();
+        const ballSize = await ball.innerSize();
         const scale = await ball.scaleFactor();
-        await self.setPosition(new PhysicalPosition(pos.x, pos.y + Math.round(52 * scale)));
+        await self.setPosition(
+          new PhysicalPosition(pos.x, pos.y + ballSize.height + Math.round(4 * scale))
+        );
       }
       await self.show();
       await self.setFocus();

@@ -374,6 +374,8 @@ export const petListSkins = () => invoke<PetSkinSummary[]>('pet_list_skins');
 export const petGetSkin = (id: string) => invoke<PetSkinDetail>('pet_get_skin', { id });
 export const petGetSkinSelection = () => invoke<string>('pet_get_skin_selection');
 export const petSetSkinSelection = (id: string) => invoke<void>('pet_set_skin_selection', { id });
+export const petGetSize = () => invoke<number>('pet_get_size');
+export const petSetSize = (size: number) => invoke<void>('pet_set_size', { size });
 
 /** System-prompt snapshot stored for a user message's turn (本地表，不同步). */
 export interface TurnContext {

@@ -8,10 +8,10 @@ import './pet-window.css';
 /** Root component for the always-on-top pet window. Dragging the ball starts an
  *  OS-level window move (across all screens); a plain click emits `pet:click`
  *  so the main window opens the chat panel. Anything that needs more than the
- *  ball's 48×48 — speech bubbles, the right-click menu — lives in its own
- *  ephemeral window: this window NEVER resizes, because a transparent window
- *  swallows mouse events across its whole rectangle, and an enlarged
- *  rectangle that fails to shrink back becomes an invisible click trap. */
+ *  ball's square — speech bubbles, the right-click menu — lives in its own
+ *  ephemeral window: this window only resizes via the size setting, because a
+ *  transparent window swallows mouse events across its whole rectangle, and an
+ *  enlarged rectangle that fails to shrink back becomes an invisible click trap. */
 export function PetBallWindow() {
   const downRef = useRef<{ x: number; y: number } | null>(null);
   const draggedRef = useRef(false);
@@ -95,6 +95,50 @@ export function PetBallWindow() {
   const [skin, setSkin] = useState<PetSkinDetail | null>(null);
   const [interactNonce, setInteractNonce] = useState(0);
   const handleSpriteError = useCallback(() => setSkin(null), []);
+  // Ball edge length in px (device setting `pet.size`, default 48).
+  const [ballSize, setBallSize] = useState(48);
+  // Drag direction while the ball moves; drives the sprite's walking tracks.
+  const [moveDir, setMoveDir] = useState<'left' | 'right' | null>(null);
+
+  useEffect(() => {
+    const win = getCurrentWindow();
+    let lastX: number | null = null;
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+    const unlisten = win.onMoved(({ payload: pos }) => {
+      if (lastX !== null) {
+        const dx = pos.x - lastX;
+        if (Math.abs(dx) > 2) setMoveDir(dx > 0 ? 'right' : 'left');
+      }
+      lastX = pos.x;
+      // Movement stopped (drag released): back to the state track.
+      if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = setTimeout(() => {
+        setMoveDir(null);
+        lastX = null;
+      }, 250);
+    });
+    return () => {
+      unlisten.then((u) => u());
+      if (settleTimer) clearTimeout(settleTimer);
+    };
+  }, []);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const { petGetSize } = await import('@/lib/tauri');
+        setBallSize(await petGetSize());
+      } catch {
+        /* keep default */
+      }
+    };
+    load();
+    let unlisten: (() => void) | undefined;
+    listen<number>('pet:size_changed', (e) => setBallSize(e.payload)).then((u) => {
+      unlisten = u;
+    });
+    return () => unlisten?.();
+  }, []);
 
   useEffect(() => {
     const load = async () => {
@@ -246,21 +290,34 @@ export function PetBallWindow() {
       onMouseLeave={() => closeDetail()}
     >
       {skin ? (
-        <div className="pet-ball-fixed w-10 h-10 cursor-pointer">
+        <div
+          className="pet-ball-fixed cursor-pointer"
+          style={{ width: ballSize - 8, height: ballSize - 8 }}
+        >
           <PetSprite
             manifest={skin.manifest}
             sheetDataUrl={skin.sheetDataUrl}
             state={agentState}
             interactNonce={interactNonce}
+            moveDir={moveDir}
+            boxSize={ballSize - 8}
             onError={handleSpriteError}
           />
         </div>
       ) : (
-        <div className={`pet-ball pet-ball-fixed pet-state-${agentState} w-10 h-10 rounded-full bg-gradient-to-br from-primary to-amber-700 flex items-center justify-center shadow-lg cursor-pointer`}>
-          <div className="relative w-6 h-6">
-            <div className="pet-eye absolute top-1 left-0 w-2 h-2 rounded-full bg-background" />
-            <div className="pet-eye absolute top-1 right-0 w-2 h-2 rounded-full bg-background" />
-            <div className="absolute bottom-0.5 left-1/2 -translate-x-1/2 w-3 h-1.5 rounded-b-full bg-background/80" />
+        // The built-in ball is drawn at 40px; scale the wrapper so the eye /
+        // mouth layout and the state animations (transform-based, on the
+        // inner div) never fight the resize.
+        <div
+          className="pet-ball-fixed"
+          style={{ transform: `scale(${(ballSize - 8) / 40})`, transformOrigin: 'top left' }}
+        >
+          <div className={`pet-ball pet-state-${agentState} w-10 h-10 rounded-full bg-gradient-to-br from-primary to-amber-700 flex items-center justify-center shadow-lg cursor-pointer`}>
+            <div className="relative w-6 h-6">
+              <div className="pet-eye absolute top-1 left-0 w-2 h-2 rounded-full bg-background" />
+              <div className="pet-eye absolute top-1 right-0 w-2 h-2 rounded-full bg-background" />
+              <div className="absolute bottom-0.5 left-1/2 -translate-x-1/2 w-3 h-1.5 rounded-b-full bg-background/80" />
+            </div>
           </div>
         </div>
       )}

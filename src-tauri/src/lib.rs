@@ -162,14 +162,15 @@ async fn set_complete(app: tauri::AppHandle) -> Result<(), String> {
 pub fn create_pet_window<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> Result<tauri::WebviewWindow<R>, tauri::Error> {
+    let size = crate::commands::pet::pet_window_size() as f64;
     let pet = tauri::WebviewWindowBuilder::new(app, "pet", tauri::WebviewUrl::default())
         .title("思库宠物")
-        .inner_size(48.0, 48.0)
+        .inner_size(size, size)
         // Structural guarantee: the ball window can never exceed the ball,
         // no matter what any webview JS asks for — a transparent window
         // swallows mouse events over its whole rectangle, so an oversized
         // pet window is an invisible click trap.
-        .max_inner_size(48.0, 48.0)
+        .max_inner_size(size, size)
         .resizable(false)
         .decorations(false)
         .transparent(true)
@@ -190,7 +191,7 @@ pub fn create_pet_window<R: tauri::Runtime>(
     // (~132 DIP ≈ 131 wide at 200% scale — observed on a user's machine).
     // That clamp only applies to CreateWindowEx and interactive tracking;
     // SetWindowPos ignores it, so re-asserting the size here sticks.
-    let _ = pet.set_size(tauri::Size::Logical(tauri::LogicalSize::new(48.0, 48.0)));
+    let _ = pet.set_size(tauri::Size::Logical(tauri::LogicalSize::new(size, size)));
     Ok(pet)
 }
 
@@ -514,6 +515,10 @@ pub fn run() {
                 core::logger::init(&handle2, &app_settings).expect("failed to initialize logger");
                 info!("Siku application starting");
 
+                // Load the persisted ball size before creating the window so
+                // it comes up at the configured edge length.
+                commands::pet::load_pet_size(&db).await;
+
                 // Create the pet window only when the user has it enabled.
                 // Runs after the logger is up so any creation failure (e.g.
                 // WebView2 not fully initialized yet) is written to the log
@@ -721,22 +726,24 @@ pub fn run() {
             }
             // Self-healing clamp: the pet ball is a transparent window, so an
             // oversized rectangle swallows mouse clicks over its invisible
-            // area. Nothing in the app resizes it, yet a user observed a
-            // ~131×48 hit region on Windows — snap any stray resize back and
-            // log the offending size so the source can be identified.
+            // area. Nothing in the app resizes it except the size setting,
+            // yet a user observed a ~131×48 hit region on Windows — snap any
+            // stray resize back to the configured size and log the offender.
             if window.label() == "pet" {
                 if let tauri::WindowEvent::Resized(size) = event {
                     let scale = window.scale_factor().unwrap_or(1.0);
-                    let expected = (48.0_f64 * scale).round() as u32;
+                    let expected =
+                        (crate::commands::pet::pet_window_size() as f64 * scale).round() as u32;
                     if size.width != expected || size.height != expected {
+                        let edge = crate::commands::pet::pet_window_size() as f64;
                         tracing::warn!(
                             width = size.width,
                             height = size.height,
                             scale_factor = scale,
-                            "pet window resized unexpectedly; forcing back to 48x48"
+                            "pet window resized unexpectedly; forcing back to configured size"
                         );
                         let _ = window.set_size(tauri::Size::Logical(
-                            tauri::LogicalSize::new(48.0, 48.0),
+                            tauri::LogicalSize::new(edge, edge),
                         ));
                     }
                 }
@@ -884,6 +891,8 @@ pub fn run() {
             commands::pet::pet_get_skin,
             commands::pet::pet_get_skin_selection,
             commands::pet::pet_set_skin_selection,
+            commands::pet::pet_get_size,
+            commands::pet::pet_set_size,
             commands::agent::agent_get_turn_context,
             commands::agent::pet_domains,
             commands::agent::get_agent_steps,

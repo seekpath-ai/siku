@@ -260,9 +260,74 @@ body,
   50% { transform: translateY(-2px); }
 }
 
+/* ── Built-in ball facial expressions. Direction/look transforms live on the
+   .pet-face wrapper because the blink keyframes own .pet-eye's transform.
+   Drag rules come last so they win over per-state face poses. ── */
+
+.pet-face {
+  transition: transform 0.15s ease;
+}
+
+/* running: eyes glance up — thinking. */
+.pet-state-running .pet-face {
+  transform: translateY(-1.5px);
+}
+
+/* waiting: eyes scan side to side while awaiting your decision, and the
+   mouth becomes a small "o". */
+.pet-state-waiting .pet-face {
+  animation: pet-scan 1.4s ease-in-out infinite;
+}
+
+.pet-state-waiting .pet-mouth {
+  border-radius: 9999px;
+  width: 6px;
+  height: 6px;
+}
+
+@keyframes pet-scan {
+  0%, 100% { transform: translateX(-2px); }
+  50% { transform: translateX(2px); }
+}
+
+/* done: happy — ^ ^ eyes and a bigger smile. */
+.pet-state-done .pet-eye {
+  animation: none;
+  height: 4px;
+  margin-top: 3px;
+  border-radius: 8px 8px 0 0;
+}
+
+.pet-state-done .pet-mouth {
+  width: 14px;
+  height: 7px;
+}
+
+/* failed: droopy eyes + frown (∩ mouth). */
+.pet-state-failed .pet-eye {
+  animation: none;
+  transform: scaleY(0.55);
+  margin-top: 2px;
+}
+
+.pet-state-failed .pet-mouth {
+  border-radius: 8px 8px 0 0;
+  height: 6px;
+}
+
+/* Dragging left → glance back right (and vice versa). */
+.pet-drag-left .pet-face {
+  transform: translateX(2px);
+}
+
+.pet-drag-right .pet-face {
+  transform: translateX(-2px);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .pet-state-idle,
-  .pet-eye {
+  .pet-eye,
+  .pet-state-waiting .pet-face {
     animation: none;
   }
 }

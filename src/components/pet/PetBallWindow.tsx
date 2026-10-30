@@ -301,11 +301,11 @@ export function PetBallWindow() {
           className="pet-ball-fixed"
           style={{ transform: `scale(${(ballSize - 8) / 40})`, transformOrigin: 'top left' }}
         >
-          <div className={`pet-ball pet-state-${agentState} w-10 h-10 rounded-full bg-gradient-to-br from-primary to-amber-700 flex items-center justify-center shadow-lg cursor-pointer`}>
-            <div className="relative w-6 h-6">
+          <div className={`pet-ball pet-state-${agentState}${moveDir ? (moveDir === 'left' ? ' pet-drag-left' : ' pet-drag-right') : ''} w-10 h-10 rounded-full bg-gradient-to-br from-primary to-amber-700 flex items-center justify-center shadow-lg cursor-pointer`}>
+            <div className="pet-face relative w-6 h-6">
               <div className="pet-eye absolute top-1 left-0 w-2 h-2 rounded-full bg-background" />
               <div className="pet-eye absolute top-1 right-0 w-2 h-2 rounded-full bg-background" />
-              <div className="absolute bottom-0.5 left-1/2 -translate-x-1/2 w-3 h-1.5 rounded-b-full bg-background/80" />
+              <div className="pet-mouth absolute bottom-0.5 left-1/2 -translate-x-1/2 w-3 h-1.5 rounded-b-full bg-background/80" />
             </div>
           </div>
         </div>

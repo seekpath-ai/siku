@@ -194,6 +194,33 @@ body,
   opacity: 0.75;
 }
 
+/* Concurrent task rows on the detail card (cap 3, enforced backend-side). */
+.pet-detail-task {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 5px;
+}
+
+.pet-detail-task-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.pet-detail-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-top: 5px;
+  flex-shrink: 0;
+  background: #9aa0ab;
+}
+
+.pet-detail-dot-running { background: #60a5fa; }
+.pet-detail-dot-waiting { background: #f59e0b; }
+.pet-detail-dot-done { background: #34d399; }
+.pet-detail-dot-failed { background: #f87171; }
+
 /* ── Idle liveliness: blink + gentle float (idle state only, so the state
    mirror animations on the same element never fight) ── */
 

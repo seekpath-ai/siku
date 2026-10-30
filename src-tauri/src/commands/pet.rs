@@ -308,6 +308,184 @@ pub async fn pet_set_skin_selection(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Activity aggregation: chat turns and the background AI features (table
+// extraction, review generation, classification) all feed ONE aggregate pet
+// state. The ball mirrors the aggregate; the hover card lists the individual
+// tasks (cap 3).
+// ---------------------------------------------------------------------------
+
+/// Device setting gating whether plain chat sessions drive the pet.
+/// Domain-agent (pet panel) sessions always drive it.
+pub const CHAT_LINKED_KEY: &str = "pet.chat_linked";
+
+/// One concurrent task shown on the hover detail card.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PetActivity {
+    /// "AI 表格列" / "AI 综述" / "AI 分类" / "对话 · <标题>"
+    pub label: String,
+    /// running | waiting | done | failed
+    pub state: String,
+    /// Progress line: "12/30 · 论文标题", "工具：paper_read", prompt head…
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PetStatusInfo {
+    /// Aggregate state across all activities.
+    pub state: String,
+    /// Active tasks (cap 3); when idle, the most recent terminal activity.
+    pub activities: Vec<PetActivity>,
+    pub updated_at: String,
+}
+
+static PET_ACTIVITIES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, PetActivity>>> =
+    std::sync::OnceLock::new();
+/// Last finished/failed task, kept so the card can show it once nothing is
+/// active anymore. Replaced by the next terminal report.
+static PET_LAST_TERMINAL: std::sync::OnceLock<std::sync::Mutex<Option<(String, PetActivity)>>> =
+    std::sync::OnceLock::new();
+static PET_STATUS: std::sync::OnceLock<std::sync::Mutex<Option<PetStatusInfo>>> =
+    std::sync::OnceLock::new();
+
+fn activities() -> &'static std::sync::Mutex<HashMap<String, PetActivity>> {
+    PET_ACTIVITIES.get_or_init(Default::default)
+}
+fn last_terminal() -> &'static std::sync::Mutex<Option<(String, PetActivity)>> {
+    PET_LAST_TERMINAL.get_or_init(Default::default)
+}
+fn status_slot() -> &'static std::sync::Mutex<Option<PetStatusInfo>> {
+    PET_STATUS.get_or_init(Default::default)
+}
+
+/// Lower = wins the aggregate.
+fn state_rank(s: &str) -> u8 {
+    match s {
+        "failed" => 0,
+        "waiting" => 1,
+        "running" => 2,
+        "done" => 3,
+        _ => 4,
+    }
+}
+
+fn rank_to_state(r: u8) -> &'static str {
+    match r {
+        0 => "failed",
+        1 => "waiting",
+        2 => "running",
+        3 => "done",
+        _ => "idle",
+    }
+}
+
+fn aggregate_and_emit(app_handle: &tauri::AppHandle) {
+    let (state, acts) = {
+        let map = activities().lock().unwrap_or_else(|e| e.into_inner());
+        let mut acts: Vec<PetActivity> = map.values().cloned().collect();
+        let rank = acts.iter().map(|a| state_rank(&a.state)).min().unwrap_or_else(|| {
+            last_terminal()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|(_, a)| state_rank(&a.state))
+                .unwrap_or(4)
+        });
+        // Card content: active tasks first; nothing active → last terminal.
+        if acts.is_empty() {
+            if let Some((_, a)) = last_terminal()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
+                acts.push(a);
+            }
+        }
+        acts.sort_by(|a, b| state_rank(&a.state).cmp(&state_rank(&b.state)));
+        acts.truncate(3);
+        (rank_to_state(rank), acts)
+    };
+    if let Ok(mut g) = status_slot().lock() {
+        *g = Some(PetStatusInfo {
+            state: state.to_string(),
+            activities: acts,
+            updated_at: crate::core::time::now_iso(),
+        });
+    }
+    use tauri::Emitter;
+    let _ = app_handle.emit("pet:state", state);
+}
+
+/// Report one activity heartbeat. `source` identifies the task (e.g.
+/// "chat:<session_id>", "ai_table"). Terminal "done"/"failed" move the entry
+/// to the last-terminal slot (the ball decays them visually on its own
+/// timer); "idle" removes it silently (cancellations shouldn't flash).
+pub fn pet_report(
+    app_handle: &tauri::AppHandle,
+    source: &str,
+    label: &str,
+    state: &str,
+    detail: Option<String>,
+) {
+    let activity = PetActivity {
+        label: label.to_string(),
+        state: state.to_string(),
+        detail,
+    };
+    match state {
+        "done" | "failed" => {
+            activities()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(source);
+            *last_terminal().lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((source.to_string(), activity));
+        }
+        "idle" => {
+            activities()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(source);
+        }
+        _ => {
+            activities()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(source.to_string(), activity);
+        }
+    }
+    aggregate_and_emit(app_handle);
+}
+
+/// Hover detail card data (null when nothing has run this app launch).
+#[tauri::command]
+pub async fn pet_current_status() -> Option<PetStatusInfo> {
+    status_slot().lock().ok().and_then(|g| g.clone())
+}
+
+/// Whether plain chat sessions drive the pet ball (default on).
+#[tauri::command]
+pub async fn pet_get_chat_linked(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(
+        crate::core::settings_service::get_device_setting(&state.db, CHAT_LINKED_KEY)
+            .await?
+            .map(|v| v != "0")
+            .unwrap_or(true),
+    )
+}
+
+#[tauri::command]
+pub async fn pet_set_chat_linked(state: State<'_, AppState>, linked: bool) -> Result<(), String> {
+    crate::core::settings_service::set_device_setting(
+        &state.db,
+        CHAT_LINKED_KEY,
+        if linked { "1" } else { "0" },
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

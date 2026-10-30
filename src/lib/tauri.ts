@@ -324,19 +324,29 @@ export async function petCreateSession(domain: string, context: Record<string, u
   return invoke<AgentSession>('pet_create_session', { domain, context });
 }
 
-/** Latest pet-session activity snapshot for the ball's hover detail card. */
-export interface PetStatusInfo {
+/** Latest pet activity snapshot for the ball's hover detail card. */
+export interface PetActivity {
+  /** "AI 表格列" / "AI 综述" / "AI 分类" / "对话 · <标题>" */
+  label: string;
+  /** running | waiting | done | failed */
   state: string;
-  session_title: string;
-  user_prompt: string;
-  tool_name: string | null;
-  pending: string | null;
+  detail: string | null;
+}
+
+export interface PetStatusInfo {
+  /** Aggregate state across all activities. */
+  state: string;
+  /** Active tasks (cap 3); when idle, the most recent terminal activity. */
+  activities: PetActivity[];
   updated_at: string;
 }
 
 export async function petCurrentStatus(): Promise<PetStatusInfo | null> {
   return invoke<PetStatusInfo | null>('pet_current_status');
 }
+
+export const petGetChatLinked = () => invoke<boolean>('pet_get_chat_linked');
+export const petSetChatLinked = (linked: boolean) => invoke<void>('pet_set_chat_linked', { linked });
 
 // ── Pet skins (.codex-pet compatible) ──
 

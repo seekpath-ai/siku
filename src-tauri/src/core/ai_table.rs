@@ -179,6 +179,28 @@ fn emit(app: &AppHandle, p: &ExtractProgress) {
     if let Err(e) = app.emit(PROGRESS_EVENT, p) {
         tracing::warn!(error = %e, "failed to emit ai-table progress");
     }
+    // Pet ball mirror. Reasoning beats are too chatty and carry placeholder
+    // counters; report only real progress beats and terminal states.
+    if p.reasoning.is_none() {
+        let report: Option<(&str, Option<String>)> = match p.finished.as_deref() {
+            None if p.total > 0 => Some((
+                "running",
+                Some(format!("{}/{} · {}", p.done, p.total, p.current_title)),
+            )),
+            Some("done") => {
+                if p.failed > 0 || (p.total == 0 && p.log.is_some()) {
+                    Some(("failed", p.log.clone()))
+                } else {
+                    Some(("done", Some(format!("完成 {}/{}", p.done, p.total))))
+                }
+            }
+            Some("cancelled") => Some(("idle", None)),
+            _ => None,
+        };
+        if let Some((state, detail)) = report {
+            crate::commands::pet::pet_report(app, "ai_table", "AI 表格列", state, detail);
+        }
+    }
 }
 
 /// How hard the run looks for evidence. Cost (LLM calls per paper) and the

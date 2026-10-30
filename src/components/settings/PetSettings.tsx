@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Loader2, Check } from 'lucide-react';
-import { settingsGet, settingsSet, petDomains, petListSkins, petGetSkinSelection, petSetSkinSelection, petGetSize, petSetSize } from '@/lib/tauri';
+import { settingsGet, settingsSet, petDomains, petListSkins, petGetSkinSelection, petSetSkinSelection, petGetSize, petSetSize, petGetChatLinked, petSetChatLinked } from '@/lib/tauri';
 import type { PetSkinSummary } from '@/lib/tauri';
 
 interface DomainConfig {
@@ -39,6 +39,8 @@ export function PetSettings() {
   const [skinId, setSkinId] = useState('');
   /** Ball edge length in px. */
   const [ballSize, setBallSize] = useState(48);
+  /** Whether plain chat sessions drive the pet ball (default on). */
+  const [chatLinked, setChatLinked] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -55,11 +57,12 @@ export function PetSettings() {
         console.error('load pet domains:', e);
       }
       try {
-        const [list, selected, size] = await Promise.all([petListSkins(), petGetSkinSelection(), petGetSize()]);
+        const [list, selected, size, linked] = await Promise.all([petListSkins(), petGetSkinSelection(), petGetSize(), petGetChatLinked()]);
         if (!cancelled) {
           setSkins(list);
           setSkinId(selected);
           setBallSize(size);
+          setChatLinked(linked);
         }
       } catch (e) {
         console.error('load pet skins:', e);
@@ -173,6 +176,32 @@ export function PetSettings() {
             <option value={96}>大</option>
             <option value={128}>超大</option>
           </select>
+        </div>
+        <div className="flex items-center gap-3 mt-3 pt-3 border-t border-surface-hover">
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-medium text-text-primary">对话时桌宠联动</div>
+            <div className="text-xs text-text-secondary/60 mt-0.5">
+              对话生成期间桌宠同步显示工作状态，离开对话页查看笔记、文献时也能感知进度。
+            </div>
+          </div>
+          <button
+            role="switch"
+            aria-checked={chatLinked}
+            onClick={async () => {
+              const next = !chatLinked;
+              setChatLinked(next);
+              await petSetChatLinked(next).catch((err) => console.error('save chat linked:', err));
+            }}
+            className={`w-9 h-5 rounded-full transition-colors shrink-0 ${
+              chatLinked ? 'bg-primary' : 'bg-surface-hover'
+            }`}
+          >
+            <span
+              className={`block w-4 h-4 rounded-full bg-white shadow transition-transform ${
+                chatLinked ? 'translate-x-[18px]' : 'translate-x-0.5'
+              }`}
+            />
+          </button>
         </div>
       </div>
 

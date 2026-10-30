@@ -69,41 +69,6 @@ fn pending_approvals() -> &'static std::sync::Mutex<std::collections::HashMap<St
     PENDING_APPROVALS.get_or_init(Default::default)
 }
 
-/// Latest activity snapshot of pet (domain-agent) sessions, consumed by the
-/// ball window's hover detail card via `pet_current_status`.
-#[derive(Clone, serde::Serialize)]
-pub struct PetStatusInfo {
-    pub state: String,
-    pub session_title: String,
-    pub user_prompt: String,
-    pub tool_name: Option<String>,
-    pub pending: Option<String>,
-    pub updated_at: String,
-}
-
-static PET_STATUS: std::sync::OnceLock<std::sync::Mutex<Option<PetStatusInfo>>> =
-    std::sync::OnceLock::new();
-
-fn pet_status_slot() -> &'static std::sync::Mutex<Option<PetStatusInfo>> {
-    PET_STATUS.get_or_init(Default::default)
-}
-
-fn pet_status_update(f: impl FnOnce(&mut PetStatusInfo)) {
-    if let Ok(mut guard) = pet_status_slot().lock() {
-        if let Some(s) = guard.as_mut() {
-            f(s);
-            s.updated_at = crate::core::time::now_iso();
-        }
-    }
-}
-
-/// Hover detail card data for the pet ball (null when no pet session has run
-/// this app launch).
-#[tauri::command]
-pub async fn pet_current_status() -> Option<PetStatusInfo> {
-    pet_status_slot().lock().ok().and_then(|g| g.clone())
-}
-
 async fn ensure_agent_config(
     config: &mut AgentConfig,
     app_settings: &crate::core::models::AppSettings,
@@ -1376,38 +1341,53 @@ pub(crate) async fn run_agent_turn(
     // Create event channel
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
 
-    // Pet ball: resolve whether this is a domain-agent (pet) session BEFORE
-    // `content` moves into the turn task. The flag drives both the coarse
-    // "pet:state" event and the hover detail aggregate; the initial snapshot
-    // carries the user prompt head for the detail card. skill_reviewer is an
-    // internal background agent and stays excluded.
-    let pet_session: Option<(String, String)> = sqlx::query_as::<_, (Option<String>, String)>(
+    // Pet ball: decide whether this session drives the pet BEFORE `content`
+    // moves into the turn task. Domain-agent (pet panel) sessions always do;
+    // plain chat sessions follow the "对话时桌宠联动" device setting
+    // (default on). skill_reviewer is an internal background agent and stays
+    // excluded either way.
+    let session_row = sqlx::query_as::<_, (Option<String>, String)>(
         "SELECT domain, title FROM chat_sessions WHERE id = ?",
     )
     .bind(&session_id)
     .fetch_optional(&state.db)
     .await
     .ok()
-    .flatten()
-    .and_then(|(domain, title)| {
-        let d = domain?;
-        (d != "skill_reviewer" && crate::ai::agent::domain::get_domain(&d).is_some())
-            .then_some((d, title))
-    });
-    if let Some((_, title)) = &pet_session {
+    .flatten();
+    let is_domain_session = session_row
+        .as_ref()
+        .and_then(|(d, _)| d.as_deref())
+        .map(|d| d != "skill_reviewer" && crate::ai::agent::domain::get_domain(d).is_some())
+        .unwrap_or(false);
+    let chat_linked = is_domain_session
+        || crate::core::settings_service::get_device_setting(
+            &state.db,
+            crate::commands::pet::CHAT_LINKED_KEY,
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let pet_link: Option<(String, String)> = if chat_linked {
+        let title = session_row
+            .as_ref()
+            .map(|(_, t)| t.clone())
+            .unwrap_or_else(|| "对话".to_string());
+        Some((format!("chat:{session_id}"), title))
+    } else {
+        None
+    };
+    if let Some((src, title)) = &pet_link {
         let prompt_head: String = content.chars().take(60).collect();
-        if let Ok(mut guard) = pet_status_slot().lock() {
-            *guard = Some(PetStatusInfo {
-                state: "running".to_string(),
-                session_title: title.clone(),
-                user_prompt: prompt_head,
-                tool_name: None,
-                pending: None,
-                updated_at: crate::core::time::now_iso(),
-            });
-        }
+        crate::commands::pet::pet_report(
+            &app_handle,
+            src,
+            &format!("对话 · {title}"),
+            "running",
+            Some(prompt_head),
+        );
     }
-    let is_pet_session = pet_session.is_some();
     // Cloned for the terminal done/cancelled event, which must be emitted
     // only AFTER the run's results have been persisted (the frontend reloads
     // the session history on it). Sending through the same channel keeps it
@@ -1624,8 +1604,10 @@ pub(crate) async fn run_agent_turn(
     // agent_approve_tool can resolve the tool_call id from context.
     let app_clone2 = app_handle.clone();
     let fwd_sid = session_id.clone();
-    // is_pet_session was resolved above (before `content` moved): pet sessions
-    // additionally emit "pet:state" and feed the hover detail aggregate.
+    // pet_link was resolved above (before `content` moved): linked sessions
+    // feed the pet activity aggregator on meaningful transitions only —
+    // Delta/Reasoning heartbeats are far too chatty to re-report.
+    let pet_fwd = pet_link;
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             if let AgentEvent::ToolApprovalRequired { tool_call_id, .. } = &event {
@@ -1633,43 +1615,25 @@ pub(crate) async fn run_agent_turn(
                     m.insert(fwd_sid.clone(), tool_call_id.clone());
                 }
             }
-            if is_pet_session {
-                let state = match &event {
-                    AgentEvent::Thinking { .. }
-                    | AgentEvent::Delta { .. }
-                    | AgentEvent::Reasoning { .. }
-                    | AgentEvent::ToolCall { .. }
-                    | AgentEvent::ToolResult { .. }
-                    | AgentEvent::StepComplete { .. } => Some("running"),
-                    AgentEvent::ToolApprovalRequired { .. } | AgentEvent::AskUser { .. } => {
-                        Some("waiting")
+            if let Some((src, title)) = &pet_fwd {
+                let label = format!("对话 · {title}");
+                let report: Option<(&str, Option<String>)> = match &event {
+                    AgentEvent::ToolCall { tool_name, .. } => {
+                        Some(("running", Some(format!("工具：{tool_name}"))))
                     }
-                    AgentEvent::Done { .. } => Some("done"),
-                    AgentEvent::Cancelled { .. } => Some("idle"),
-                    AgentEvent::Error { .. } => Some("failed"),
+                    AgentEvent::ToolApprovalRequired { tool_name, .. } => {
+                        Some(("waiting", Some(format!("审批：{tool_name}"))))
+                    }
+                    AgentEvent::AskUser { .. } => Some(("waiting", Some("提问".to_string()))),
+                    AgentEvent::Done { .. } => Some(("done", None)),
+                    AgentEvent::Cancelled { .. } => Some(("idle", None)),
+                    AgentEvent::Error { content, .. } => {
+                        Some(("failed", Some(content.chars().take(60).collect())))
+                    }
+                    _ => None,
                 };
-                if let Some(s) = state {
-                    pet_status_update(|st| {
-                        st.state = s.to_string();
-                        match &event {
-                            AgentEvent::ToolCall { tool_name, .. } => {
-                                st.tool_name = Some(tool_name.clone());
-                                st.pending = None;
-                            }
-                            AgentEvent::ToolApprovalRequired { tool_name, .. } => {
-                                st.pending = Some(format!("审批：{tool_name}"));
-                            }
-                            AgentEvent::AskUser { .. } => {
-                                st.pending = Some("提问".to_string());
-                            }
-                            AgentEvent::Done { .. } | AgentEvent::Cancelled { .. } => {
-                                st.tool_name = None;
-                                st.pending = None;
-                            }
-                            _ => {}
-                        }
-                    });
-                    let _ = app_clone2.emit("pet:state", s);
+                if let Some((s, detail)) = report {
+                    crate::commands::pet::pet_report(&app_clone2, src, &label, s, detail);
                 }
             }
             let _ = app_clone2.emit("agent:event", &event);

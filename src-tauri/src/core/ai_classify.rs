@@ -364,6 +364,30 @@ fn emit(app: &AppHandle, p: &ClassifyProgress) {
     if let Err(e) = app.emit(PROGRESS_EVENT, p) {
         tracing::warn!(error = %e, "failed to emit ai-classify progress");
     }
+    // Pet ball mirror.
+    let report: Option<(&str, Option<String>)> = match p.finished.as_deref() {
+        None => Some((
+            "running",
+            Some(if p.total > 0 {
+                format!("{}/{} · {}", p.done, p.total, p.current)
+            } else {
+                p.current.clone()
+            }),
+        )),
+        Some("done") => {
+            if p.failed > 0 {
+                Some(("failed", p.log.clone()))
+            } else {
+                Some(("done", Some(format!("完成 {}/{}", p.done, p.total))))
+            }
+        }
+        Some("error") => Some(("failed", p.log.clone())),
+        Some("cancelled") => Some(("idle", None)),
+        _ => None,
+    };
+    if let Some((state, detail)) = report {
+        crate::commands::pet::pet_report(app, "ai_classify", "AI 分类", state, detail);
+    }
 }
 
 fn chat_msg(role: &str, content: String) -> ChatMessage {

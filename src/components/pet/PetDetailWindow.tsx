@@ -1,6 +1,9 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { PhysicalPosition } from '@tauri-apps/api/dpi';
+import { listen } from '@tauri-apps/api/event';
+import { petCurrentStatus } from '@/lib/tauri';
+import type { PetStatusInfo } from '@/lib/tauri';
 import './pet-window.css';
 
 const STATE_LABEL: Record<string, string> = {
@@ -14,14 +17,29 @@ const STATE_LABEL: Record<string, string> = {
 /** Ephemeral hover detail card shown below the pet ball (created by
  *  PetBallWindow on mouse-enter, closed on mouse-leave). Same pattern as the
  *  speech bubble: own always-on-top transparent window so the ball window
- *  stays exactly ball-sized; click-through so it never steals pointer events. */
+ *  stays exactly ball-sized; click-through so it never steals pointer events.
+ *  Fetches the status itself (supporting multiple concurrent tasks) and
+ *  refreshes whenever the aggregate state changes. */
 export function PetDetailWindow() {
-  const q = new URLSearchParams(window.location.search);
-  const state = q.get('state') ?? 'idle';
-  const title = q.get('title') ?? '';
-  const prompt = q.get('prompt') ?? '';
-  const tool = q.get('tool') ?? '';
-  const pending = q.get('pending') ?? '';
+  const [status, setStatus] = useState<PetStatusInfo | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const st = await petCurrentStatus();
+        if (!cancelled) setStatus(st);
+      } catch {
+        /* show idle */
+      }
+    };
+    load();
+    const unlisten = listen<string>('pet:state', () => load());
+    return () => {
+      cancelled = true;
+      unlisten.then((u) => u());
+    };
+  }, []);
 
   // Anchor below the ball and go click-through before becoming visible.
   useEffect(() => {
@@ -42,14 +60,22 @@ export function PetDetailWindow() {
     })().catch(() => {});
   }, []);
 
+  const state = status?.state ?? 'idle';
+  const activities = status?.activities ?? [];
+
   return (
     <div className="pet-detail-window">
       <div className={`pet-detail pet-detail-${state}`}>
         <div className="pet-detail-state">{STATE_LABEL[state] ?? state}</div>
-        {title && <div className="pet-detail-title">{title}</div>}
-        {pending && <div className="pet-detail-pending">待处理：{pending}</div>}
-        {tool && state === 'running' && <div className="pet-detail-row">工具：{tool}</div>}
-        {prompt && <div className="pet-detail-row pet-detail-prompt">{prompt}</div>}
+        {activities.map((a, i) => (
+          <div key={i} className="pet-detail-task">
+            <span className={`pet-detail-dot pet-detail-dot-${a.state}`} />
+            <div className="pet-detail-task-body">
+              <div className="pet-detail-title">{a.label}</div>
+              {a.detail && <div className="pet-detail-row pet-detail-prompt">{a.detail}</div>}
+            </div>
+          </div>
+        ))}
         <div className="pet-detail-hint">点击打开智能体 · 右键菜单</div>
       </div>
     </div>

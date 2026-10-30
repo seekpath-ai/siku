@@ -223,27 +223,16 @@ export function PetBallWindow() {
 
   const showDetail = async () => {
     try {
-      const { petCurrentStatus } = await import('@/lib/tauri');
-      // Null until the first pet-domain session runs this launch — the card
-      // must still open (as "空闲") so hover never looks broken.
-      const st = await petCurrentStatus();
       const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const existing = await WebviewWindow.getByLabel('pet-detail');
       if (existing) await existing.close().catch(() => {});
-      const params = new URLSearchParams({
-        state: st?.state ?? 'idle',
-        title: st?.session_title ?? '',
-        prompt: st?.user_prompt ?? '',
-        tool: st?.tool_name ?? '',
-        pending: st?.pending ?? '',
-      });
-      // Created hidden; PetDetailWindow positions itself under the ball, goes
-      // click-through, then shows.
+      // Created hidden; PetDetailWindow positions itself under the ball,
+      // fetches the status snapshot itself, goes click-through, then shows.
       new WebviewWindow('pet-detail', {
-        url: `index.html?${params.toString()}`,
+        url: 'index.html',
         title: '',
-        width: 260,
-        height: 132,
+        width: 280,
+        height: 220,
         decorations: false,
         transparent: true,
         shadow: false,

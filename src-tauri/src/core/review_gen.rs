@@ -60,6 +60,46 @@ fn emit(app: Option<&AppHandle>, progress: &ReviewProgress) {
         if let Err(e) = app.emit(PROGRESS_EVENT, progress) {
             tracing::warn!(error = %e, "failed to emit review progress");
         }
+        // Pet ball mirror. Delta/reasoning beats arrive per token — skip
+        // them and report only stage transitions.
+        if let (None, None) = (&progress.delta, &progress.reasoning) {
+            let report: Option<(&str, Option<String>)> = match progress.stage.as_str() {
+            "done" => Some(("done", progress.message.clone())),
+            "error" => Some((
+                "failed",
+                progress.error.clone().or_else(|| progress.message.clone()),
+            )),
+            "cancelled" => Some(("idle", None)),
+            stage => {
+                let detail = match stage {
+                    "read" => match (progress.done_papers, progress.total_papers) {
+                        (Some(d), Some(t)) => format!("证据卡 {d}/{t}"),
+                        _ => "阅读文献".to_string(),
+                    },
+                    "section" => {
+                        if progress.total_sections > 0 {
+                            format!(
+                                "撰写 {}/{} · {}",
+                                progress.section_index + 1,
+                                progress.total_sections,
+                                progress.section_title
+                            )
+                        } else {
+                            "撰写".to_string()
+                        }
+                    }
+                    other => progress
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| other.to_string()),
+                };
+                Some(("running", Some(detail)))
+            }
+        };
+            if let Some((state, detail)) = report {
+                crate::commands::pet::pet_report(app, "ai_review", "AI 综述", state, detail);
+            }
+        }
     }
 }
 

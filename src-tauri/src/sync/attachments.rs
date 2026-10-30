@@ -117,6 +117,43 @@ pub async fn collect_missing_blob_hashes(
     Ok(missing)
 }
 
+/// Startup migration: notes written before snapshot refs were ingested still
+/// embed absolute `snapshots/...` paths, which are meaningless on other
+/// devices and never trigger blob requests. Rewrite them to `blobs/` refs
+/// (ingest copies the file into the blob store), bump `updated_at` so the
+/// rewrite propagates over sync, and register the blobs for proactive push.
+/// Returns how many notes were rewritten.
+pub async fn migrate_note_snapshot_refs(
+    db: &SqlitePool,
+    app_data_dir: &std::path::Path,
+) -> Result<usize> {
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, content FROM notes WHERE content LIKE '%snapshots/%'")
+            .fetch_all(db)
+            .await
+            .context("scan notes for snapshot refs")?;
+    let mut rewritten = 0usize;
+    for (id, content) in rows {
+        let (new_content, blobs) = file_store::ingest_snapshot_image_refs(&content, app_data_dir);
+        if new_content == content {
+            continue;
+        }
+        sqlx::query("UPDATE notes SET content = ?, updated_at = ? WHERE id = ?")
+            .bind(&new_content)
+            .bind(crate::core::time::now_iso())
+            .bind(&id)
+            .execute(db)
+            .await
+            .context("rewrite note snapshot refs")?;
+        mark_blobs_pending_push(db, app_data_dir, &blobs).await;
+        rewritten += 1;
+    }
+    if rewritten > 0 {
+        info!(rewritten, "migrated note snapshot refs to blob store");
+    }
+    Ok(rewritten)
+}
+
 /// Hard cap the relay enforces on a single websocket frame (tungstenite
 /// frame/message limit on the deployed relay): a larger frame gets the
 /// connection killed outright, before any application-level ack can exist.
@@ -347,6 +384,17 @@ pub async fn mark_blob_pending_push(db: &SqlitePool, app_data_dir: &std::path::P
         &ext,
     )
     .await;
+}
+
+/// Mark every newly written blob for proactive push (see `mark_blob_pending_push`).
+pub async fn mark_blobs_pending_push(
+    db: &SqlitePool,
+    app_data_dir: &std::path::Path,
+    blobs: &[(String, String)],
+) {
+    for (hash, ext) in blobs {
+        mark_blob_pending_push(db, app_data_dir, hash, ext).await;
+    }
 }
 
 /// Re-arm a pending push after a failed attempt: the marker value becomes

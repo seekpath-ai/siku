@@ -18,7 +18,8 @@ pub async fn notes_create(
             crate::core::note_service::SYSTEM_LIBRARY_NAME
         ));
     }
-    let content = crate::file_store::ingest_snapshot_image_refs(&content, &state.app_data_dir);
+    let (content, new_blobs) = crate::file_store::ingest_snapshot_image_refs(&content, &state.app_data_dir);
+    crate::sync::attachments::mark_blobs_pending_push(&state.db, &state.app_data_dir, &new_blobs).await;
     let vault_id = crate::core::vault_service::get_current_vault_id(&state.db).await?;
     crate::core::note_service::create_note(&state.db, &title, &content, paper_id.as_deref(), parent_id.as_deref(), &vault_id, is_folder.unwrap_or(false)).await
 }
@@ -46,7 +47,8 @@ pub async fn note_create_from_reply(
 ) -> Result<Note, String> {
     let markdown =
         crate::core::evidence_note::convert(&state.db, &content, paper_id.as_deref()).await?;
-    let markdown = crate::file_store::ingest_snapshot_image_refs(&markdown, &state.app_data_dir);
+    let (markdown, new_blobs) = crate::file_store::ingest_snapshot_image_refs(&markdown, &state.app_data_dir);
+    crate::sync::attachments::mark_blobs_pending_push(&state.db, &state.app_data_dir, &new_blobs).await;
     let vault_id = crate::core::vault_service::get_current_vault_id(&state.db).await?;
     match paper_id.as_deref().filter(|p| !p.is_empty()) {
         Some(pid) => {
@@ -69,7 +71,8 @@ pub async fn note_create_under_paper(
     title: String,
     content: String,
 ) -> Result<Note, String> {
-    let content = crate::file_store::ingest_snapshot_image_refs(&content, &state.app_data_dir);
+    let (content, new_blobs) = crate::file_store::ingest_snapshot_image_refs(&content, &state.app_data_dir);
+    crate::sync::attachments::mark_blobs_pending_push(&state.db, &state.app_data_dir, &new_blobs).await;
     let vault_id = crate::core::vault_service::get_current_vault_id(&state.db).await?;
     crate::core::note_service::create_note_under_paper(&state.db, &paper_id, &title, &content, &vault_id).await
 }
@@ -83,7 +86,8 @@ pub async fn note_add_excerpt(
     paper_id: String,
     content: String,
 ) -> Result<Note, String> {
-    let content = crate::file_store::ingest_snapshot_image_refs(&content, &state.app_data_dir);
+    let (content, new_blobs) = crate::file_store::ingest_snapshot_image_refs(&content, &state.app_data_dir);
+    crate::sync::attachments::mark_blobs_pending_push(&state.db, &state.app_data_dir, &new_blobs).await;
     let vault_id = crate::core::vault_service::get_current_vault_id(&state.db).await?;
     crate::core::note_service::add_excerpt_to_paper(&state.db, &paper_id, &content, &vault_id).await
 }
@@ -96,6 +100,15 @@ pub async fn note_merge_into_excerpt(
     note_id: String,
     paper_id: String,
 ) -> Result<Note, String> {
+    // The source note may predate snapshot-ref ingestion; rewrite its image
+    // refs (and push the blobs) before the merge carries them over.
+    let note = crate::core::note_service::get_note(&state.db, &note_id).await?;
+    let (ingested, new_blobs) =
+        crate::file_store::ingest_snapshot_image_refs(&note.content, &state.app_data_dir);
+    if ingested != note.content {
+        crate::core::note_service::update_note(&state.db, &note_id, None, Some(&ingested), None, None, None, None).await?;
+        crate::sync::attachments::mark_blobs_pending_push(&state.db, &state.app_data_dir, &new_blobs).await;
+    }
     let vault_id = crate::core::vault_service::get_current_vault_id(&state.db).await?;
     crate::core::note_service::merge_note_into_paper_note(&state.db, &note_id, &paper_id, &vault_id).await
 }
@@ -113,7 +126,13 @@ pub async fn notes_update(
     content: Option<String>, paper_id: Option<String>, aliases: Option<String>, is_favorite: Option<i32>,
     touch: Option<bool>,
 ) -> Result<Note, String> {
-    let content = content.as_deref().map(|c| crate::file_store::ingest_snapshot_image_refs(c, &state.app_data_dir));
+    let mut new_blobs = Vec::new();
+    let content = content.as_deref().map(|c| {
+        let (c, blobs) = crate::file_store::ingest_snapshot_image_refs(c, &state.app_data_dir);
+        new_blobs = blobs;
+        c
+    });
+    crate::sync::attachments::mark_blobs_pending_push(&state.db, &state.app_data_dir, &new_blobs).await;
     crate::core::note_service::update_note(&state.db, &id, title.as_deref(), content.as_deref(), paper_id.as_deref(), aliases.as_deref(), is_favorite, touch).await
 }
 
@@ -244,5 +263,8 @@ pub async fn note_version_restore(
         .map_err(|e| format!("db: {e}"))?;
     }
 
-    crate::core::note_service::update_note(&state.db, &v.note_id, Some(&v.title), Some(&v.content), None, None, None, None).await
+    let (restored, new_blobs) =
+        crate::file_store::ingest_snapshot_image_refs(&v.content, &state.app_data_dir);
+    crate::sync::attachments::mark_blobs_pending_push(&state.db, &state.app_data_dir, &new_blobs).await;
+    crate::core::note_service::update_note(&state.db, &v.note_id, Some(&v.title), Some(&restored), None, None, None, None).await
 }

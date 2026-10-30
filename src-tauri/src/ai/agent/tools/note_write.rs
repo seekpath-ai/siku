@@ -77,7 +77,8 @@ impl Tool for NoteWriteTool {
         let content = crate::core::evidence_note::convert(&self.db, raw, default_paper.as_deref())
             .await
             .map_err(|e| format!("引用格式转换失败: {e}"))?;
-        let content = crate::file_store::ingest_snapshot_image_refs(content.as_str(), &self.app_data_dir);
+        let (content, new_blobs) = crate::file_store::ingest_snapshot_image_refs(content.as_str(), &self.app_data_dir);
+        crate::sync::attachments::mark_blobs_pending_push(&self.db, &self.app_data_dir, &new_blobs).await;
         let content = content.as_str();
 
         if let Some(note_id) = args["note_id"].as_str() {

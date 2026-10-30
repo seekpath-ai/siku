@@ -1,7 +1,8 @@
 use crate::sync::attachments::{
     blob_answer_on_cooldown, blob_dedup_key, blob_push_chunk_cursor, blob_request_on_cooldown,
     chunk_count, collect_missing_blob_hashes, mark_blob_pushed, mark_push_retry,
-    missing_chunk_indices, note_blob_answered, note_blob_chunks_pushed, note_blob_request_sent,
+    migrate_note_snapshot_refs, missing_chunk_indices, note_blob_answered, note_blob_chunks_pushed,
+    note_blob_request_sent,
     pending_blob_pushes, read_blob_base64, read_blob_chunk_base64, try_assemble_blob,
     write_blob_from_base64, write_incoming_chunk, MAX_CHUNKED_BLOB_BYTES,
     MAX_MAILBOX_BLOB_BYTES, PROACTIVE_PUSH_CHUNK_MAX_BYTES, RELAY_MAX_FRAME_BYTES,
@@ -1897,6 +1898,11 @@ pub async fn rescan_missing_blobs_at_startup(
     token: &str,
     self_device_id: &str,
 ) -> Result<()> {
+    // Old notes may still embed absolute snapshots/ paths (pre-ingest writes);
+    // rewrite them first so the rescan below can see the blob refs.
+    if let Err(e) = migrate_note_snapshot_refs(db, app_data_dir).await {
+        warn!(error = %e, "note snapshot ref migration failed");
+    }
     let missing = collect_missing_blob_hashes(db, app_data_dir).await?;
     if missing.is_empty() {
         return Ok(());

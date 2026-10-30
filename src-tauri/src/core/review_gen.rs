@@ -1356,7 +1356,11 @@ async fn save_review_inner(app: Option<&AppHandle>, db: &SqlitePool, run_id: &st
     let markdown = render_note_markdown(&raw, &state, &audit);
     // Snapshot 截图引用搬进 blob 存储，随笔记同步（app 为空仅发生在测试里）。
     let markdown = match app.and_then(|a| a.path().app_data_dir().ok()) {
-        Some(dir) => crate::file_store::ingest_snapshot_image_refs(&markdown, &dir),
+        Some(dir) => {
+            let (md, new_blobs) = crate::file_store::ingest_snapshot_image_refs(&markdown, &dir);
+            crate::sync::attachments::mark_blobs_pending_push(db, &dir, &new_blobs).await;
+            md
+        }
         None => markdown,
     };
     let note_title = format!("综述：{}", state.run.question.chars().take(40).collect::<String>());

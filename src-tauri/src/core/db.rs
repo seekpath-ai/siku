@@ -1187,6 +1187,10 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // treatment; also repairs the knowledge_items FTS triggers/index after a
     // rebuild). (added 2026-10-15)
     migrate_knowledge_crr_tables(&db).await?;
+    // Migration: AI 表格列/综述/分类表加入 CRR 集合——旧形状有裸 NOT NULL 列
+    // （无 DEFAULT），crsql_as_crr 会在启动时直接拒绝。重建为合规形状。
+    // (added 2026-10-30)
+    migrate_ai_feature_crr_tables(&db).await?;
     add_column_if_missing(&db, "research_sources", "relevance_score", "INTEGER").await?;
     add_column_if_missing(&db, "research_sources", "relevance_reason", "TEXT").await?;
 
@@ -1216,8 +1220,8 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
             value TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'done',
             edited INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (paper_id, column_key)
         )"
     )
@@ -1235,7 +1239,7 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
             column_key TEXT PRIMARY KEY NOT NULL,
             terms_json TEXT NOT NULL DEFAULT '[]',
             source TEXT NOT NULL DEFAULT 'ai',
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL DEFAULT ''
         )"
     )
     .execute(&db)
@@ -1247,7 +1251,7 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
             paper_id TEXT NOT NULL,
             column_key TEXT NOT NULL,
             refs_json TEXT NOT NULL DEFAULT '[]',
-            updated_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (paper_id, column_key)
         )"
     )
@@ -1257,10 +1261,10 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ai_table_presets (
             id TEXT PRIMARY KEY NOT NULL,
-            name TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
             columns_json TEXT NOT NULL DEFAULT '[]',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
         )"
     )
     .execute(&db)
@@ -1283,7 +1287,7 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
             groups_json TEXT NOT NULL DEFAULT '[]',
             provider_id TEXT,
             status TEXT NOT NULL DEFAULT 'draft',
-            created_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT '',
             applied_at TEXT,
             undone_at TEXT
         )"
@@ -1299,7 +1303,7 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
             reason TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'proposed',
             edited INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (run_id, paper_id)
         )"
     )
@@ -1353,8 +1357,8 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
             provider_id TEXT,
             last_run_at TEXT,
             last_result TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
         )"
     )
     .execute(&db)
@@ -1366,14 +1370,13 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ai_classify_vocab (
             id TEXT PRIMARY KEY NOT NULL,
-            dimension TEXT NOT NULL,
-            target TEXT NOT NULL,
-            path TEXT NOT NULL,
+            dimension TEXT NOT NULL DEFAULT '',
+            target TEXT NOT NULL DEFAULT '',
+            path TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'staged',
             source TEXT NOT NULL DEFAULT 'ai',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE (dimension, target, path)
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
         )"
     )
     .execute(&db)
@@ -1958,6 +1961,259 @@ async fn migrate_knowledge_crr_tables(db: &Db) -> anyhow::Result<()> {
         info!("knowledge_items: recreated FTS triggers and rebuilt the index");
     }
     Ok(())
+}
+
+/// Rebuild the AI-feature tables (AI 表格列 / 综述 / 分类) into CRR-compatible
+/// shapes (added 2026-10-30): their legacy shapes have NOT NULL columns
+/// without defaults (created_at/updated_at and a few others), which
+/// crsql_as_crr rejects at startup. PK columns are exempt from the rule;
+/// `ai_classify_applied` is already compliant and untouched. The vocab table
+/// additionally drops UNIQUE(dimension, target, path): CRDT merges cannot
+/// enforce uniqueness (same reason tags dropped UNIQUE(name)); dedup is the
+/// application layer's job.
+async fn migrate_ai_feature_crr_tables(db: &Db) -> anyhow::Result<()> {
+    run_crr_rebuilds(db, &[
+        CrrRebuildSpec {
+            table: "ai_table_cells",
+            new_ddl:
+                "CREATE TABLE ai_table_cells_new (
+                    paper_id TEXT NOT NULL,
+                    column_key TEXT NOT NULL,
+                    value TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'done',
+                    edited INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    meta_json TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (paper_id, column_key)
+                )",
+            cols: "paper_id, column_key, value, status, edited, created_at, updated_at, meta_json",
+            cols_legacy: "paper_id, column_key, value, status, edited, created_at, updated_at",
+            is_legacy: |sql| !sql.contains("created_at TEXT NOT NULL DEFAULT"),
+            indexes: &[],
+        },
+        CrrRebuildSpec {
+            table: "ai_table_term_cache",
+            new_ddl:
+                "CREATE TABLE ai_table_term_cache_new (
+                    column_key TEXT PRIMARY KEY NOT NULL,
+                    terms_json TEXT NOT NULL DEFAULT '[]',
+                    source TEXT NOT NULL DEFAULT 'ai',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )",
+            cols: "column_key, terms_json, source, updated_at",
+            cols_legacy: "column_key, terms_json, source, updated_at",
+            is_legacy: |sql| !sql.contains("updated_at TEXT NOT NULL DEFAULT"),
+            indexes: &[],
+        },
+        CrrRebuildSpec {
+            table: "ai_table_cell_evidence",
+            new_ddl:
+                "CREATE TABLE ai_table_cell_evidence_new (
+                    paper_id TEXT NOT NULL,
+                    column_key TEXT NOT NULL,
+                    refs_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (paper_id, column_key)
+                )",
+            cols: "paper_id, column_key, refs_json, updated_at",
+            cols_legacy: "paper_id, column_key, refs_json, updated_at",
+            is_legacy: |sql| !sql.contains("updated_at TEXT NOT NULL DEFAULT"),
+            indexes: &[],
+        },
+        CrrRebuildSpec {
+            table: "ai_table_presets",
+            new_ddl:
+                "CREATE TABLE ai_table_presets_new (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    columns_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )",
+            cols: "id, name, columns_json, created_at, updated_at",
+            cols_legacy: "id, name, columns_json, created_at, updated_at",
+            is_legacy: |sql| !sql.contains("name TEXT NOT NULL DEFAULT"),
+            indexes: &[],
+        },
+        CrrRebuildSpec {
+            table: "review_runs",
+            new_ddl:
+                "CREATE TABLE review_runs_new (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'created',
+                    stage TEXT NOT NULL DEFAULT 'read',
+                    question TEXT NOT NULL DEFAULT '',
+                    scope TEXT NOT NULL DEFAULT '',
+                    language TEXT NOT NULL DEFAULT '中文',
+                    target_words INTEGER NOT NULL DEFAULT 4000,
+                    provider_id TEXT,
+                    paper_ids_json TEXT NOT NULL DEFAULT '[]',
+                    synthesis_json TEXT,
+                    outline_json TEXT NOT NULL DEFAULT '[]',
+                    evidence_registry_json TEXT NOT NULL DEFAULT '[]',
+                    final_raw_markdown TEXT,
+                    audit_json TEXT,
+                    warnings_json TEXT NOT NULL DEFAULT '[]',
+                    note_id TEXT,
+                    error TEXT,
+                    cancelled INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )",
+            cols: "id, status, stage, question, scope, language, target_words, provider_id, paper_ids_json, synthesis_json, outline_json, evidence_registry_json, final_raw_markdown, audit_json, warnings_json, note_id, error, cancelled, created_at, updated_at",
+            cols_legacy: "id, status, stage, question, scope, language, target_words, provider_id, paper_ids_json, synthesis_json, outline_json, evidence_registry_json, final_raw_markdown, audit_json, warnings_json, note_id, error, cancelled, created_at, updated_at",
+            is_legacy: |sql| !sql.contains("created_at TEXT NOT NULL DEFAULT"),
+            indexes: &[],
+        },
+        CrrRebuildSpec {
+            table: "review_paper_cards",
+            new_ddl:
+                "CREATE TABLE review_paper_cards_new (
+                    run_id TEXT NOT NULL,
+                    paper_id TEXT NOT NULL,
+                    paper_index INTEGER NOT NULL DEFAULT 0,
+                    title TEXT NOT NULL DEFAULT '',
+                    authors TEXT NOT NULL DEFAULT '[]',
+                    year INTEGER,
+                    journal TEXT,
+                    doi TEXT,
+                    url TEXT,
+                    abstract_text TEXT NOT NULL DEFAULT '',
+                    source_chunks_json TEXT NOT NULL DEFAULT '[]',
+                    source_kind TEXT NOT NULL DEFAULT 'unusable',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    chunk_count INTEGER NOT NULL DEFAULT 0,
+                    abstract_chars INTEGER NOT NULL DEFAULT 0,
+                    card_json TEXT,
+                    cache_key TEXT NOT NULL DEFAULT '',
+                    index_fingerprint TEXT NOT NULL DEFAULT '',
+                    error TEXT,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (run_id, paper_id)
+                )",
+            cols: "run_id, paper_id, paper_index, title, authors, year, journal, doi, url, abstract_text, source_chunks_json, source_kind, status, chunk_count, abstract_chars, card_json, cache_key, index_fingerprint, error, created_at, updated_at",
+            cols_legacy: "run_id, paper_id, paper_index, title, authors, year, journal, doi, url, abstract_text, source_chunks_json, source_kind, status, chunk_count, abstract_chars, card_json, cache_key, index_fingerprint, error, created_at, updated_at",
+            is_legacy: |sql| !sql.contains("created_at TEXT NOT NULL DEFAULT"),
+            indexes: &[
+                "CREATE INDEX IF NOT EXISTS idx_review_cards_cache ON review_paper_cards(paper_id, cache_key, status)",
+            ],
+        },
+        CrrRebuildSpec {
+            table: "review_sections",
+            new_ddl:
+                "CREATE TABLE review_sections_new (
+                    run_id TEXT NOT NULL,
+                    section_index INTEGER NOT NULL,
+                    plan_json TEXT NOT NULL DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    raw_markdown TEXT NOT NULL DEFAULT '',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (run_id, section_index)
+                )",
+            cols: "run_id, section_index, plan_json, status, raw_markdown, attempts, error, updated_at",
+            cols_legacy: "run_id, section_index, plan_json, status, raw_markdown, attempts, error, updated_at",
+            is_legacy: |sql| !sql.contains("updated_at TEXT NOT NULL DEFAULT"),
+            indexes: &[],
+        },
+        CrrRebuildSpec {
+            table: "ai_classify_runs",
+            new_ddl:
+                "CREATE TABLE ai_classify_runs_new (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    scope_kind TEXT NOT NULL DEFAULT 'selection',
+                    scope_id TEXT,
+                    dimension TEXT NOT NULL DEFAULT '',
+                    target TEXT NOT NULL DEFAULT 'collection',
+                    engine TEXT NOT NULL DEFAULT 'batch',
+                    sample_size INTEGER,
+                    paper_ids_json TEXT NOT NULL DEFAULT '[]',
+                    groups_json TEXT NOT NULL DEFAULT '[]',
+                    provider_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    applied_at TEXT,
+                    undone_at TEXT,
+                    threshold REAL NOT NULL DEFAULT 0.75,
+                    two_level INTEGER NOT NULL DEFAULT 0,
+                    skip_existing INTEGER NOT NULL DEFAULT 0
+                )",
+            cols: "id, scope_kind, scope_id, dimension, target, engine, sample_size, paper_ids_json, groups_json, provider_id, status, created_at, applied_at, undone_at, threshold, two_level, skip_existing",
+            cols_legacy: "id, scope_kind, scope_id, dimension, target, engine, sample_size, paper_ids_json, groups_json, provider_id, status, created_at, applied_at, undone_at",
+            is_legacy: |sql| !sql.contains("created_at TEXT NOT NULL DEFAULT"),
+            indexes: &[],
+        },
+        CrrRebuildSpec {
+            table: "ai_classify_items",
+            new_ddl:
+                "CREATE TABLE ai_classify_items_new (
+                    run_id TEXT NOT NULL,
+                    paper_id TEXT NOT NULL,
+                    group_name TEXT NOT NULL DEFAULT '',
+                    confidence REAL NOT NULL DEFAULT 0,
+                    reason TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'proposed',
+                    edited INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    labels_json TEXT NOT NULL DEFAULT '[]',
+                    PRIMARY KEY (run_id, paper_id)
+                )",
+            cols: "run_id, paper_id, group_name, confidence, reason, status, edited, created_at, labels_json",
+            cols_legacy: "run_id, paper_id, group_name, confidence, reason, status, edited, created_at",
+            is_legacy: |sql| !sql.contains("created_at TEXT NOT NULL DEFAULT"),
+            indexes: &[],
+        },
+        CrrRebuildSpec {
+            table: "ai_classify_rules",
+            new_ddl:
+                "CREATE TABLE ai_classify_rules_new (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    dimension TEXT NOT NULL DEFAULT '',
+                    target TEXT NOT NULL DEFAULT 'collection',
+                    scope_kind TEXT NOT NULL DEFAULT 'all',
+                    scope_id TEXT,
+                    max_groups INTEGER NOT NULL DEFAULT 8,
+                    threshold REAL NOT NULL DEFAULT 0.85,
+                    two_level INTEGER NOT NULL DEFAULT 1,
+                    reuse_existing INTEGER NOT NULL DEFAULT 1,
+                    cron TEXT NOT NULL DEFAULT '0 9 * * *',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    provider_id TEXT,
+                    last_run_at TEXT,
+                    last_result TEXT,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )",
+            cols: "id, name, dimension, target, scope_kind, scope_id, max_groups, threshold, two_level, reuse_existing, cron, enabled, provider_id, last_run_at, last_result, created_at, updated_at",
+            cols_legacy: "id, name, dimension, target, scope_kind, scope_id, max_groups, threshold, two_level, reuse_existing, cron, enabled, provider_id, last_run_at, last_result, created_at, updated_at",
+            is_legacy: |sql| !sql.contains("created_at TEXT NOT NULL DEFAULT"),
+            indexes: &[],
+        },
+        CrrRebuildSpec {
+            table: "ai_classify_vocab",
+            new_ddl:
+                "CREATE TABLE ai_classify_vocab_new (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    dimension TEXT NOT NULL DEFAULT '',
+                    target TEXT NOT NULL DEFAULT '',
+                    path TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'staged',
+                    source TEXT NOT NULL DEFAULT 'ai',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )",
+            cols: "id, dimension, target, path, status, source, created_at, updated_at",
+            cols_legacy: "id, dimension, target, path, status, source, created_at, updated_at",
+            is_legacy: |sql| !sql.contains("dimension TEXT NOT NULL DEFAULT"),
+            indexes: &[],
+        },
+    ])
+    .await
+    .map(|_| ())
 }
 
 
@@ -3657,6 +3913,101 @@ pub(crate) mod tests {
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;
+        Ok(())
+    }
+
+    /// Legacy (pre-CRR) AI-feature tables carry bare NOT NULL columns without
+    /// defaults; crsql_as_crr rejects them at startup (the 1.4.2 launch
+    /// crash). The rebuild must preserve rows, add defaults, and leave every
+    /// table registrable.
+    #[tokio::test]
+    async fn ai_feature_tables_rebuilt_for_crr() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-ai-crr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let db = tests::connect_with_crsqlite(&dir.join("t.db")).await?;
+
+        // Legacy shapes (as shipped before the CRR registration).
+        sqlx::raw_sql(
+            "CREATE TABLE ai_table_cells (
+                paper_id TEXT NOT NULL, column_key TEXT NOT NULL,
+                value TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'done',
+                edited INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY (paper_id, column_key));
+             INSERT INTO ai_table_cells VALUES ('p1','方法','访谈','done',0,'t','t');
+             CREATE TABLE review_runs (
+                id TEXT PRIMARY KEY NOT NULL,
+                status TEXT NOT NULL DEFAULT 'created', stage TEXT NOT NULL DEFAULT 'read',
+                question TEXT NOT NULL DEFAULT '', scope TEXT NOT NULL DEFAULT '',
+                language TEXT NOT NULL DEFAULT '中文', target_words INTEGER NOT NULL DEFAULT 4000,
+                provider_id TEXT, paper_ids_json TEXT NOT NULL DEFAULT '[]',
+                synthesis_json TEXT, outline_json TEXT NOT NULL DEFAULT '[]',
+                evidence_registry_json TEXT NOT NULL DEFAULT '[]', final_raw_markdown TEXT,
+                audit_json TEXT, warnings_json TEXT NOT NULL DEFAULT '[]',
+                note_id TEXT, error TEXT, cancelled INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+             INSERT INTO review_runs (id, created_at, updated_at) VALUES ('r1','t','t');
+             CREATE TABLE ai_classify_vocab (
+                id TEXT PRIMARY KEY NOT NULL, dimension TEXT NOT NULL,
+                target TEXT NOT NULL, path TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'staged', source TEXT NOT NULL DEFAULT 'ai',
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                UNIQUE (dimension, target, path));
+             INSERT INTO ai_classify_vocab VALUES ('v1','主题','collection','AI','staged','ai','t','t');
+             -- Compliant empty table so the spec's index recreation has a target.
+             CREATE TABLE review_paper_cards (
+                run_id TEXT NOT NULL, paper_id TEXT NOT NULL,
+                paper_index INTEGER NOT NULL DEFAULT 0,
+                title TEXT NOT NULL DEFAULT '', authors TEXT NOT NULL DEFAULT '[]',
+                year INTEGER, journal TEXT, doi TEXT, url TEXT,
+                abstract_text TEXT NOT NULL DEFAULT '', source_chunks_json TEXT NOT NULL DEFAULT '[]',
+                source_kind TEXT NOT NULL DEFAULT 'unusable', status TEXT NOT NULL DEFAULT 'pending',
+                chunk_count INTEGER NOT NULL DEFAULT 0, abstract_chars INTEGER NOT NULL DEFAULT 0,
+                card_json TEXT, cache_key TEXT NOT NULL DEFAULT '', index_fingerprint TEXT NOT NULL DEFAULT '',
+                error TEXT, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (run_id, paper_id));",
+        )
+        .execute(&db)
+        .await?;
+
+        super::migrate_ai_feature_crr_tables(&db).await?;
+
+        // Rows survive the rebuild.
+        let cell: (String,) = sqlx::query_as("SELECT value FROM ai_table_cells WHERE paper_id = 'p1'")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(cell.0, "访谈");
+        let run: (String,) = sqlx::query_as("SELECT id FROM review_runs")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(run.0, "r1");
+        let vocab: (String,) = sqlx::query_as("SELECT path FROM ai_classify_vocab")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(vocab.0, "AI");
+        // UNIQUE is gone (CRDT merges cannot enforce it).
+        let mut conn = db.acquire().await?;
+        let ddl = super::table_definition_sql(&mut *conn, "ai_classify_vocab").await?;
+        drop(conn);
+        assert!(!ddl.contains("UNIQUE"), "vocab UNIQUE must be dropped: {ddl}");
+
+        // The actual startup assertion: rebuilt tables register as CRR.
+        super::register_crr_tables(&db, &["ai_table_cells", "review_runs", "ai_classify_vocab"])
+            .await?;
+
+        // Idempotent: a second migrate + register cycle is a no-op.
+        super::migrate_ai_feature_crr_tables(&db).await?;
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }

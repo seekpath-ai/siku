@@ -750,27 +750,51 @@ async fn vocab_upsert(
     source: &str,
 ) -> Result<(), String> {
     let now = crate::core::time::now_iso();
-    sqlx::query(
-        "INSERT INTO ai_classify_vocab
-           (id, dimension, target, path, status, source, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (dimension, target, path) DO UPDATE SET
-           status = CASE WHEN ai_classify_vocab.status = 'rejected' THEN ai_classify_vocab.status
-                         ELSE excluded.status END,
-           source = excluded.source,
-           updated_at = excluded.updated_at",
+    // The table is CRR-synced and therefore has no UNIQUE constraint (merges
+    // can't enforce it) — upsert is done by lookup + update/insert instead of
+    // ON CONFLICT. 'rejected' stays sticky: it is negative memory.
+    let existing: Option<(String, String)> = sqlx::query_as(
+        "SELECT id, status FROM ai_classify_vocab WHERE dimension = ? AND target = ? AND path = ?",
     )
-    .bind(uuid::Uuid::new_v4().to_string())
     .bind(dimension)
     .bind(target)
     .bind(path)
-    .bind(status)
-    .bind(source)
-    .bind(&now)
-    .bind(&now)
-    .execute(db)
+    .fetch_optional(db)
     .await
     .map_err(|e| format!("db: {e}"))?;
+    match existing {
+        Some((id, old_status)) => {
+            let new_status = if old_status == "rejected" { old_status } else { status.to_string() };
+            sqlx::query(
+                "UPDATE ai_classify_vocab SET status = ?, source = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(new_status)
+            .bind(source)
+            .bind(&now)
+            .bind(&id)
+            .execute(db)
+            .await
+            .map_err(|e| format!("db: {e}"))?;
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO ai_classify_vocab
+                   (id, dimension, target, path, status, source, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(dimension)
+            .bind(target)
+            .bind(path)
+            .bind(status)
+            .bind(source)
+            .bind(&now)
+            .bind(&now)
+            .execute(db)
+            .await
+            .map_err(|e| format!("db: {e}"))?;
+        }
+    }
     Ok(())
 }
 

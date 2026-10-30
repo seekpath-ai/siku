@@ -21,13 +21,13 @@ CREATE TABLE IF NOT EXISTS review_runs (
     note_id TEXT,
     error TEXT,
     cancelled INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS review_paper_cards (
     run_id TEXT NOT NULL,
     paper_id TEXT NOT NULL,
-    paper_index INTEGER NOT NULL,
+    paper_index INTEGER NOT NULL DEFAULT 0,
     title TEXT NOT NULL DEFAULT '',
     authors TEXT NOT NULL DEFAULT '[]',
     year INTEGER,
@@ -44,8 +44,8 @@ CREATE TABLE IF NOT EXISTS review_paper_cards (
     cache_key TEXT NOT NULL DEFAULT '',
     index_fingerprint TEXT NOT NULL DEFAULT '',
     error TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (run_id, paper_id)
 );
 CREATE INDEX IF NOT EXISTS idx_review_cards_cache ON review_paper_cards(paper_id, cache_key, status);
@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS review_sections (
     raw_markdown TEXT NOT NULL DEFAULT '',
     attempts INTEGER NOT NULL DEFAULT 0,
     error TEXT,
-    updated_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (run_id, section_index)
 );
 "#;

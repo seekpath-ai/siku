@@ -821,6 +821,15 @@ function PaperRow({
 export function PaperList() {
   const activeFilter = useLibraryStore((s) => s.activeFilter);
   const searchQuery = useLibraryStore((s) => s.searchQuery);
+  // Local input state + 250ms debounce: typing must not fire a full query
+  // per keystroke against the FTS index.
+  const [searchInput, setSearchInput] = useState(searchQuery);
+  useEffect(() => setSearchInput(searchQuery), [searchQuery]);
+  useEffect(() => {
+    const t = setTimeout(() => setSearchQuery(searchInput), 250);
+    return () => clearTimeout(t);
+    // setSearchQuery identity is stable (zustand action).
+  }, [searchInput]); // eslint-disable-line react-hooks/exhaustive-deps
   const sortBy = useLibraryStore((s) => s.sortBy);
   const sortOrder = useLibraryStore((s) => s.sortOrder);
   const viewMode = useLibraryStore((s) => s.viewMode);
@@ -1118,8 +1127,8 @@ export function PaperList() {
           <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-secondary/50" />
           <input
             type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
             placeholder="搜索标题、作者、PDF 全文..."
             className="w-full h-8 pl-8 pr-3 rounded-lg bg-surface border border-surface-hover text-sm text-text-primary placeholder:text-text-secondary/40 focus:outline-none focus:border-primary/50"
           />

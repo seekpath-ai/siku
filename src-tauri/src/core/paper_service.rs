@@ -1002,20 +1002,10 @@ pub async fn list_papers(db: &SqlitePool, params: ListPapersParams) -> Result<Ve
         sql.push_str(&format!(" OFFSET {}", offset));
     }
 
-    // Bind values in the same order as placeholders.
-    if let Some(ref pattern) = search_pattern {
-        bind_values.push(pattern.clone());
-        bind_values.push(pattern.clone());
-    }
-    if let Some(ref fts) = fts_query {
-        bind_values.push(fts.clone());
-    }
-    if let Some(ref coll_id) = collection_id_filter {
-        bind_values.push(coll_id.clone());
-    }
-    for tid in &tag_ids {
-        bind_values.push(tid.clone());
-    }
+    // Bind values in the same order as placeholders appear in the SQL string:
+    // read_status → year → journal → related → search (title/authors/fts) →
+    // collection → tags. (The SQL clauses above are appended in that order;
+    // a mismatch silently binds values to the wrong placeholder.)
     if let Some(status) = params.read_status.as_deref().filter(|s| !s.is_empty()) {
         bind_values.push(status.to_string());
     }
@@ -1031,6 +1021,19 @@ pub async fn list_papers(db: &SqlitePool, params: ListPapersParams) -> Result<Ve
     if let Some(id) = params.related_to.as_deref().filter(|i| !i.is_empty()) {
         bind_values.push(id.to_string());
         bind_values.push(id.to_string());
+    }
+    if let Some(ref pattern) = search_pattern {
+        bind_values.push(pattern.clone());
+        bind_values.push(pattern.clone());
+    }
+    if let Some(ref fts) = fts_query {
+        bind_values.push(fts.clone());
+    }
+    if let Some(ref coll_id) = collection_id_filter {
+        bind_values.push(coll_id.clone());
+    }
+    for tid in &tag_ids {
+        bind_values.push(tid.clone());
     }
 
     let mut q = sqlx::query_as::<_, Paper>(&sql);
@@ -2150,6 +2153,64 @@ mod tests {
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;
+        Ok(())
+    }
+
+    /// Regression: bind values must align with SQL placeholder order. The
+    /// search binds used to be pushed first while the `read_status`/`year`/
+    /// `journal` placeholders come earlier in the SQL string, so combining
+    /// search with any of those filters bound the pattern into the wrong
+    /// slot and returned garbage (or nothing).
+    #[tokio::test]
+    async fn list_papers_search_combines_with_filters() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-list-papers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = crate::core::db::tests::connect_with_crsqlite(&dir.join("t.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL)
+            .execute(&db)
+            .await?;
+
+        sqlx::query(
+            "INSERT INTO papers (id, title, year, journal, read_status) VALUES \
+             ('p1', 'Preference-Aware Memory Update', 2024, 'NeurIPS', 'unread'), \
+             ('p2', 'Unrelated Work', 2020, 'Nature', 'read')",
+        )
+        .execute(&db)
+        .await?;
+
+        let params = ListPapersParams {
+            search: Some("preference-aware".to_string()),
+            read_status: Some("unread".to_string()),
+            year_from: Some(2023),
+            year_to: Some(2025),
+            journal: Some("neur".to_string()),
+            collection_id: None,
+            tag_ids: None,
+            tag_logic: None,
+            sort_by: None,
+            sort_order: None,
+            limit: None,
+            offset: None,
+            include_deleted: None,
+            is_favorite: None,
+            related_to: None,
+            has_been_read: None,
+        };
+        let rows = list_papers(&db, params).await?;
+        assert_eq!(rows.len(), 1, "search + filters must keep only p1");
+        assert_eq!(rows[0].id, "p1");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }

@@ -879,6 +879,7 @@ pub fn run() {
             commands::agent::agent_session_workspace,
             commands::agent::agent_session_workspace_clear,
             commands::agent::pet_create_session,
+            commands::agent::pet_current_status,
             commands::agent::agent_get_turn_context,
             commands::agent::pet_domains,
             commands::agent::get_agent_steps,

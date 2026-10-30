@@ -69,6 +69,41 @@ fn pending_approvals() -> &'static std::sync::Mutex<std::collections::HashMap<St
     PENDING_APPROVALS.get_or_init(Default::default)
 }
 
+/// Latest activity snapshot of pet (domain-agent) sessions, consumed by the
+/// ball window's hover detail card via `pet_current_status`.
+#[derive(Clone, serde::Serialize)]
+pub struct PetStatusInfo {
+    pub state: String,
+    pub session_title: String,
+    pub user_prompt: String,
+    pub tool_name: Option<String>,
+    pub pending: Option<String>,
+    pub updated_at: String,
+}
+
+static PET_STATUS: std::sync::OnceLock<std::sync::Mutex<Option<PetStatusInfo>>> =
+    std::sync::OnceLock::new();
+
+fn pet_status_slot() -> &'static std::sync::Mutex<Option<PetStatusInfo>> {
+    PET_STATUS.get_or_init(Default::default)
+}
+
+fn pet_status_update(f: impl FnOnce(&mut PetStatusInfo)) {
+    if let Ok(mut guard) = pet_status_slot().lock() {
+        if let Some(s) = guard.as_mut() {
+            f(s);
+            s.updated_at = crate::core::time::now_iso();
+        }
+    }
+}
+
+/// Hover detail card data for the pet ball (null when no pet session has run
+/// this app launch).
+#[tauri::command]
+pub async fn pet_current_status() -> Option<PetStatusInfo> {
+    pet_status_slot().lock().ok().and_then(|g| g.clone())
+}
+
 async fn ensure_agent_config(
     config: &mut AgentConfig,
     app_settings: &crate::core::models::AppSettings,
@@ -1340,6 +1375,39 @@ pub(crate) async fn run_agent_turn(
 
     // Create event channel
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+
+    // Pet ball: resolve whether this is a domain-agent (pet) session BEFORE
+    // `content` moves into the turn task. The flag drives both the coarse
+    // "pet:state" event and the hover detail aggregate; the initial snapshot
+    // carries the user prompt head for the detail card. skill_reviewer is an
+    // internal background agent and stays excluded.
+    let pet_session: Option<(String, String)> = sqlx::query_as::<_, (Option<String>, String)>(
+        "SELECT domain, title FROM chat_sessions WHERE id = ?",
+    )
+    .bind(&session_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|(domain, title)| {
+        let d = domain?;
+        (d != "skill_reviewer" && crate::ai::agent::domain::get_domain(&d).is_some())
+            .then_some((d, title))
+    });
+    if let Some((_, title)) = &pet_session {
+        let prompt_head: String = content.chars().take(60).collect();
+        if let Ok(mut guard) = pet_status_slot().lock() {
+            *guard = Some(PetStatusInfo {
+                state: "running".to_string(),
+                session_title: title.clone(),
+                user_prompt: prompt_head,
+                tool_name: None,
+                pending: None,
+                updated_at: crate::core::time::now_iso(),
+            });
+        }
+    }
+    let is_pet_session = pet_session.is_some();
     // Cloned for the terminal done/cancelled event, which must be emitted
     // only AFTER the run's results have been persisted (the frontend reloads
     // the session history on it). Sending through the same channel keeps it
@@ -1556,21 +1624,8 @@ pub(crate) async fn run_agent_turn(
     // agent_approve_tool can resolve the tool_call id from context.
     let app_clone2 = app_handle.clone();
     let fwd_sid = session_id.clone();
-    // Pet ball state: domain-agent (pet) sessions additionally emit a coarse
-    // "pet:state" so the always-on-top ball reflects what the agent is doing
-    // even with every chat panel closed. skill_reviewer is an internal
-    // background agent and stays excluded.
-    let is_pet_session: bool = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT domain FROM chat_sessions WHERE id = ?",
-    )
-    .bind(&session_id)
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten()
-    .flatten()
-    .map(|d| d != "skill_reviewer" && crate::ai::agent::domain::get_domain(&d).is_some())
-    .unwrap_or(false);
+    // is_pet_session was resolved above (before `content` moved): pet sessions
+    // additionally emit "pet:state" and feed the hover detail aggregate.
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             if let AgentEvent::ToolApprovalRequired { tool_call_id, .. } = &event {
@@ -1594,6 +1649,26 @@ pub(crate) async fn run_agent_turn(
                     AgentEvent::Error { .. } => Some("failed"),
                 };
                 if let Some(s) = state {
+                    pet_status_update(|st| {
+                        st.state = s.to_string();
+                        match &event {
+                            AgentEvent::ToolCall { tool_name, .. } => {
+                                st.tool_name = Some(tool_name.clone());
+                                st.pending = None;
+                            }
+                            AgentEvent::ToolApprovalRequired { tool_name, .. } => {
+                                st.pending = Some(format!("审批：{tool_name}"));
+                            }
+                            AgentEvent::AskUser { .. } => {
+                                st.pending = Some("提问".to_string());
+                            }
+                            AgentEvent::Done { .. } | AgentEvent::Cancelled { .. } => {
+                                st.tool_name = None;
+                                st.pending = None;
+                            }
+                            _ => {}
+                        }
+                    });
                     let _ = app_clone2.emit("pet:state", s);
                 }
             }

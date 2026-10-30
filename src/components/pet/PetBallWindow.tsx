@@ -142,12 +142,59 @@ export function PetBallWindow() {
       .catch(() => {});
   };
 
+  // Hover detail card: an ephemeral window (own label 'pet-detail') shown on
+  // mouse-enter with the latest pet-session status snapshot, closed on leave
+  // or drag — the ball window itself never resizes.
+  const closeDetail = async () => {
+    const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+    WebviewWindow.getByLabel('pet-detail')
+      .then((w) => w?.close())
+      .catch(() => {});
+  };
+
+  const showDetail = async () => {
+    try {
+      const { petCurrentStatus } = await import('@/lib/tauri');
+      const st = await petCurrentStatus();
+      if (!st) return;
+      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+      const existing = await WebviewWindow.getByLabel('pet-detail');
+      if (existing) await existing.close().catch(() => {});
+      const params = new URLSearchParams({
+        state: st.state,
+        title: st.session_title,
+        prompt: st.user_prompt,
+        tool: st.tool_name ?? '',
+        pending: st.pending ?? '',
+      });
+      // Created hidden; PetDetailWindow positions itself under the ball, goes
+      // click-through, then shows.
+      new WebviewWindow('pet-detail', {
+        url: `index.html?${params.toString()}`,
+        title: '',
+        width: 260,
+        height: 132,
+        decorations: false,
+        transparent: true,
+        shadow: false,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        resizable: false,
+        focus: false,
+        visible: false,
+      });
+    } catch (err) {
+      console.error('show pet detail:', err);
+    }
+  };
+
   const handleMouseDown = (e: React.MouseEvent) => {
     if (e.button !== 0) return;
     // Dragging/clicking the ball dismisses an open menu deterministically —
     // the ball window is unfocusable, so the menu's blur-close cannot be
     // relied on for this case.
     closeMenu();
+    closeDetail();
     downRef.current = { x: e.clientX, y: e.clientY };
     draggedRef.current = false;
   };
@@ -168,6 +215,8 @@ export function PetBallWindow() {
       onMouseDown={handleMouseDown}
       onClick={handleClick}
       onContextMenu={handleContextMenu}
+      onMouseEnter={showDetail}
+      onMouseLeave={() => closeDetail()}
       title="点击打开智能体，右键可隐藏"
     >
       <div className={`pet-ball pet-ball-fixed pet-state-${agentState} w-10 h-10 rounded-full bg-gradient-to-br from-primary to-amber-700 flex items-center justify-center shadow-lg cursor-pointer`}>

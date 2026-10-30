@@ -324,6 +324,20 @@ export async function petCreateSession(domain: string, context: Record<string, u
   return invoke<AgentSession>('pet_create_session', { domain, context });
 }
 
+/** Latest pet-session activity snapshot for the ball's hover detail card. */
+export interface PetStatusInfo {
+  state: string;
+  session_title: string;
+  user_prompt: string;
+  tool_name: string | null;
+  pending: string | null;
+  updated_at: string;
+}
+
+export async function petCurrentStatus(): Promise<PetStatusInfo | null> {
+  return invoke<PetStatusInfo | null>('pet_current_status');
+}
+
 /** System-prompt snapshot stored for a user message's turn (本地表，不同步). */
 export interface TurnContext {
   system_prompt: string;

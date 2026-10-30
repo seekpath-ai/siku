@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Loader2, Check } from 'lucide-react';
-import { settingsGet, settingsSet, petDomains } from '@/lib/tauri';
+import { settingsGet, settingsSet, petDomains, petListSkins, petGetSkinSelection, petSetSkinSelection } from '@/lib/tauri';
+import type { PetSkinSummary } from '@/lib/tauri';
 
 interface DomainConfig {
   id: string;
@@ -33,6 +34,9 @@ export function PetSettings() {
   const [defaultPrompts, setDefaultPrompts] = useState<Record<string, string>>({});
   /** Built-in per-domain output caps, shown as placeholders. */
   const [defaultMaxTokens, setDefaultMaxTokens] = useState<Record<string, number | null>>({});
+  /** Installed .codex-pet skins + the selected one ('' = built-in ball). */
+  const [skins, setSkins] = useState<PetSkinSummary[]>([]);
+  const [skinId, setSkinId] = useState('');
 
   useEffect(() => {
     let cancelled = false;
@@ -47,6 +51,15 @@ export function PetSettings() {
         }
       } catch (e) {
         console.error('load pet domains:', e);
+      }
+      try {
+        const [list, selected] = await Promise.all([petListSkins(), petGetSkinSelection()]);
+        if (!cancelled) {
+          setSkins(list);
+          setSkinId(selected);
+        }
+      } catch (e) {
+        console.error('load pet skins:', e);
       }
       const result: Record<string, DomainState> = {};
       for (const d of DOMAINS) {
@@ -108,6 +121,37 @@ export function PetSettings() {
         <p className="text-xs text-text-secondary/60 mt-1">
           全局宠物球在不同页面唤起对应的内置智能体。可在此控制各智能体是否启用，或自定义其提示词与单轮词元输出上限（留空使用默认）。
         </p>
+      </div>
+
+      {/* Skin picker: built-in CSS ball or any installed .codex-pet. */}
+      <div className="rounded-lg border border-surface-hover bg-surface px-4 py-3">
+        <div className="flex items-center gap-3">
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-medium text-text-primary">宠物外观</div>
+            <div className="text-xs text-text-secondary/60 mt-0.5">
+              兼容 Codex 宠物包：把宠物目录放入应用数据目录 pets/ 或 ~/.codex/pets/ 后重新打开本页即可选择。
+            </div>
+          </div>
+          <select
+            value={skinId}
+            onChange={async (e) => {
+              const id = e.target.value;
+              setSkinId(id);
+              await petSetSkinSelection(id).catch((err) => console.error('save pet skin:', err));
+            }}
+            className="h-8 rounded-lg bg-background border border-surface-hover text-sm text-text-primary px-2 focus:outline-none focus:border-primary/50"
+          >
+            <option value="">内置球（默认）</option>
+            {skins.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.displayName}{s.source === 'codex' ? '（来自 Codex）' : ''}
+              </option>
+            ))}
+          </select>
+        </div>
+        {skinId && !skins.some((s) => s.id === skinId) && (
+          <div className="text-xs text-amber-500 mt-2">当前选择的皮肤已不存在，已回退为内置球显示；请重新选择。</div>
+        )}
       </div>
 
       {DOMAINS.map((d) => {

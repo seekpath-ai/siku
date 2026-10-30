@@ -338,6 +338,43 @@ export async function petCurrentStatus(): Promise<PetStatusInfo | null> {
   return invoke<PetStatusInfo | null>('pet_current_status');
 }
 
+// ── Pet skins (.codex-pet compatible) ──
+
+export interface PetTrack {
+  frames: number[];
+  fps: number;
+  loop: boolean;
+  fallback?: string | null;
+}
+
+export interface PetManifest {
+  id: string;
+  displayName: string;
+  description: string;
+  spritesheetPath: string;
+  frame: { width: number; height: number };
+  spriteVersionNumber?: number | null;
+  animations: Record<string, PetTrack>;
+}
+
+export interface PetSkinSummary {
+  id: string;
+  displayName: string;
+  description: string;
+  source: string;
+}
+
+export interface PetSkinDetail {
+  manifest: PetManifest;
+  /** data: URL of the spritesheet. */
+  sheetDataUrl: string;
+}
+
+export const petListSkins = () => invoke<PetSkinSummary[]>('pet_list_skins');
+export const petGetSkin = (id: string) => invoke<PetSkinDetail>('pet_get_skin', { id });
+export const petGetSkinSelection = () => invoke<string>('pet_get_skin_selection');
+export const petSetSkinSelection = (id: string) => invoke<void>('pet_set_skin_selection', { id });
+
 /** System-prompt snapshot stored for a user message's turn (本地表，不同步). */
 export interface TurnContext {
   system_prompt: string;

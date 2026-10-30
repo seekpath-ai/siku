@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { PetSprite } from './PetSprite';
+import type { PetSkinDetail } from '@/lib/tauri';
 import './pet-window.css';
 
 /** Root component for the always-on-top pet window. Dragging the ball starts an
@@ -88,6 +90,28 @@ export function PetBallWindow() {
   // brief flashes that decay back to idle on a timer.
   const [agentState, setAgentState] = useState<'idle' | 'running' | 'waiting' | 'done' | 'failed'>('idle');
   const decayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Custom .codex-pet skin (null = the built-in CSS ball) + click interaction
+  // nonce for the sprite's wave/bounce track.
+  const [skin, setSkin] = useState<PetSkinDetail | null>(null);
+  const [interactNonce, setInteractNonce] = useState(0);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const { petGetSkinSelection, petGetSkin } = await import('@/lib/tauri');
+        const id = await petGetSkinSelection();
+        setSkin(id ? await petGetSkin(id) : null);
+      } catch {
+        setSkin(null);
+      }
+    };
+    load();
+    let unlisten: (() => void) | undefined;
+    listen('pet:skin_changed', () => load()).then((u) => {
+      unlisten = u;
+    });
+    return () => unlisten?.();
+  }, []);
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     listen<string>('pet:state', (event) => {
@@ -201,6 +225,7 @@ export function PetBallWindow() {
 
   const handleClick = () => {
     if (draggedRef.current) return;
+    if (skin) setInteractNonce((n) => n + 1);
     emit('pet:click').catch(() => {});
   };
 
@@ -219,13 +244,24 @@ export function PetBallWindow() {
       onMouseLeave={() => closeDetail()}
       title="点击打开智能体，右键可隐藏"
     >
-      <div className={`pet-ball pet-ball-fixed pet-state-${agentState} w-10 h-10 rounded-full bg-gradient-to-br from-primary to-amber-700 flex items-center justify-center shadow-lg cursor-pointer`}>
-        <div className="relative w-6 h-6">
-          <div className="pet-eye absolute top-1 left-0 w-2 h-2 rounded-full bg-background" />
-          <div className="pet-eye absolute top-1 right-0 w-2 h-2 rounded-full bg-background" />
-          <div className="absolute bottom-0.5 left-1/2 -translate-x-1/2 w-3 h-1.5 rounded-b-full bg-background/80" />
+      {skin ? (
+        <div className="pet-ball-fixed w-10 h-10 cursor-pointer">
+          <PetSprite
+            manifest={skin.manifest}
+            sheetDataUrl={skin.sheetDataUrl}
+            state={agentState}
+            interactNonce={interactNonce}
+          />
         </div>
-      </div>
+      ) : (
+        <div className={`pet-ball pet-ball-fixed pet-state-${agentState} w-10 h-10 rounded-full bg-gradient-to-br from-primary to-amber-700 flex items-center justify-center shadow-lg cursor-pointer`}>
+          <div className="relative w-6 h-6">
+            <div className="pet-eye absolute top-1 left-0 w-2 h-2 rounded-full bg-background" />
+            <div className="pet-eye absolute top-1 right-0 w-2 h-2 rounded-full bg-background" />
+            <div className="absolute bottom-0.5 left-1/2 -translate-x-1/2 w-3 h-1.5 rounded-b-full bg-background/80" />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

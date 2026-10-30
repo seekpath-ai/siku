@@ -17,6 +17,7 @@ pub mod knowledge;
 pub mod library;
 pub mod llm_provider;
 pub mod notes;
+pub mod pet;
 pub mod projects;
 pub mod reader;
 pub mod region;

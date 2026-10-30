@@ -43,6 +43,28 @@ pub(crate) const CORE_SYNC_TABLES: &[&str] = &[
     // memory rows may arrive before/regardless of their session — harmless,
     // they apply once the session exists).
     "agent_memories",
+    // AI table columns: extraction results cost LLM tokens, so cells and
+    // their per-cell evidence/provenance sync rather than being re-run on
+    // every machine. All four are FK-free (paper_id is a plain column;
+    // papers sync via CORE above).
+    "ai_table_cells",
+    "ai_table_term_cache",
+    "ai_table_cell_evidence",
+    "ai_table_presets",
+    // AI review: runs + evidence cards + per-section drafts. The final
+    // markdown also lands in notes when saved, but syncing the run state
+    // keeps the review view intact across machines.
+    "review_runs",
+    "review_paper_cards",
+    "review_sections",
+    // AI classification: rules/vocab are user assets; runs/items/applied are
+    // the revertible action record. The classification *result* itself lands
+    // in collections/tags/paper_* (already synced).
+    "ai_classify_runs",
+    "ai_classify_items",
+    "ai_classify_applied",
+    "ai_classify_rules",
+    "ai_classify_vocab",
     // NOTE: `creators` is intentionally NOT synced — it is a device-local
     // overlay rebuilt from the papers.authors/editor JSON columns (which do
     // sync via the papers table). See paper_service::rebuild_creators_for_papers.
@@ -591,7 +613,7 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // Initialize schema if tables don't exist (data persists across restarts)
     info!("initializing schema from schema_init.sql");
     sqlx::query(SCHEMA_INIT_SQL).execute(&db).await?;
-    // AI 综述 run、卡片和分节均为设备本地派生状态，不注册到 CR-SQLite 同步表。
+    // AI 综述表（run/卡片/分节）须在 register_crr_tables 之前建表。
     sqlx::raw_sql(crate::core::review_store::SCHEMA_SQL).execute(&db).await?;
 
     // Migration: sync_outbox gains the relay message_id so outbox retries
@@ -1186,8 +1208,7 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     add_column_if_missing(&db, "paper_paragraphs", "version", "INTEGER NOT NULL DEFAULT 1").await?;
 
     // AI 表格列: per-(paper, column) extraction cells + reusable column
-    // presets. Device-local like paper_paragraphs: cells are cheap to
-    // recompute from the index, and syncing them would be pure weight.
+    // presets. 全部注册为 CRR 同步表：cells 是 LLM 抽取结果，换机器不应重跑。
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ai_table_cells (
             paper_id TEXT NOT NULL,
@@ -1203,7 +1224,7 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     .execute(&db)
     .await?;
     // P1: per-cell provenance (src page/section, model confidence) and the
-    // "empty vs. absent" distinction. Device-local derived data like the cells.
+    // "empty vs. absent" distinction. Syncs along with the cells.
     add_column_if_missing(&db, "ai_table_cells", "meta_json", "TEXT NOT NULL DEFAULT '{}'")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for ai_table_cells.meta_json: {}", e))?;
@@ -1220,7 +1241,7 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     .execute(&db)
     .await?;
     // Audit trail: the passages that backed each cell, kept out of
-    // ai_table_cells so the grid query stays small. Device-local derived data.
+    // ai_table_cells so the grid query stays small. Syncs along with the cells.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ai_table_cell_evidence (
             paper_id TEXT NOT NULL,
@@ -1247,9 +1268,8 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
 
     // AI 文献分类: one row per run (scope + confirmed taxonomy draft), one row
     // per paper assignment, and an applied-log that makes the whole run
-    // revertible. Device-local like the AI-table tables: the *result* of
-    // classification lands in collections/tags/paper_* (which already sync),
-    // while the run history is this machine's action record.
+    // revertible. Run history and rules/vocab sync as user assets; the
+    // classification *result* itself lands in collections/tags/paper_*.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ai_classify_runs (
             id TEXT PRIMARY KEY NOT NULL,

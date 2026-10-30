@@ -38,9 +38,10 @@ changeset 投递同样受帧上限约束：`deliver_changes_mailbox` 按 6MB JSO
 
 ## 数据模型
 
-- 核心同步表（始终同步）：notes、papers、attachments、annotations、vaults、note_versions、note_links、files、tags、paper_tags、collections、paper_collections、related_papers、bookmarks、file_bookmarks、saved_searches、saved_items、imports、agent_memories、research_topics、research_sources、knowledge_domains、knowledge_items（见 `core/db.rs::CORE_SYNC_TABLES`）。
+- 核心同步表（始终同步）：notes、papers、attachments、annotations、vaults、note_versions、note_links、files、tags、paper_tags、collections、paper_collections、related_papers、bookmarks、file_bookmarks、saved_searches、saved_items、imports、agent_memories、research_topics、research_sources、knowledge_domains、knowledge_items、ai_table_cells、ai_table_term_cache、ai_table_cell_evidence、ai_table_presets、review_runs、review_paper_cards、review_sections、ai_classify_runs、ai_classify_items、ai_classify_applied、ai_classify_rules、ai_classify_vocab（见 `core/db.rs::CORE_SYNC_TABLES`）。
 - 可选同步表（`sync_optional_data` 开关）：chat_sessions、chat_messages、settings（`app_settings`、`account.*` 与 `notes.current_vault_id` 键永不同步；chat_sessions 的 `working_dir` 列是设备本地绝对路径，导出与应用两侧均剥离）。
-- 不同步：agent_memories_local（本机记忆，设备环境类事实，同步会在其它设备注入错误真值）、creators（接收端从 papers.authors 重建）、device_settings、搜索索引、LLM 提供商等设备本地数据。
+- 不同步：agent_memories_local（本机记忆，设备环境类事实，同步会在其它设备注入错误真值）、creators（接收端从 papers.authors 重建）、device_settings、paper_paragraphs 等解析索引、搜索索引、LLM 提供商等设备本地数据。
+- 笔记图片：写入笔记时 snapshots/ 绝对路径被改写为 blobs/ 引用并登记主动推送（mark_blob_pending_push）；启动时 migrate_note_snapshot_refs 自愈老笔记的残留绝对路径。
 - 冲突解决：cr-sqlite 默认 col_version 合并 + 应用前按 `updated_at` 的 LWW 过滤；删除为 delete-wins（已知取舍：peer 旧删除会覆盖本地新编辑）。
 - 首次连接与周期存档刷新发送**全量历史 changeset**（从 `crsql_changes` 以 db_version 0 导出，含 tombstone），接收侧走与增量完全相同的 `apply_changes` 合并路径——已删除的行不会被快照复活。旧版 `FullSnapshot`（INSERT OR IGNORE）消息仍被接收侧兼容处理，但插入前会按 `crsql_changes` 中的删除标记过滤。之后按 per-peer 游标增量推送。
 

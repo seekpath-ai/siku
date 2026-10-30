@@ -47,6 +47,7 @@ export function PetDetailWindow() {
         {pending && <div className="pet-detail-pending">待处理：{pending}</div>}
         {tool && state === 'running' && <div className="pet-detail-row">工具：{tool}</div>}
         {prompt && <div className="pet-detail-row pet-detail-prompt">{prompt}</div>}
+        <div className="pet-detail-hint">点击打开智能体 · 右键菜单</div>
       </div>
     </div>
   );

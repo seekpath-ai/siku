@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { emit, listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { PetSprite } from './PetSprite';
@@ -94,6 +94,7 @@ export function PetBallWindow() {
   // nonce for the sprite's wave/bounce track.
   const [skin, setSkin] = useState<PetSkinDetail | null>(null);
   const [interactNonce, setInteractNonce] = useState(0);
+  const handleSpriteError = useCallback(() => setSkin(null), []);
 
   useEffect(() => {
     const load = async () => {
@@ -179,17 +180,18 @@ export function PetBallWindow() {
   const showDetail = async () => {
     try {
       const { petCurrentStatus } = await import('@/lib/tauri');
+      // Null until the first pet-domain session runs this launch — the card
+      // must still open (as "空闲") so hover never looks broken.
       const st = await petCurrentStatus();
-      if (!st) return;
       const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const existing = await WebviewWindow.getByLabel('pet-detail');
       if (existing) await existing.close().catch(() => {});
       const params = new URLSearchParams({
-        state: st.state,
-        title: st.session_title,
-        prompt: st.user_prompt,
-        tool: st.tool_name ?? '',
-        pending: st.pending ?? '',
+        state: st?.state ?? 'idle',
+        title: st?.session_title ?? '',
+        prompt: st?.user_prompt ?? '',
+        tool: st?.tool_name ?? '',
+        pending: st?.pending ?? '',
       });
       // Created hidden; PetDetailWindow positions itself under the ball, goes
       // click-through, then shows.
@@ -242,7 +244,6 @@ export function PetBallWindow() {
       onContextMenu={handleContextMenu}
       onMouseEnter={showDetail}
       onMouseLeave={() => closeDetail()}
-      title="点击打开智能体，右键可隐藏"
     >
       {skin ? (
         <div className="pet-ball-fixed w-10 h-10 cursor-pointer">
@@ -251,6 +252,7 @@ export function PetBallWindow() {
             sheetDataUrl={skin.sheetDataUrl}
             state={agentState}
             interactNonce={interactNonce}
+            onError={handleSpriteError}
           />
         </div>
       ) : (

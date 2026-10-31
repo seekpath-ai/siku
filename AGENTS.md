@@ -24,7 +24,7 @@ pnpm tauri build --target x86_64-pc-windows-gnu
 
 顺序要点：**先改版本号再打 tag 最后编译**，保证 tag、仓库、二进制三者一致。
 
-CI Linux 产物说明：deb/rpm 包名规范要求 ASCII，中文 productName 会被剥成空名（出现 `-1.5.0-1.x86_64.rpm` 这类文件），故 CI 的 ubuntu 任务用 `--config src-tauri/tauri.linux.conf.json` 把 productName 覆盖为 `siku`；该文件不含版本号，发版无需改动。
+CI 产物命名约束：productName 必须保持 ASCII（`siku`）。deb/rpm 包名规范不支持中文（会得到 `-1.5.0-1.x86_64.rpm` 空名产物）；Windows 的 NSIS/WiX 在 GitHub runner 非 UTF-8 代码页下也会因中文 productName 构建失败。中文桌面快捷方式后续用 NSIS 自定义模板实现，不走 productName。ubuntu 任务的 `--config src-tauri/tauri.linux.conf.json` 覆盖是双保险，该文件不含版本号，发版无需改动。
 
 ## 验证命令
 

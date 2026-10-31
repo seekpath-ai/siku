@@ -24,7 +24,9 @@ pnpm tauri build --target x86_64-pc-windows-gnu
 
 顺序要点：**先改版本号再打 tag 最后编译**，保证 tag、仓库、二进制三者一致。
 
-CI 产物命名约束：productName 必须保持 ASCII（`siku`）。deb/rpm 包名规范不支持中文（会得到 `-1.5.0-1.x86_64.rpm` 空名产物）；Windows 的 NSIS/WiX 在 GitHub runner 非 UTF-8 代码页下也会因中文 productName 构建失败。中文桌面快捷方式后续用 NSIS 自定义模板实现，不走 productName。ubuntu 任务的 `--config src-tauri/tauri.linux.conf.json` 覆盖是双保险，该文件不含版本号，发版无需改动。
+CI 产物命名约束：productName 必须保持 ASCII（`siku`）。deb/rpm 包名规范不支持中文（会得到 `-1.5.0-1.x86_64.rpm` 空名产物）；Windows 的 NSIS/WiX 在 GitHub runner 非 UTF-8 代码页下也会因中文 productName 构建失败。中文桌面快捷方式后续用 NSIS 自定义模板实现，不走 productName。
+
+平台资源打包：tauri 按目标平台自动合并 `tauri.<平台>.conf.json`（无需 --config，CI ubuntu 任务显式传了是双保险）。**新增需要打包的资源文件时三个平台配置文件都要检查**：windows/macos/linux 各自的 resources 是自包含的，漏配会在用户机器上报 "crsqlite not found" 这类启动错误（开发机上不会暴露，因为会命中 `src-tauri/ext/` 的编译机路径）。
 
 ## 验证命令
 

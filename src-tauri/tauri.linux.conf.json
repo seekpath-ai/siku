@@ -1,3 +1,10 @@
 {
-  "productName": "siku"
+  "productName": "siku",
+  "bundle": {
+    "resources": {
+      "ext/crsqlite.so": "ext/crsqlite.so",
+      "bin/libpdfium.so": "libpdfium.so",
+      "bin/PDFIUM-LICENSE.txt": "PDFIUM-LICENSE.txt"
+    }
+  }
 }

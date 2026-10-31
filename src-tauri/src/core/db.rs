@@ -1191,6 +1191,10 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // （无 DEFAULT），crsql_as_crr 会在启动时直接拒绝。重建为合规形状。
     // (added 2026-10-30)
     migrate_ai_feature_crr_tables(&db).await?;
+    // Migration: note_links/paper_tags/paper_collections/related_papers 去受检
+    // 外键——旧库带 REFERENCES ... ON DELETE CASCADE，crsql_as_crr 直接拒绝
+    // （此前只能靠 scripts/fix-old-db-drop-fks.sql 手动修）。(added 2026-10-31)
+    migrate_link_crr_tables(&db).await?;
     add_column_if_missing(&db, "research_sources", "relevance_score", "INTEGER").await?;
     add_column_if_missing(&db, "research_sources", "relevance_reason", "TEXT").await?;
 
@@ -1870,6 +1874,78 @@ async fn migrate_research_crr_tables(db: &Db) -> anyhow::Result<()> {
             cols_legacy: TOPICS_COLS,
             is_legacy: |sql| !sql.contains("PRIMARY KEY NOT NULL"),
             indexes: &[],
+        },
+    ])
+    .await
+    .map(|_| ())
+}
+
+/// Rebuild the four link tables into CRR-compatible shapes (added 2026-10-31;
+/// see CrrRebuildSpec for the crash-recovery semantics). Legacy shapes carry
+/// checked FKs (`REFERENCES ... ON DELETE CASCADE`) that crsqlite refuses to
+/// register as CRR — previously fixable only via the manual
+/// scripts/fix-old-db-drop-fks.sql, so any DB created by an old version
+/// crashed at startup. Fresh installs get the compliant shapes from
+/// schema_init.sql directly.
+async fn migrate_link_crr_tables(db: &Db) -> anyhow::Result<()> {
+    run_crr_rebuilds(db, &[
+        CrrRebuildSpec {
+            table: "note_links",
+            new_ddl:
+                "CREATE TABLE note_links_new (
+                    source_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    context TEXT,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (source_id, target_id)
+                )",
+            cols: "source_id, target_id, context, created_at",
+            cols_legacy: "source_id, target_id, context, created_at",
+            is_legacy: |sql| sql.contains("REFERENCES"),
+            indexes: &[],
+        },
+        CrrRebuildSpec {
+            table: "paper_tags",
+            new_ddl:
+                "CREATE TABLE paper_tags_new (
+                    paper_id TEXT NOT NULL,
+                    tag_id TEXT NOT NULL,
+                    PRIMARY KEY (paper_id, tag_id)
+                )",
+            cols: "paper_id, tag_id",
+            cols_legacy: "paper_id, tag_id",
+            is_legacy: |sql| sql.contains("REFERENCES"),
+            indexes: &[],
+        },
+        CrrRebuildSpec {
+            table: "paper_collections",
+            new_ddl:
+                "CREATE TABLE paper_collections_new (
+                    paper_id TEXT NOT NULL,
+                    collection_id TEXT NOT NULL,
+                    PRIMARY KEY (paper_id, collection_id)
+                )",
+            cols: "paper_id, collection_id",
+            cols_legacy: "paper_id, collection_id",
+            is_legacy: |sql| sql.contains("REFERENCES"),
+            indexes: &[],
+        },
+        CrrRebuildSpec {
+            table: "related_papers",
+            new_ddl:
+                "CREATE TABLE related_papers_new (
+                    paper_id TEXT NOT NULL,
+                    related_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (paper_id, related_id)
+                )",
+            cols: "paper_id, related_id, created_at",
+            cols_legacy: "paper_id, related_id, created_at",
+            is_legacy: |sql| sql.contains("REFERENCES"),
+            indexes: &[
+                "CREATE INDEX IF NOT EXISTS idx_related_paper ON related_papers(paper_id)",
+                "CREATE INDEX IF NOT EXISTS idx_related_other ON related_papers(related_id)",
+            ],
         },
     ])
     .await
@@ -3675,6 +3751,108 @@ pub(crate) mod tests {
             .fetch_one(&db)
             .await?;
         assert_eq!(count, 1);
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Legacy link tables carry checked FKs (REFERENCES ... ON DELETE
+    /// CASCADE) that crsqlite refuses to register; the rebuild must strip
+    /// them and keep the rows.
+    #[tokio::test]
+    async fn link_rebuild_strips_checked_fks_and_keeps_rows() -> anyhow::Result<()> {
+        let (_dir, db) = research_repro_db("link-fks").await?;
+        sqlx::query("CREATE TABLE notes (id TEXT PRIMARY KEY)")
+            .execute(&db)
+            .await?;
+        sqlx::query("CREATE TABLE papers (id TEXT PRIMARY KEY)")
+            .execute(&db)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE note_links (
+                source_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+                target_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+                context TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (source_id, target_id)
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE related_papers (
+                paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                related_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (paper_id, related_id)
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE paper_tags (
+                paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                tag_id TEXT NOT NULL,
+                PRIMARY KEY (paper_id, tag_id)
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE paper_collections (
+                paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                collection_id TEXT NOT NULL,
+                PRIMARY KEY (paper_id, collection_id)
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query("INSERT INTO notes VALUES ('a'), ('b')")
+            .execute(&db)
+            .await?;
+        sqlx::query("INSERT INTO papers VALUES ('p1'), ('p2')")
+            .execute(&db)
+            .await?;
+        sqlx::query("INSERT INTO note_links VALUES ('a', 'b', 'ctx', 'now')")
+            .execute(&db)
+            .await?;
+        sqlx::query("INSERT INTO related_papers VALUES ('p1', 'p2', 'now')")
+            .execute(&db)
+            .await?;
+
+        super::migrate_link_crr_tables(&db).await?;
+
+        let (ctx,): (Option<String>,) =
+            sqlx::query_as("SELECT context FROM note_links WHERE source_id = 'a'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(ctx.as_deref(), Some("ctx"), "rows must survive the rebuild");
+        let (cnt,): (i64,) = sqlx::query_as("SELECT count(*) FROM related_papers")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(cnt, 1);
+        for t in ["note_links", "paper_tags", "paper_collections", "related_papers"] {
+            let ddl: Option<(String,)> = sqlx::query_as(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name = ?",
+            )
+            .bind(t)
+            .fetch_optional(&db)
+            .await?;
+            if let Some((sql,)) = ddl {
+                assert!(!sql.contains("REFERENCES"), "{t}: FK must be gone");
+            }
+        }
+        // Rebuilt tables must register as CRRs (legacy shapes were rejected).
+        register_crr_tables(&db, &["note_links", "paper_tags", "paper_collections", "related_papers"])
+            .await?;
+
+        // Idempotent: second run keeps the data.
+        super::migrate_link_crr_tables(&db).await?;
+        let (cnt,): (i64,) = sqlx::query_as("SELECT count(*) FROM note_links")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(cnt, 1);
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;

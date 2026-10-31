@@ -17,14 +17,16 @@ export function PetBubbleWindow() {
   const text = new URLSearchParams(window.location.search).get('text') ?? '';
   const [placement, setPlacement] = useState<BallPlacement | null>(null);
 
-  // Anchor next to the ball and go click-through before becoming visible.
+  // Anchor next to the ball and go click-through. show() must come first: on
+  // Linux/tao the ignore-events request needs a realized GdkWindow — sent
+  // pre-show it is silently skipped and the bubble would swallow clicks.
   useEffect(() => {
     (async () => {
       const self = getCurrentWindow();
       const p = await placeNearBall().catch(() => null);
       setPlacement(p);
-      await self.setIgnoreCursorEvents(true).catch(() => {});
       await self.show();
+      await self.setIgnoreCursorEvents(true).catch(() => {});
     })().catch(() => {});
   }, []);
 

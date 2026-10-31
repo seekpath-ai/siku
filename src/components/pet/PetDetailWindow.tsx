@@ -42,13 +42,14 @@ export function PetDetailWindow() {
   }, []);
 
   // Anchor next to the ball (flipped above it near the screen bottom) and go
-  // click-through before becoming visible.
+  // click-through. show() must come first: on Linux/tao the ignore-events
+  // request needs a realized GdkWindow — sent pre-show it is silently skipped.
   useEffect(() => {
     (async () => {
       const self = getCurrentWindow();
       await placeNearBall().catch(() => null);
-      await self.setIgnoreCursorEvents(true).catch(() => {});
       await self.show();
+      await self.setIgnoreCursorEvents(true).catch(() => {});
     })().catch(() => {});
   }, []);
 

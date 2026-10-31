@@ -28,6 +28,8 @@ CI 产物命名约束：productName 必须保持 ASCII（`siku`）。deb/rpm 包
 
 平台资源打包：tauri 按目标平台自动合并 `tauri.<平台>.conf.json`（无需 --config，CI ubuntu 任务显式传了是双保险）。**新增需要打包的资源文件时三个平台配置文件都要检查**：windows/macos/linux 各自的 resources 是自包含的，漏配会在用户机器上报 "crsqlite not found" 这类启动错误（开发机上不会暴露，因为会命中 `src-tauri/ext/` 的编译机路径）。
 
+Linux 窗口坑：桌宠气泡/详情卡这类透明覆盖窗调 `setIgnoreCursorEvents` 必须**在 `show()` 之后**。tao 的 Linux 实现处理该请求时 `window.window().unwrap()`，窗口 realize 前调用必 panic（整应用退出），先 show 后设置即可规避（参考 `src/components/pet/PetBubbleWindow.tsx`）。
+
 ## 验证命令
 
 - 前端：`npx tsc --noEmit` + `npx eslint <改动文件>`

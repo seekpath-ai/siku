@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
+import QRCode from 'qrcode';
 import { Check, Loader2, Trash2 } from 'lucide-react';
 import {
   remoteFeishuConfig,
@@ -8,8 +9,12 @@ import {
   remotePairingSet,
   remotePairings,
   remoteStatus,
+  remoteWeixinConfig,
+  remoteWeixinLoginStart,
+  remoteWeixinLoginVerify,
+  remoteWeixinLogout,
 } from '@/lib/tauri';
-import type { RemoteChannelStatus, RemotePairing } from '@/lib/tauri';
+import type { RemoteChannelStatus, RemotePairing, WeixinConfigInfo, WeixinQrEvent } from '@/lib/tauri';
 
 const CHANNEL_LABEL: Record<string, string> = { feishu: '飞书', weixin: '微信' };
 
@@ -23,6 +28,12 @@ export function RemoteSettings() {
   const [saved, setSaved] = useState(false);
   const [status, setStatus] = useState<RemoteChannelStatus[]>([]);
   const [pairings, setPairings] = useState<RemotePairing[]>([]);
+  const [weixinCfg, setWeixinCfg] = useState<WeixinConfigInfo | null>(null);
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const [qrMessage, setQrMessage] = useState<string | null>(null);
+  const [needVerify, setNeedVerify] = useState(false);
+  const [verifyCode, setVerifyCode] = useState('');
+  const [loginBusy, setLoginBusy] = useState(false);
 
   const loadPairings = useCallback(async () => {
     try {
@@ -36,12 +47,13 @@ export function RemoteSettings() {
     let cancelled = false;
     (async () => {
       try {
-        const [cfg, st] = await Promise.all([remoteFeishuConfig(), remoteStatus()]);
+        const [cfg, st, wx] = await Promise.all([remoteFeishuConfig(), remoteStatus(), remoteWeixinConfig()]);
         if (!cancelled) {
           setEnabled(cfg.enabled);
           setAppId(cfg.app_id);
           setAppSecret(cfg.app_secret);
           setStatus(st);
+          setWeixinCfg(wx);
         }
       } catch (e) {
         console.error('load remote settings:', e);
@@ -52,12 +64,44 @@ export function RemoteSettings() {
 
     const un1 = listen<RemoteChannelStatus[]>('remote:status', (e) => setStatus(e.payload));
     const un2 = listen('remote:pairing', () => loadPairings());
+    const un3 = listen<WeixinQrEvent>('remote:weixin-qr', async (e) => {
+      const { url, message, need_verify } = e.payload;
+      setNeedVerify(need_verify);
+      setQrMessage(message);
+      if (url) {
+        try {
+          setQrDataUrl(await QRCode.toDataURL(url, { width: 220, margin: 1 }));
+        } catch (err) {
+          console.error('render qr:', err);
+        }
+      } else {
+        setQrDataUrl(null);
+      }
+      if (message === '已连接微信') {
+        setLoginBusy(false);
+        remoteWeixinConfig().then(setWeixinCfg).catch(() => {});
+      }
+    });
     return () => {
       cancelled = true;
       un1.then((u) => u());
       un2.then((u) => u());
+      un3.then((u) => u());
     };
   }, [loadPairings]);
+
+  const startWeixinLogin = async () => {
+    setLoginBusy(true);
+    setQrMessage(null);
+    setQrDataUrl(null);
+    setNeedVerify(false);
+    try {
+      await remoteWeixinLoginStart();
+    } catch (e) {
+      setQrMessage(String(e));
+      setLoginBusy(false);
+    }
+  };
 
   const save = async (nextEnabled: boolean) => {
     setSaving(true);
@@ -74,6 +118,7 @@ export function RemoteSettings() {
   };
 
   const feishuStatus = status.find((s) => s.channel === 'feishu');
+  const weixinStatus = status.find((s) => s.channel === 'weixin');
   const pending = pairings.filter((p) => !p.approved);
   const approved = pairings.filter((p) => p.approved);
 
@@ -152,6 +197,87 @@ export function RemoteSettings() {
             </button>
           )}
         </div>
+      </div>
+
+      {/* WeChat ClawBot */}
+      <div className="rounded-lg border border-surface-hover bg-surface px-4 py-3 space-y-3">
+        <div className="flex items-center gap-3">
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-medium text-text-primary">微信 ClawBot</div>
+            <div className="text-xs text-text-secondary/60 mt-0.5">
+              扫码将微信连接到本机思库，之后在微信 ClawBot 里直接发消息对话。需微信 8.0.70+。
+            </div>
+          </div>
+          {weixinStatus && (
+            <span
+              className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${
+                weixinStatus.connected
+                  ? 'bg-green-500/10 text-green-500'
+                  : weixinStatus.enabled
+                    ? 'bg-amber-500/10 text-amber-500'
+                    : 'bg-surface-hover text-text-secondary/60'
+              }`}
+            >
+              {weixinStatus.connected ? weixinStatus.detail || '已连接' : weixinStatus.enabled ? weixinStatus.detail || '未连接' : '未连接'}
+            </span>
+          )}
+        </div>
+
+        {weixinCfg?.enabled ? (
+          <div className="flex items-center gap-3">
+            <div className="flex-1 min-w-0 text-xs text-text-secondary/60">
+              已连接微信账号 {weixinCfg.ilink_user_id || '—'}
+            </div>
+            <button
+              onClick={() =>
+                remoteWeixinLogout()
+                  .then(() => remoteWeixinConfig())
+                  .then(setWeixinCfg)
+                  .catch((e) => console.error('weixin logout:', e))
+              }
+              className="h-8 px-3 rounded-lg border border-surface-hover text-sm text-text-secondary hover:text-text-primary"
+            >
+              断开连接
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {!loginBusy && (
+              <button
+                onClick={startWeixinLogin}
+                className="h-8 px-3 rounded-lg bg-primary text-white text-sm"
+              >
+                扫码连接微信
+              </button>
+            )}
+            {qrDataUrl && (
+              <div className="flex flex-col items-start gap-2">
+                <img src={qrDataUrl} alt="微信登录二维码" className="rounded-lg border border-surface-hover" />
+              </div>
+            )}
+            {needVerify && (
+              <div className="flex items-center gap-2">
+                <input
+                  value={verifyCode}
+                  onChange={(e) => setVerifyCode(e.target.value)}
+                  placeholder="微信中显示的数字"
+                  className="w-40 h-8 rounded-lg bg-background border border-surface-hover text-sm text-text-primary px-3 focus:outline-none focus:border-primary/50"
+                />
+                <button
+                  onClick={() => {
+                    remoteWeixinLoginVerify(verifyCode.trim()).catch((e) => setQrMessage(String(e)));
+                    setVerifyCode('');
+                  }}
+                  disabled={!verifyCode.trim()}
+                  className="h-8 px-3 rounded-lg bg-primary text-white text-sm disabled:opacity-40"
+                >
+                  提交
+                </button>
+              </div>
+            )}
+            {qrMessage && <div className="text-xs text-text-secondary/70">{qrMessage}</div>}
+          </div>
+        )}
       </div>
 
       {/* Pairing requests */}

@@ -671,6 +671,29 @@ pub struct DeviceAppSettings {
 pub struct RemoteSettings {
     #[serde(default)]
     pub feishu: FeishuChannelConfig,
+    #[serde(default)]
+    pub weixin: WeixinChannelConfig,
+}
+
+/// WeChat ClawBot (iLink) credentials. `enabled` is set by a successful QR
+/// login; `context_tokens` maps chat user id → the per-conversation token the
+/// send API requires.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct WeixinChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub bot_token: String,
+    #[serde(default)]
+    pub ilink_bot_id: String,
+    #[serde(default)]
+    pub ilink_user_id: String,
+    #[serde(default)]
+    pub baseurl: String,
+    #[serde(default)]
+    pub get_updates_buf: String,
+    #[serde(default)]
+    pub context_tokens: std::collections::HashMap<String, String>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -699,6 +722,10 @@ impl std::fmt::Debug for DeviceAppSettings {
             .field(
                 "remote.feishu.app_secret",
                 &crate::core::redact::redact_api_key(&self.remote.feishu.app_secret),
+            )
+            .field(
+                "remote.weixin.bot_token",
+                &crate::core::redact::redact_api_key(&self.remote.weixin.bot_token),
             )
             .finish()
     }

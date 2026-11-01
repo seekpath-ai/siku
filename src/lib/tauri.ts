@@ -2857,3 +2857,31 @@ export async function remotePairingSet(channel: string, chatId: string, approved
 export async function remotePairingDelete(channel: string, chatId: string): Promise<void> {
   return invoke<void>('remote_pairing_delete', { channel, chatId });
 }
+
+export interface WeixinConfigInfo {
+  enabled: boolean;
+  ilink_user_id: string;
+  ilink_bot_id: string;
+}
+
+export interface WeixinQrEvent {
+  url: string | null;
+  message: string | null;
+  need_verify: boolean;
+}
+
+export async function remoteWeixinConfig(): Promise<WeixinConfigInfo> {
+  return invoke<WeixinConfigInfo>('remote_weixin_config');
+}
+
+export async function remoteWeixinLoginStart(): Promise<void> {
+  return invoke<void>('remote_weixin_login_start');
+}
+
+export async function remoteWeixinLoginVerify(code: string): Promise<void> {
+  return invoke<void>('remote_weixin_login_verify', { code });
+}
+
+export async function remoteWeixinLogout(): Promise<void> {
+  return invoke<void>('remote_weixin_logout');
+}

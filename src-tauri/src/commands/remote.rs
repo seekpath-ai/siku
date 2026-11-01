@@ -42,6 +42,67 @@ pub async fn remote_feishu_save(
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+pub struct WeixinConfigInfo {
+    pub enabled: bool,
+    pub ilink_user_id: String,
+    pub ilink_bot_id: String,
+}
+
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn remote_weixin_config(state: State<'_, AppState>) -> Result<WeixinConfigInfo, String> {
+    let cfg = crate::core::settings_service::load_device_settings(&state.db)
+        .await?
+        .remote
+        .weixin;
+    Ok(WeixinConfigInfo {
+        enabled: cfg.enabled,
+        ilink_user_id: cfg.ilink_user_id,
+        ilink_bot_id: cfg.ilink_bot_id,
+    })
+}
+
+/// Start the QR login flow. The QR image and progress arrive via the
+/// `remote:weixin-qr` event.
+#[tauri::command]
+#[instrument(skip(state, app))]
+pub async fn remote_weixin_login_start(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    if state.remote.start_weixin_login(&app).await {
+        Ok(())
+    } else {
+        Err("已有进行中的扫码登录".to_string())
+    }
+}
+
+/// Submit the digit code WeChat shows when the server asks for verification.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn remote_weixin_login_verify(
+    state: State<'_, AppState>,
+    code: String,
+) -> Result<(), String> {
+    if state.remote.weixin_login_verify(code).await {
+        Ok(())
+    } else {
+        Err("当前没有进行中的扫码登录".to_string())
+    }
+}
+
+#[tauri::command]
+#[instrument(skip(state, app))]
+pub async fn remote_weixin_logout(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+    state.remote.cancel_weixin_login().await;
+    let mut settings = crate::core::settings_service::load_device_settings(&state.db).await?;
+    settings.remote.weixin = crate::core::models::WeixinChannelConfig::default();
+    crate::core::settings_service::save_device_settings(&state.db, &settings).await?;
+    state.remote.sync_config(&state.db, &app).await;
+    Ok(())
+}
+
 #[derive(serde::Serialize, sqlx::FromRow)]
 pub struct PairingRow {
     pub channel: String,

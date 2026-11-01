@@ -54,11 +54,16 @@ export function SessionModelBadge({ session, onModelChange, maxWidthClass = 'max
   const llm = session.llm_models?.[0];
   const poolId = session.llm_provider_ids?.[0];
   const pool = poolId ? providers.find((p) => p.id === poolId) : undefined;
+  // Sessions that never picked a model (remote IM sessions, legacy rows) run
+  // on the global default at runtime — show it instead of hiding the badge.
+  const fallbackDefault = !pool && !llm ? providers.find((p) => p.is_default) : undefined;
   const modelLabel = pool
     ? `${pool.provider} / ${pool.model}`
     : llm
       ? `${llm.provider} / ${llm.model}`
-      : '';
+      : fallbackDefault
+        ? `${fallbackDefault.provider} / ${fallbackDefault.model}`
+        : '';
 
   // Current selection in the switcher. A custom (inline) LLM that exactly
   // matches a global provider (provider+model+base_url) is deduped INTO that
@@ -69,7 +74,7 @@ export function SessionModelBadge({ session, onModelChange, maxWidthClass = 'max
           (p) => p.provider === llm.provider && p.model === llm.model && p.base_url === llm.base_url
         )
       : undefined;
-  const currentProviderId = poolId ?? matchedCustom?.id ?? null;
+  const currentProviderId = poolId ?? matchedCustom?.id ?? fallbackDefault?.id ?? null;
   const showCustomEntry = !!llm && !poolId && !matchedCustom;
 
   if (!modelLabel) return null;

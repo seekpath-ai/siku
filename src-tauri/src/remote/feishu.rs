@@ -185,7 +185,10 @@ impl EventHandler for FeishuMessageHandler {
                     router::enqueue(self.app.clone(), inbound, self.sink.clone()).await;
                 }
                 Ok(None) => {
-                    if is_non_text_user_message(&payload) {
+                    // The "text only" notice must honor the same group-mention
+                    // policy as real replies — otherwise every sticker/image in
+                    // a group gets an unprompted bot reply.
+                    if is_non_text_user_message(&payload) && bot_engaged(&payload, &self.bot_open_id) {
                         let chat_id = payload
                             .pointer("/message/chat_id")
                             .and_then(|v| v.as_str())
@@ -231,20 +234,14 @@ fn parse_inbound(
 
     // Mention keys look like "@_user_1" inside the text; strip them all.
     let mut mentioned_keys: Vec<String> = Vec::new();
-    let mut bot_mentioned = false;
     if let Some(list) = message.get("mentions").and_then(|m| m.as_array()) {
         for m in list {
             if let Some(key) = m.get("key").and_then(|k| k.as_str()) {
                 mentioned_keys.push(key.to_string());
             }
-            if m.pointer("/id/open_id").and_then(|v| v.as_str()) == Some(bot_open_id)
-                && !bot_open_id.is_empty()
-            {
-                bot_mentioned = true;
-            }
         }
     }
-    if kind == ChatKind::Group && !bot_mentioned {
+    if kind == ChatKind::Group && !bot_engaged(payload, bot_open_id) {
         return Err("群聊消息未 @ 机器人，按策略忽略");
     }
 
@@ -285,6 +282,29 @@ fn parse_inbound(
             .to_string(),
         text,
     }))
+}
+
+
+/// Engagement policy shared by the reply path and the "text only" notice:
+/// p2p chats always engage; group chats only when the bot is @-mentioned
+/// (mention entries carry the target's open_id under id.open_id).
+fn bot_engaged(payload: &serde_json::Value, bot_open_id: &str) -> bool {
+    let Some(message) = payload.get("message") else {
+        return false;
+    };
+    if message.get("chat_type").and_then(|v| v.as_str()) == Some("p2p") {
+        return true;
+    }
+    !bot_open_id.is_empty()
+        && message
+            .get("mentions")
+            .and_then(|m| m.as_array())
+            .map(|list| {
+                list.iter().any(|m| {
+                    m.pointer("/id/open_id").and_then(|v| v.as_str()) == Some(bot_open_id)
+                })
+            })
+            .unwrap_or(false)
 }
 
 fn is_non_text_user_message(payload: &serde_json::Value) -> bool {

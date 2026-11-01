@@ -171,20 +171,35 @@ impl EventHandler for FeishuMessageHandler {
     fn handle(&self, event: Event) -> Pin<Box<dyn Future<Output = EventHandlerResult> + Send + '_>> {
         Box::pin(async move {
             let Some(payload) = event.event else {
+                tracing::warn!("feishu event without payload");
                 return Ok(None);
             };
-            if let Some(inbound) = parse_inbound(&payload, &self.bot_open_id) {
-                router::enqueue(self.app.clone(), inbound, self.sink.clone()).await;
-            } else if is_non_text_user_message(&payload) {
-                let chat_id = payload
-                    .pointer("/message/chat_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if !chat_id.is_empty() {
-                    let _ = self
-                        .sink
-                        .send_text(chat_id, "目前只支持文字消息，图片和文件请在思库应用内处理。")
-                        .await;
+            tracing::info!(
+                chat_type = payload.pointer("/message/chat_type").and_then(|v| v.as_str()).unwrap_or("?"),
+                message_type = payload.pointer("/message/message_type").and_then(|v| v.as_str()).unwrap_or("?"),
+                sender_type = payload.pointer("/sender/sender_type").and_then(|v| v.as_str()).unwrap_or("?"),
+                "feishu message event"
+            );
+            match parse_inbound(&payload, &self.bot_open_id) {
+                Ok(Some(inbound)) => {
+                    router::enqueue(self.app.clone(), inbound, self.sink.clone()).await;
+                }
+                Ok(None) => {
+                    if is_non_text_user_message(&payload) {
+                        let chat_id = payload
+                            .pointer("/message/chat_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if !chat_id.is_empty() {
+                            let _ = self
+                                .sink
+                                .send_text(chat_id, "目前只支持文字消息，图片和文件请在思库应用内处理。")
+                                .await;
+                        }
+                    }
+                }
+                Err(reason) => {
+                    tracing::info!(reason, "feishu message dropped");
                 }
             }
             Ok(None)
@@ -193,19 +208,24 @@ impl EventHandler for FeishuMessageHandler {
 }
 
 /// Text messages from humans that pass the group-mention policy become
-/// inbound messages; everything else returns None.
-fn parse_inbound(payload: &serde_json::Value, bot_open_id: &str) -> Option<InboundMessage> {
-    let sender_type = payload.pointer("/sender/sender_type")?.as_str()?;
+/// inbound messages. Err(reason) marks a deliberate drop for logging.
+fn parse_inbound(
+    payload: &serde_json::Value,
+    bot_open_id: &str,
+) -> Result<Option<InboundMessage>, &'static str> {
+    let sender_type = payload
+        .pointer("/sender/sender_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     if sender_type != "user" {
-        return None; // ignore other bots
+        return Err("非人类发送者（机器人消息），忽略");
     }
-    let message = payload.get("message")?;
-    if message.get("msg_type")?.as_str()? != "text" {
-        return None;
+    let message = payload.get("message").ok_or("负载缺少 message 字段")?;
+    if message.get("message_type").and_then(|v| v.as_str()) != Some("text") {
+        return Ok(None); // non-text: handled by the caller with a notice
     }
-    let chat_type = message.get("chat_type")?.as_str()?;
-    let kind = match chat_type {
-        "p2p" => ChatKind::Private,
+    let kind = match message.get("chat_type").and_then(|v| v.as_str()) {
+        Some("p2p") => ChatKind::Private,
         _ => ChatKind::Group,
     };
 
@@ -225,26 +245,32 @@ fn parse_inbound(payload: &serde_json::Value, bot_open_id: &str) -> Option<Inbou
         }
     }
     if kind == ChatKind::Group && !bot_mentioned {
-        return None;
+        return Err("群聊消息未 @ 机器人，按策略忽略");
     }
 
-    let content = message.get("content")?.as_str()?;
+    let content = message
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or("消息缺少 content")?;
     let mut text = serde_json::from_str::<serde_json::Value>(content)
-        .ok()?
-        .get("text")?
-        .as_str()?
-        .to_string();
+        .ok()
+        .and_then(|c| c.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
+        .ok_or("content 不是合法的 text 消息体")?;
     for key in &mentioned_keys {
         text = text.replace(key.as_str(), "");
     }
     let text = text.trim().to_string();
     if text.is_empty() {
-        return None;
+        return Err("去除 @ 引用后文本为空");
     }
 
-    Some(InboundMessage {
+    let chat_id = message
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .ok_or("消息缺少 chat_id")?;
+    Ok(Some(InboundMessage {
         channel: "feishu",
-        chat_id: message.get("chat_id")?.as_str()?.to_string(),
+        chat_id: chat_id.to_string(),
         kind,
         user_id: payload
             .pointer("/sender/sender_id/open_id")
@@ -253,17 +279,17 @@ fn parse_inbound(payload: &serde_json::Value, bot_open_id: &str) -> Option<Inbou
             .to_string(),
         user_name: String::new(),
         msg_id: message
-            .get("msg_id")
+            .get("message_id")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
         text,
-    })
+    }))
 }
 
 fn is_non_text_user_message(payload: &serde_json::Value) -> bool {
     payload.pointer("/sender/sender_type").and_then(|v| v.as_str()) == Some("user")
-        && payload.pointer("/message/msg_type").and_then(|v| v.as_str()) != Some("text")
+        && payload.pointer("/message/message_type").and_then(|v| v.as_str()) != Some("text")
 }
 
 // ---------------------------------------------------------------- replies

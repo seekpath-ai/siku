@@ -404,6 +404,13 @@ fn show_panic_dialog(message: &str) {
 }
 
 pub fn run() {
+    // The dependency graph enables BOTH rustls crypto providers (aws-lc-rs
+    // and ring — feishu-sdk's websocket stack vs the pre-existing reqwest/
+    // webrtc stack), so rustls cannot pick a process-level default and any
+    // TLS client construction panics. Install one explicitly before anything
+    // touches TLS.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Install a custom panic hook so that unclean database shutdowns (e.g.
     // CR-SQLite unfinalized statements) do not pop up multiple OS error
     // dialogs and obscure the main window. We still log the panic (with a

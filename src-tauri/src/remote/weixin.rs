@@ -345,8 +345,10 @@ impl ReplySink for WeixinSink {
             if let Some(t) = &context_token {
                 msg["context_token"] = serde_json::Value::String(t.clone());
             }
+            // The official endpoint really is "sendmessages" — no trailing
+            // s; a 404 here previously swallowed every reply.
             let url = format!(
-                "{}/ilink/bot/sendmessages",
+                "{}/ilink/bot/sendmessage",
                 self.base_url.trim_end_matches('/')
             );
             let resp = self
@@ -358,13 +360,33 @@ impl ReplySink for WeixinSink {
                 .send()
                 .await
                 .map_err(|e| format!("微信发送失败: {e}"))?;
-            let body: serde_json::Value = resp
-                .json()
+            let status = resp.status();
+            let body = resp
+                .text()
                 .await
-                .map_err(|e| format!("微信发送响应解析失败: {e}"))?;
-            let ret = body.get("ret").and_then(|v| v.as_i64()).unwrap_or(0);
+                .map_err(|e| format!("微信发送响应读取失败: {e}"))?;
+            if !status.is_success() {
+                return Err(format!(
+                    "微信发送失败: HTTP {status} {}",
+                    body.chars().take(200).collect::<String>()
+                ));
+            }
+            // A 2xx with an empty/non-JSON body has been observed on delivered
+            // messages; strict .json() parsing used to fail those sends even
+            // though the text reached WeChat.
+            let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(
+                        body = %body.chars().take(200).collect::<String>(),
+                        "weixin sendmessage: non-JSON 2xx body, treating as delivered"
+                    );
+                    continue;
+                }
+            };
+            let ret = parsed.get("ret").and_then(|v| v.as_i64()).unwrap_or(0);
             if ret != 0 {
-                let errmsg = body.get("errmsg").and_then(|v| v.as_str()).unwrap_or("");
+                let errmsg = parsed.get("errmsg").and_then(|v| v.as_str()).unwrap_or("");
                 return Err(format!("微信发送失败: ret={ret} {errmsg}"));
             }
         }

@@ -69,6 +69,10 @@ http = "1"
 libsqlite3-sys = "0.30"
 pdf_oxide = "0.3"
 feishu-sdk = { version = "0.1", features = ["websocket"] }
+# Direct dep so we can install_default() the process CryptoProvider at
+# startup: the graph enables both aws-lc-rs and ring, which makes rustls
+# refuse to auto-pick one.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 
 # macOS-only: window transparency APIs (.transparent()) are gated behind this
 # feature. It must stay target-gated — when enabled globally, tauri's build

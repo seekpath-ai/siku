@@ -31,6 +31,8 @@ const SEEN_CAP: usize = 2048;
 const SEEN_TTL_SECS: i64 = 24 * 3600;
 /// How often an unapproved chat is reminded to pair.
 const PAIRING_NOTICE_INTERVAL_SECS: i64 = 3600;
+/// Max wait for a remote turn to persist its reply before giving up.
+const REPLY_TIMEOUT_SECS: u64 = 600;
 
 /// True when a chat_sessions.context marks the row as remote-originated.
 pub fn is_remote_context(context: &str) -> bool {
@@ -236,6 +238,18 @@ async fn process_batch(
         Some(text.chars().take(50).collect::<String>()),
     );
 
+    // run_agent_turn spawns the turn and returns immediately, so remember
+    // where the assistant history ends and poll for the row the turn appends
+    // when it finishes. Grabbing the latest row right away would return the
+    // PREVIOUS turn's reply.
+    let baseline: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(rowid), 0) FROM chat_messages WHERE session_id = ? AND role = 'assistant'",
+    )
+    .bind(&session_id)
+    .fetch_one(&db)
+    .await
+    .unwrap_or(0);
+
     let result = crate::commands::agent::run_agent_turn(
         &state,
         &app,
@@ -246,9 +260,9 @@ async fn process_batch(
     .await;
 
     let reply = match result {
-        Ok(()) => match latest_assistant_reply(&db, &session_id).await {
-            Ok(Some(r)) if !r.trim().is_empty() => r,
-            _ => "（没有生成回复）".to_string(),
+        Ok(()) => match wait_for_new_reply(&db, &session_id, baseline).await {
+            Some(r) if !r.trim().is_empty() => r,
+            _ => "（回复生成超时，请稍后在思库对话中查看，或追问一次）".to_string(),
         },
         Err(e) if e.contains("正在生成中") => {
             "上一条消息还在处理中，请稍后再发。".to_string()
@@ -267,15 +281,31 @@ async fn process_batch(
     }
 }
 
-async fn latest_assistant_reply(db: &SqlitePool, session_id: &str) -> Result<Option<String>, String> {
-    sqlx::query_scalar(
-        "SELECT content FROM chat_messages WHERE session_id = ? AND role = 'assistant'
-         ORDER BY created_at DESC, rowid DESC LIMIT 1",
-    )
-    .bind(session_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| format!("db error: {e}"))
+/// The agent persists its assistant message only when the turn ends, so a
+/// new row past `baseline` is exactly "this turn finished" — including
+/// failures, which are persisted with an ❌ marker. Polls until the timeout.
+async fn wait_for_new_reply(db: &SqlitePool, session_id: &str, baseline: i64) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(REPLY_TIMEOUT_SECS);
+    loop {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT content FROM chat_messages WHERE session_id = ? AND role = 'assistant' AND rowid > ?
+             ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(baseline)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+        if row.is_some() {
+            return row;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(session_id, "remote reply wait timed out");
+            return None;
+        }
+    }
 }
 
 fn channel_label(channel: &str) -> String {

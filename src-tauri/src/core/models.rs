@@ -662,6 +662,25 @@ pub struct DeviceAppSettings {
     /// Stable device identifier used for pairing and sync presence.
     #[serde(default = "default_empty_string")]
     pub device_id: String,
+    /// Remote IM channels (feishu/weixin bots serving this device's agent).
+    #[serde(default)]
+    pub remote: RemoteSettings,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct RemoteSettings {
+    #[serde(default)]
+    pub feishu: FeishuChannelConfig,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct FeishuChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub app_id: String,
+    #[serde(default)]
+    pub app_secret: String,
 }
 
 impl std::fmt::Debug for DeviceAppSettings {
@@ -677,6 +696,10 @@ impl std::fmt::Debug for DeviceAppSettings {
             .field("sync_optional_data", &self.sync_optional_data)
             .field("allow_plaintext_relay", &self.allow_plaintext_relay)
             .field("device_id", &self.device_id)
+            .field(
+                "remote.feishu.app_secret",
+                &crate::core::redact::redact_api_key(&self.remote.feishu.app_secret),
+            )
             .finish()
     }
 }
@@ -691,6 +714,7 @@ impl Default for DeviceAppSettings {
             sync_optional_data: true,
             allow_plaintext_relay: false,
             device_id: default_empty_string(),
+            remote: RemoteSettings::default(),
         }
     }
 }

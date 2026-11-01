@@ -1,6 +1,6 @@
 import { createRoute } from '@tanstack/react-router';
 import { Route as RootRoute } from './__root';
-import { SettingsLayout, GeneralIcon, AppearanceIcon, LlmIcon, AgentIcon, PetIcon, DomainsIcon, AdvancedIcon, SyncIcon, SearchIcon } from '@/components/settings/SettingsLayout';
+import { SettingsLayout, GeneralIcon, AppearanceIcon, LlmIcon, AgentIcon, PetIcon, DomainsIcon, AdvancedIcon, SyncIcon, SearchIcon, RemoteIcon } from '@/components/settings/SettingsLayout';
 import { LlmProviderSettings } from '@/components/settings/LlmProviderSettings';
 import { GeneralSettings } from '@/components/settings/GeneralSettings';
 import { AppearanceSettings } from '@/components/settings/AppearanceSettings';
@@ -8,6 +8,7 @@ import { SearchSettings } from '@/components/settings/SearchSettings';
 import { AgentDefaultsSettings } from '@/components/settings/AgentDefaultsSettings';
 import { PetSettings } from '@/components/settings/PetSettings';
 import { DomainAgentSettings } from '@/components/settings/DomainAgentSettings';
+import { RemoteSettings } from '@/components/settings/RemoteSettings';
 import { AdvancedSettings } from '@/components/settings/AdvancedSettings';
 import { SyncSettings } from '@/components/settings/SyncSettings';
 
@@ -22,6 +23,7 @@ function SettingsPage() {
         { key: 'search', label: '网络搜索', icon: <SearchIcon />, component: <SearchSettings /> },
         { key: 'pet', label: '宠物', icon: <PetIcon />, component: <PetSettings /> },
         { key: 'domains', label: '领域智能体', icon: <DomainsIcon />, component: <DomainAgentSettings /> },
+        { key: 'remote', label: '远程接入', icon: <RemoteIcon />, component: <RemoteSettings /> },
         { key: 'advanced', label: '高级', icon: <AdvancedIcon />, component: <AdvancedSettings /> },
         { key: 'sync', label: '同步', icon: <SyncIcon />, component: <SyncSettings /> },
       ]}

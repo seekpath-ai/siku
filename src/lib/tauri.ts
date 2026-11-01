@@ -2808,3 +2808,52 @@ export async function reviewGenerateCancel(runId: string): Promise<void> {
 export async function reviewGenerateSave(runId: string): Promise<string> {
   return invoke<string>('review_generate_save', { runId });
 }
+
+// ---------------------------------------------------------------- remote IM channels
+
+export interface RemoteChannelStatus {
+  channel: string;
+  enabled: boolean;
+  connected: boolean;
+  detail: string;
+}
+
+export interface FeishuChannelConfig {
+  enabled: boolean;
+  app_id: string;
+  app_secret: string;
+}
+
+export interface RemotePairing {
+  channel: string;
+  chat_id: string;
+  user_id: string;
+  user_name: string;
+  approved: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function remoteStatus(): Promise<RemoteChannelStatus[]> {
+  return invoke<RemoteChannelStatus[]>('remote_status');
+}
+
+export async function remoteFeishuConfig(): Promise<FeishuChannelConfig> {
+  return invoke<FeishuChannelConfig>('remote_feishu_config');
+}
+
+export async function remoteFeishuSave(appId: string, appSecret: string, enabled: boolean): Promise<void> {
+  return invoke<void>('remote_feishu_save', { appId, appSecret, enabled });
+}
+
+export async function remotePairings(): Promise<RemotePairing[]> {
+  return invoke<RemotePairing[]>('remote_pairings');
+}
+
+export async function remotePairingSet(channel: string, chatId: string, approved: boolean): Promise<void> {
+  return invoke<void>('remote_pairing_set', { channel, chatId, approved });
+}
+
+export async function remotePairingDelete(channel: string, chatId: string): Promise<void> {
+  return invoke<void>('remote_pairing_delete', { channel, chatId });
+}

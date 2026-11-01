@@ -4,6 +4,7 @@ mod core;
 mod file_store;
 mod navigation_guard;
 mod pdf;
+mod remote;
 mod sync;
 
 use std::sync::Mutex;
@@ -46,6 +47,8 @@ pub struct AppState {
     pub background_tasks: std::sync::Arc<
         tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     >,
+    /// Remote IM channels (feishu/weixin bots) serving this device's agent.
+    pub remote: crate::remote::RemoteManager,
 }
 
 /// Spawn a background task and register its handle so the exit path can abort
@@ -555,7 +558,14 @@ pub fn run() {
                     )),
                     shutdown_tx: shutdown_tx.clone(),
                     background_tasks: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                    remote: crate::remote::RemoteManager::default(),
                 });
+
+                // Start remote IM channels (feishu/weixin) if configured.
+                {
+                    let st = handle2.state::<AppState>();
+                    st.remote.sync_config(&st.db, &handle2).await;
+                }
 
                 // Start the cron scheduler (fires scheduled agent prompts).
                 let sched_handle = handle2.clone();
@@ -866,6 +876,13 @@ pub fn run() {
             // Reader
             commands::reader::read_pdf_bytes,
             commands::reader::export_pdf,
+            // Remote IM channels
+            commands::remote::remote_status,
+            commands::remote::remote_feishu_config,
+            commands::remote::remote_feishu_save,
+            commands::remote::remote_pairings,
+            commands::remote::remote_pairing_set,
+            commands::remote::remote_pairing_delete,
             // Agent
             commands::agent::agent_create_session,
             commands::agent::agent_update_session,

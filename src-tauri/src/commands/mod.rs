@@ -20,6 +20,7 @@ pub mod notes;
 pub mod pet;
 pub mod projects;
 pub mod reader;
+pub mod remote;
 pub mod region;
 pub mod research;
 pub mod review;

@@ -1160,6 +1160,24 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     .execute(&db)
     .await?;
 
+    // Remote IM channel (feishu/weixin) chat bindings. Device-local on
+    // purpose: external ids and pairing state must not roam via sync.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS remote_chats (
+            channel TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            user_name TEXT NOT NULL DEFAULT '',
+            session_id TEXT,
+            approved INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (channel, chat_id)
+        )"
+    )
+    .execute(&db)
+    .await?;
+
     // Per-turn system-prompt snapshots for the "查看本轮上下文" viewer.
     // Device-local on purpose: the assembled prompt is a function of this
     // device's settings/memory at send time and would just be sync weight.

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { HardDrive, Bot, Cpu, SlidersHorizontal, Cat, RefreshCw, Search, Layers, Palette } from 'lucide-react';
+import { HardDrive, Bot, Cpu, SlidersHorizontal, Cat, RefreshCw, Search, Layers, Palette, MessagesSquare } from 'lucide-react';
 
 interface Section {
   key: string;
@@ -67,3 +67,4 @@ export function DomainsIcon() { return <Layers size={16} />; }
 export function SearchIcon() { return <Search size={16} />; }
 export function AdvancedIcon() { return <SlidersHorizontal size={16} />; }
 export function SyncIcon() { return <RefreshCw size={16} />; }
+export function RemoteIcon() { return <MessagesSquare size={16} />; }

@@ -986,6 +986,16 @@ pub(crate) async fn run_agent_turn(
             .await,
         );
     }
+    // Remote IM sessions (feishu/weixin): keep the user's effective prompt
+    // but append channel rules — plain text only, no app-internal links or
+    // local paths, which are meaningless on a phone chat client.
+    if crate::remote::is_remote_context(session.context.as_deref().unwrap_or("")) {
+        let effective = config.effective_system_prompt();
+        config.system_prompt = Some(format!(
+            "{effective}\n\n{}",
+            crate::remote::router::REMOTE_PROMPT_ADDENDUM
+        ));
+    }
     let device_settings = settings_service::load_device_settings(&state.db).await?;
 
     // Resolve the session's project directory (Codex-style project context).

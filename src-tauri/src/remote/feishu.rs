@@ -198,25 +198,34 @@ impl EventHandler for FeishuMessageHandler {
                         .unwrap_or(false);
                     if is_image {
                         let m = inbound.media.clone().unwrap();
-                        match download_resource(&self.cfg, &m.message_id, &m.file_key, "image").await {
-                            Ok((bytes, mime)) => {
-                                inbound.images.push(crate::ai::llm::ImageAttachment {
-                                    mime: if mime.starts_with("image/") { mime } else { "image/jpeg".to_string() },
-                                    base64: base64::Engine::encode(
-                                        &base64::engine::general_purpose::STANDARD,
-                                        &bytes,
-                                    ),
-                                    name: None,
-                                });
+                        let mut keys = vec![m.file_key.clone()];
+                        keys.extend(m.extra_image_keys.iter().cloned());
+                        let mut download_failed = false;
+                        for key in &keys {
+                            match download_resource(&self.cfg, &m.message_id, key, "image").await {
+                                Ok((bytes, mime)) => {
+                                    inbound.images.push(crate::ai::llm::ImageAttachment {
+                                        mime: if mime.starts_with("image/") { mime } else { "image/jpeg".to_string() },
+                                        base64: base64::Engine::encode(
+                                            &base64::engine::general_purpose::STANDARD,
+                                            &bytes,
+                                        ),
+                                        name: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "feishu image download failed");
+                                    download_failed = true;
+                                    break;
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "feishu image download failed");
-                                let _ = self
-                                    .sink
-                                    .send_text(&inbound.chat_id, "图片下载失败，请重发一次。")
-                                    .await;
-                                return Ok(None);
-                            }
+                        }
+                        if download_failed {
+                            let _ = self
+                                .sink
+                                .send_text(&inbound.chat_id, "图片下载失败，请重发一次。")
+                                .await;
+                            return Ok(None);
                         }
                     }
                     router::enqueue(self.app.clone(), inbound, self.sink.clone()).await;
@@ -233,7 +242,7 @@ impl EventHandler for FeishuMessageHandler {
                         if !chat_id.is_empty() {
                             let _ = self
                                 .sink
-                                .send_text(chat_id, "暂不支持这类消息：目前支持文字和图片；文件请在思库对话列表右键本会话 →「查看群文件」处理。")
+                                .send_text(chat_id, "暂不支持这类消息：目前支持文字、图片和图文混排；文件请在思库对话列表右键本会话 →「查看群文件」处理。")
                                 .await;
                         }
                     }
@@ -262,7 +271,7 @@ fn parse_inbound(
     }
     let message = payload.get("message").ok_or("负载缺少 message 字段")?;
     let msg_type = message.get("message_type").and_then(|v| v.as_str()).unwrap_or_default();
-    if msg_type != "text" && msg_type != "image" && msg_type != "file" {
+    if msg_type != "text" && msg_type != "image" && msg_type != "file" && msg_type != "post" {
         return Ok(None); // other types: handled by the caller with a notice
     }
     let kind = match message.get("chat_type").and_then(|v| v.as_str()) {
@@ -297,6 +306,98 @@ fn parse_inbound(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+
+    // Rich-text (post) messages: paragraphs of tagged segments. Text/link
+    // segments become the prompt text, at-segments keep "@name" for context
+    // (the bot's own mention is dropped), img segments become image
+    // attachments downloaded by the handler.
+    if msg_type == "post" {
+        let content = message
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or("消息缺少 content")?;
+        let c: serde_json::Value =
+            serde_json::from_str(content).map_err(|_| "content 不是合法的 JSON")?;
+        let mut text = String::new();
+        let mut image_keys: Vec<String> = Vec::new();
+        if let Some(title) = c
+            .get("title")
+            .and_then(|t| t.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            text.push_str(title);
+            text.push('\n');
+        }
+        if let Some(paragraphs) = c.get("content").and_then(|c| c.as_array()) {
+            for para in paragraphs.iter().filter_map(|p| p.as_array()) {
+                for seg in para {
+                    match seg.get("tag").and_then(|t| t.as_str()) {
+                        Some("text") | Some("a") => {
+                            if let Some(t) = seg.get("text").and_then(|t| t.as_str()) {
+                                text.push_str(t);
+                            }
+                        }
+                        Some("at") => {
+                            let uid = seg
+                                .get("user_id")
+                                .and_then(|u| u.as_str())
+                                .unwrap_or_default();
+                            if uid != bot_open_id {
+                                if let Some(name) =
+                                    seg.get("user_name").and_then(|n| n.as_str())
+                                {
+                                    text.push('@');
+                                    text.push_str(name);
+                                    text.push(' ');
+                                }
+                            }
+                        }
+                        Some("img") => {
+                            if let Some(k) = seg
+                                .get("image_key")
+                                .and_then(|k| k.as_str())
+                                .filter(|k| !k.is_empty())
+                            {
+                                image_keys.push(k.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                text.push('\n');
+            }
+        }
+        let text = text.trim().to_string();
+        if text.is_empty() && image_keys.is_empty() {
+            return Err("post 消息无文本也无图片");
+        }
+        let (first_key, extra_keys) = match image_keys.split_first() {
+            Some((first, rest)) => (first.clone(), rest.to_vec()),
+            None => (String::new(), Vec::new()),
+        };
+        return Ok(Some(InboundMessage {
+            channel: "feishu",
+            chat_id: chat_id.to_string(),
+            kind,
+            user_id,
+            user_name: String::new(),
+            msg_id: msg_id.clone(),
+            text,
+            images: Vec::new(),
+            media: if first_key.is_empty() {
+                None
+            } else {
+                Some(crate::remote::router::MediaRef {
+                    kind: "image".to_string(),
+                    name: "图片".to_string(),
+                    message_id: msg_id,
+                    file_key: first_key,
+                    extra_image_keys: extra_keys,
+                })
+            },
+        }));
+    }
 
     if msg_type != "text" {
         // Media messages carry no text; the file_key/image_key locates the
@@ -339,6 +440,7 @@ fn parse_inbound(
                 name,
                 message_id: msg_id,
                 file_key: key.to_string(),
+                extra_image_keys: Vec::new(),
             }),
         }));
     }
@@ -678,11 +780,25 @@ pub(crate) async fn fetch_chat_files(
         let data = feishu_data(&v, "获取群文件")?;
         if let Some(items) = data.get("items").and_then(|i| i.as_array()) {
             for m in items {
-                let msg_type = m.get("message_type").and_then(|t| t.as_str()).unwrap_or_default();
+                // REST API message objects differ from event payloads:
+                // msg_type (not message_type), body.content (not content),
+                // create_time may be a number (events use strings).
+                if m.get("deleted").and_then(|d| d.as_bool()).unwrap_or(false) {
+                    continue;
+                }
+                let msg_type = m
+                    .get("msg_type")
+                    .or_else(|| m.get("message_type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default();
                 if msg_type != "file" && msg_type != "image" {
                     continue;
                 }
-                let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("{}");
+                let content = m
+                    .pointer("/body/content")
+                    .or_else(|| m.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("{}");
                 let c: serde_json::Value = serde_json::from_str(content).unwrap_or_default();
                 let (key, name, size) = if msg_type == "file" {
                     (
@@ -707,7 +823,10 @@ pub(crate) async fn fetch_chat_files(
                     name,
                     size_bytes: size,
                     sender_id: m.pointer("/sender/id").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-                    create_time_ms: m.get("create_time").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+                    create_time_ms: m
+                        .get("create_time")
+                        .and_then(|x| x.as_str().map(|s| s.to_string()).or_else(|| x.as_i64().map(|n| n.to_string())))
+                        .unwrap_or_default(),
                 });
                 if out.len() >= 200 {
                     return Ok(out);

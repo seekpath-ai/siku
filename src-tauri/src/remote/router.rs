@@ -55,6 +55,8 @@ pub struct MediaRef {
     /// Channel-specific attachment locators (feishu message_id + file_key).
     pub message_id: String,
     pub file_key: String,
+    /// Extra image keys of a feishu post message (file_key holds the first).
+    pub extra_image_keys: Vec<String>,
 }
 
 #[derive(Clone)]

@@ -305,6 +305,7 @@ async fn handle_inbound(
                                     name: name.clone(),
                                     message_id: String::new(),
                                     file_key: String::new(),
+                                    extra_image_keys: Vec::new(),
                                 });
                             }
                             Err(e) => {

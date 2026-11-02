@@ -92,7 +92,16 @@ pub trait ReplySink: Send + Sync {
     }
     /// A remote turn started: channels with live UI (feishu card) create
     /// their progress surface; channels with delayed acks (weixin) arm them.
-    async fn progress_start(&self, _chat_id: &str, _preview: &str) -> Result<(), String> {
+    /// session_id/prompt/kind are carried so card buttons can stop the turn
+    /// or retry the same prompt without further context lookups.
+    async fn progress_start(
+        &self,
+        _chat_id: &str,
+        _preview: &str,
+        _session_id: &str,
+        _prompt: &str,
+        _kind: ChatKind,
+    ) -> Result<(), String> {
         Ok(())
     }
     /// Periodic progress snapshot (throttled by the router's driver).
@@ -394,7 +403,9 @@ async fn process_batch(
 
     // Live progress surface (feishu card / weixin delayed ack): created
     // before the turn starts so early events are not missed.
-    let _ = sink.progress_start(&meta.chat_id, &preview).await;
+    let _ = sink
+        .progress_start(&meta.chat_id, &preview, &session_id, &text, meta.kind)
+        .await;
     let driver = spawn_progress_driver(&app, &session_id, &meta.chat_id, sink.clone());
 
     // run_agent_turn spawns the turn and returns immediately, so remember

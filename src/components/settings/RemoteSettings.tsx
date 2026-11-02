@@ -245,7 +245,7 @@ export function RemoteSettings() {
             <div className="text-sm font-medium text-text-primary">飞书机器人</div>
             <div className="text-xs text-text-secondary/60 mt-0.5">
               在 <a className="text-primary" href="https://open.feishu.cn/app" target="_blank" rel="noreferrer">飞书开放平台</a> 创建企业自建应用，启用机器人能力并发布版本；
-              事件订阅选择「使用长连接接收事件」，添加 im.message.receive_v1；权限需包含 im:message 与 im:message:send。可添加多个机器人（跨租户或同租户多应用）。
+              事件订阅选择「使用长连接接收事件」，添加 im.message.receive_v1 与 card.action.trigger（卡片按钮：停止/重试）；权限需包含 im:message 与 im:message:send。可添加多个机器人（跨租户或同租户多应用）。
             </div>
           </div>
           <button

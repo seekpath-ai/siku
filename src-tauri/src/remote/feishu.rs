@@ -10,7 +10,7 @@ use feishu_sdk::event::{
     Event, EventDispatcher, EventDispatcherConfig, EventHandler, EventHandlerResult,
 };
 use feishu_sdk::ws::StreamClient;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager as _};
 
 use crate::core::models::FeishuBotConfig;
 use crate::remote::router::{self, ChatKind, InboundMessage, ReplySink};
@@ -65,10 +65,11 @@ async fn run(
     let http_client = feishu_sdk::Client::builder(config.clone())
         .build()
         .map_err(|e| format!("feishu client init failed: {e}"))?;
+    let cards: CardRegistry = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let sink: Arc<dyn ReplySink> = Arc::new(FeishuSink {
         client: http_client,
         cfg: cfg.clone(),
-        cards: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        cards: cards.clone(),
     });
 
     let dispatcher = EventDispatcher::new(EventDispatcherConfig::new(), logger);
@@ -78,6 +79,18 @@ async fn run(
             sink: sink.clone(),
             bot_open_id: bot.open_id.clone(),
             cfg: cfg.clone(),
+            instance_channel: format!("feishu:{}", cfg.app_id),
+        }))
+        .await;
+    // Card button callbacks (停止/重试/思考过程). Requires the
+    // "卡片回传交互 card.action.trigger" event subscription in the app
+    // console; without it the buttons simply do nothing.
+    dispatcher
+        .register_handler(Box::new(FeishuCardActionHandler {
+            app: app.clone(),
+            cfg: cfg.clone(),
+            cards,
+            sink: sink.clone(),
             instance_channel: format!("feishu:{}", cfg.app_id),
         }))
         .await;
@@ -513,19 +526,166 @@ fn is_non_text_user_message(payload: &serde_json::Value) -> bool {
         && payload.pointer("/message/message_type").and_then(|v| v.as_str()) != Some("text")
 }
 
+// ---------------------------------------------------------------- card actions
+// Button callbacks from progress/final cards (停止生成 / 重试 / 思考过程).
+// They arrive as card.action.trigger events over the same long connection.
+
+struct FeishuCardActionHandler {
+    app: AppHandle,
+    cfg: FeishuBotConfig,
+    cards: CardRegistry,
+    sink: Arc<dyn ReplySink>,
+    instance_channel: String,
+}
+
+impl EventHandler for FeishuCardActionHandler {
+    fn event_type(&self) -> &str {
+        "card.action.trigger"
+    }
+
+    fn handle(&self, event: Event) -> Pin<Box<dyn Future<Output = EventHandlerResult> + Send + '_>> {
+        Box::pin(async move {
+            let Some(payload) = event.event else {
+                return Ok(None);
+            };
+            let action = payload
+                .pointer("/action/value/remote")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let chat_id = payload
+                .pointer("/context/open_chat_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let message_id = payload
+                .pointer("/context/open_message_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let operator = payload
+                .pointer("/operator/open_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if action.is_empty() || chat_id.is_empty() {
+                return Ok(None);
+            }
+            let state = self
+                .cards
+                .lock()
+                .ok()
+                .and_then(|cards| cards.get(chat_id).cloned());
+            let Some(state) = state else {
+                return Ok(None);
+            };
+            // Ignore clicks on superseded cards from older turns.
+            if !message_id.is_empty() && message_id != state.message_id {
+                return Ok(None);
+            }
+            match action {
+                "stop" => self.handle_stop(chat_id, state).await,
+                "retry" => self.handle_retry(chat_id, operator, state).await,
+                "toggle_thinking" => self.handle_toggle(chat_id).await,
+                _ => {}
+            }
+            Ok(None)
+        })
+    }
+}
+
+impl FeishuCardActionHandler {
+    /// Cancel the engine turn. The router's progress_finish renders the
+    /// final stopped card once the cancelled reply row lands; we patch a
+    /// "stopping" hint immediately so the button feels responsive.
+    async fn handle_stop(&self, chat_id: &str, mut state: CardState) {
+        if state.finished {
+            return;
+        }
+        {
+            let app_state = self.app.state::<crate::AppState>();
+            let tokens = app_state.cancel_tokens.lock().await;
+            if let Some(token) = tokens.get(&state.session_id) {
+                token.cancel();
+            }
+        }
+        state.stopped = true;
+        if let Ok(mut cards) = self.cards.lock() {
+            cards.insert(chat_id.to_string(), state.clone());
+        }
+        let hint = card_json(
+            "⏹ 正在停止…",
+            "orange",
+            vec![md_div(&state.preview), note_el("思库远程助手")],
+        );
+        let _ = card_update(&self.cfg, &state.message_id, &hint).await;
+    }
+
+    /// Re-run the same prompt through the normal pipeline. The old card
+    /// gets a retried marker; the new turn creates its own progress card.
+    async fn handle_retry(&self, chat_id: &str, operator: &str, mut state: CardState) {
+        if !state.finished {
+            return;
+        }
+        state.footer = format!("{} · 已重试 ↻", state.footer);
+        let _ = card_update(&self.cfg, &state.message_id, &final_card(&state)).await;
+        let inbound = InboundMessage {
+            channel: self.instance_channel.clone(),
+            chat_id: chat_id.to_string(),
+            kind: state.kind,
+            user_id: operator.to_string(),
+            user_name: String::new(),
+            msg_id: String::new(), // synthetic click: no dedup entry
+            text: state.prompt.clone(),
+            images: Vec::new(),
+            media: None,
+        };
+        router::enqueue(self.app.clone(), inbound, self.sink.clone()).await;
+    }
+
+    async fn handle_toggle(&self, chat_id: &str) {
+        let (message_id, card) = {
+            let Ok(mut cards) = self.cards.lock() else {
+                return;
+            };
+            let Some(state) = cards.get_mut(chat_id) else {
+                return;
+            };
+            state.thinking_expanded = !state.thinking_expanded;
+            (state.message_id.clone(), final_card(state))
+        };
+        let _ = card_update(&self.cfg, &message_id, &card).await;
+    }
+}
+
 // ---------------------------------------------------------------- replies
 
 struct FeishuSink {
     client: feishu_sdk::Client,
     cfg: FeishuBotConfig,
-    /// In-flight progress cards: chat_id → card state. One per chat at
-    /// a time (the per-chat lock serializes remote turns).
-    cards: Arc<std::sync::Mutex<std::collections::HashMap<String, CardState>>>,
+    /// In-flight and settled progress cards: chat_id → card state. Shared
+    /// with the card-action callback handler (stop/retry/thinking buttons).
+    cards: CardRegistry,
 }
 
+type CardRegistry = Arc<std::sync::Mutex<std::collections::HashMap<String, CardState>>>;
+
+#[derive(Clone)]
 struct CardState {
     message_id: String,
     preview: String,
+    /// Full prompt and routing context, so the retry button can re-run the
+    /// turn without any further lookup.
+    prompt: String,
+    session_id: String,
+    kind: ChatKind,
+    /// Set by progress_finish when the turn settled.
+    finished: bool,
+    ok: bool,
+    /// Card body (the reply, or the "分条发送" pointer for long replies).
+    reply: String,
+    thinking: String,
+    footer: String,
+    /// The user clicked 停止生成 before the turn settled: progress_finish
+    /// renders the stopped header instead of the success one.
+    stopped: bool,
+    thinking_expanded: bool,
 }
 
 // ---------------------------------------------------------------- progress cards
@@ -552,6 +712,44 @@ fn card_json(header: &str, template: &str, elements: Vec<serde_json::Value>) -> 
         "elements": elements,
     })
     .to_string()
+}
+
+/// Card action row. Each button carries {"remote": action} in its value —
+/// the card.action.trigger callback dispatches on it.
+fn buttons_el(buttons: &[(&str, &str, &str)]) -> serde_json::Value {
+    serde_json::json!({
+        "tag": "action",
+        "actions": buttons.iter().map(|(text, kind, action)| serde_json::json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": text },
+            "type": kind,
+            "value": { "remote": action },
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// The settled card: success/stopped/failure header, reply body, optional
+/// expanded thinking section, footer, retry (+thinking toggle) buttons.
+fn final_card(state: &CardState) -> String {
+    let (header, template) = if state.stopped {
+        ("⏹ 已停止", "orange")
+    } else if state.ok {
+        ("✅ 已完成", "green")
+    } else {
+        ("❌ 处理失败", "red")
+    };
+    let mut els = vec![md_div(&state.reply), hr_el(), note_el(&state.footer)];
+    let mut buttons: Vec<(&str, &str, &str)> = vec![("重试", "primary", "retry")];
+    if !state.thinking.is_empty() {
+        if state.thinking_expanded {
+            els.push(md_div(&format!("**思考过程**\n{}", state.thinking)));
+            buttons.push(("收起思考过程", "default", "toggle_thinking"));
+        } else {
+            buttons.push(("思考过程", "default", "toggle_thinking"));
+        }
+    }
+    els.push(buttons_el(&buttons));
+    card_json(header, template, els)
 }
 
 /// The in-progress card: prompt preview, tool action lines with live
@@ -586,6 +784,7 @@ fn progress_card(preview: &str, p: &crate::remote::router::RemoteProgress) -> St
         els.push(md_div(&p.answer_so_far));
     }
     els.push(note_el(&format!("已用时 {}s · 思库远程助手", p.elapsed_secs())));
+    els.push(buttons_el(&[("停止生成", "danger", "stop")]));
     card_json("⏳ 思库正在处理", "blue", els)
 }
 
@@ -756,7 +955,14 @@ impl ReplySink for FeishuSink {
         Ok(())
     }
 
-    async fn progress_start(&self, chat_id: &str, preview: &str) -> Result<(), String> {
+    async fn progress_start(
+        &self,
+        chat_id: &str,
+        preview: &str,
+        session_id: &str,
+        prompt: &str,
+        kind: ChatKind,
+    ) -> Result<(), String> {
         let card = progress_card(preview, &crate::remote::router::RemoteProgress::default());
         match card_create(&self.cfg, chat_id, &card).await {
             Ok(message_id) => {
@@ -766,6 +972,16 @@ impl ReplySink for FeishuSink {
                         CardState {
                             message_id,
                             preview: preview.to_string(),
+                            prompt: prompt.to_string(),
+                            session_id: session_id.to_string(),
+                            kind,
+                            finished: false,
+                            ok: false,
+                            reply: String::new(),
+                            thinking: String::new(),
+                            footer: String::new(),
+                            stopped: false,
+                            thinking_expanded: false,
                         },
                     );
                 }
@@ -806,35 +1022,35 @@ impl ReplySink for FeishuSink {
         ok: bool,
         progress: &crate::remote::router::RemoteProgress,
     ) -> Result<bool, String> {
-        let state = self
-            .cards
-            .lock()
-            .ok()
-            .and_then(|mut cards| cards.remove(chat_id));
-        let Some(CardState { message_id, .. }) = state else {
-            return Ok(false);
-        };
         // Long replies overflow the card body: finalize the card with a
         // pointer and let the router send the text chunks as usual.
         const FINAL_CARD_MAX: usize = 2500;
+        let (body, handled) = if !ok {
+            (reply.to_string(), true)
+        } else if reply.len() <= FINAL_CARD_MAX {
+            (reply.to_string(), true)
+        } else {
+            ("回复较长，分条发送：".to_string(), false)
+        };
         let footer = format!(
-            "用时 {}s · {} 次工具调用",
+            "用时 {}s · {} 次工具调用 · 思库远程助手",
             progress.elapsed_secs(),
             progress.actions.len()
         );
-        let (header, template, body, handled) = if !ok {
-            ("❌ 处理失败", "red", reply.to_string(), true)
-        } else if reply.len() <= FINAL_CARD_MAX {
-            ("✅ 已完成", "green", reply.to_string(), true)
-        } else {
-            (
-                "✅ 已完成",
-                "green",
-                "回复较长，分条发送：".to_string(),
-                false,
-            )
+        let (message_id, card) = {
+            let Ok(mut cards) = self.cards.lock() else {
+                return Ok(false);
+            };
+            let Some(state) = cards.get_mut(chat_id) else {
+                return Ok(false);
+            };
+            state.finished = true;
+            state.ok = ok;
+            state.reply = body;
+            state.thinking = progress.thinking_so_far.clone();
+            state.footer = footer;
+            (state.message_id.clone(), final_card(state))
         };
-        let card = card_json(header, template, vec![md_div(&body), hr_el(), note_el(&footer)]);
         card_update(&self.cfg, &message_id, &card).await?;
         Ok(handled)
     }

@@ -466,7 +466,14 @@ impl ReplySink for WeixinSink {
         send_text_raw(&self.http, &self.base_url, &self.token, &self.db, chat_id, text).await
     }
 
-    async fn progress_start(&self, chat_id: &str, _preview: &str) -> Result<(), String> {
+    async fn progress_start(
+        &self,
+        chat_id: &str,
+        _preview: &str,
+        _session_id: &str,
+        _prompt: &str,
+        _kind: crate::remote::router::ChatKind,
+    ) -> Result<(), String> {
         let mut handles = Vec::new();
         for (delay_secs, notice) in [
             (ACK_DELAY_SECS, "收到，正在思考…"),

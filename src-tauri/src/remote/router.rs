@@ -211,6 +211,21 @@ pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySin
 
 // ---------------------------------------------------------------- processing
 
+/// Per-chat serialization: tasks waiting on the lock ARE the message queue.
+/// A second message mid-turn no longer gets "稍后再发" — it waits its turn
+/// and is answered automatically when the running turn completes.
+static CHAT_LOCKS: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+async fn chat_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    CHAT_LOCKS
+        .lock()
+        .await
+        .entry(key.to_string())
+        .or_default()
+        .clone()
+}
+
 async fn process_batch(
     app: AppHandle,
     meta: InboundMessage,
@@ -231,12 +246,25 @@ async fn process_batch(
         return;
     }
 
+    // Pairing stays outside the queue: a stranger gets the pairing notice
+    // immediately instead of waiting behind a running turn.
     let session_id = match ensure_paired(&db, &app, &meta, &sink).await {
         Ok(Some(sid)) => sid,
         Ok(None) => return, // pairing notice already handled
         Err(e) => {
             tracing::error!(error = %e, "remote pairing check failed");
             return;
+        }
+    };
+
+    let lock = chat_lock(&format!("{}:{}", meta.channel, meta.chat_id)).await;
+    let _guard = match lock.clone().try_lock_owned() {
+        Ok(g) => g,
+        Err(_) => {
+            let _ = sink
+                .send_text(&meta.chat_id, "收到，上一条还在处理——这条已排队，完成后自动回复你。")
+                .await;
+            lock.lock_owned().await
         }
     };
 
@@ -276,7 +304,9 @@ async fn process_batch(
             _ => "（回复生成超时，请稍后在思库对话中查看，或追问一次）".to_string(),
         },
         Err(e) if e.contains("正在生成中") => {
-            "上一条消息还在处理中，请稍后再发。".to_string()
+            // The per-chat lock serializes remote turns, so reaching here
+            // means the session is being driven from the siku UI itself.
+            "这个会话正在思库应用内处理消息，请稍后再发。".to_string()
         }
         Err(e) => {
             tracing::error!(error = %e, "remote agent turn failed");

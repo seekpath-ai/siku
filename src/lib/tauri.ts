@@ -2885,3 +2885,48 @@ export async function remoteWeixinLoginVerify(code: string): Promise<void> {
 export async function remoteWeixinLogout(): Promise<void> {
   return invoke<void>('remote_weixin_logout');
 }
+
+// ---------------------------------------------------------------- remote group info/files
+
+export interface RemoteChatMember {
+  id: string;
+  name: string;
+  is_owner: boolean;
+}
+
+export interface RemoteChatInfo {
+  name: string;
+  description: string;
+  member_count: number;
+  members: RemoteChatMember[];
+}
+
+export interface RemoteChatFile {
+  message_id: string;
+  file_key: string;
+  kind: string;
+  name: string;
+  size_bytes: number;
+  sender_id: string;
+  create_time_ms: string;
+}
+
+export async function remoteChatInfo(channel: string, chatId: string): Promise<RemoteChatInfo> {
+  return invoke<RemoteChatInfo>('remote_chat_info', { channel, chatId });
+}
+
+export async function remoteChatFiles(channel: string, chatId: string): Promise<RemoteChatFile[]> {
+  return invoke<RemoteChatFile[]>('remote_chat_files', { channel, chatId });
+}
+
+export async function remoteChatFileSave(
+  channel: string, messageId: string, fileKey: string, kind: string, savePath: string
+): Promise<void> {
+  return invoke<void>('remote_chat_file_save', { channel, messageId, fileKey, kind, savePath });
+}
+
+export async function remoteChatFileImport(
+  channel: string, messageId: string, fileKey: string, kind: string, fileName: string
+): Promise<Paper> {
+  return invoke<Paper>('remote_chat_file_import', { channel, messageId, fileKey, kind, fileName });
+}

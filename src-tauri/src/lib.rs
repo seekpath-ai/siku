@@ -894,6 +894,10 @@ pub fn run() {
             commands::remote::remote_pairings,
             commands::remote::remote_pairing_set,
             commands::remote::remote_pairing_delete,
+            commands::remote::remote_chat_info,
+            commands::remote::remote_chat_files,
+            commands::remote::remote_chat_file_save,
+            commands::remote::remote_chat_file_import,
             // Agent
             commands::agent::agent_create_session,
             commands::agent::agent_update_session,

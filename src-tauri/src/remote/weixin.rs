@@ -246,20 +246,79 @@ async fn handle_inbound(
         }
     }
     let mut text = String::new();
+    let mut images: Vec<crate::ai::llm::ImageAttachment> = Vec::new();
+    let mut media: Option<crate::remote::router::MediaRef> = None;
     if let Some(items) = msg.get("item_list").and_then(|v| v.as_array()) {
         for item in items {
-            if item.get("type").and_then(|v| v.as_i64()) == Some(1) {
-                if let Some(t) = item.pointer("/text_item/text").and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        text.push('\n');
+            match item.get("type").and_then(|v| v.as_i64()) {
+                Some(1) => {
+                    if let Some(t) = item.pointer("/text_item/text").and_then(|v| v.as_str()) {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(t);
                     }
-                    text.push_str(t);
                 }
+                // IMAGE: download + AES-128-ECB decrypt, feed the vision turn.
+                Some(2) => {
+                    let media_ref = item.get("image_item").and_then(|i| i.get("media"));
+                    let aeskey = item
+                        .pointer("/image_item/aeskey")
+                        .and_then(|v| v.as_str());
+                    if let Some(m) = media_ref {
+                        match cdn_download(m, aeskey).await {
+                            Ok(bytes) => images.push(crate::ai::llm::ImageAttachment {
+                                mime: sniff_image_mime(&bytes).to_string(),
+                                base64: base64::Engine::encode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    &bytes,
+                                ),
+                                name: None,
+                            }),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "weixin image download failed");
+                            }
+                        }
+                    }
+                }
+                // FILE: download + decrypt, stash under remote_downloads and
+                // let the router answer with guidance.
+                Some(4) => {
+                    let media_ref = item.get("file_item").and_then(|i| i.get("media"));
+                    let name = item
+                        .pointer("/file_item/file_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("文件")
+                        .to_string();
+                    if let Some(m) = media_ref {
+                        match cdn_download(m, None).await {
+                            Ok(bytes) => {
+                                let dir = app.state::<crate::AppState>().app_data_dir.join("remote_downloads");
+                                if std::fs::create_dir_all(&dir).is_ok() {
+                                    let path = dir.join(format!("{}_{}", uuid::Uuid::new_v4(), name));
+                                    if let Err(e) = std::fs::write(&path, &bytes) {
+                                        tracing::warn!(error = %e, "weixin file save failed");
+                                    }
+                                }
+                                media = Some(crate::remote::router::MediaRef {
+                                    kind: "file".to_string(),
+                                    name: name.clone(),
+                                    message_id: String::new(),
+                                    file_key: String::new(),
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "weixin file download failed");
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
     let text = text.trim().to_string();
-    if text.is_empty() {
+    if text.is_empty() && images.is_empty() && media.is_none() {
         return;
     }
     let msg_id = msg
@@ -286,6 +345,8 @@ async fn handle_inbound(
             user_name: String::new(),
             msg_id,
             text,
+            images,
+            media,
         },
         sink.clone(),
     )
@@ -619,4 +680,124 @@ async fn run_login(
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     Err("登录超时，请重新发起".to_string())
+}
+
+// ---------------------------------------------------------------- CDN media
+// Inbound images/files arrive as CDNMedia references: encrypted bytes on the
+// WeChat CDN, AES-128-ECB key in the message. Mirrors the official plugin's
+// pic-decrypt.ts.
+
+const CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+
+/// encrypt_query_param is base64-ish; encode only what a query value must.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Key material arrives in two encodings (per the official plugin):
+/// base64(raw 16 bytes) — images; base64(32-char hex) — file/voice/video.
+fn parse_aes_key(b64: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    if decoded.len() == 16 {
+        return Some(decoded);
+    }
+    if decoded.len() == 32 {
+        if let Ok(s) = std::str::from_utf8(&decoded) {
+            if let Ok(raw) = hex::decode(s) {
+                if raw.len() == 16 {
+                    return Some(raw);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// ECB with manual PKCS7 unpad, block-by-block over raw AES-128 (avoids the
+/// `ecb` crate's mode trait plumbing for a 16-byte-block scheme).
+fn aes_ecb_decrypt(key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    use aes::cipher::{BlockDecrypt, KeyInit};
+    if data.is_empty() || data.len() % 16 != 0 || key.len() != 16 {
+        return None;
+    }
+    let cipher = aes::Aes128::new(key.into());
+    let mut out = data.to_vec();
+    for chunk in out.chunks_exact_mut(16) {
+        cipher.decrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(chunk));
+    }
+    let pad = *out.last()? as usize;
+    if pad == 0 || pad > 16 || pad > out.len() {
+        return None;
+    }
+    if out.iter().skip(out.len() - pad).any(|&b| b as usize != pad) {
+        return None;
+    }
+    out.truncate(out.len() - pad);
+    Some(out)
+}
+
+fn sniff_image_mime(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "image/png"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        "image/webp"
+    } else {
+        "image/jpeg"
+    }
+}
+
+/// Download (and when keyed, AES-128-ECB decrypt) a CDN media reference.
+/// `full_url` wins; otherwise the URL is built from encrypt_query_param.
+async fn cdn_download(
+    media: &serde_json::Value,
+    aeskey_hex: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let url = match media.get("full_url").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        Some(u) => u.to_string(),
+        None => {
+            let eqp = media
+                .get("encrypt_query_param")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or("CDN 媒体缺少 full_url/encrypt_query_param")?;
+            format!("{CDN_BASE_URL}/download?encrypted_query_param={}", percent_encode(eqp))
+        }
+    };
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("CDN 下载失败: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("CDN 下载失败: HTTP {}", resp.status()));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("CDN 读取失败: {e}"))?
+        .to_vec();
+    // image_item.aeskey (raw hex) is preferred over media.aes_key (base64).
+    let key = aeskey_hex
+        .and_then(|h| hex::decode(h).ok())
+        .filter(|k| k.len() == 16)
+        .or_else(|| media.get("aes_key").and_then(|v| v.as_str()).and_then(parse_aes_key));
+    match key {
+        Some(k) => aes_ecb_decrypt(&k, &bytes).ok_or_else(|| "CDN 媒体解密失败".to_string()),
+        None => Ok(bytes),
+    }
 }

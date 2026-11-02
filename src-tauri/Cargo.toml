@@ -43,6 +43,8 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 base64 = "0.22"
+# WeChat iLink CDN media is AES-128-ECB encrypted (see remote/weixin.rs).
+aes = "0.8"
 anyhow = "1.0"
 raw-window-handle = "0.6"
 tracing = "0.1"

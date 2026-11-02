@@ -75,6 +75,7 @@ async fn run(
             app: app.clone(),
             sink: sink.clone(),
             bot_open_id: bot.open_id.clone(),
+            cfg: cfg.clone(),
         }))
         .await;
 
@@ -110,7 +111,7 @@ struct BotInfo {
 
 /// tenant_access_token, split out of fetch_bot_info so name resolution can
 /// reuse it.
-async fn tenant_token(cfg: &FeishuChannelConfig) -> Result<String, String> {
+pub(crate) async fn tenant_token(cfg: &FeishuChannelConfig) -> Result<String, String> {
     let http = reqwest::Client::new();
     let token_resp: serde_json::Value = http
         .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
@@ -165,6 +166,7 @@ struct FeishuMessageHandler {
     app: AppHandle,
     sink: Arc<dyn ReplySink>,
     bot_open_id: String,
+    cfg: FeishuChannelConfig,
 }
 
 impl EventHandler for FeishuMessageHandler {
@@ -185,7 +187,38 @@ impl EventHandler for FeishuMessageHandler {
                 "feishu message event"
             );
             match parse_inbound(&payload, &self.bot_open_id) {
-                Ok(Some(inbound)) => {
+                Ok(Some(mut inbound)) => {
+                    // Image messages: fetch the attachment now so the agent
+                    // turn gets real pixels. Files stay as references — the
+                    // router answers them with guidance instead.
+                    let is_image = inbound
+                        .media
+                        .as_ref()
+                        .map(|m| m.kind == "image")
+                        .unwrap_or(false);
+                    if is_image {
+                        let m = inbound.media.clone().unwrap();
+                        match download_resource(&self.cfg, &m.message_id, &m.file_key, "image").await {
+                            Ok((bytes, mime)) => {
+                                inbound.images.push(crate::ai::llm::ImageAttachment {
+                                    mime: if mime.starts_with("image/") { mime } else { "image/jpeg".to_string() },
+                                    base64: base64::Engine::encode(
+                                        &base64::engine::general_purpose::STANDARD,
+                                        &bytes,
+                                    ),
+                                    name: None,
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "feishu image download failed");
+                                let _ = self
+                                    .sink
+                                    .send_text(&inbound.chat_id, "图片下载失败，请重发一次。")
+                                    .await;
+                                return Ok(None);
+                            }
+                        }
+                    }
                     router::enqueue(self.app.clone(), inbound, self.sink.clone()).await;
                 }
                 Ok(None) => {
@@ -200,7 +233,7 @@ impl EventHandler for FeishuMessageHandler {
                         if !chat_id.is_empty() {
                             let _ = self
                                 .sink
-                                .send_text(chat_id, "目前只支持文字消息，图片和文件请在思库应用内处理。")
+                                .send_text(chat_id, "暂不支持这类消息：目前支持文字和图片；文件请在思库对话列表右键本会话 →「查看群文件」处理。")
                                 .await;
                         }
                     }
@@ -228,8 +261,9 @@ fn parse_inbound(
         return Err("非人类发送者（机器人消息），忽略");
     }
     let message = payload.get("message").ok_or("负载缺少 message 字段")?;
-    if message.get("message_type").and_then(|v| v.as_str()) != Some("text") {
-        return Ok(None); // non-text: handled by the caller with a notice
+    let msg_type = message.get("message_type").and_then(|v| v.as_str()).unwrap_or_default();
+    if msg_type != "text" && msg_type != "image" && msg_type != "file" {
+        return Ok(None); // other types: handled by the caller with a notice
     }
     let kind = match message.get("chat_type").and_then(|v| v.as_str()) {
         Some("p2p") => ChatKind::Private,
@@ -249,6 +283,66 @@ fn parse_inbound(
         return Err("群聊消息未 @ 机器人，按策略忽略");
     }
 
+    let msg_id = message
+        .get("message_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let chat_id = message
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .ok_or("消息缺少 chat_id")?;
+    let user_id = payload
+        .pointer("/sender/sender_id/open_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    if msg_type != "text" {
+        // Media messages carry no text; the file_key/image_key locates the
+        // attachment for the handler to download (images) or for the group
+        // files dialog to fetch later (files).
+        let content = message
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or("消息缺少 content")?;
+        let c: serde_json::Value = serde_json::from_str(content)
+            .map_err(|_| "content 不是合法的 JSON")?;
+        let (key, name) = if msg_type == "image" {
+            (
+                c.get("image_key").and_then(|k| k.as_str()).unwrap_or_default(),
+                "图片".to_string(),
+            )
+        } else {
+            (
+                c.get("file_key").and_then(|k| k.as_str()).unwrap_or_default(),
+                c.get("file_name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("文件")
+                    .to_string(),
+            )
+        };
+        if key.is_empty() {
+            return Err("媒体消息缺少 file_key/image_key");
+        }
+        return Ok(Some(InboundMessage {
+            channel: "feishu",
+            chat_id: chat_id.to_string(),
+            kind,
+            user_id,
+            user_name: String::new(),
+            msg_id: msg_id.clone(),
+            text: String::new(),
+            images: Vec::new(),
+            media: Some(crate::remote::router::MediaRef {
+                kind: msg_type.to_string(),
+                name,
+                message_id: msg_id,
+                file_key: key.to_string(),
+            }),
+        }));
+    }
+
     let content = message
         .get("content")
         .and_then(|v| v.as_str())
@@ -265,26 +359,16 @@ fn parse_inbound(
         return Err("去除 @ 引用后文本为空");
     }
 
-    let chat_id = message
-        .get("chat_id")
-        .and_then(|v| v.as_str())
-        .ok_or("消息缺少 chat_id")?;
     Ok(Some(InboundMessage {
         channel: "feishu",
         chat_id: chat_id.to_string(),
         kind,
-        user_id: payload
-            .pointer("/sender/sender_id/open_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
+        user_id,
         user_name: String::new(),
-        msg_id: message
-            .get("message_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
+        msg_id,
         text,
+        images: Vec::new(),
+        media: None,
     }))
 }
 
@@ -464,4 +548,215 @@ fn chunk_text(text: &str, max: usize) -> Vec<String> {
         out.push(current);
     }
     out
+}
+
+// ---------------------------------------------------------------- group info & files
+// REST helpers backing the "查看群信息 / 查看群文件" dialogs. They reuse the
+// stored app credentials and need no live channel connection.
+
+pub(crate) struct FeishuChatInfo {
+    pub name: String,
+    pub description: String,
+    pub owner_id: String,
+    pub member_count: i64,
+}
+
+pub(crate) struct FeishuMember {
+    pub open_id: String,
+    pub name: String,
+}
+
+pub(crate) struct FeishuChatFile {
+    pub message_id: String,
+    pub file_key: String,
+    pub kind: String, // "file" | "image"
+    pub name: String,
+    pub size_bytes: i64,
+    pub sender_id: String,
+    pub create_time_ms: String,
+}
+
+fn feishu_data(v: &serde_json::Value, what: &str) -> Result<serde_json::Value, String> {
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(format!("飞书{what}失败: code={code} {msg}（请确认权限已开通并已发布版本）"));
+    }
+    Ok(v.get("data").cloned().unwrap_or(serde_json::Value::Null))
+}
+
+pub(crate) async fn fetch_chat_info(
+    cfg: &FeishuChannelConfig,
+    chat_id: &str,
+) -> Result<(FeishuChatInfo, Vec<FeishuMember>), String> {
+    let token = tenant_token(cfg).await?;
+    let http = reqwest::Client::new();
+
+    let v: serde_json::Value = http
+        .get(format!("https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| format!("飞书群信息请求失败: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("飞书群信息解析失败: {e}"))?;
+    let data = feishu_data(&v, "获取群信息")?;
+    let info = FeishuChatInfo {
+        name: data.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string(),
+        description: data
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        owner_id: data.get("owner_id").and_then(|o| o.as_str()).unwrap_or_default().to_string(),
+        member_count: data
+            .get("user_count")
+            .and_then(|c| c.as_str().and_then(|s| s.parse().ok()).or_else(|| c.as_i64()))
+            .unwrap_or(0),
+    };
+
+    let mut members = Vec::new();
+    let mut page_token = String::new();
+    for _ in 0..6 {
+        let url = format!(
+            "https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}/members?member_id_type=open_id&page_size=100{page}"
+        , page = if page_token.is_empty() { String::new() } else { format!("&page_token={page_token}") });
+        let v: serde_json::Value = http
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| format!("飞书群成员请求失败: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("飞书群成员解析失败: {e}"))?;
+        let data = feishu_data(&v, "获取群成员")?;
+        if let Some(items) = data.get("items").and_then(|i| i.as_array()) {
+            for m in items {
+                members.push(FeishuMember {
+                    open_id: m.get("member_id").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+                    name: m.get("name").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+                });
+            }
+        }
+        let more = data.get("has_more").and_then(|h| h.as_bool()).unwrap_or(false);
+        page_token = data
+            .get("page_token")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if !more || page_token.is_empty() {
+            break;
+        }
+    }
+    Ok((info, members))
+}
+
+/// File/image messages in the chat, newest first (capped at ~200 entries).
+pub(crate) async fn fetch_chat_files(
+    cfg: &FeishuChannelConfig,
+    chat_id: &str,
+) -> Result<Vec<FeishuChatFile>, String> {
+    let token = tenant_token(cfg).await?;
+    let http = reqwest::Client::new();
+    let mut out = Vec::new();
+    let mut page_token = String::new();
+    for _ in 0..10 {
+        let url = format!(
+            "https://open.feishu.cn/open-apis/im/v1/messages?container_id_type=chat&container_id={chat_id}&sort_type=ByCreateTimeDesc&page_size=50{page}"
+        , page = if page_token.is_empty() { String::new() } else { format!("&page_token={page_token}") });
+        let v: serde_json::Value = http
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| format!("飞书消息列表请求失败: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("飞书消息列表解析失败: {e}"))?;
+        let data = feishu_data(&v, "获取群文件")?;
+        if let Some(items) = data.get("items").and_then(|i| i.as_array()) {
+            for m in items {
+                let msg_type = m.get("message_type").and_then(|t| t.as_str()).unwrap_or_default();
+                if msg_type != "file" && msg_type != "image" {
+                    continue;
+                }
+                let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("{}");
+                let c: serde_json::Value = serde_json::from_str(content).unwrap_or_default();
+                let (key, name, size) = if msg_type == "file" {
+                    (
+                        c.get("file_key").and_then(|k| k.as_str()).unwrap_or_default().to_string(),
+                        c.get("file_name").and_then(|n| n.as_str()).unwrap_or("文件").to_string(),
+                        c.get("file_size").and_then(|s| s.as_i64()).unwrap_or(0),
+                    )
+                } else {
+                    (
+                        c.get("image_key").and_then(|k| k.as_str()).unwrap_or_default().to_string(),
+                        format!("图片.{}", c.get("image_type").and_then(|t| t.as_str()).unwrap_or("png")),
+                        0,
+                    )
+                };
+                if key.is_empty() {
+                    continue;
+                }
+                out.push(FeishuChatFile {
+                    message_id: m.get("message_id").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+                    file_key: key,
+                    kind: msg_type.to_string(),
+                    name,
+                    size_bytes: size,
+                    sender_id: m.pointer("/sender/id").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+                    create_time_ms: m.get("create_time").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+                });
+                if out.len() >= 200 {
+                    return Ok(out);
+                }
+            }
+        }
+        let more = data.get("has_more").and_then(|h| h.as_bool()).unwrap_or(false);
+        page_token = data
+            .get("page_token")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if !more || page_token.is_empty() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Download a message attachment (file or image); returns bytes + mime.
+pub(crate) async fn download_resource(
+    cfg: &FeishuChannelConfig,
+    message_id: &str,
+    file_key: &str,
+    kind: &str,
+) -> Result<(Vec<u8>, String), String> {
+    let token = tenant_token(cfg).await?;
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}?type={kind}"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| format!("飞书文件下载失败: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("飞书文件下载失败: HTTP {status} {}", body.chars().take(200).collect::<String>()));
+    }
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("飞书文件读取失败: {e}"))?;
+    Ok((bytes.to_vec(), mime))
 }

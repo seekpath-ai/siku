@@ -48,6 +48,16 @@ pub enum ChatKind {
 }
 
 #[derive(Clone)]
+pub struct MediaRef {
+    /// "image" | "file" (images are additionally materialized into `images`).
+    pub kind: String,
+    pub name: String,
+    /// Channel-specific attachment locators (feishu message_id + file_key).
+    pub message_id: String,
+    pub file_key: String,
+}
+
+#[derive(Clone)]
 pub struct InboundMessage {
     pub channel: &'static str,
     pub chat_id: String,
@@ -56,6 +66,9 @@ pub struct InboundMessage {
     pub user_name: String,
     pub msg_id: String,
     pub text: String,
+    /// Downloaded image attachments ready for the agent turn.
+    pub images: Vec<crate::ai::llm::ImageAttachment>,
+    pub media: Option<MediaRef>,
 }
 
 #[async_trait::async_trait]
@@ -159,6 +172,7 @@ async fn rate_limited(user_key: &str) -> bool {
 struct PendingBatch {
     generation: u64,
     texts: Vec<String>,
+    images: Vec<crate::ai::llm::ImageAttachment>,
     meta: Option<InboundMessage>,
     sink: Arc<dyn ReplySink>,
 }
@@ -179,11 +193,13 @@ pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySin
         let entry = map.entry(key.clone()).or_insert_with(|| PendingBatch {
             generation: 0,
             texts: Vec::new(),
+            images: Vec::new(),
             meta: None,
             sink: sink.clone(),
         });
         entry.generation += 1;
         entry.texts.push(msg.text.clone());
+        entry.images.extend(msg.images.clone());
         entry.meta = Some(msg);
         entry.sink = sink;
         entry.generation
@@ -196,15 +212,16 @@ pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySin
             map.get_mut(&key).and_then(|entry| {
                 if entry.generation == generation {
                     let texts = std::mem::take(&mut entry.texts);
+                    let images = std::mem::take(&mut entry.images);
                     let meta = entry.meta.clone();
-                    meta.map(|m| (m, texts, entry.sink.clone()))
+                    meta.map(|m| (m, texts, images, entry.sink.clone()))
                 } else {
                     None
                 }
             })
         };
-        if let Some((meta, texts, sink)) = ready {
-            process_batch(app, meta, texts, sink).await;
+        if let Some((meta, texts, images, sink)) = ready {
+            process_batch(app, meta, texts, images, sink).await;
         }
     });
 }
@@ -230,10 +247,14 @@ async fn process_batch(
     app: AppHandle,
     meta: InboundMessage,
     texts: Vec<String>,
+    images: Vec<crate::ai::llm::ImageAttachment>,
     sink: Arc<dyn ReplySink>,
 ) {
-    let text = texts.join("\n");
-    if text.trim().is_empty() {
+    let mut text = texts.join("\n");
+    if text.trim().is_empty() && !images.is_empty() {
+        text = "[图片]".to_string();
+    }
+    if text.trim().is_empty() && images.is_empty() && meta.media.is_none() {
         return;
     }
     let state = app.state::<AppState>();
@@ -268,6 +289,25 @@ async fn process_batch(
         }
     };
 
+    // File messages never reach the agent (remote tools are read-only and
+    // cannot open attachments); answer with guidance instead.
+    if let Some(media) = &meta.media {
+        if media.kind == "file" {
+            let guidance = match meta.channel {
+                "feishu" => format!(
+                    "已收到文件《{}》。在思库对话列表右键本会话 →「查看群文件」，可将其导入文献库或另存到本地。",
+                    media.name
+                ),
+                _ => format!(
+                    "已收到文件《{}》，已保存到思库数据目录，请在思库应用内处理。",
+                    media.name
+                ),
+            };
+            let _ = sink.send_text(&meta.chat_id, &guidance).await;
+            return;
+        }
+    }
+
     let channel_label = channel_label(meta.channel);
     crate::commands::pet::pet_report(
         &app,
@@ -294,7 +334,7 @@ async fn process_batch(
         &app,
         session_id.clone(),
         text.clone(),
-        None,
+        if images.is_empty() { None } else { Some(images) },
     )
     .await;
 
@@ -404,7 +444,7 @@ async fn ensure_paired(
         .await
         .map_err(|e| format!("db error: {e}"))?;
         let _ = app.emit("remote:pairing", ());
-        let who = if display_user.is_empty() { "你" } else { &display_user };
+        let who = if display_user.is_empty() { "飞友" } else { &display_user };
         let _ = sink
             .send_text(
                 &meta.chat_id,
@@ -573,6 +613,10 @@ async fn create_remote_session(
         "remote": true,
         "channel": meta.channel,
         "chat_id": meta.chat_id,
+        "kind": match meta.kind {
+            ChatKind::Group => "group",
+            ChatKind::Private => "private",
+        },
     })
     .to_string();
     sqlx::query(

@@ -170,3 +170,138 @@ pub async fn remote_pairing_delete(
     let _ = app.emit("remote:pairing", ());
     Ok(())
 }
+
+// ---------------------------------------------------------------- group info & files (feishu)
+
+fn feishu_cfg(settings: &crate::core::models::DeviceAppSettings) -> Result<FeishuChannelConfig, String> {
+    let cfg = settings.remote.feishu.clone();
+    if cfg.app_id.is_empty() || cfg.app_secret.is_empty() {
+        return Err("飞书渠道未配置 App ID / App Secret".to_string());
+    }
+    Ok(cfg)
+}
+
+#[derive(serde::Serialize)]
+pub struct RemoteChatMember {
+    pub id: String,
+    pub name: String,
+    pub is_owner: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct RemoteChatInfo {
+    pub name: String,
+    pub description: String,
+    pub member_count: i64,
+    pub members: Vec<RemoteChatMember>,
+}
+
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn remote_chat_info(
+    state: State<'_, AppState>,
+    channel: String,
+    chat_id: String,
+) -> Result<RemoteChatInfo, String> {
+    if channel != "feishu" {
+        return Err("仅飞书会话支持查看群信息".to_string());
+    }
+    let cfg = feishu_cfg(&crate::core::settings_service::load_device_settings(&state.db).await?)?;
+    let (info, members) = crate::remote::feishu::fetch_chat_info(&cfg, &chat_id).await?;
+    Ok(RemoteChatInfo {
+        name: info.name,
+        description: info.description,
+        member_count: info.member_count,
+        members: members
+            .into_iter()
+            .map(|m| RemoteChatMember {
+                is_owner: !info.owner_id.is_empty() && m.open_id == info.owner_id,
+                id: m.open_id,
+                name: m.name,
+            })
+            .collect(),
+    })
+}
+
+#[derive(serde::Serialize)]
+pub struct RemoteChatFile {
+    pub message_id: String,
+    pub file_key: String,
+    pub kind: String,
+    pub name: String,
+    pub size_bytes: i64,
+    pub sender_id: String,
+    pub create_time_ms: String,
+}
+
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn remote_chat_files(
+    state: State<'_, AppState>,
+    channel: String,
+    chat_id: String,
+) -> Result<Vec<RemoteChatFile>, String> {
+    if channel != "feishu" {
+        return Err("仅飞书会话支持查看群文件".to_string());
+    }
+    let cfg = feishu_cfg(&crate::core::settings_service::load_device_settings(&state.db).await?)?;
+    let files = crate::remote::feishu::fetch_chat_files(&cfg, &chat_id).await?;
+    Ok(files
+        .into_iter()
+        .map(|f| RemoteChatFile {
+            message_id: f.message_id,
+            file_key: f.file_key,
+            kind: f.kind,
+            name: f.name,
+            size_bytes: f.size_bytes,
+            sender_id: f.sender_id,
+            create_time_ms: f.create_time_ms,
+        })
+        .collect())
+}
+
+/// Download a chat file message attachment to a user-chosen path.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn remote_chat_file_save(
+    state: State<'_, AppState>,
+    channel: String,
+    message_id: String,
+    file_key: String,
+    kind: String,
+    save_path: String,
+) -> Result<(), String> {
+    if channel != "feishu" {
+        return Err("仅飞书会话支持下载群文件".to_string());
+    }
+    let cfg = feishu_cfg(&crate::core::settings_service::load_device_settings(&state.db).await?)?;
+    let (bytes, _mime) = crate::remote::feishu::download_resource(&cfg, &message_id, &file_key, &kind).await?;
+    std::fs::write(&save_path, &bytes).map_err(|e| format!("写入文件失败: {e}"))
+}
+
+/// Download a chat file and import it into the library (PDF).
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn remote_chat_file_import(
+    state: State<'_, AppState>,
+    channel: String,
+    message_id: String,
+    file_key: String,
+    kind: String,
+    file_name: String,
+) -> Result<crate::core::models::Paper, String> {
+    if channel != "feishu" {
+        return Err("仅飞书会话支持导入群文件".to_string());
+    }
+    let cfg = feishu_cfg(&crate::core::settings_service::load_device_settings(&state.db).await?)?;
+    let (bytes, _mime) = crate::remote::feishu::download_resource(&cfg, &message_id, &file_key, &kind).await?;
+    let tmp_dir = state.app_data_dir.join("remote_downloads");
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("创建下载目录失败: {e}"))?;
+    let tmp = tmp_dir.join(format!("{}_{}", uuid::Uuid::new_v4(), file_name));
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("写入临时文件失败: {e}"))?;
+    let result = crate::core::paper_service::import_paper(&state.db, &state.app_data_dir, &tmp)
+        .await
+        .map_err(|e| e.to_string());
+    let _ = std::fs::remove_file(&tmp);
+    result
+}

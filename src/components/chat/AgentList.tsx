@@ -16,6 +16,7 @@ import {
   ArchiveRestore,
   Pencil,
   Download,
+  Users,
   ChevronDown,
   ChevronRight,
   Search,
@@ -39,6 +40,20 @@ import {
   saveTextFile,
 } from '@/lib/tauri';
 import type { ChatMessageHit } from '@/lib/tauri';
+import { RemoteChatInfoDialog } from './RemoteChatInfoDialog';
+import { RemoteChatFilesDialog } from './RemoteChatFilesDialog';
+
+/** Parse a session's remote-channel context; null for ordinary sessions. */
+function remoteContextOf(context: string | null): { channel: string; chatId: string; kind: string } | null {
+  if (!context) return null;
+  try {
+    const v = JSON.parse(context);
+    if (!v?.remote || typeof v.channel !== 'string' || typeof v.chat_id !== 'string') return null;
+    return { channel: v.channel, chatId: v.chat_id, kind: typeof v.kind === 'string' ? v.kind : '' };
+  } catch {
+    return null;
+  }
+}
 import { buildSessionMarkdown, sessionExportFileName } from '@/lib/exportTurn';
 import { useDialog } from '@/hooks/useDialog';
 import { ConfirmButton } from '@/components/ui/ConfirmButton';
@@ -150,6 +165,10 @@ export function AgentList() {
     y: 0,
     agentId: '',
   });
+  /** Open 「查看群信息 / 查看群文件」 dialog for a remote feishu session. */
+  const [remoteDialog, setRemoteDialog] = useState<
+    { kind: 'info' | 'files'; channel: string; chatId: string } | null
+  >(null);
   const [projectMenu, setProjectMenu] = useState<ProjectMenuState>({
     visible: false,
     x: 0,
@@ -884,12 +903,38 @@ export function AgentList() {
           {(() => {
             const agent = sessions.find((s) => s.id === contextMenu.agentId);
             if (!agent) return null;
+            const remote = remoteContextOf(agent.context);
+            const closeMenu = () => setContextMenu({ visible: false, x: 0, y: 0, agentId: '' });
             return (
               <>
+                {remote && remote.channel === 'feishu' && remote.kind !== 'private' && (
+                  <button
+                    onClick={() => {
+                      setRemoteDialog({ kind: 'info', channel: remote.channel, chatId: remote.chatId });
+                      closeMenu();
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
+                  >
+                    <Users size={14} />
+                    查看群信息
+                  </button>
+                )}
+                {remote && remote.channel === 'feishu' && (
+                  <button
+                    onClick={() => {
+                      setRemoteDialog({ kind: 'files', channel: remote.channel, chatId: remote.chatId });
+                      closeMenu();
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
+                  >
+                    <FolderOpen size={14} />
+                    查看群文件
+                  </button>
+                )}
                 <button
                   onClick={() => {
                     handlePin(agent.id, !agent.is_pinned);
-                    setContextMenu({ visible: false, x: 0, y: 0, agentId: '' });
+                    closeMenu();
                   }}
                   className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
                 >
@@ -899,7 +944,7 @@ export function AgentList() {
                 <button
                   onClick={() => {
                     setConfigAgent(agent);
-                    setContextMenu({ visible: false, x: 0, y: 0, agentId: '' });
+                    closeMenu();
                   }}
                   className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
                 >
@@ -909,7 +954,7 @@ export function AgentList() {
                 <button
                   onClick={() => {
                     void handleOpenWorkspace(agent);
-                    setContextMenu({ visible: false, x: 0, y: 0, agentId: '' });
+                    closeMenu();
                   }}
                   className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
                 >
@@ -919,7 +964,7 @@ export function AgentList() {
                 <button
                   onClick={() => {
                     void handleExportSession(agent);
-                    setContextMenu({ visible: false, x: 0, y: 0, agentId: '' });
+                    closeMenu();
                   }}
                   className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
                 >
@@ -929,7 +974,7 @@ export function AgentList() {
                 <button
                   onClick={() => {
                     handleArchiveSession(agent.id, !agent.archived);
-                    setContextMenu({ visible: false, x: 0, y: 0, agentId: '' });
+                    closeMenu();
                   }}
                   className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
                 >
@@ -939,7 +984,7 @@ export function AgentList() {
                 <button
                   onClick={() => {
                     handleDelete(agent.id);
-                    setContextMenu({ visible: false, x: 0, y: 0, agentId: '' });
+                    closeMenu();
                   }}
                   className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-danger hover:bg-codex-hover"
                 >
@@ -950,6 +995,22 @@ export function AgentList() {
             );
           })()}
         </div>
+      )}
+
+      {/* Remote chat dialogs (feishu group info / files) */}
+      {remoteDialog?.kind === 'info' && (
+        <RemoteChatInfoDialog
+          channel={remoteDialog.channel}
+          chatId={remoteDialog.chatId}
+          onClose={() => setRemoteDialog(null)}
+        />
+      )}
+      {remoteDialog?.kind === 'files' && (
+        <RemoteChatFilesDialog
+          channel={remoteDialog.channel}
+          chatId={remoteDialog.chatId}
+          onClose={() => setRemoteDialog(null)}
+        />
       )}
 
       {/* Project context menu */}

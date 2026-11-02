@@ -89,8 +89,11 @@ CREATE TABLE remote_chats (           -- 设备本地表，不进 CRR 同步
    - 第 1 级（建会话时自动解析名称）：✅ 已实现——`ReplySink::resolve_names`（默认空实现），飞书调 `im/v1/chats/{chat_id}` 拿群名、`contact/v3/users/{open_id}` 拿成员名（需 `im:chat:readonly`、`contact:user.base:readonly` 权限并重新发布，缺权限降级为 id 并记 warn 日志）；群标题用群名、私聊用对方姓名；存量裸 id 标题在下次消息时一次性回填。**微信 iLink 协议拿不到昵称**（官方插件也只用 from_user_id），微信标题维持 id。
    - 第 2 级（会话内反查群详情）：**入口仅放对话列表右键菜单**——远程会话右键加「查看群信息」「查看群文件」两项（不做对话页头部图标、不进设置页），点击开居中模态框（复用 TaskCenterDialog 交互范式）：
      - 「查看群信息」小模态框（~400px）：实时调 `/im/v1/chats/{chat_id}` + `/members`，展示群名、群主、成员数、成员列表。仅飞书可做，微信 iLink 无群概念。
-     - 「查看群文件」大模态框（~640px）：调 `/im/v1/messages?container_id_type=chat&container_id={chat_id}` 筛 file/image 消息，列表展示文件名/大小/发送者/时间（倒序），每行操作「导入文献库」（PDF，走现成导入管线）或「另存为」，行内显示进度。下载走 `im/v1/messages/{id}/resources/{file_key}`，与第 5 项媒体消息共用接收管线。群文件标签页的云文档（Drive 体系）不做。
-5. **媒体消息**：微信图片/文件收（CDN 下载 + AES-128-ECB 解密）与发（上传）；飞书图片/文件收发；飞书卡片远程审批。微信侧最绕，放最后。
+     - 「查看群文件」大模态框（~640px）：调 `/im/v1/messages?container_id_type=chat&container_id={chat_id}` 筛 file/image 消息，列表展示文件名/大小/时间（倒序，封顶 200 条），每行操作「导入文献库」（PDF，走现成导入管线）或「另存为」，行内显示进度。下载走 `im/v1/messages/{id}/resources/{file_key}`，与第 5 项媒体消息共用接收管线。群文件标签页的云文档（Drive 体系）不做。**已实现**：右键菜单仅在远程飞书非私聊会话显示（context JSON 新增 `kind` 字段）；命令 `remote_chat_info/files/file_save/file_import`。
+5. **媒体消息**：✅ 已实现入站侧——
+   - 飞书图片：`resources` 下载 → base64 → 视觉输入（`run_agent_turn` attachments，模型不支持视觉时回明确错误）；文件：路由层短路回执，引导"右键会话→查看群文件"导入/另存；其它类型（语音/视频/帖子/表情）回不支持提示（仍受群@策略约束）。
+   - 微信图片/文件：CDN 下载（`full_url` 优先，否则 `encrypt_query_param` 拼 `novac2c.cdn.weixin.qq.com/c2c/download`）+ AES-128-ECB 解密（密钥两种编码：base64(raw16) / base64(hex32)，图片另有 aeskey hex 优先；RustCrypto `aes`+`ecb` 纯 Rust 实现）；图片进视觉输入，文件存 `app_data/remote_downloads/` 并回执。
+   - 未做（暂不评估）：出站媒体（远程工具只读，agent 不产出文件）、飞书卡片远程审批、微信语音 silk 转码。
 
 ## 7. 验证方式
 

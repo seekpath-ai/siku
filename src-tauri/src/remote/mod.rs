@@ -219,7 +219,9 @@ impl RemoteManager {
     /// current role. Only the Active device connects. Feishu runs one
     /// connection per configured bot; slots for removed bots are torn down.
     async fn apply_channels(&self, db: &sqlx::SqlitePool, app: &AppHandle) {
-        let remote = crate::core::settings_service::cached_settings().remote;
+        let remote = crate::core::settings_service::load_remote_config(db)
+            .await
+            .unwrap_or_default();
         let weixin_cfg = remote.weixin.clone();
 
         let mut inner = self.inner.lock().await;

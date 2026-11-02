@@ -634,11 +634,11 @@ pub struct AppSettings {
     pub research_discover_max_results: i32,
 
     // ── Remote IM channels ──
-    /// Feishu/weixin bot credentials. Synced so the remote gateway roams
-    /// between this account's devices (single-active arbitration decides
-    /// which device actually connects). The sync channel is end-to-end
-    /// encrypted, so these secrets get the same protection as chat content.
-    #[serde(default)]
+    /// LEGACY migration source only. Remote config moved to the dedicated
+    /// synced `remote_config` settings row (see settings_service): the
+    /// `app_settings` row never syncs, so anything stored here could not
+    /// roam. Read once by `migrate_remote_settings`; dropped on save.
+    #[serde(default, skip_serializing)]
     pub remote: RemoteSettings,
 }
 
@@ -670,7 +670,8 @@ pub struct DeviceAppSettings {
     /// Stable device identifier used for pairing and sync presence.
     #[serde(default = "default_empty_string")]
     pub device_id: String,
-    /// Remote IM channels (feishu/weixin bots serving this device's agent).
+    /// LEGACY migration source only (pre-roaming remote config, device-local).
+    /// Read once by `migrate_remote_settings`, then blanked.
     #[serde(default)]
     pub remote: RemoteSettings,
 }
@@ -791,14 +792,6 @@ impl std::fmt::Debug for DeviceAppSettings {
             .field("sync_optional_data", &self.sync_optional_data)
             .field("allow_plaintext_relay", &self.allow_plaintext_relay)
             .field("device_id", &self.device_id)
-            .field(
-                "remote.feishu.app_secret",
-                &crate::core::redact::redact_api_key(&self.remote.feishu.app_secret),
-            )
-            .field(
-                "remote.weixin.bot_token",
-                &crate::core::redact::redact_api_key(&self.remote.weixin.bot_token),
-            )
             .finish()
     }
 }
@@ -872,25 +865,6 @@ impl std::fmt::Debug for AppSettings {
             .field(
                 "research_discover_max_results",
                 &self.research_discover_max_results,
-            )
-            .field(
-                "remote.feishu_bots",
-                &self
-                    .remote
-                    .feishu_bots
-                    .iter()
-                    .map(|b| {
-                        format!(
-                            "{}(secret={})",
-                            b.app_id,
-                            crate::core::redact::redact_api_key(&b.app_secret)
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .field(
-                "remote.weixin.bot_token",
-                &crate::core::redact::redact_api_key(&self.remote.weixin.bot_token),
             )
             .finish()
     }

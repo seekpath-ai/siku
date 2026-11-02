@@ -831,9 +831,9 @@ async fn run_login(
                 if bot_token.is_empty() {
                     return Err("登录失败：服务器未返回 bot_token".to_string());
                 }
-                let mut settings =
-                    crate::core::settings_service::load_app_settings(&db).await?;
-                settings.remote.weixin = WeixinChannelConfig {
+                let mut remote =
+                    crate::core::settings_service::load_remote_config(&db).await?;
+                remote.weixin = WeixinChannelConfig {
                     enabled: true,
                     bot_token,
                     ilink_bot_id,
@@ -841,7 +841,7 @@ async fn run_login(
                     baseurl,
                     ..Default::default()
                 };
-                crate::core::settings_service::save_app_settings(&db, &settings).await?;
+                crate::core::settings_service::save_remote_config(&db, &remote).await?;
                 // Fresh binding: the old long-poll cursor and context tokens
                 // belong to the replaced session.
                 let _ = crate::core::settings_service::save_weixin_state(

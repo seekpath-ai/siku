@@ -123,12 +123,7 @@ pub async fn delete_setting(db: &SqlitePool, key: &str) -> Result<(), String> {
 /// Load app settings from the database, falling back to defaults.
 pub async fn load_app_settings(db: &SqlitePool) -> Result<AppSettings, String> {
     match get_setting(db, APP_SETTINGS_KEY).await? {
-        Some(value) => {
-            let mut settings: AppSettings =
-                serde_json::from_str(&value).map_err(|e| format!("invalid app settings: {e}"))?;
-            settings.remote.normalize();
-            Ok(settings)
-        }
+        Some(value) => serde_json::from_str(&value).map_err(|e| format!("invalid app settings: {e}")),
         None => Ok(AppSettings::default()),
     }
 }
@@ -138,8 +133,7 @@ pub async fn save_app_settings(
     db: &SqlitePool,
     settings: &AppSettings,
 ) -> Result<(), String> {
-    let mut settings = settings.clone();
-    settings.remote.normalize();
+    let settings = settings.clone();
     let value = serde_json::to_string(&settings).map_err(|e| format!("json: {e}"))?;
     set_setting(db, APP_SETTINGS_KEY, &value).await?;
     update_cached_settings(settings);
@@ -216,6 +210,40 @@ pub async fn migrate_legacy_account_settings(db: &SqlitePool) -> Result<(), Stri
 
 pub const REMOTE_WEIXIN_STATE_KEY: &str = "remote_weixin_state";
 pub const REMOTE_HOLDER_KEY: &str = "remote_holder";
+/// Feishu bots + weixin binding roam in this dedicated synced settings row.
+/// NOT in `app_settings`: that row never syncs (it embeds LLM API keys),
+/// which is why the earlier "roaming" design silently never left the device.
+pub const REMOTE_CONFIG_KEY: &str = "remote_config";
+
+/// Load the synced remote-channel config (feishu bots + weixin binding).
+pub async fn load_remote_config(
+    db: &SqlitePool,
+) -> Result<crate::core::models::RemoteSettings, String> {
+    match get_setting(db, REMOTE_CONFIG_KEY).await? {
+        Some(v) => {
+            let mut cfg: crate::core::models::RemoteSettings =
+                serde_json::from_str(&v).map_err(|e| format!("invalid remote config: {e}"))?;
+            cfg.normalize();
+            Ok(cfg)
+        }
+        None => Ok(Default::default()),
+    }
+}
+
+pub async fn save_remote_config(
+    db: &SqlitePool,
+    cfg: &crate::core::models::RemoteSettings,
+) -> Result<(), String> {
+    let mut cfg = cfg.clone();
+    cfg.normalize();
+    // The weixin long-poll cursor/context tokens ride their own synced row
+    // (REMOTE_WEIXIN_STATE_KEY) so their churn cannot clobber config edits
+    // via whole-row last-writer-wins. Never persist them here.
+    cfg.weixin.get_updates_buf = String::new();
+    cfg.weixin.context_tokens = Default::default();
+    let v = serde_json::to_string(&cfg).map_err(|e| format!("json: {e}"))?;
+    set_setting(db, REMOTE_CONFIG_KEY, &v).await
+}
 
 /// Load the synced weixin runtime state (long-poll cursor + context tokens).
 pub async fn load_weixin_state(
@@ -255,44 +283,72 @@ pub async fn save_remote_holder(
     set_setting(db, REMOTE_HOLDER_KEY, &v).await
 }
 
-/// One-time migration: remote channel config used to live in device-local
-/// settings, forcing a fresh WeChat QR bind on every machine — and WeChat
-/// replaces the previous binding on re-bind. Move it into the synced
-/// `app_settings.remote` so the gateway roams; the constantly-changing
-/// cursor/context tokens go to their own synced row so their churn cannot
-/// clobber unrelated settings edits via whole-blob last-writer-wins.
-/// NOTE: unlike account credentials (see migrate_legacy_account_settings),
-/// bot tokens MAY roam — they are protected by the account sync key, not
-/// the root of trust themselves.
+/// Fill gaps in `target` from `source`: feishu bots union by app_id (the
+/// target's version of a bot wins), weixin taken wholesale only when the
+/// target has no binding yet.
+fn merge_remote_config(
+    target: &mut crate::core::models::RemoteSettings,
+    source: &crate::core::models::RemoteSettings,
+) {
+    for bot in &source.feishu_bots {
+        if !bot.app_id.is_empty()
+            && !target.feishu_bots.iter().any(|b| b.app_id == bot.app_id)
+        {
+            target.feishu_bots.push(bot.clone());
+        }
+    }
+    if target.weixin.bot_token.is_empty() && !source.weixin.bot_token.is_empty() {
+        target.weixin = source.weixin.clone();
+    }
+}
+
+/// One-time migration: remote channel config lived in `app_settings.remote`
+/// (and before that in device-local settings) — but the `app_settings` row
+/// never syncs, so the "roaming" config never actually left the device.
+/// Move everything into the dedicated synced `remote_config` row, merging
+/// all legacy sources gap-fill style so no device's feishu bots or weixin
+/// binding is lost, then blank the legacy copies so they cannot resurrect
+/// deleted entries on a later run.
+/// NOTE: bot tokens MAY roam — they are protected by the account sync key,
+/// not the root of trust themselves.
 pub async fn migrate_remote_settings(db: &SqlitePool) -> Result<(), String> {
+    let mut merged = load_remote_config(db).await?;
     let mut app = load_app_settings(db).await?;
-    let has_synced =
-        !app.remote.feishu.app_id.is_empty() || !app.remote.weixin.bot_token.is_empty();
-    if has_synced {
+    app.remote.normalize();
+    let mut dev = load_device_settings(db).await?.remote;
+    dev.normalize();
+    let app_has = !app.remote.feishu_bots.is_empty() || !app.remote.weixin.bot_token.is_empty();
+    let dev_has = !dev.feishu_bots.is_empty() || !dev.weixin.bot_token.is_empty();
+    if !app_has && !dev_has {
         return Ok(());
     }
-    let legacy = load_device_settings(db).await?.remote;
-    let has_legacy = !legacy.feishu.app_id.is_empty()
-        || !legacy.weixin.bot_token.is_empty()
-        || legacy.feishu.enabled
-        || legacy.weixin.enabled;
-    if !has_legacy {
-        return Ok(());
+    merge_remote_config(&mut merged, &app.remote);
+    merge_remote_config(&mut merged, &dev);
+    tracing::info!("migrating remote channel config to the synced remote_config row");
+    save_remote_config(db, &merged).await?;
+    if app_has {
+        app.remote = Default::default();
+        save_app_settings(db, &app).await?;
     }
-    tracing::info!("migrating remote channel config to synced settings");
-    app.remote = legacy.clone();
-    app.remote.weixin.get_updates_buf = String::new();
-    app.remote.weixin.context_tokens = Default::default();
-    save_app_settings(db, &app).await?;
-    if !legacy.weixin.get_updates_buf.is_empty() || !legacy.weixin.context_tokens.is_empty() {
-        save_weixin_state(
-            db,
-            &crate::core::models::WeixinChannelState {
-                get_updates_buf: legacy.weixin.get_updates_buf.clone(),
-                context_tokens: legacy.weixin.context_tokens.clone(),
-            },
-        )
-        .await?;
+    if dev_has {
+        // The legacy device-local weixin cursor/context tokens move to their
+        // synced state row (gap-fill: an existing synced cursor wins).
+        if !dev.weixin.get_updates_buf.is_empty() || !dev.weixin.context_tokens.is_empty() {
+            let existing = load_weixin_state(db).await?;
+            if existing.get_updates_buf.is_empty() && existing.context_tokens.is_empty() {
+                save_weixin_state(
+                    db,
+                    &crate::core::models::WeixinChannelState {
+                        get_updates_buf: dev.weixin.get_updates_buf.clone(),
+                        context_tokens: dev.weixin.context_tokens.clone(),
+                    },
+                )
+                .await?;
+            }
+        }
+        let mut dev_settings = load_device_settings(db).await?;
+        dev_settings.remote = Default::default();
+        save_device_settings(db, &dev_settings).await?;
     }
     Ok(())
 }
@@ -303,11 +359,11 @@ pub async fn migrate_remote_settings(db: &SqlitePool) -> Result<(), String> {
 /// app. With zero or several bots the rows are left alone (members re-pair
 /// on their next message, same as a fresh install).
 pub async fn migrate_feishu_instance_channels(db: &SqlitePool) -> Result<(), String> {
-    let app = load_app_settings(db).await?;
-    if app.remote.feishu_bots.len() != 1 {
+    let remote = load_remote_config(db).await?;
+    if remote.feishu_bots.len() != 1 {
         return Ok(());
     }
-    let channel = format!("feishu:{}", app.remote.feishu_bots[0].app_id);
+    let channel = format!("feishu:{}", remote.feishu_bots[0].app_id);
     sqlx::query("UPDATE remote_chats SET channel = ? WHERE channel = 'feishu'")
         .bind(&channel)
         .execute(db)

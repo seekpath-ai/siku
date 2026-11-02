@@ -17,9 +17,8 @@ pub async fn remote_status(state: State<'_, AppState>) -> Result<Vec<ChannelStat
 pub async fn remote_feishu_bots(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::core::models::FeishuBotConfig>, String> {
-    Ok(crate::core::settings_service::load_app_settings(&state.db)
+    Ok(crate::core::settings_service::load_remote_config(&state.db)
         .await?
-        .remote
         .feishu_bots)
 }
 
@@ -38,8 +37,8 @@ pub async fn remote_feishu_bot_save(
     if app_id.is_empty() {
         return Err("App ID 不能为空".to_string());
     }
-    let mut settings = crate::core::settings_service::load_app_settings(&state.db).await?;
-    let bots = &mut settings.remote.feishu_bots;
+    let mut remote = crate::core::settings_service::load_remote_config(&state.db).await?;
+    let bots = &mut remote.feishu_bots;
     match bots.iter_mut().find(|b| b.app_id == app_id) {
         Some(bot) => {
             bot.name = name.trim().to_string();
@@ -60,7 +59,7 @@ pub async fn remote_feishu_bot_save(
             });
         }
     }
-    crate::core::settings_service::save_app_settings(&state.db, &settings).await?;
+    crate::core::settings_service::save_remote_config(&state.db, &remote).await?;
     state.remote.sync_config(&state.db, &app).await;
     Ok(())
 }
@@ -72,12 +71,9 @@ pub async fn remote_feishu_bot_delete(
     app: AppHandle,
     app_id: String,
 ) -> Result<(), String> {
-    let mut settings = crate::core::settings_service::load_app_settings(&state.db).await?;
-    settings
-        .remote
-        .feishu_bots
-        .retain(|b| b.app_id != app_id);
-    crate::core::settings_service::save_app_settings(&state.db, &settings).await?;
+    let mut remote = crate::core::settings_service::load_remote_config(&state.db).await?;
+    remote.feishu_bots.retain(|b| b.app_id != app_id);
+    crate::core::settings_service::save_remote_config(&state.db, &remote).await?;
     state.remote.sync_config(&state.db, &app).await;
     Ok(())
 }
@@ -92,9 +88,8 @@ pub struct WeixinConfigInfo {
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn remote_weixin_config(state: State<'_, AppState>) -> Result<WeixinConfigInfo, String> {
-    let cfg = crate::core::settings_service::load_app_settings(&state.db)
+    let cfg = crate::core::settings_service::load_remote_config(&state.db)
         .await?
-        .remote
         .weixin;
     Ok(WeixinConfigInfo {
         enabled: cfg.enabled,
@@ -136,9 +131,9 @@ pub async fn remote_weixin_login_verify(
 #[instrument(skip(state, app))]
 pub async fn remote_weixin_logout(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
     state.remote.cancel_weixin_login().await;
-    let mut settings = crate::core::settings_service::load_app_settings(&state.db).await?;
-    settings.remote.weixin = crate::core::models::WeixinChannelConfig::default();
-    crate::core::settings_service::save_app_settings(&state.db, &settings).await?;
+    let mut remote = crate::core::settings_service::load_remote_config(&state.db).await?;
+    remote.weixin = crate::core::models::WeixinChannelConfig::default();
+    crate::core::settings_service::save_remote_config(&state.db, &remote).await?;
     // Drop the roaming cursor/context tokens too — no device should resume
     // the dead session.
     let _ = crate::core::settings_service::save_weixin_state(&state.db, &Default::default()).await;
@@ -225,10 +220,10 @@ pub async fn remote_pairing_delete(
 // ---------------------------------------------------------------- group info & files (feishu)
 
 fn feishu_cfg(
-    settings: &crate::core::models::AppSettings,
+    remote: &crate::core::models::RemoteSettings,
     channel: &str,
 ) -> Result<crate::core::models::FeishuBotConfig, String> {
-    let bots = &settings.remote.feishu_bots;
+    let bots = &remote.feishu_bots;
     // Instance channel "feishu:<app_id>" picks the exact bot; legacy bare
     // "feishu" (pre-multi-bot sessions) resolves to the only configured bot.
     let bot = match channel.strip_prefix("feishu:") {
@@ -268,7 +263,7 @@ pub async fn remote_chat_info(
     if crate::remote::router::channel_kind(&channel) != "feishu" {
         return Err("仅飞书会话支持查看群信息".to_string());
     }
-    let cfg = feishu_cfg(&crate::core::settings_service::load_app_settings(&state.db).await?, &channel)?;
+    let cfg = feishu_cfg(&crate::core::settings_service::load_remote_config(&state.db).await?, &channel)?;
     let (info, members) = crate::remote::feishu::fetch_chat_info(&cfg, &chat_id).await?;
     Ok(RemoteChatInfo {
         name: info.name,
@@ -306,7 +301,7 @@ pub async fn remote_chat_files(
     if crate::remote::router::channel_kind(&channel) != "feishu" {
         return Err("仅飞书会话支持查看群文件".to_string());
     }
-    let cfg = feishu_cfg(&crate::core::settings_service::load_app_settings(&state.db).await?, &channel)?;
+    let cfg = feishu_cfg(&crate::core::settings_service::load_remote_config(&state.db).await?, &channel)?;
     let files = crate::remote::feishu::fetch_chat_files(&cfg, &chat_id).await?;
     Ok(files
         .into_iter()
@@ -336,7 +331,7 @@ pub async fn remote_chat_file_save(
     if crate::remote::router::channel_kind(&channel) != "feishu" {
         return Err("仅飞书会话支持下载群文件".to_string());
     }
-    let cfg = feishu_cfg(&crate::core::settings_service::load_app_settings(&state.db).await?, &channel)?;
+    let cfg = feishu_cfg(&crate::core::settings_service::load_remote_config(&state.db).await?, &channel)?;
     let (bytes, _mime) = crate::remote::feishu::download_resource(&cfg, &message_id, &file_key, &kind).await?;
     std::fs::write(&save_path, &bytes).map_err(|e| format!("写入文件失败: {e}"))
 }
@@ -355,7 +350,7 @@ pub async fn remote_chat_file_import(
     if crate::remote::router::channel_kind(&channel) != "feishu" {
         return Err("仅飞书会话支持导入群文件".to_string());
     }
-    let cfg = feishu_cfg(&crate::core::settings_service::load_app_settings(&state.db).await?, &channel)?;
+    let cfg = feishu_cfg(&crate::core::settings_service::load_remote_config(&state.db).await?, &channel)?;
     let (bytes, _mime) = crate::remote::feishu::download_resource(&cfg, &message_id, &file_key, &kind).await?;
     let tmp_dir = state.app_data_dir.join("remote_downloads");
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("创建下载目录失败: {e}"))?;

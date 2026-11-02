@@ -51,8 +51,8 @@ CREATE TABLE remote_chats (           -- 同步表（OPTIONAL_SYNC_TABLES）：�
 );
 ```
 
-- **渠道配置**（AppID/Secret、iLink token、开关）存**同步** `app_settings.remote`：账号下设备漫游，微信扫码一次全账号共享（重扫会替换旧绑定，漫游是硬需求）。安全性依据：同步通道本身 E2E 加密（relay 只存密文），bot token 与对话内容同级保护；与"账号凭证绝不进同步表"不冲突——账号 token/同步密钥是信任根，bot token 是被保护的内容。
-- **飞书多机器人**（多租户/多应用同支持）：`feishu_bots: Vec<FeishuBotConfig>`，每个实例 = 一组 app_id/app_secret，app_id 即实例 id。实例维度编码进 channel 字符串（`feishu:<app_id>`），配对主键、会话 context、限流/串行锁键、状态槽位全部按实例隔离——跨租户 chat_id 撞车不会串；同租户两机器人同群时飞书 message_id 全局唯一，入站去重天然丢弃第二条事件。旧单配置 `feishu` 字段在 settings load/save 时归一化进列表；旧配对行由 `migrate_feishu_instance_channels` 在恰好一个机器人时改写为实例 channel。微信维持单实例（漫游单活模型一对一）。
+- **渠道配置**（飞书 bots AppID/Secret、iLink token、开关）存**独立同步行 `remote_config`**：账号下设备漫游，微信扫码一次全账号共享（重扫会替换旧绑定，漫游是硬需求）。注意不能放 `app_settings.remote`——`app_settings` 行因含 LLM API key 被同步层（changeset/快照/statement 三处）永久排除，漫游会静默失效（2026-11 踩过：配对表和微信游标漫游正常，唯独配置不到达对端）。旧位置（`app_settings.remote`、设备本地 `device_settings.remote`）由 `migrate_remote_settings` 按"填隙合并"（飞书按 app_id 并集、微信取非空）一次性迁入并清空。安全性依据：同步通道本身 E2E 加密（relay 只存密文），bot token 与对话内容同级保护；与"账号凭证绝不进同步表"不冲突——账号 token/同步密钥是信任根，bot token 是被保护的内容。
+- **飞书多机器人**（多租户/多应用同支持）：`feishu_bots: Vec<FeishuBotConfig>`，每个实例 = 一组 app_id/app_secret，app_id 即实例 id。实例维度编码进 channel 字符串（`feishu:<app_id>`），配对主键、会话 context、限流/串行锁键、状态槽位全部按实例隔离——跨租户 chat_id 撞车不会串；同租户两机器人同群时飞书 message_id 全局唯一，入站去重天然丢弃第二条事件。旧单配置 `feishu` 字段在 remote_config 读写与迁移时归一化进列表；旧配对行由 `migrate_feishu_instance_channels` 在恰好一个机器人时改写为实例 channel。微信维持单实例（漫游单活模型一对一）。
 - **微信运行时态**（长轮询游标、context_tokens）单独存同步行 `remote_weixin_state`：游标每个轮询周期都可能前进，若埋在 app_settings 整 blob 里，LWW 会冲掉其它设备对无关设置的编辑。checkpoint 15s 节流 + 退出时终写。
 - **单活仲裁**（`remote/mod.rs`）：连接同一时刻只允许一台设备持有。holder 确定性选举——relay 房间 presence（`api/devices` 返回 online 标记）中 device_id 最小者，所有设备独立计算同一结果，无锁无心跳；同步行 `remote_holder` 提供手动接管覆盖（设置页「在本机接管」），override 设备在线时优先。仲裁器每 45s 重估，presence 查询失败保持原角色（宁停勿双）；未登录同步账号时按单设备旧行为直连。渠道任务按 (want, config指纹) 跳过不变重启，健康连接不被 45s 周期打断。
 - **限流**：每用户 10 条/分钟滑动窗口；消息 ID 24h 去重（内存 LRU + app_data json 持久化）。

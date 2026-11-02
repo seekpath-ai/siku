@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import QRCode from 'qrcode';
-import { Check, Loader2, Pencil, Plus, Power, Trash2 } from 'lucide-react';
+import { Check, HelpCircle, Loader2, Pencil, Plus, Power, Trash2 } from 'lucide-react';
 import {
   remoteFeishuBotDelete,
   remoteFeishuBotSave,
@@ -35,6 +35,23 @@ function StatusChip({ st }: { st?: RemoteChannelStatus }) {
       : 'bg-surface-hover text-text-secondary/60';
   const text = st.connected ? st.detail || '已连接' : st.enabled ? st.detail || '未连接' : '未启用';
   return <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${cls}`}>{text}</span>;
+}
+
+/** Small "?" icon with a hover tooltip panel for channel setup guidance.
+ *  The gap between icon and panel is bridged with padding (not margin) so
+ *  the mouse can travel into the panel without losing hover — required for
+ *  selecting/copying text like event names. */
+function HintIcon({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="relative group inline-flex items-center align-middle ml-1">
+      <HelpCircle size={14} className="text-text-secondary/40 group-hover:text-primary cursor-help transition-colors" />
+      <span className="hidden group-hover:block absolute left-0 top-full pt-1.5 z-50 w-80 max-w-[80vw] select-text cursor-default">
+        <span className="block rounded-lg border border-surface-hover bg-surface shadow-xl px-3 py-2.5 text-xs leading-relaxed text-text-secondary font-normal">
+          {children}
+        </span>
+      </span>
+    </span>
+  );
 }
 
 /** Settings page section: remote IM channels (feishu bots, weixin, pairing). */
@@ -218,7 +235,7 @@ export function RemoteSettings() {
       <div>
         <h2 className="text-base font-semibold text-text-primary">远程接入</h2>
         <p className="text-xs text-text-secondary/60 mt-1">
-          思库运行期间，通过飞书/微信机器人远程对话：查询笔记、文献，或让智能体处理任务。配置与配对随账号同步漫游，同时只有一台在线设备持有连接，其它设备自动待机。远程会话使用只读工具集，并显示在主对话列表中。
+          思库运行期间，通过飞书/微信机器人远程对话：查询笔记、文献，或让智能体处理任务。配置与配对随账号同步漫游，同时只有一台在线设备持有连接，其它设备自动待机。远程会话显示在主对话列表中，能力与本机对话一致，按配对成员授予「全部 / 只读」权限。
         </p>
       </div>
 
@@ -243,10 +260,22 @@ export function RemoteSettings() {
       <div className="rounded-lg border border-surface-hover bg-surface px-4 py-3 space-y-3">
         <div className="flex items-center gap-3">
           <div className="flex-1 min-w-0">
-            <div className="text-sm font-medium text-text-primary">飞书机器人</div>
-            <div className="text-xs text-text-secondary/60 mt-0.5">
-              在 <a className="text-primary" href="https://open.feishu.cn/app" target="_blank" rel="noreferrer">飞书开放平台</a> 创建企业自建应用，启用机器人能力并发布版本；
-              事件订阅选择「使用长连接接收事件」，添加 im.message.receive_v1 与 card.action.trigger（卡片按钮：停止/重试）；权限需包含 im:message 与 im:message:send。可添加多个机器人（跨租户或同租户多应用）。
+            <div className="text-sm font-medium text-text-primary">
+              飞书机器人
+              <HintIcon>
+                <div className="space-y-2">
+                  <p>
+                    在 <a className="text-primary" href="https://open.feishu.cn/app" target="_blank" rel="noreferrer">飞书开放平台</a> 创建企业自建应用，启用机器人能力；「事件订阅」选择使用长连接接收事件，添加 <code className="px-1 rounded bg-background text-text-primary font-mono text-[11px]">im.message.receive_v1</code>；权限需包含 <code className="px-1 rounded bg-background text-text-primary font-mono text-[11px]">im:message</code> 与 <code className="px-1 rounded bg-background text-text-primary font-mono text-[11px]">im:message:send</code>。可添加多个机器人（跨租户或同租户多应用）。
+                  </p>
+                  <p>卡片按钮（停止 / 重新生成 / 思考过程）需额外订阅「卡片回传交互」回调：</p>
+                  <ol className="list-decimal pl-4 space-y-1">
+                    <li>「事件与回调 → <b>回调订阅</b>」页签（注意不是「事件订阅」）；</li>
+                    <li>订阅方式选「使用长连接接收回调」（与消息事件同通道，无需公网 URL）；</li>
+                    <li>添加回调 → 搜索「卡片回传交互」（<code className="px-1 rounded bg-background text-text-primary font-mono text-[11px]">card.action.trigger</code>）；</li>
+                    <li>创建版本并发布后生效（开发版可先用「测试企业与人员」验证）。</li>
+                  </ol>
+                </div>
+              </HintIcon>
             </div>
           </div>
           <button
@@ -345,9 +374,13 @@ export function RemoteSettings() {
       <div className="rounded-lg border border-surface-hover bg-surface px-4 py-3 space-y-3">
         <div className="flex items-center gap-3">
           <div className="flex-1 min-w-0">
-            <div className="text-sm font-medium text-text-primary">微信 ClawBot</div>
-            <div className="text-xs text-text-secondary/60 mt-0.5">
-              扫码将微信绑定到思库账号，账号下各设备共享该绑定，无需重复扫码。之后在微信 ClawBot 里直接发消息对话。需微信 8.0.70+。
+            <div className="text-sm font-medium text-text-primary">
+              微信 ClawBot
+              <HintIcon>
+                <p>
+                  扫码将微信绑定到思库账号，账号下各设备共享该绑定，无需重复扫码（重复扫码会替换旧绑定）。之后在微信 ClawBot 里直接发消息对话。需微信 8.0.70+。
+                </p>
+              </HintIcon>
             </div>
           </div>
           <StatusChip st={weixinStatus} />

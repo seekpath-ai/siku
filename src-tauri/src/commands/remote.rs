@@ -133,15 +133,17 @@ pub async fn remote_pairing_set(
     app: AppHandle,
     channel: String,
     chat_id: String,
+    user_id: String,
     approved: bool,
 ) -> Result<(), String> {
     sqlx::query(
-        "UPDATE remote_chats SET approved = ?, updated_at = ? WHERE channel = ? AND chat_id = ?",
+        "UPDATE remote_chats SET approved = ?, updated_at = ? WHERE channel = ? AND chat_id = ? AND user_id = ?",
     )
     .bind(approved as i64)
     .bind(crate::core::time::now_iso())
     .bind(&channel)
     .bind(&chat_id)
+    .bind(&user_id)
     .execute(&state.db)
     .await
     .map_err(|e| format!("db error: {e}"))?;
@@ -156,10 +158,12 @@ pub async fn remote_pairing_delete(
     app: AppHandle,
     channel: String,
     chat_id: String,
+    user_id: String,
 ) -> Result<(), String> {
-    sqlx::query("DELETE FROM remote_chats WHERE channel = ? AND chat_id = ?")
+    sqlx::query("DELETE FROM remote_chats WHERE channel = ? AND chat_id = ? AND user_id = ?")
         .bind(&channel)
         .bind(&chat_id)
+        .bind(&user_id)
         .execute(&state.db)
         .await
         .map_err(|e| format!("db error: {e}"))?;

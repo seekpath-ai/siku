@@ -151,6 +151,51 @@ async fn add_column_if_missing(
     Ok(())
 }
 
+/// Rebuild remote_chats when its primary key is still (channel, chat_id):
+/// pairing became per-member (channel, chat_id, user_id). Table is tiny and
+/// device-local, so rename-and-copy is enough.
+async fn migrate_remote_chats_per_user(db: &Db) -> anyhow::Result<()> {
+    let rows = sqlx::query("PRAGMA table_info(remote_chats)")
+        .fetch_all(db)
+        .await?;
+    use sqlx::Row;
+    let user_in_pk = rows.iter().any(|r| {
+        r.try_get::<String, _>("name").map(|n| n == "user_id").unwrap_or(false)
+            && r.try_get::<i64, _>("pk").unwrap_or(0) > 0
+    });
+    if user_in_pk {
+        return Ok(());
+    }
+    info!("running migration: rebuild remote_chats with per-member primary key");
+    sqlx::query("ALTER TABLE remote_chats RENAME TO remote_chats_old")
+        .execute(db)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE remote_chats (
+            channel TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            user_name TEXT NOT NULL DEFAULT '',
+            session_id TEXT,
+            approved INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (channel, chat_id, user_id)
+        )"
+    )
+    .execute(db)
+    .await?;
+    sqlx::query(
+        "INSERT INTO remote_chats (channel, chat_id, user_id, user_name, session_id, approved, created_at, updated_at)
+         SELECT channel, chat_id, user_id, user_name, session_id, approved, created_at, updated_at
+         FROM remote_chats_old GROUP BY channel, chat_id, user_id"
+    )
+    .execute(db)
+    .await?;
+    sqlx::query("DROP TABLE remote_chats_old").execute(db).await?;
+    Ok(())
+}
+
 /// Read the device_id stored in a SQLite database file without loading the
 /// CR-SQLite extension. Returns None if the file does not exist or the setting
 /// is missing/empty.
@@ -1162,6 +1207,8 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
 
     // Remote IM channel (feishu/weixin) chat bindings. Device-local on
     // purpose: external ids and pairing state must not roam via sync.
+    // Pairing is per (channel, chat_id, user_id): in a group chat each member
+    // must be approved individually, while session_id is shared per chat.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS remote_chats (
             channel TEXT NOT NULL,
@@ -1172,11 +1219,14 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
             approved INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            PRIMARY KEY (channel, chat_id)
+            PRIMARY KEY (channel, chat_id, user_id)
         )"
     )
     .execute(&db)
     .await?;
+    // Existing DBs: the PK was (channel, chat_id) — one approval covered the
+    // whole group. Rebuild to the per-member shape. (added 2026-11-02)
+    migrate_remote_chats_per_user(&db).await?;
 
     // Per-turn system-prompt snapshots for the "查看本轮上下文" viewer.
     // Device-local on purpose: the assembled prompt is a function of this

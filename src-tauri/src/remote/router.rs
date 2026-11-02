@@ -318,25 +318,29 @@ fn channel_label(channel: &str) -> String {
 
 // ---------------------------------------------------------------- pairing
 
-/// Returns Ok(Some(session_id)) when paired; Ok(None) when not approved yet
-/// (notice handled here).
+/// Returns Ok(Some(session_id)) when the SENDER is paired; Ok(None) when not
+/// approved yet (notice handled here). Pairing is per (channel, chat_id,
+/// user_id): in a group every member pairs individually, while the backing
+/// chat session is shared across the group's approved members.
 async fn ensure_paired(
     db: &SqlitePool,
     app: &AppHandle,
     meta: &InboundMessage,
     sink: &Arc<dyn ReplySink>,
 ) -> Result<Option<String>, String> {
-    let row = sqlx::query_as::<_, (String, String, i64, Option<String>)>(
-        "SELECT user_id, user_name, approved, session_id FROM remote_chats WHERE channel = ? AND chat_id = ?",
+    let row = sqlx::query_as::<_, (String, i64, Option<String>)>(
+        "SELECT user_name, approved, session_id FROM remote_chats
+         WHERE channel = ? AND chat_id = ? AND user_id = ?",
     )
     .bind(meta.channel)
     .bind(&meta.chat_id)
+    .bind(&meta.user_id)
     .fetch_optional(db)
     .await
     .map_err(|e| format!("db error: {e}"))?;
 
     let now = crate::core::time::now_iso();
-    let Some((user_id, _name, approved, session_id)) = row else {
+    let Some((user_name, approved, session_id)) = row else {
         sqlx::query(
             "INSERT INTO remote_chats (channel, chat_id, user_id, user_name, session_id, approved, created_at, updated_at)
              VALUES (?, ?, ?, ?, NULL, 0, ?, ?)",
@@ -351,10 +355,11 @@ async fn ensure_paired(
         .await
         .map_err(|e| format!("db error: {e}"))?;
         let _ = app.emit("remote:pairing", ());
+        let who = if meta.user_name.is_empty() { "你" } else { &meta.user_name };
         let _ = sink
             .send_text(
                 &meta.chat_id,
-                "你好，我是思库远程助手。请在思库「设置 → 远程接入」中确认配对后再开始对话。",
+                &format!("{who} 你好，我是思库远程助手。请在思库「设置 → 远程接入」中确认配对后再开始对话。群内每位成员需分别确认。"),
             )
             .await;
         return Ok(None);
@@ -363,10 +368,11 @@ async fn ensure_paired(
     if approved == 0 {
         // Throttle the reminder: only re-notify when the row is stale.
         let stale = sqlx::query_scalar::<_, String>(
-            "SELECT updated_at FROM remote_chats WHERE channel = ? AND chat_id = ?",
+            "SELECT updated_at FROM remote_chats WHERE channel = ? AND chat_id = ? AND user_id = ?",
         )
         .bind(meta.channel)
         .bind(&meta.chat_id)
+        .bind(&meta.user_id)
         .fetch_one(db)
         .await
         .map_err(|e| format!("db error: {e}"))?;
@@ -375,13 +381,13 @@ async fn ensure_paired(
             .unwrap_or(i64::MAX);
         if stale_secs >= PAIRING_NOTICE_INTERVAL_SECS {
             let _ = sqlx::query(
-                "UPDATE remote_chats SET updated_at = ?, user_id = ?, user_name = ? WHERE channel = ? AND chat_id = ?",
+                "UPDATE remote_chats SET updated_at = ?, user_name = ? WHERE channel = ? AND chat_id = ? AND user_id = ?",
             )
             .bind(&now)
-            .bind(&meta.user_id)
             .bind(&meta.user_name)
             .bind(meta.channel)
             .bind(&meta.chat_id)
+            .bind(&meta.user_id)
             .execute(db)
             .await;
             let _ = sink
@@ -394,16 +400,16 @@ async fn ensure_paired(
         return Ok(None);
     }
 
-    // Keep the latest sender identity fresh (group chats share one row).
-    if user_id != meta.user_id {
+    // Keep the sender display name fresh.
+    if !meta.user_name.is_empty() && user_name != meta.user_name {
         let _ = sqlx::query(
-            "UPDATE remote_chats SET user_id = ?, user_name = ?, updated_at = ? WHERE channel = ? AND chat_id = ?",
+            "UPDATE remote_chats SET user_name = ?, updated_at = ? WHERE channel = ? AND chat_id = ? AND user_id = ?",
         )
-        .bind(&meta.user_id)
         .bind(&meta.user_name)
         .bind(&now)
         .bind(meta.channel)
         .bind(&meta.chat_id)
+        .bind(&meta.user_id)
         .execute(db)
         .await;
     }
@@ -412,7 +418,22 @@ async fn ensure_paired(
         return Ok(Some(sid));
     }
 
-    let sid = create_remote_session(db, meta).await?;
+    // The chat session is shared: reuse any approved member's session for
+    // this (channel, chat_id) before creating a new one.
+    let existing = sqlx::query_scalar::<_, String>(
+        "SELECT session_id FROM remote_chats
+         WHERE channel = ? AND chat_id = ? AND session_id IS NOT NULL AND session_id != '' LIMIT 1",
+    )
+    .bind(meta.channel)
+    .bind(&meta.chat_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("db error: {e}"))?;
+    let sid = match existing {
+        Some(s) => s,
+        None => create_remote_session(db, meta).await?,
+    };
+    // Stamp every row of the chat so later members skip the lookup.
     sqlx::query("UPDATE remote_chats SET session_id = ?, updated_at = ? WHERE channel = ? AND chat_id = ?")
         .bind(&sid)
         .bind(&now)

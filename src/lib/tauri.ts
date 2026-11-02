@@ -2850,12 +2850,12 @@ export async function remotePairings(): Promise<RemotePairing[]> {
   return invoke<RemotePairing[]>('remote_pairings');
 }
 
-export async function remotePairingSet(channel: string, chatId: string, approved: boolean): Promise<void> {
-  return invoke<void>('remote_pairing_set', { channel, chatId, approved });
+export async function remotePairingSet(channel: string, chatId: string, userId: string, approved: boolean): Promise<void> {
+  return invoke<void>('remote_pairing_set', { channel, chatId, userId, approved });
 }
 
-export async function remotePairingDelete(channel: string, chatId: string): Promise<void> {
-  return invoke<void>('remote_pairing_delete', { channel, chatId });
+export async function remotePairingDelete(channel: string, chatId: string, userId: string): Promise<void> {
+  return invoke<void>('remote_pairing_delete', { channel, chatId, userId });
 }
 
 export interface WeixinConfigInfo {

@@ -286,18 +286,20 @@ export function RemoteSettings() {
           <div className="text-sm font-medium text-text-primary mb-2">待确认配对（{pending.length}）</div>
           <div className="space-y-2">
             {pending.map((p) => (
-              <div key={`${p.channel}:${p.chat_id}`} className="flex items-center gap-3 text-sm">
+              <div key={`${p.channel}:${p.chat_id}:${p.user_id}`} className="flex items-center gap-3 text-sm">
                 <div className="flex-1 min-w-0 text-text-secondary">
-                  {CHANNEL_LABEL[p.channel] ?? p.channel} 会话 <span className="text-text-secondary/60">{p.chat_id}</span>
+                  {CHANNEL_LABEL[p.channel] ?? p.channel}{' '}
+                  <span className="text-text-primary">{p.user_name || p.user_id}</span>
+                  <span className="text-text-secondary/60">（会话 {p.chat_id}）</span>
                 </div>
                 <button
-                  onClick={() => remotePairingSet(p.channel, p.chat_id, true).then(loadPairings)}
+                  onClick={() => remotePairingSet(p.channel, p.chat_id, p.user_id, true).then(loadPairings)}
                   className="h-7 px-2.5 rounded-lg bg-primary text-white text-xs"
                 >
                   允许
                 </button>
                 <button
-                  onClick={() => remotePairingDelete(p.channel, p.chat_id).then(loadPairings)}
+                  onClick={() => remotePairingDelete(p.channel, p.chat_id, p.user_id).then(loadPairings)}
                   className="h-7 px-2.5 rounded-lg border border-surface-hover text-xs text-text-secondary hover:text-text-primary"
                 >
                   忽略
@@ -305,21 +307,24 @@ export function RemoteSettings() {
               </div>
             ))}
           </div>
+          <div className="mt-2 text-[11px] text-text-secondary/60">群聊按成员逐个确认；同群已确认成员共享一个远程会话。</div>
         </div>
       )}
 
       {/* Approved chats */}
       {approved.length > 0 && (
         <div className="rounded-lg border border-surface-hover bg-surface px-4 py-3">
-          <div className="text-sm font-medium text-text-primary mb-2">已配对会话（{approved.length}）</div>
+          <div className="text-sm font-medium text-text-primary mb-2">已配对成员（{approved.length}）</div>
           <div className="space-y-2">
             {approved.map((p) => (
-              <div key={`${p.channel}:${p.chat_id}`} className="flex items-center gap-3 text-sm">
+              <div key={`${p.channel}:${p.chat_id}:${p.user_id}`} className="flex items-center gap-3 text-sm">
                 <div className="flex-1 min-w-0 text-text-secondary">
-                  {CHANNEL_LABEL[p.channel] ?? p.channel} 会话 <span className="text-text-secondary/60">{p.chat_id}</span>
+                  {CHANNEL_LABEL[p.channel] ?? p.channel}{' '}
+                  <span className="text-text-primary">{p.user_name || p.user_id}</span>
+                  <span className="text-text-secondary/60">（会话 {p.chat_id}）</span>
                 </div>
                 <button
-                  onClick={() => remotePairingDelete(p.channel, p.chat_id).then(loadPairings)}
+                  onClick={() => remotePairingDelete(p.channel, p.chat_id, p.user_id).then(loadPairings)}
                   className="h-7 w-7 rounded-lg border border-surface-hover text-text-secondary hover:text-red-400 flex items-center justify-center"
                   title="解除配对"
                 >

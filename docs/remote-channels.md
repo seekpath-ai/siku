@@ -35,24 +35,19 @@
 
 - **会话映射**：每个 (channel, external_chat_id) 惰性创建 `chat_sessions` 行，配置克隆用户默认对话智能体，`domain = 'remote'` 标记，`context` 存渠道信息。`RunningTurnGuard` 保证同一远程聊天串行。
 - **工具裁剪**：`ToolRegistry::retain()` 白名单：`note_read`、`paper_search`、`paper_read`、`library_search`、`knowledge`、`memory_recall`、`web_search`、`web_fetch`、`tasks`（只读类）。排除 `bash`、一切写工具。
-- **配对绑定**：陌生人首发消息 → 回复"请在思库设置中确认配对" → 设置页确认后入白名单。配对键是 `(channel, chat_id)`，**按会话不按人**：群聊配对一次全群生效，全群共享一个远程会话（与 OpenClaw 默认一致），限流按发送者 open_id。
-
-**访问控制收紧（阶段三候选，两方向均已认可）**：
-
-1. **群白名单**：设置页维护"允许响应的群"列表，不在列表的群 @ 了也不响应（现配对 UI 即雏形，但批准一次全群生效，需显式化）。
-2. **群内按人配对**：配对键改为 `(channel, chat_id, user_id)`，每个成员单独确认；会话仍按群共享，只挡未授权发言者。防陌生大群任意成员调用文献库工具。
+- **配对绑定**：陌生人首发消息 → 回复"请在思库设置中确认配对" → 设置页确认后入白名单。配对键是 `(channel, chat_id, user_id)`，**按人配对**（已实现）：群内每位成员需单独确认；同群已确认成员共享一个远程会话（session_id 落在该群所有成员行上）。群白名单由此隐含达成：某群没有任何已确认成员时，该群 @ 机器人只会收到配对提示，无法对话；设置页删除全部成员行即等效拉黑该群。
 
 ```sql
 CREATE TABLE remote_chats (           -- 设备本地表，不进 CRR 同步
   channel TEXT NOT NULL,              -- 'feishu' | 'weixin'
   chat_id TEXT NOT NULL,              -- 外部会话 id
-  user_id TEXT NOT NULL,              -- 外部用户 id（白名单键）
+  user_id TEXT NOT NULL,              -- 外部用户 id（配对键的一部分）
   user_name TEXT,
-  session_id TEXT,                    -- 惰性创建的 chat_sessions.id
+  session_id TEXT,                    -- 群共享：同 chat_id 各行持有同一会话
   approved INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  PRIMARY KEY (channel, chat_id)
+  PRIMARY KEY (channel, chat_id, user_id)
 );
 ```
 
@@ -87,12 +82,14 @@ CREATE TABLE remote_chats (           -- 设备本地表，不进 CRR 同步
 
 **阶段三 backlog（优先级从高到低）**：
 
-1. **访问控制收紧**：群白名单 + 群内按人配对（见 §3）。先做，挡住陌生群风险。
+1. **访问控制收紧**：✅ 已实现——配对键扩为 `(channel, chat_id, user_id)` 群内按人配对（旧库自动迁移重建），群白名单由"无已确认成员即不可对话"隐含达成。
 2. **任务触发 + 完成推送**：远程发"帮我综述 xxx"→ 后台跑综述/分析任务 → 完成主动推 IM。需打通任务系统与渠道回发（reply 按 chat_id 主动发，不再依赖当轮上下文）。
 3. **远程消息排队**：生成中再发的消息目前吃"稍后再发"；改为每聊天一个队列，回合结束自动接续下一条。
 4. **会话体验打磨**：对话列表加渠道图标、远程会话标识。**会话标题人性化**（两级，均认可）：
    - 第 1 级（建会话时自动解析名称）：飞书调 `GET /open-apis/im/v1/chats/{chat_id}`（需 `im:chat` 权限）拿群名做标题（"飞书 · 课题三组"），私聊调用户信息接口拿姓名；微信用 getupdates 里的发送者昵称。解决现状标题是 chat_id 裸串的问题。
-   - 第 2 级（会话内反查群详情）：对话页头部/右键加"查看群信息"，实时调 `/im/v1/chats/{chat_id}` + `/members` 展示群名、群主、成员列表。仅飞书可做，微信 iLink 无群概念、无等价接口。
+   - 第 2 级（会话内反查群详情）：**入口仅放对话列表右键菜单**——远程会话右键加「查看群信息」「查看群文件」两项（不做对话页头部图标、不进设置页），点击开居中模态框（复用 TaskCenterDialog 交互范式）：
+     - 「查看群信息」小模态框（~400px）：实时调 `/im/v1/chats/{chat_id}` + `/members`，展示群名、群主、成员数、成员列表。仅飞书可做，微信 iLink 无群概念。
+     - 「查看群文件」大模态框（~640px）：调 `/im/v1/messages?container_id_type=chat&container_id={chat_id}` 筛 file/image 消息，列表展示文件名/大小/发送者/时间（倒序），每行操作「导入文献库」（PDF，走现成导入管线）或「另存为」，行内显示进度。下载走 `im/v1/messages/{id}/resources/{file_key}`，与第 5 项媒体消息共用接收管线。群文件标签页的云文档（Drive 体系）不做。
 5. **媒体消息**：微信图片/文件收（CDN 下载 + AES-128-ECB 解密）与发（上传）；飞书图片/文件收发；飞书卡片远程审批。微信侧最绕，放最后。
 
 ## 7. 验证方式

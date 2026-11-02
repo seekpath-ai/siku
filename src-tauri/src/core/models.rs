@@ -677,10 +677,50 @@ pub struct DeviceAppSettings {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct RemoteSettings {
+    /// Feishu bot instances. Each entry is one self-built app (app_id +
+    /// app_secret); several entries may span tenants or be multiple apps in
+    /// one tenant — the gateway connects them all while this device holds
+    /// the connection.
     #[serde(default)]
+    pub feishu_bots: Vec<FeishuBotConfig>,
+    /// Legacy single-bot config. Read-only: folded into `feishu_bots` by
+    /// `normalize()` on load and dropped on save.
+    #[serde(default, skip_serializing)]
     pub feishu: FeishuChannelConfig,
     #[serde(default)]
     pub weixin: WeixinChannelConfig,
+}
+
+impl RemoteSettings {
+    /// Fold the legacy single-bot `feishu` config into `feishu_bots`
+    /// (idempotent; called on settings load/save).
+    pub fn normalize(&mut self) {
+        if self.feishu_bots.is_empty()
+            && (!self.feishu.app_id.is_empty() || self.feishu.enabled)
+        {
+            self.feishu_bots.push(FeishuBotConfig {
+                name: String::new(),
+                enabled: self.feishu.enabled,
+                app_id: self.feishu.app_id.clone(),
+                app_secret: self.feishu.app_secret.clone(),
+            });
+        }
+    }
+}
+
+/// One feishu bot instance (a self-built app). The app_id doubles as the
+/// instance id: it is unique per app, including across tenants.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct FeishuBotConfig {
+    /// Display name; falls back to the app id in the UI when empty.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub app_id: String,
+    #[serde(default)]
+    pub app_secret: String,
 }
 
 /// WeChat ClawBot (iLink) credentials. `enabled` is set by a successful QR
@@ -834,8 +874,19 @@ impl std::fmt::Debug for AppSettings {
                 &self.research_discover_max_results,
             )
             .field(
-                "remote.feishu.app_secret",
-                &crate::core::redact::redact_api_key(&self.remote.feishu.app_secret),
+                "remote.feishu_bots",
+                &self
+                    .remote
+                    .feishu_bots
+                    .iter()
+                    .map(|b| {
+                        format!(
+                            "{}(secret={})",
+                            b.app_id,
+                            crate::core::redact::redact_api_key(&b.app_secret)
+                        )
+                    })
+                    .collect::<Vec<_>>(),
             )
             .field(
                 "remote.weixin.bot_token",

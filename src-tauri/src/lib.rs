@@ -522,6 +522,9 @@ pub fn run() {
                 // One-time migration: remote channel config moves from
                 // device-local settings into the synced app settings.
                 let _ = core::settings_service::migrate_remote_settings(&db).await;
+                // One-time migration: legacy bare "feishu" pairing rows get
+                // the bot-instance channel ("feishu:<app_id>").
+                let _ = core::settings_service::migrate_feishu_instance_channels(&db).await;
                 let app_settings = core::settings_service::cached_settings();
 
                 let _ = handle2.emit("splash:phase", "正在初始化日志系统...");
@@ -890,8 +893,9 @@ pub fn run() {
             commands::reader::export_pdf,
             // Remote IM channels
             commands::remote::remote_status,
-            commands::remote::remote_feishu_config,
-            commands::remote::remote_feishu_save,
+            commands::remote::remote_feishu_bots,
+            commands::remote::remote_feishu_bot_save,
+            commands::remote::remote_feishu_bot_delete,
             commands::remote::remote_weixin_config,
             commands::remote::remote_weixin_login_start,
             commands::remote::remote_weixin_login_verify,

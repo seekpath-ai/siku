@@ -3,7 +3,6 @@
 use tauri::{AppHandle, Emitter, State};
 use tracing::instrument;
 
-use crate::core::models::FeishuChannelConfig;
 use crate::remote::ChannelStatusInfo;
 use crate::AppState;
 
@@ -15,28 +14,69 @@ pub async fn remote_status(state: State<'_, AppState>) -> Result<Vec<ChannelStat
 
 #[tauri::command]
 #[instrument(skip(state))]
-pub async fn remote_feishu_config(state: State<'_, AppState>) -> Result<FeishuChannelConfig, String> {
+pub async fn remote_feishu_bots(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::core::models::FeishuBotConfig>, String> {
     Ok(crate::core::settings_service::load_app_settings(&state.db)
         .await?
         .remote
-        .feishu)
+        .feishu_bots)
 }
 
+/// Upsert a feishu bot (keyed by app_id), then re-evaluate channels.
 #[tauri::command]
 #[instrument(skip(state, app))]
-pub async fn remote_feishu_save(
+pub async fn remote_feishu_bot_save(
     state: State<'_, AppState>,
     app: AppHandle,
+    name: String,
     app_id: String,
     app_secret: String,
     enabled: bool,
 ) -> Result<(), String> {
+    let app_id = app_id.trim().to_string();
+    if app_id.is_empty() {
+        return Err("App ID 不能为空".to_string());
+    }
     let mut settings = crate::core::settings_service::load_app_settings(&state.db).await?;
-    settings.remote.feishu = FeishuChannelConfig {
-        enabled,
-        app_id: app_id.trim().to_string(),
-        app_secret: app_secret.trim().to_string(),
-    };
+    let bots = &mut settings.remote.feishu_bots;
+    match bots.iter_mut().find(|b| b.app_id == app_id) {
+        Some(bot) => {
+            bot.name = name.trim().to_string();
+            bot.enabled = enabled;
+            if !app_secret.trim().is_empty() {
+                bot.app_secret = app_secret.trim().to_string();
+            }
+        }
+        None => {
+            if app_secret.trim().is_empty() {
+                return Err("App Secret 不能为空".to_string());
+            }
+            bots.push(crate::core::models::FeishuBotConfig {
+                name: name.trim().to_string(),
+                enabled,
+                app_id,
+                app_secret: app_secret.trim().to_string(),
+            });
+        }
+    }
+    crate::core::settings_service::save_app_settings(&state.db, &settings).await?;
+    state.remote.sync_config(&state.db, &app).await;
+    Ok(())
+}
+
+#[tauri::command]
+#[instrument(skip(state, app))]
+pub async fn remote_feishu_bot_delete(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    app_id: String,
+) -> Result<(), String> {
+    let mut settings = crate::core::settings_service::load_app_settings(&state.db).await?;
+    settings
+        .remote
+        .feishu_bots
+        .retain(|b| b.app_id != app_id);
     crate::core::settings_service::save_app_settings(&state.db, &settings).await?;
     state.remote.sync_config(&state.db, &app).await;
     Ok(())
@@ -184,12 +224,23 @@ pub async fn remote_pairing_delete(
 
 // ---------------------------------------------------------------- group info & files (feishu)
 
-fn feishu_cfg(settings: &crate::core::models::AppSettings) -> Result<FeishuChannelConfig, String> {
-    let cfg = settings.remote.feishu.clone();
-    if cfg.app_id.is_empty() || cfg.app_secret.is_empty() {
+fn feishu_cfg(
+    settings: &crate::core::models::AppSettings,
+    channel: &str,
+) -> Result<crate::core::models::FeishuBotConfig, String> {
+    let bots = &settings.remote.feishu_bots;
+    // Instance channel "feishu:<app_id>" picks the exact bot; legacy bare
+    // "feishu" (pre-multi-bot sessions) resolves to the only configured bot.
+    let bot = match channel.strip_prefix("feishu:") {
+        Some(app_id) => bots.iter().find(|b| b.app_id == app_id),
+        None if bots.len() == 1 => bots.first(),
+        None => None,
+    };
+    let bot = bot.ok_or_else(|| "飞书机器人配置不存在（可能已删除）".to_string())?;
+    if bot.app_id.is_empty() || bot.app_secret.is_empty() {
         return Err("飞书渠道未配置 App ID / App Secret".to_string());
     }
-    Ok(cfg)
+    Ok(bot.clone())
 }
 
 #[derive(serde::Serialize)]
@@ -214,10 +265,10 @@ pub async fn remote_chat_info(
     channel: String,
     chat_id: String,
 ) -> Result<RemoteChatInfo, String> {
-    if channel != "feishu" {
+    if crate::remote::router::channel_kind(&channel) != "feishu" {
         return Err("仅飞书会话支持查看群信息".to_string());
     }
-    let cfg = feishu_cfg(&crate::core::settings_service::load_app_settings(&state.db).await?)?;
+    let cfg = feishu_cfg(&crate::core::settings_service::load_app_settings(&state.db).await?, &channel)?;
     let (info, members) = crate::remote::feishu::fetch_chat_info(&cfg, &chat_id).await?;
     Ok(RemoteChatInfo {
         name: info.name,
@@ -252,10 +303,10 @@ pub async fn remote_chat_files(
     channel: String,
     chat_id: String,
 ) -> Result<Vec<RemoteChatFile>, String> {
-    if channel != "feishu" {
+    if crate::remote::router::channel_kind(&channel) != "feishu" {
         return Err("仅飞书会话支持查看群文件".to_string());
     }
-    let cfg = feishu_cfg(&crate::core::settings_service::load_app_settings(&state.db).await?)?;
+    let cfg = feishu_cfg(&crate::core::settings_service::load_app_settings(&state.db).await?, &channel)?;
     let files = crate::remote::feishu::fetch_chat_files(&cfg, &chat_id).await?;
     Ok(files
         .into_iter()
@@ -282,10 +333,10 @@ pub async fn remote_chat_file_save(
     kind: String,
     save_path: String,
 ) -> Result<(), String> {
-    if channel != "feishu" {
+    if crate::remote::router::channel_kind(&channel) != "feishu" {
         return Err("仅飞书会话支持下载群文件".to_string());
     }
-    let cfg = feishu_cfg(&crate::core::settings_service::load_app_settings(&state.db).await?)?;
+    let cfg = feishu_cfg(&crate::core::settings_service::load_app_settings(&state.db).await?, &channel)?;
     let (bytes, _mime) = crate::remote::feishu::download_resource(&cfg, &message_id, &file_key, &kind).await?;
     std::fs::write(&save_path, &bytes).map_err(|e| format!("写入文件失败: {e}"))
 }
@@ -301,10 +352,10 @@ pub async fn remote_chat_file_import(
     kind: String,
     file_name: String,
 ) -> Result<crate::core::models::Paper, String> {
-    if channel != "feishu" {
+    if crate::remote::router::channel_kind(&channel) != "feishu" {
         return Err("仅飞书会话支持导入群文件".to_string());
     }
-    let cfg = feishu_cfg(&crate::core::settings_service::load_app_settings(&state.db).await?)?;
+    let cfg = feishu_cfg(&crate::core::settings_service::load_app_settings(&state.db).await?, &channel)?;
     let (bytes, _mime) = crate::remote::feishu::download_resource(&cfg, &message_id, &file_key, &kind).await?;
     let tmp_dir = state.app_data_dir.join("remote_downloads");
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("创建下载目录失败: {e}"))?;

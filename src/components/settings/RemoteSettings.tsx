@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import QRCode from 'qrcode';
-import { Check, Loader2, Trash2 } from 'lucide-react';
+import { Check, Loader2, Pencil, Plus, Power, Trash2 } from 'lucide-react';
 import {
-  remoteFeishuConfig,
-  remoteFeishuSave,
+  remoteFeishuBotDelete,
+  remoteFeishuBotSave,
+  remoteFeishuBots,
   remotePairingDelete,
   remotePairingSet,
   remotePairings,
@@ -15,18 +16,30 @@ import {
   remoteWeixinLoginVerify,
   remoteWeixinLogout,
 } from '@/lib/tauri';
-import type { RemoteChannelStatus, RemotePairing, WeixinConfigInfo, WeixinQrEvent } from '@/lib/tauri';
+import type { FeishuBotConfig, RemoteChannelStatus, RemotePairing, WeixinConfigInfo, WeixinQrEvent } from '@/lib/tauri';
 
 const CHANNEL_LABEL: Record<string, string> = { feishu: '飞书', weixin: '微信' };
 
-/** Settings page section: remote IM channels (feishu bot, pairing). */
+function channelLabel(channel: string): string {
+  return CHANNEL_LABEL[channel.split(':')[0]] ?? channel;
+}
+
+/** Unified status chip: 未启用 灰 / 待机或异常 琥珀 / 已连接 绿. */
+function StatusChip({ st }: { st?: RemoteChannelStatus }) {
+  if (!st) return null;
+  const cls = st.connected
+    ? 'bg-green-500/10 text-green-500'
+    : st.enabled
+      ? 'bg-amber-500/10 text-amber-500'
+      : 'bg-surface-hover text-text-secondary/60';
+  const text = st.connected ? st.detail || '已连接' : st.enabled ? st.detail || '未连接' : '未启用';
+  return <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${cls}`}>{text}</span>;
+}
+
+/** Settings page section: remote IM channels (feishu bots, weixin, pairing). */
 export function RemoteSettings() {
   const [loading, setLoading] = useState(true);
-  const [enabled, setEnabled] = useState(false);
-  const [appId, setAppId] = useState('');
-  const [appSecret, setAppSecret] = useState('');
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [bots, setBots] = useState<FeishuBotConfig[]>([]);
   const [status, setStatus] = useState<RemoteChannelStatus[]>([]);
   const [pairings, setPairings] = useState<RemotePairing[]>([]);
   const [weixinCfg, setWeixinCfg] = useState<WeixinConfigInfo | null>(null);
@@ -36,6 +49,14 @@ export function RemoteSettings() {
   const [verifyCode, setVerifyCode] = useState('');
   const [loginBusy, setLoginBusy] = useState(false);
   const [takingOver, setTakingOver] = useState(false);
+  // Bot edit form: 'new' for the add form, an app_id when editing, null closed.
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [formName, setFormName] = useState('');
+  const [formAppId, setFormAppId] = useState('');
+  const [formSecret, setFormSecret] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   const loadPairings = useCallback(async () => {
     try {
@@ -45,15 +66,20 @@ export function RemoteSettings() {
     }
   }, []);
 
+  const loadBots = useCallback(async () => {
+    try {
+      setBots(await remoteFeishuBots());
+    } catch (e) {
+      console.error('load feishu bots:', e);
+    }
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [cfg, st, wx] = await Promise.all([remoteFeishuConfig(), remoteStatus(), remoteWeixinConfig()]);
+        const [st, wx] = await Promise.all([remoteStatus(), remoteWeixinConfig()]);
         if (!cancelled) {
-          setEnabled(cfg.enabled);
-          setAppId(cfg.app_id);
-          setAppSecret(cfg.app_secret);
           setStatus(st);
           setWeixinCfg(wx);
         }
@@ -62,6 +88,7 @@ export function RemoteSettings() {
       }
       if (!cancelled) setLoading(false);
     })();
+    loadBots();
     loadPairings();
 
     const un1 = listen<RemoteChannelStatus[]>('remote:status', (e) => setStatus(e.payload));
@@ -90,7 +117,7 @@ export function RemoteSettings() {
       un2.then((u) => u());
       un3.then((u) => u());
     };
-  }, [loadPairings]);
+  }, [loadPairings, loadBots]);
 
   const startWeixinLogin = async () => {
     setLoginBusy(true);
@@ -105,21 +132,62 @@ export function RemoteSettings() {
     }
   };
 
-  const save = async (nextEnabled: boolean) => {
+  const openNewBotForm = () => {
+    setEditingId('new');
+    setFormName('');
+    setFormAppId('');
+    setFormSecret('');
+    setFormError(null);
+  };
+
+  const openEditBotForm = (bot: FeishuBotConfig) => {
+    setEditingId(bot.app_id);
+    setFormName(bot.name);
+    setFormAppId(bot.app_id);
+    setFormSecret('');
+    setFormError(null);
+  };
+
+  const saveBot = async () => {
     setSaving(true);
+    setFormError(null);
     try {
-      await remoteFeishuSave(appId, appSecret, nextEnabled);
-      setEnabled(nextEnabled);
-      setSaved(true);
-      window.setTimeout(() => setSaved(false), 2000);
+      const existing = bots.find((b) => b.app_id === formAppId.trim());
+      await remoteFeishuBotSave(formName, formAppId, formSecret, existing?.enabled ?? true);
+      setEditingId(null);
+      await loadBots();
     } catch (e) {
-      console.error('save feishu config:', e);
+      setFormError(String(e));
     } finally {
       setSaving(false);
     }
   };
 
-  const feishuStatus = status.find((s) => s.channel === 'feishu');
+  const toggleBot = async (bot: FeishuBotConfig) => {
+    try {
+      // Empty secret = keep the stored one (backend upsert semantics).
+      await remoteFeishuBotSave(bot.name, bot.app_id, '', !bot.enabled);
+      await loadBots();
+    } catch (e) {
+      console.error('toggle feishu bot:', e);
+    }
+  };
+
+  const deleteBot = async (bot: FeishuBotConfig) => {
+    if (confirmDeleteId !== bot.app_id) {
+      setConfirmDeleteId(bot.app_id);
+      window.setTimeout(() => setConfirmDeleteId((cur) => (cur === bot.app_id ? null : cur)), 3000);
+      return;
+    }
+    setConfirmDeleteId(null);
+    try {
+      await remoteFeishuBotDelete(bot.app_id);
+      await loadBots();
+    } catch (e) {
+      console.error('delete feishu bot:', e);
+    }
+  };
+
   const weixinStatus = status.find((s) => s.channel === 'weixin');
   const standbyHolder = status.find((s) => s.role === 'standby')?.holder;
   const pending = pairings.filter((p) => !p.approved);
@@ -170,64 +238,106 @@ export function RemoteSettings() {
         </div>
       )}
 
-      {/* Feishu channel */}
+      {/* Feishu bots */}
       <div className="rounded-lg border border-surface-hover bg-surface px-4 py-3 space-y-3">
         <div className="flex items-center gap-3">
           <div className="flex-1 min-w-0">
             <div className="text-sm font-medium text-text-primary">飞书机器人</div>
             <div className="text-xs text-text-secondary/60 mt-0.5">
               在 <a className="text-primary" href="https://open.feishu.cn/app" target="_blank" rel="noreferrer">飞书开放平台</a> 创建企业自建应用，启用机器人能力并发布版本；
-              事件订阅选择「使用长连接接收事件」，添加 im.message.receive_v1；权限需包含 im:message 与 im:message:send。
+              事件订阅选择「使用长连接接收事件」，添加 im.message.receive_v1；权限需包含 im:message 与 im:message:send。可添加多个机器人（跨租户或同租户多应用）。
             </div>
           </div>
-          {feishuStatus && (
-            <span
-              className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${
-                feishuStatus.connected
-                  ? 'bg-green-500/10 text-green-500'
-                  : feishuStatus.enabled
-                    ? 'bg-amber-500/10 text-amber-500'
-                    : 'bg-surface-hover text-text-secondary/60'
-              }`}
-            >
-              {feishuStatus.connected ? feishuStatus.detail || '已连接' : feishuStatus.enabled ? feishuStatus.detail || '未连接' : '未启用'}
-            </span>
-          )}
-        </div>
-        <div className="space-y-2">
-          <input
-            value={appId}
-            onChange={(e) => setAppId(e.target.value)}
-            placeholder="App ID（cli_ 开头）"
-            className="w-full h-8 rounded-lg bg-background border border-surface-hover text-sm text-text-primary px-3 focus:outline-none focus:border-primary/50"
-          />
-          <input
-            type="password"
-            value={appSecret}
-            onChange={(e) => setAppSecret(e.target.value)}
-            placeholder="App Secret"
-            className="w-full h-8 rounded-lg bg-background border border-surface-hover text-sm text-text-primary px-3 focus:outline-none focus:border-primary/50"
-          />
-        </div>
-        <div className="flex items-center gap-2">
           <button
-            onClick={() => save(true)}
-            disabled={saving || !appId.trim() || !appSecret.trim()}
-            className="h-8 px-3 rounded-lg bg-primary text-white text-sm disabled:opacity-40 flex items-center gap-1.5"
+            onClick={openNewBotForm}
+            className="h-8 px-3 rounded-lg border border-surface-hover text-sm text-text-secondary hover:text-text-primary flex items-center gap-1.5 shrink-0"
           >
-            {saving ? <Loader2 size={13} className="animate-spin" /> : saved ? <Check size={13} /> : null}
-            保存并启用
+            <Plus size={13} />
+            添加机器人
           </button>
-          {enabled && (
-            <button
-              onClick={() => save(false)}
-              disabled={saving}
-              className="h-8 px-3 rounded-lg border border-surface-hover text-sm text-text-secondary hover:text-text-primary disabled:opacity-40"
-            >
-              停用
-            </button>
-          )}
         </div>
+
+        {bots.length === 0 && editingId !== 'new' && (
+          <div className="text-xs text-text-secondary/50 py-1">尚未配置机器人。</div>
+        )}
+
+        {bots.map((bot) => {
+          const st = status.find((s) => s.channel === `feishu:${bot.app_id}`);
+          const editing = editingId === bot.app_id;
+          return (
+            <div key={bot.app_id} className="rounded-lg border border-surface-hover/60 bg-background/40 px-3 py-2.5">
+              <div className="flex items-center gap-3">
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm text-text-primary truncate">{bot.name || bot.app_id}</div>
+                  {bot.name && <div className="text-[11px] text-text-secondary/50 truncate">{bot.app_id}</div>}
+                </div>
+                <StatusChip st={st} />
+                <button
+                  onClick={() => toggleBot(bot)}
+                  title={bot.enabled ? '停用' : '启用'}
+                  className={`h-7 w-7 rounded-lg border flex items-center justify-center ${
+                    bot.enabled
+                      ? 'border-primary/40 text-primary'
+                      : 'border-surface-hover text-text-secondary hover:text-text-primary'
+                  }`}
+                >
+                  <Power size={13} />
+                </button>
+                <button
+                  onClick={() => openEditBotForm(bot)}
+                  title="编辑"
+                  className="h-7 w-7 rounded-lg border border-surface-hover text-text-secondary hover:text-text-primary flex items-center justify-center"
+                >
+                  <Pencil size={13} />
+                </button>
+                <button
+                  onClick={() => deleteBot(bot)}
+                  title={confirmDeleteId === bot.app_id ? '再点一次确认删除' : '删除'}
+                  className={`h-7 w-7 rounded-lg border flex items-center justify-center ${
+                    confirmDeleteId === bot.app_id
+                      ? 'border-red-500/50 text-red-400'
+                      : 'border-surface-hover text-text-secondary hover:text-red-400'
+                  }`}
+                >
+                  <Trash2 size={13} />
+                </button>
+              </div>
+              {editing && (
+                <BotForm
+                  name={formName}
+                  appId={formAppId}
+                  secret={formSecret}
+                  appIdLocked
+                  error={formError}
+                  saving={saving}
+                  onName={setFormName}
+                  onAppId={setFormAppId}
+                  onSecret={setFormSecret}
+                  onCancel={() => setEditingId(null)}
+                  onSave={saveBot}
+                />
+              )}
+            </div>
+          );
+        })}
+
+        {editingId === 'new' && (
+          <div className="rounded-lg border border-primary/30 bg-background/40 px-3 py-2.5">
+            <BotForm
+              name={formName}
+              appId={formAppId}
+              secret={formSecret}
+              appIdLocked={false}
+              error={formError}
+              saving={saving}
+              onName={setFormName}
+              onAppId={setFormAppId}
+              onSecret={setFormSecret}
+              onCancel={() => setEditingId(null)}
+              onSave={saveBot}
+            />
+          </div>
+        )}
       </div>
 
       {/* WeChat ClawBot */}
@@ -239,19 +349,7 @@ export function RemoteSettings() {
               扫码将微信绑定到思库账号，账号下各设备共享该绑定，无需重复扫码。之后在微信 ClawBot 里直接发消息对话。需微信 8.0.70+。
             </div>
           </div>
-          {weixinStatus && (
-            <span
-              className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${
-                weixinStatus.connected
-                  ? 'bg-green-500/10 text-green-500'
-                  : weixinStatus.enabled
-                    ? 'bg-amber-500/10 text-amber-500'
-                    : 'bg-surface-hover text-text-secondary/60'
-              }`}
-            >
-              {weixinStatus.connected ? weixinStatus.detail || '已连接' : weixinStatus.enabled ? weixinStatus.detail || '未连接' : '未连接'}
-            </span>
-          )}
+          <StatusChip st={weixinStatus} />
         </div>
 
         {weixinCfg?.enabled ? (
@@ -319,7 +417,7 @@ export function RemoteSettings() {
             {pending.map((p) => (
               <div key={`${p.channel}:${p.chat_id}:${p.user_id}`} className="flex items-center gap-3 text-sm">
                 <div className="flex-1 min-w-0 text-text-secondary">
-                  {CHANNEL_LABEL[p.channel] ?? p.channel}{' '}
+                  {channelLabel(p.channel)}{' '}
                   <span className="text-text-primary">{p.user_name || p.user_id}</span>
                   <span className="text-text-secondary/60">（会话 {p.chat_id}）</span>
                 </div>
@@ -350,7 +448,7 @@ export function RemoteSettings() {
             {approved.map((p) => (
               <div key={`${p.channel}:${p.chat_id}:${p.user_id}`} className="flex items-center gap-3 text-sm">
                 <div className="flex-1 min-w-0 text-text-secondary">
-                  {CHANNEL_LABEL[p.channel] ?? p.channel}{' '}
+                  {channelLabel(p.channel)}{' '}
                   <span className="text-text-primary">{p.user_name || p.user_id}</span>
                   <span className="text-text-secondary/60">（会话 {p.chat_id}）</span>
                 </div>
@@ -366,6 +464,76 @@ export function RemoteSettings() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/** Shared add/edit form for a feishu bot. */
+function BotForm({
+  name,
+  appId,
+  secret,
+  appIdLocked,
+  error,
+  saving,
+  onName,
+  onAppId,
+  onSecret,
+  onCancel,
+  onSave,
+}: {
+  name: string;
+  appId: string;
+  secret: string;
+  appIdLocked: boolean;
+  error: string | null;
+  saving: boolean;
+  onName: (v: string) => void;
+  onAppId: (v: string) => void;
+  onSecret: (v: string) => void;
+  onCancel: () => void;
+  onSave: () => void;
+}) {
+  return (
+    <div className="mt-2.5 pt-2.5 border-t border-surface-hover/60 space-y-2">
+      <input
+        value={name}
+        onChange={(e) => onName(e.target.value)}
+        placeholder="名称（可选，便于区分多个机器人）"
+        className="w-full h-8 rounded-lg bg-background border border-surface-hover text-sm text-text-primary px-3 focus:outline-none focus:border-primary/50"
+      />
+      <input
+        value={appId}
+        onChange={(e) => onAppId(e.target.value)}
+        placeholder="App ID（cli_ 开头）"
+        disabled={appIdLocked}
+        className="w-full h-8 rounded-lg bg-background border border-surface-hover text-sm text-text-primary px-3 focus:outline-none focus:border-primary/50 disabled:opacity-50"
+      />
+      <input
+        type="password"
+        value={secret}
+        onChange={(e) => onSecret(e.target.value)}
+        placeholder={appIdLocked ? 'App Secret（留空保持不变）' : 'App Secret'}
+        className="w-full h-8 rounded-lg bg-background border border-surface-hover text-sm text-text-primary px-3 focus:outline-none focus:border-primary/50"
+      />
+      {error && <div className="text-xs text-red-400">{error}</div>}
+      <div className="flex items-center gap-2">
+        <button
+          onClick={onSave}
+          disabled={saving || !appId.trim() || (!appIdLocked && !secret.trim())}
+          className="h-8 px-3 rounded-lg bg-primary text-white text-sm disabled:opacity-40 flex items-center gap-1.5"
+        >
+          {saving ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
+          保存
+        </button>
+        <button
+          onClick={onCancel}
+          disabled={saving}
+          className="h-8 px-3 rounded-lg border border-surface-hover text-sm text-text-secondary hover:text-text-primary disabled:opacity-40"
+        >
+          取消
+        </button>
+      </div>
     </div>
   );
 }

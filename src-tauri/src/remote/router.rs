@@ -61,7 +61,10 @@ pub struct MediaRef {
 
 #[derive(Clone)]
 pub struct InboundMessage {
-    pub channel: &'static str,
+    /// "weixin" or "feishu:<app_id>" — the bot instance id is encoded so
+    /// several feishu apps (across tenants or within one) stay distinct in
+    /// pairing keys, session contexts and rate-limit/lock keys.
+    pub channel: String,
     pub chat_id: String,
     pub kind: ChatKind,
     pub user_id: String,
@@ -295,7 +298,7 @@ async fn process_batch(
     // cannot open attachments); answer with guidance instead.
     if let Some(media) = &meta.media {
         if media.kind == "file" {
-            let guidance = match meta.channel {
+            let guidance = match channel_kind(&meta.channel) {
                 "feishu" => format!(
                     "已收到文件《{}》。在思库对话列表右键本会话 →「查看群文件」，可将其导入文献库或另存到本地。",
                     media.name
@@ -310,7 +313,7 @@ async fn process_batch(
         }
     }
 
-    let channel_label = channel_label(meta.channel);
+    let channel_label = channel_label(&meta.channel);
     crate::commands::pet::pet_report(
         &app,
         "remote",
@@ -392,11 +395,16 @@ async fn wait_for_new_reply(db: &SqlitePool, session_id: &str, baseline: i64) ->
 }
 
 fn channel_label(channel: &str) -> String {
-    match channel {
+    match channel_kind(channel) {
         "feishu" => "飞书".to_string(),
         "weixin" => "微信".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Channel family without the bot-instance suffix ("feishu:cli_x" → "feishu").
+pub fn channel_kind(channel: &str) -> &str {
+    channel.split(':').next().unwrap_or(channel)
 }
 
 // ---------------------------------------------------------------- pairing
@@ -415,7 +423,7 @@ async fn ensure_paired(
         "SELECT user_name, approved, session_id FROM remote_chats
          WHERE channel = ? AND chat_id = ? AND user_id = ?",
     )
-    .bind(meta.channel)
+     .bind(&meta.channel)
     .bind(&meta.chat_id)
     .bind(&meta.user_id)
     .fetch_optional(db)
@@ -436,7 +444,7 @@ async fn ensure_paired(
             "INSERT INTO remote_chats (channel, chat_id, user_id, user_name, session_id, approved, created_at, updated_at)
              VALUES (?, ?, ?, ?, NULL, 0, ?, ?)",
         )
-        .bind(meta.channel)
+         .bind(&meta.channel)
         .bind(&meta.chat_id)
         .bind(&meta.user_id)
         .bind(&display_user)
@@ -461,7 +469,7 @@ async fn ensure_paired(
         let stale = sqlx::query_scalar::<_, String>(
             "SELECT updated_at FROM remote_chats WHERE channel = ? AND chat_id = ? AND user_id = ?",
         )
-        .bind(meta.channel)
+         .bind(&meta.channel)
         .bind(&meta.chat_id)
         .bind(&meta.user_id)
         .fetch_one(db)
@@ -476,7 +484,7 @@ async fn ensure_paired(
             )
             .bind(&now)
             .bind(&meta.user_name)
-            .bind(meta.channel)
+             .bind(&meta.channel)
             .bind(&meta.chat_id)
             .bind(&meta.user_id)
             .execute(db)
@@ -498,7 +506,7 @@ async fn ensure_paired(
         )
         .bind(&meta.user_name)
         .bind(&now)
-        .bind(meta.channel)
+         .bind(&meta.channel)
         .bind(&meta.chat_id)
         .bind(&meta.user_id)
         .execute(db)
@@ -516,7 +524,7 @@ async fn ensure_paired(
         "SELECT session_id FROM remote_chats
          WHERE channel = ? AND chat_id = ? AND session_id IS NOT NULL AND session_id != '' LIMIT 1",
     )
-    .bind(meta.channel)
+     .bind(&meta.channel)
     .bind(&meta.chat_id)
     .fetch_optional(db)
     .await
@@ -537,7 +545,7 @@ async fn ensure_paired(
     sqlx::query("UPDATE remote_chats SET session_id = ?, updated_at = ? WHERE channel = ? AND chat_id = ?")
         .bind(&sid)
         .bind(&now)
-        .bind(meta.channel)
+         .bind(&meta.channel)
         .bind(&meta.chat_id)
         .execute(db)
         .await
@@ -585,7 +593,7 @@ fn remote_session_title(
     chat_name: Option<String>,
     resolved_user: Option<String>,
 ) -> String {
-    let label = channel_label(meta.channel);
+    let label = channel_label(&meta.channel);
     let who = match meta.kind {
         ChatKind::Group => chat_name
             .filter(|n| !n.is_empty())
@@ -613,7 +621,7 @@ async fn create_remote_session(
     let title = remote_session_title(meta, chat_name, resolved_user);
     let context = serde_json::json!({
         "remote": true,
-        "channel": meta.channel,
+        "channel": &meta.channel,
         "chat_id": meta.chat_id,
         "kind": match meta.kind {
             ChatKind::Group => "group",

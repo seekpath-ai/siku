@@ -12,7 +12,7 @@ use feishu_sdk::event::{
 use feishu_sdk::ws::StreamClient;
 use tauri::AppHandle;
 
-use crate::core::models::FeishuChannelConfig;
+use crate::core::models::FeishuBotConfig;
 use crate::remote::router::{self, ChatKind, InboundMessage, ReplySink};
 use crate::remote::RemoteManager;
 
@@ -22,23 +22,24 @@ pub fn spawn(
     db: sqlx::SqlitePool,
     app: AppHandle,
     manager: RemoteManager,
-    cfg: FeishuChannelConfig,
+    cfg: FeishuBotConfig,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
+        let status_key = format!("feishu:{}", cfg.app_id);
         manager
-            .set_feishu_status(false, "连接中…".to_string(), &app)
+            .set_channel_status(&status_key, false, "连接中…".to_string(), &app)
             .await;
         match run(db, &app, &manager, &cfg, cancel).await {
             Ok(()) => {
                 manager
-                    .set_feishu_status(false, "已停止".to_string(), &app)
+                    .set_channel_status(&status_key, false, "已停止".to_string(), &app)
                     .await
             }
             Err(e) => {
-                tracing::error!(error = %e, "feishu channel stopped with error");
+                tracing::error!(error = %e, app_id = %cfg.app_id, "feishu channel stopped with error");
                 manager
-                    .set_feishu_status(false, format!("错误：{e}"), &app)
+                    .set_channel_status(&status_key, false, format!("错误：{e}"), &app)
                     .await
             }
         }
@@ -49,7 +50,7 @@ async fn run(
     _db: sqlx::SqlitePool,
     app: &AppHandle,
     manager: &RemoteManager,
-    cfg: &FeishuChannelConfig,
+    cfg: &FeishuBotConfig,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<(), String> {
     // Validate credentials and learn the bot identity (needed to detect
@@ -76,6 +77,7 @@ async fn run(
             sink: sink.clone(),
             bot_open_id: bot.open_id.clone(),
             cfg: cfg.clone(),
+            instance_channel: format!("feishu:{}", cfg.app_id),
         }))
         .await;
 
@@ -85,7 +87,12 @@ async fn run(
         .map_err(|e| format!("feishu stream init failed: {e}"))?;
 
     manager
-        .set_feishu_status(true, format!("已连接（{}）", bot.app_name), app)
+        .set_channel_status(
+            &format!("feishu:{}", cfg.app_id),
+            true,
+            format!("已连接（{}）", bot.app_name),
+            app,
+        )
         .await;
 
     let mut handle = stream.spawn();
@@ -111,7 +118,7 @@ struct BotInfo {
 
 /// tenant_access_token, split out of fetch_bot_info so name resolution can
 /// reuse it.
-pub(crate) async fn tenant_token(cfg: &FeishuChannelConfig) -> Result<String, String> {
+pub(crate) async fn tenant_token(cfg: &FeishuBotConfig) -> Result<String, String> {
     let http = reqwest::Client::new();
     let token_resp: serde_json::Value = http
         .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
@@ -135,7 +142,7 @@ pub(crate) async fn tenant_token(cfg: &FeishuChannelConfig) -> Result<String, St
 
 /// tenant_access_token → bot/v3/info. Two tiny REST calls; the SDK keeps its
 /// token handling internal, so we do this directly.
-async fn fetch_bot_info(cfg: &FeishuChannelConfig) -> Result<BotInfo, String> {
+async fn fetch_bot_info(cfg: &FeishuBotConfig) -> Result<BotInfo, String> {
     let token = tenant_token(cfg).await?;
     let http = reqwest::Client::new();
     let info: serde_json::Value = http
@@ -166,7 +173,9 @@ struct FeishuMessageHandler {
     app: AppHandle,
     sink: Arc<dyn ReplySink>,
     bot_open_id: String,
-    cfg: FeishuChannelConfig,
+    cfg: FeishuBotConfig,
+    /// "feishu:<app_id>" — instance-scoped channel key for routing/pairing.
+    instance_channel: String,
 }
 
 impl EventHandler for FeishuMessageHandler {
@@ -186,7 +195,7 @@ impl EventHandler for FeishuMessageHandler {
                 sender_type = payload.pointer("/sender/sender_type").and_then(|v| v.as_str()).unwrap_or("?"),
                 "feishu message event"
             );
-            match parse_inbound(&payload, &self.bot_open_id) {
+            match parse_inbound(&payload, &self.bot_open_id, &self.instance_channel) {
                 Ok(Some(mut inbound)) => {
                     // Image messages: fetch the attachment now so the agent
                     // turn gets real pixels. Files stay as references — the
@@ -261,6 +270,7 @@ impl EventHandler for FeishuMessageHandler {
 fn parse_inbound(
     payload: &serde_json::Value,
     bot_open_id: &str,
+    instance_channel: &str,
 ) -> Result<Option<InboundMessage>, &'static str> {
     let sender_type = payload
         .pointer("/sender/sender_type")
@@ -377,7 +387,7 @@ fn parse_inbound(
             None => (String::new(), Vec::new()),
         };
         return Ok(Some(InboundMessage {
-            channel: "feishu",
+            channel: instance_channel.to_string(),
             chat_id: chat_id.to_string(),
             kind,
             user_id,
@@ -427,7 +437,7 @@ fn parse_inbound(
             return Err("媒体消息缺少 file_key/image_key");
         }
         return Ok(Some(InboundMessage {
-            channel: "feishu",
+            channel: instance_channel.to_string(),
             chat_id: chat_id.to_string(),
             kind,
             user_id,
@@ -462,7 +472,7 @@ fn parse_inbound(
     }
 
     Ok(Some(InboundMessage {
-        channel: "feishu",
+        channel: instance_channel.to_string(),
         chat_id: chat_id.to_string(),
         kind,
         user_id,
@@ -506,14 +516,14 @@ fn is_non_text_user_message(payload: &serde_json::Value) -> bool {
 
 struct FeishuSink {
     client: feishu_sdk::Client,
-    cfg: FeishuChannelConfig,
+    cfg: FeishuBotConfig,
 }
 
 /// Group name via im/v1/chats/{chat_id}; member name via
 /// contact/v3/users/{open_id}. Both need extra scopes (im:chat:readonly,
 /// contact:user.base:readonly) — failures degrade to None, never block.
 async fn fetch_feishu_names(
-    cfg: &FeishuChannelConfig,
+    cfg: &FeishuBotConfig,
     chat_id: &str,
     user_id: &str,
     kind: ChatKind,
@@ -688,7 +698,7 @@ fn feishu_data(v: &serde_json::Value, what: &str) -> Result<serde_json::Value, S
 }
 
 pub(crate) async fn fetch_chat_info(
-    cfg: &FeishuChannelConfig,
+    cfg: &FeishuBotConfig,
     chat_id: &str,
 ) -> Result<(FeishuChatInfo, Vec<FeishuMember>), String> {
     let token = tenant_token(cfg).await?;
@@ -757,7 +767,7 @@ pub(crate) async fn fetch_chat_info(
 
 /// File/image messages in the chat, newest first (capped at ~200 entries).
 pub(crate) async fn fetch_chat_files(
-    cfg: &FeishuChannelConfig,
+    cfg: &FeishuBotConfig,
     chat_id: &str,
 ) -> Result<Vec<FeishuChatFile>, String> {
     let token = tenant_token(cfg).await?;
@@ -848,7 +858,7 @@ pub(crate) async fn fetch_chat_files(
 
 /// Download a message attachment (file or image); returns bytes + mime.
 pub(crate) async fn download_resource(
-    cfg: &FeishuChannelConfig,
+    cfg: &FeishuBotConfig,
     message_id: &str,
     file_key: &str,
     kind: &str,

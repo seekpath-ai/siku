@@ -907,7 +907,7 @@ export function AgentList() {
             const closeMenu = () => setContextMenu({ visible: false, x: 0, y: 0, agentId: '' });
             return (
               <>
-                {remote && remote.channel === 'feishu' && remote.kind !== 'private' && (
+                {remote && remote.channel.startsWith('feishu') && remote.kind !== 'private' && (
                   <button
                     onClick={() => {
                       setRemoteDialog({ kind: 'info', channel: remote.channel, chatId: remote.chatId });
@@ -919,7 +919,7 @@ export function AgentList() {
                     查看群信息
                   </button>
                 )}
-                {remote && remote.channel === 'feishu' && (
+                {remote && remote.channel.startsWith('feishu') && (
                   <button
                     onClick={() => {
                       setRemoteDialog({ kind: 'files', channel: remote.channel, chatId: remote.chatId });

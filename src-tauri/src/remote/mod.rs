@@ -72,8 +72,9 @@ impl Role {
 
 #[derive(Default)]
 struct Inner {
-    feishu: ChannelSlot,
-    weixin: ChannelSlot,
+    /// Live channel slots keyed by instance: "feishu:<app_id>" per feishu
+    /// bot, "weixin" for the single WeChat binding.
+    slots: std::collections::HashMap<String, ChannelSlot>,
     /// Active QR login flow (cancel + verify-code slot), at most one.
     weixin_login: Option<(tokio_util::sync::CancellationToken, Arc<weixin::LoginState>)>,
     role: Role,
@@ -215,11 +216,11 @@ impl RemoteManager {
     }
 
     /// Start/stop channel tasks so they match the synced config and the
-    /// current role. Only the Active device connects.
+    /// current role. Only the Active device connects. Feishu runs one
+    /// connection per configured bot; slots for removed bots are torn down.
     async fn apply_channels(&self, db: &sqlx::SqlitePool, app: &AppHandle) {
         let remote = crate::core::settings_service::cached_settings().remote;
-        let feishu = remote.feishu.clone();
-        let weixin = remote.weixin.clone();
+        let weixin_cfg = remote.weixin.clone();
 
         let mut inner = self.inner.lock().await;
         let active = inner.role == Role::Active;
@@ -228,20 +229,59 @@ impl RemoteManager {
             _ => None,
         };
 
-        Self::sync_one(
-            &mut inner.feishu,
-            active && feishu.enabled && !feishu.app_id.is_empty() && !feishu.app_secret.is_empty(),
-            format!("{}:{}:{}", feishu.enabled, feishu.app_id, feishu.app_secret),
-            standby_detail.clone(),
-            |cancel| feishu::spawn(db.clone(), app.clone(), self.clone(), feishu, cancel),
-        );
-        Self::sync_one(
-            &mut inner.weixin,
-            active && weixin.enabled && !weixin.bot_token.is_empty(),
-            format!("{}:{}", weixin.enabled, weixin.bot_token),
-            standby_detail,
-            |cancel| weixin::spawn(db.clone(), app.clone(), self.clone(), weixin, cancel),
-        );
+        let mut desired: Vec<(String, bool, String)> = Vec::new();
+        for bot in &remote.feishu_bots {
+            let key = format!("feishu:{}", bot.app_id);
+            let want = active && bot.enabled && !bot.app_id.is_empty() && !bot.app_secret.is_empty();
+            let fingerprint = format!("{}:{}", bot.enabled, bot.app_secret);
+            desired.push((key, want, fingerprint));
+        }
+        {
+            let want = active && weixin_cfg.enabled && !weixin_cfg.bot_token.is_empty();
+            let fingerprint = format!("{}:{}", weixin_cfg.enabled, weixin_cfg.bot_token);
+            desired.push(("weixin".to_string(), want, fingerprint));
+        }
+        let desired_keys: std::collections::HashSet<&str> =
+            desired.iter().map(|(k, _, _)| k.as_str()).collect();
+
+        // Tear down slots whose bot was removed from the config.
+        let stale: Vec<String> = inner
+            .slots
+            .keys()
+            .filter(|k| !desired_keys.contains(k.as_str()))
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some(mut slot) = inner.slots.remove(&key) {
+                if let Some(rt) = slot.runtime.take() {
+                    rt.cancel.cancel();
+                }
+            }
+        }
+
+        for (key, want, fingerprint) in desired {
+            let slot = inner.slots.entry(key.clone()).or_default();
+            let standby = standby_detail.clone();
+            match key.strip_prefix("feishu:") {
+                Some(app_id) => {
+                    let bot = remote
+                        .feishu_bots
+                        .iter()
+                        .find(|b| b.app_id == app_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    Self::sync_one(slot, want, fingerprint, standby, |cancel| {
+                        feishu::spawn(db.clone(), app.clone(), self.clone(), bot, cancel)
+                    });
+                }
+                None => {
+                    let cfg = weixin_cfg.clone();
+                    Self::sync_one(slot, want, fingerprint, standby, |cancel| {
+                        weixin::spawn(db.clone(), app.clone(), self.clone(), cfg, cancel)
+                    });
+                }
+            }
+        }
         drop(inner);
         self.emit_status(app).await;
     }
@@ -284,20 +324,20 @@ impl RemoteManager {
         }
     }
 
-    pub async fn set_feishu_status(&self, connected: bool, detail: String, app: &AppHandle) {
+    /// Channel instances report their own status by slot key
+    /// ("feishu:<app_id>" / "weixin").
+    pub async fn set_channel_status(
+        &self,
+        key: &str,
+        connected: bool,
+        detail: String,
+        app: &AppHandle,
+    ) {
         {
             let mut inner = self.inner.lock().await;
-            inner.feishu.connected = connected;
-            inner.feishu.detail = detail;
-        }
-        self.emit_status(app).await;
-    }
-
-    pub async fn set_weixin_status(&self, connected: bool, detail: String, app: &AppHandle) {
-        {
-            let mut inner = self.inner.lock().await;
-            inner.weixin.connected = connected;
-            inner.weixin.detail = detail;
+            let slot = inner.slots.entry(key.to_string()).or_default();
+            slot.connected = connected;
+            slot.detail = detail;
         }
         self.emit_status(app).await;
     }
@@ -352,24 +392,21 @@ impl RemoteManager {
             Role::Standby { holder_name, .. } => holder_name.clone(),
             _ => String::new(),
         };
-        vec![
-            ChannelStatusInfo {
-                channel: "feishu".to_string(),
-                enabled: inner.feishu.enabled,
-                connected: inner.feishu.connected,
-                detail: inner.feishu.detail.clone(),
-                role: role.clone(),
-                holder: holder.clone(),
-            },
-            ChannelStatusInfo {
-                channel: "weixin".to_string(),
-                enabled: inner.weixin.enabled,
-                connected: inner.weixin.connected,
-                detail: inner.weixin.detail.clone(),
-                role,
-                holder,
-            },
-        ]
+        let mut keys: Vec<&String> = inner.slots.keys().collect();
+        keys.sort();
+        keys.into_iter()
+            .map(|key| {
+                let slot = &inner.slots[key];
+                ChannelStatusInfo {
+                    channel: key.clone(),
+                    enabled: slot.enabled,
+                    connected: slot.connected,
+                    detail: slot.detail.clone(),
+                    role: role.clone(),
+                    holder: holder.clone(),
+                }
+            })
+            .collect()
     }
 
     async fn emit_status(&self, app: &AppHandle) {

@@ -2822,7 +2822,9 @@ export interface RemoteChannelStatus {
   holder: string;
 }
 
-export interface FeishuChannelConfig {
+export interface FeishuBotConfig {
+  /** Display name; falls back to the app id when empty. */
+  name: string;
   enabled: boolean;
   app_id: string;
   app_secret: string;
@@ -2846,12 +2848,21 @@ export async function remoteTakeover(): Promise<void> {
   return invoke<void>('remote_takeover');
 }
 
-export async function remoteFeishuConfig(): Promise<FeishuChannelConfig> {
-  return invoke<FeishuChannelConfig>('remote_feishu_config');
+export async function remoteFeishuBots(): Promise<FeishuBotConfig[]> {
+  return invoke<FeishuBotConfig[]>('remote_feishu_bots');
 }
 
-export async function remoteFeishuSave(appId: string, appSecret: string, enabled: boolean): Promise<void> {
-  return invoke<void>('remote_feishu_save', { appId, appSecret, enabled });
+export async function remoteFeishuBotSave(
+  name: string,
+  appId: string,
+  appSecret: string,
+  enabled: boolean,
+): Promise<void> {
+  return invoke<void>('remote_feishu_bot_save', { name, appId, appSecret, enabled });
+}
+
+export async function remoteFeishuBotDelete(appId: string): Promise<void> {
+  return invoke<void>('remote_feishu_bot_delete', { appId });
 }
 
 export async function remotePairings(): Promise<RemotePairing[]> {

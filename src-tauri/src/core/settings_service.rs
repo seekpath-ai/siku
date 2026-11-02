@@ -123,7 +123,12 @@ pub async fn delete_setting(db: &SqlitePool, key: &str) -> Result<(), String> {
 /// Load app settings from the database, falling back to defaults.
 pub async fn load_app_settings(db: &SqlitePool) -> Result<AppSettings, String> {
     match get_setting(db, APP_SETTINGS_KEY).await? {
-        Some(value) => serde_json::from_str(&value).map_err(|e| format!("invalid app settings: {e}")),
+        Some(value) => {
+            let mut settings: AppSettings =
+                serde_json::from_str(&value).map_err(|e| format!("invalid app settings: {e}"))?;
+            settings.remote.normalize();
+            Ok(settings)
+        }
         None => Ok(AppSettings::default()),
     }
 }
@@ -133,9 +138,11 @@ pub async fn save_app_settings(
     db: &SqlitePool,
     settings: &AppSettings,
 ) -> Result<(), String> {
-    let value = serde_json::to_string(settings).map_err(|e| format!("json: {e}"))?;
+    let mut settings = settings.clone();
+    settings.remote.normalize();
+    let value = serde_json::to_string(&settings).map_err(|e| format!("json: {e}"))?;
     set_setting(db, APP_SETTINGS_KEY, &value).await?;
-    update_cached_settings(settings.clone());
+    update_cached_settings(settings);
     Ok(())
 }
 
@@ -287,6 +294,25 @@ pub async fn migrate_remote_settings(db: &SqlitePool) -> Result<(), String> {
         )
         .await?;
     }
+    Ok(())
+}
+
+/// One-time migration: multi-bot feishu support encodes the bot instance in
+/// `remote_chats.channel` ("feishu:<app_id>"). Rewrite legacy bare "feishu"
+/// rows when the bot list holds exactly one bot — their channel meant that
+/// app. With zero or several bots the rows are left alone (members re-pair
+/// on their next message, same as a fresh install).
+pub async fn migrate_feishu_instance_channels(db: &SqlitePool) -> Result<(), String> {
+    let app = load_app_settings(db).await?;
+    if app.remote.feishu_bots.len() != 1 {
+        return Ok(());
+    }
+    let channel = format!("feishu:{}", app.remote.feishu_bots[0].app_id);
+    sqlx::query("UPDATE remote_chats SET channel = ? WHERE channel = 'feishu'")
+        .bind(&channel)
+        .execute(db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
     Ok(())
 }
 

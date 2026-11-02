@@ -83,18 +83,18 @@ pub fn spawn(
 ) {
     tokio::spawn(async move {
         manager
-            .set_weixin_status(false, "连接中…".to_string(), &app)
+            .set_channel_status("weixin", false, "连接中…".to_string(), &app)
             .await;
         match run_monitor(db, &app, &manager, cfg, cancel).await {
             Ok(()) => {
                 manager
-                    .set_weixin_status(false, "已停止".to_string(), &app)
+                    .set_channel_status("weixin", false, "已停止".to_string(), &app)
                     .await
             }
             Err(e) => {
                 tracing::error!(error = %e, "weixin channel stopped with error");
                 manager
-                    .set_weixin_status(false, format!("错误：{e}"), &app)
+                    .set_channel_status("weixin", false, format!("错误：{e}"), &app)
                     .await
             }
         }
@@ -163,7 +163,7 @@ async fn run_monitor(
             let errcode = resp.get("errcode").and_then(|v| v.as_i64()).unwrap_or(0);
             if errcode == STALE_TOKEN_ERRCODE {
                 manager
-                    .set_weixin_status(
+                    .set_channel_status("weixin", 
                         false,
                         "连接已失效，1 小时后自动重试；也可在设置中重新扫码".to_string(),
                         app,
@@ -196,7 +196,7 @@ async fn run_monitor(
         if !connected_once {
             connected_once = true;
             manager
-                .set_weixin_status(true, "已连接".to_string(), app)
+                .set_channel_status("weixin", true, "已连接".to_string(), app)
                 .await;
         }
 
@@ -394,7 +394,7 @@ async fn handle_inbound(
     router::enqueue(
         app.clone(),
         InboundMessage {
-            channel: "weixin",
+            channel: "weixin".to_string(),
             chat_id: from.to_string(),
             kind: ChatKind::Private,
             user_id: from.to_string(),

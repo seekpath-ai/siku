@@ -151,10 +151,26 @@ async fn add_column_if_missing(
     Ok(())
 }
 
-/// Rebuild remote_chats when its primary key is still (channel, chat_id):
-/// pairing became per-member (channel, chat_id, user_id). Table is tiny and
-/// device-local, so rename-and-copy is enough.
-async fn migrate_remote_chats_per_user(db: &Db) -> anyhow::Result<()> {
+/// Canonical remote_chats shape. Every NOT NULL column carries a DEFAULT:
+/// crsql_as_crr rejects NOT-NULL-without-DEFAULT columns because they break
+/// forwards/backwards compatibility between schema versions.
+const REMOTE_CHATS_SCHEMA: &str = "CREATE TABLE remote_chats (
+    channel TEXT NOT NULL DEFAULT '',
+    chat_id TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL DEFAULT '',
+    user_name TEXT NOT NULL DEFAULT '',
+    session_id TEXT,
+    approved INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (channel, chat_id, user_id)
+)";
+
+/// Rebuild remote_chats when its shape is stale: either the primary key is
+/// still (channel, chat_id) — pairing became per-member (channel, chat_id,
+/// user_id) — or NOT NULL columns lack DEFAULT values, which CRR
+/// registration rejects. Table is tiny, so rename-and-copy is enough.
+async fn migrate_remote_chats_schema(db: &Db) -> anyhow::Result<()> {
     let rows = sqlx::query("PRAGMA table_info(remote_chats)")
         .fetch_all(db)
         .await?;
@@ -163,28 +179,18 @@ async fn migrate_remote_chats_per_user(db: &Db) -> anyhow::Result<()> {
         r.try_get::<String, _>("name").map(|n| n == "user_id").unwrap_or(false)
             && r.try_get::<i64, _>("pk").unwrap_or(0) > 0
     });
-    if user_in_pk {
+    let defaultless_not_null = rows.iter().any(|r| {
+        r.try_get::<i64, _>("notnull").unwrap_or(0) == 1
+            && r.try_get::<Option<String>, _>("dflt_value").unwrap_or(None).is_none()
+    });
+    if user_in_pk && !defaultless_not_null {
         return Ok(());
     }
-    info!("running migration: rebuild remote_chats with per-member primary key");
+    info!("running migration: rebuild remote_chats to the CRR-compatible shape");
     sqlx::query("ALTER TABLE remote_chats RENAME TO remote_chats_old")
         .execute(db)
         .await?;
-    sqlx::query(
-        "CREATE TABLE remote_chats (
-            channel TEXT NOT NULL,
-            chat_id TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            user_name TEXT NOT NULL DEFAULT '',
-            session_id TEXT,
-            approved INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (channel, chat_id, user_id)
-        )"
-    )
-    .execute(db)
-    .await?;
+    sqlx::query(REMOTE_CHATS_SCHEMA).execute(db).await?;
     sqlx::query(
         "INSERT INTO remote_chats (channel, chat_id, user_id, user_name, session_id, approved, created_at, updated_at)
          SELECT channel, chat_id, user_id, user_name, session_id, approved, created_at, updated_at
@@ -1212,22 +1218,23 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // session_id is shared per chat.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS remote_chats (
-            channel TEXT NOT NULL,
-            chat_id TEXT NOT NULL,
-            user_id TEXT NOT NULL,
+            channel TEXT NOT NULL DEFAULT '',
+            chat_id TEXT NOT NULL DEFAULT '',
+            user_id TEXT NOT NULL DEFAULT '',
             user_name TEXT NOT NULL DEFAULT '',
             session_id TEXT,
             approved INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (channel, chat_id, user_id)
         )"
     )
     .execute(&db)
     .await?;
-    // Existing DBs: the PK was (channel, chat_id) — one approval covered the
-    // whole group. Rebuild to the per-member shape. (added 2026-11-02)
-    migrate_remote_chats_per_user(&db).await?;
+    // Existing DBs: older shapes (PK without user_id, or NOT NULL columns
+    // without DEFAULTs — both CRR-incompatible) are rebuilt to the
+    // canonical shape.
+    migrate_remote_chats_schema(&db).await?;
 
     // Per-turn system-prompt snapshots for the "查看本轮上下文" viewer.
     // Device-local on purpose: the assembled prompt is a function of this

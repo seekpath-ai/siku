@@ -97,6 +97,11 @@ CREATE TABLE remote_chats (           -- 同步表（OPTIONAL_SYNC_TABLES）：�
    - 飞书图片：`resources` 下载 → base64 → 视觉输入（`run_agent_turn` attachments，模型不支持视觉时回明确错误）；图文混排（post）：段落标签解析，text/a 段拼文本、at 段保留"@名字"上下文（机器人自身 mention 剔除）、img 段逐张下载进视觉输入（多图支持）；文件：路由层短路回执，引导"右键会话→查看群文件"导入/另存；其它类型（语音/视频/表情）回不支持提示（仍受群@策略约束）。
    - 微信图片/文件：CDN 下载（`full_url` 优先，否则 `encrypt_query_param` 拼 `novac2c.cdn.weixin.qq.com/c2c/download`）+ AES-128-ECB 解密（密钥两种编码：base64(raw16) / base64(hex32)，图片另有 aeskey hex 优先；RustCrypto `aes`+`ecb` 纯 Rust 实现）；图片进视觉输入，文件存 `app_data/remote_downloads/` 并回执。
    - 未做（暂不评估）：出站媒体（远程工具只读，agent 不产出文件）、飞书卡片远程审批、微信语音 silk 转码。
+6. **工作状态展示**：✅ 已实现——
+   - **共用进度管线**（`router.rs`）：回合开始挂 `app.listen("agent:event")` 按 session_id 过滤，聚合 `RemoteProgress`（工具行动态含耗时、流式正文/推理摘要、计时），2s 节流推 `ReplySink::progress_update`；`progress_start`/`progress_finish` 负责建/收，finish 返回 true 时跳过纯文本补发。
+   - **飞书活卡片**：interactive 卡片 + `PATCH /im/v1/messages/{id}` 原地更新。回合开始发卡（问题摘要+计时）→ 工具行实时追加（中文化标签：阅读文献/检索文献库/联网搜索…，完成打勾+耗时）→ 流式正文预览 → 完成 PATCH 为 ✅ 绿卡（正文+用时+工具数）/失败红卡；>2500 字降级"分条发送"。卡片创建失败自动回退纯文本。
+   - **微信延迟回执**：协议无消息编辑/typing 指示，回执只能是普通消息——4s 未回发"收到，正在思考…"、15s 未回发"还在处理中…"，回合结束取消定时器；快速回合零打扰。
+   - 二期候选：卡片按钮回调（停止/重试）、思考过程折叠展示。
 
 ## 7. 验证方式
 

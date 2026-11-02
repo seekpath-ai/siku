@@ -119,6 +119,7 @@ async fn run_monitor(
         base_url: base_url.clone(),
         token: cfg.bot_token.clone(),
         db: db.clone(),
+        pending_acks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
     // The long-poll cursor lives in the synced `remote_weixin_state` row so
     // a standby device taking over resumes where the previous holder left
@@ -444,74 +445,143 @@ struct WeixinSink {
     base_url: String,
     token: String,
     db: sqlx::SqlitePool,
+    /// Delayed "working" notices per chat (ack + heartbeat), aborted when
+    /// the turn settles. WeChat has no message edit/typing indicator, so
+    /// these are ordinary text messages — delayed so fast turns stay quiet.
+    pending_acks: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, Vec<tokio::task::JoinHandle<()>>>,
+        >,
+    >,
 }
+
+/// How long a turn may run before the ack message is sent.
+const ACK_DELAY_SECS: u64 = 4;
+/// Second notice for long turns.
+const HEARTBEAT_SECS: u64 = 15;
 
 #[async_trait::async_trait]
 impl ReplySink for WeixinSink {
     async fn send_text(&self, chat_id: &str, text: &str) -> Result<(), String> {
-        let context_token = crate::core::settings_service::load_weixin_state(&self.db)
-            .await
-            .ok()
-            .and_then(|s| s.context_tokens.get(chat_id).cloned());
-        for chunk in chunk_text(text, SEND_CHUNK) {
-            let mut msg = serde_json::json!({
-                "from_user_id": "",
-                "to_user_id": chat_id,
-                "client_id": uuid::Uuid::new_v4().to_string(),
-                "message_type": 2, // BOT
-                "message_state": 2, // FINISH
-                "item_list": [{ "type": 1, "text_item": { "text": chunk } }],
-            });
-            if let Some(t) = &context_token {
-                msg["context_token"] = serde_json::Value::String(t.clone());
-            }
-            // The official endpoint really is "sendmessages" — no trailing
-            // s; a 404 here previously swallowed every reply.
-            let url = format!(
-                "{}/ilink/bot/sendmessage",
-                self.base_url.trim_end_matches('/')
-            );
-            let resp = self
-                .http
-                .post(&url)
-                .headers(common_headers(Some(&self.token)))
-                .json(&serde_json::json!({ "msg": msg, "base_info": base_info() }))
-                .timeout(std::time::Duration::from_secs(API_TIMEOUT_SECS))
-                .send()
-                .await
-                .map_err(|e| format!("微信发送失败: {e}"))?;
-            let status = resp.status();
-            let body = resp
-                .text()
-                .await
-                .map_err(|e| format!("微信发送响应读取失败: {e}"))?;
-            if !status.is_success() {
-                return Err(format!(
-                    "微信发送失败: HTTP {status} {}",
-                    body.chars().take(200).collect::<String>()
-                ));
-            }
-            // A 2xx with an empty/non-JSON body has been observed on delivered
-            // messages; strict .json() parsing used to fail those sends even
-            // though the text reached WeChat.
-            let parsed: serde_json::Value = match serde_json::from_str(&body) {
-                Ok(v) => v,
-                Err(_) => {
-                    tracing::warn!(
-                        body = %body.chars().take(200).collect::<String>(),
-                        "weixin sendmessage: non-JSON 2xx body, treating as delivered"
-                    );
-                    continue;
+        send_text_raw(&self.http, &self.base_url, &self.token, &self.db, chat_id, text).await
+    }
+
+    async fn progress_start(&self, chat_id: &str, _preview: &str) -> Result<(), String> {
+        let mut handles = Vec::new();
+        for (delay_secs, notice) in [
+            (ACK_DELAY_SECS, "收到，正在思考…"),
+            (HEARTBEAT_SECS, "还在处理中，请稍候…"),
+        ] {
+            let http = self.http.clone();
+            let base_url = self.base_url.clone();
+            let token = self.token.clone();
+            let db = self.db.clone();
+            let chat = chat_id.to_string();
+            handles.push(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                let _ = send_text_raw(&http, &base_url, &token, &db, &chat, notice).await;
+            }));
+        }
+        if let Ok(mut pending) = self.pending_acks.lock() {
+            // A previous turn's timers should be gone already (turns are
+            // serialized per chat); abort defensively.
+            if let Some(old) = pending.insert(chat_id.to_string(), handles) {
+                for h in old {
+                    h.abort();
                 }
-            };
-            let ret = parsed.get("ret").and_then(|v| v.as_i64()).unwrap_or(0);
-            if ret != 0 {
-                let errmsg = parsed.get("errmsg").and_then(|v| v.as_str()).unwrap_or("");
-                return Err(format!("微信发送失败: ret={ret} {errmsg}"));
             }
         }
         Ok(())
     }
+
+    async fn progress_finish(
+        &self,
+        chat_id: &str,
+        _reply: &str,
+        _ok: bool,
+        _progress: &crate::remote::router::RemoteProgress,
+    ) -> Result<bool, String> {
+        if let Ok(mut pending) = self.pending_acks.lock() {
+            if let Some(handles) = pending.remove(chat_id) {
+                for h in handles {
+                    h.abort();
+                }
+            }
+        }
+        // WeChat can't edit messages: the reply always goes out as text.
+        Ok(false)
+    }
+}
+
+async fn send_text_raw(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    db: &sqlx::SqlitePool,
+    chat_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    let context_token = crate::core::settings_service::load_weixin_state(db)
+        .await
+        .ok()
+        .and_then(|s| s.context_tokens.get(chat_id).cloned());
+    for chunk in chunk_text(text, SEND_CHUNK) {
+        let mut msg = serde_json::json!({
+            "from_user_id": "",
+            "to_user_id": chat_id,
+            "client_id": uuid::Uuid::new_v4().to_string(),
+            "message_type": 2, // BOT
+            "message_state": 2, // FINISH
+            "item_list": [{ "type": 1, "text_item": { "text": chunk } }],
+        });
+        if let Some(t) = &context_token {
+            msg["context_token"] = serde_json::Value::String(t.clone());
+        }
+        // The official endpoint really is "sendmessages" — no trailing
+        // s; a 404 here previously swallowed every reply.
+        let url = format!(
+            "{}/ilink/bot/sendmessage",
+            base_url.trim_end_matches('/')
+        );
+        let resp = http
+            .post(&url)
+            .headers(common_headers(Some(token)))
+            .json(&serde_json::json!({ "msg": msg, "base_info": base_info() }))
+            .timeout(std::time::Duration::from_secs(API_TIMEOUT_SECS))
+            .send()
+            .await
+            .map_err(|e| format!("微信发送失败: {e}"))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("微信发送响应读取失败: {e}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "微信发送失败: HTTP {status} {}",
+                body.chars().take(200).collect::<String>()
+            ));
+        }
+        // A 2xx with an empty/non-JSON body has been observed on delivered
+        // messages; strict .json() parsing used to fail those sends even
+        // though the text reached WeChat.
+        let parsed: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(
+                    body = %body.chars().take(200).collect::<String>(),
+                    "weixin sendmessage: non-JSON 2xx body, treating as delivered"
+                );
+                continue;
+            }
+        };
+        let ret = parsed.get("ret").and_then(|v| v.as_i64()).unwrap_or(0);
+        if ret != 0 {
+            let errmsg = parsed.get("errmsg").and_then(|v| v.as_str()).unwrap_or("");
+            return Err(format!("微信发送失败: ret={ret} {errmsg}"));
+        }
+    }
+    Ok(())
 }
 
 fn chunk_text(text: &str, max: usize) -> Vec<String> {

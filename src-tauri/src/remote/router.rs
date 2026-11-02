@@ -90,6 +90,75 @@ pub trait ReplySink: Send + Sync {
     ) -> (Option<String>, Option<String>) {
         (None, None)
     }
+    /// A remote turn started: channels with live UI (feishu card) create
+    /// their progress surface; channels with delayed acks (weixin) arm them.
+    async fn progress_start(&self, _chat_id: &str, _preview: &str) -> Result<(), String> {
+        Ok(())
+    }
+    /// Periodic progress snapshot (throttled by the router's driver).
+    async fn progress_update(
+        &self,
+        _chat_id: &str,
+        _progress: &RemoteProgress,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    /// The turn settled with its final reply. Return true when the channel
+    /// rendered the reply into its own progress surface — the router then
+    /// skips the plain-text send. Default false: plain text as usual.
+    async fn progress_finish(
+        &self,
+        _chat_id: &str,
+        _reply: &str,
+        _ok: bool,
+        _progress: &RemoteProgress,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+
+/// One tool action line in a live progress surface.
+#[derive(Clone)]
+pub struct ProgressAction {
+    pub id: String,
+    pub label: String,
+    pub done: bool,
+    pub duration_ms: Option<i32>,
+}
+
+/// Aggregated in-flight turn state, snapshotted by the progress driver and
+/// rendered by channels that support live UI.
+#[derive(Clone, Default)]
+pub struct RemoteProgress {
+    pub actions: Vec<ProgressAction>,
+    /// Accumulated streamed answer text (display-capped).
+    pub answer_so_far: String,
+    /// Accumulated reasoning text (display-capped).
+    pub thinking_so_far: String,
+    pub started: Option<Instant>,
+    pub changed: bool,
+    pub done: bool,
+}
+
+impl RemoteProgress {
+    pub fn elapsed_secs(&self) -> u64 {
+        self.started.map(|t| t.elapsed().as_secs()).unwrap_or(0)
+    }
+
+    fn append_capped(buf: &mut String, chunk: &str, cap: usize) {
+        if buf.len() >= cap {
+            return;
+        }
+        buf.push_str(chunk);
+        if buf.len() > cap {
+            // Truncate on a char boundary.
+            let mut end = cap;
+            while !buf.is_char_boundary(end) {
+                end -= 1;
+            }
+            buf.truncate(end);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- dedup
@@ -314,13 +383,19 @@ async fn process_batch(
     }
 
     let channel_label = channel_label(&meta.channel);
+    let preview: String = text.chars().take(50).collect();
     crate::commands::pet::pet_report(
         &app,
         "remote",
         &format!("{channel_label}远程会话"),
         "running",
-        Some(text.chars().take(50).collect::<String>()),
+        Some(preview.clone()),
     );
+
+    // Live progress surface (feishu card / weixin delayed ack): created
+    // before the turn starts so early events are not missed.
+    let _ = sink.progress_start(&meta.chat_id, &preview).await;
+    let driver = spawn_progress_driver(&app, &session_id, &meta.chat_id, sink.clone());
 
     // run_agent_turn spawns the turn and returns immediately, so remember
     // where the assistant history ends and poll for the row the turn appends
@@ -359,11 +434,22 @@ async fn process_batch(
         }
     };
 
-    let report_state = if reply.starts_with("处理失败") { "failed" } else { "done" };
+    let progress = driver.finish();
+    let ok = !reply.starts_with("处理失败") && !reply.starts_with("（回复生成超时");
+    // Channels with live UI render the reply into their progress surface;
+    // everyone else gets the plain-text send.
+    let handled = sink
+        .progress_finish(&meta.chat_id, &reply, ok, &progress)
+        .await
+        .unwrap_or(false);
+
+    let report_state = if ok { "done" } else { "failed" };
     crate::commands::pet::pet_report(&app, "remote", &format!("{channel_label}远程会话"), report_state, None);
 
-    if let Err(e) = sink.send_text(&meta.chat_id, &reply).await {
-        tracing::error!(error = %e, "remote reply send failed");
+    if !handled {
+        if let Err(e) = sink.send_text(&meta.chat_id, &reply).await {
+            tracing::error!(error = %e, "remote reply send failed");
+        }
     }
 }
 
@@ -391,6 +477,154 @@ async fn wait_for_new_reply(db: &SqlitePool, session_id: &str, baseline: i64) ->
             tracing::warn!(session_id, "remote reply wait timed out");
             return None;
         }
+    }
+}
+
+// ---------------------------------------------------------------- progress
+
+/// Progress tick interval: feishu card PATCHes are throttled to this pace.
+const PROGRESS_TICK_MS: u64 = 2000;
+const ANSWER_CAP: usize = 1500;
+const THINKING_CAP: usize = 400;
+
+/// Listens to the turn's "agent:event" stream, aggregates a RemoteProgress,
+/// and pushes throttled snapshots to the sink. finish() tears everything
+/// down and returns the final state for progress_finish.
+struct ProgressDriver {
+    state: Arc<std::sync::Mutex<RemoteProgress>>,
+    task: tokio::task::JoinHandle<()>,
+    listener_id: tauri::EventId,
+    app: AppHandle,
+}
+
+impl ProgressDriver {
+    fn finish(self) -> RemoteProgress {
+        use tauri::Listener as _;
+        self.app.unlisten(self.listener_id);
+        self.task.abort();
+        let mut st = self.state.lock().map(|s| s.clone()).unwrap_or_default();
+        st.done = true;
+        st
+    }
+}
+
+fn spawn_progress_driver(
+    app: &AppHandle,
+    session_id: &str,
+    chat_id: &str,
+    sink: Arc<dyn ReplySink>,
+) -> ProgressDriver {
+    use tauri::Listener as _;
+    let state = Arc::new(std::sync::Mutex::new(RemoteProgress {
+        started: Some(Instant::now()),
+        ..Default::default()
+    }));
+    let state_cb = state.clone();
+    let sid = session_id.to_string();
+    let listener_id = app.listen("agent:event", move |event| {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(event.payload()) else {
+            return;
+        };
+        if v.get("session_id").and_then(|s| s.as_str()) != Some(sid.as_str()) {
+            return;
+        }
+        let Ok(ev) = serde_json::from_value::<crate::ai::agent::engine::AgentEvent>(v) else {
+            return;
+        };
+        let Ok(mut st) = state_cb.lock() else { return };
+        use crate::ai::agent::engine::AgentEvent as E;
+        match ev {
+            E::Delta { content, .. } => {
+                RemoteProgress::append_capped(&mut st.answer_so_far, &content, ANSWER_CAP)
+            }
+            E::Reasoning { content, .. } => {
+                RemoteProgress::append_capped(&mut st.thinking_so_far, &content, THINKING_CAP)
+            }
+            E::ToolCall {
+                tool_call_id,
+                tool_name,
+                tool_args,
+                ..
+            } => st.actions.push(ProgressAction {
+                id: tool_call_id,
+                label: tool_label(&tool_name, &tool_args),
+                done: false,
+                duration_ms: None,
+            }),
+            E::ToolResult {
+                tool_call_id,
+                duration_ms,
+                ..
+            } => {
+                if let Some(a) = st.actions.iter_mut().rev().find(|a| a.id == tool_call_id) {
+                    a.done = true;
+                    a.duration_ms = duration_ms;
+                }
+            }
+            E::Done { .. } | E::Cancelled { .. } | E::Error { .. } => st.done = true,
+            _ => {}
+        }
+        st.changed = true;
+    });
+    let state_tick = state.clone();
+    let chat = chat_id.to_string();
+    let task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(PROGRESS_TICK_MS));
+        // The first interval tick fires immediately; skip it so the first
+        // snapshot goes out after a real tick.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let snapshot = {
+                let Ok(mut st) = state_tick.lock() else { break };
+                if st.done {
+                    break;
+                }
+                if st.changed {
+                    st.changed = false;
+                    Some(st.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(p) = snapshot {
+                let _ = sink.progress_update(&chat, &p).await;
+            }
+        }
+    });
+    ProgressDriver {
+        state,
+        task,
+        listener_id,
+        app: app.clone(),
+    }
+}
+
+/// Human-facing label for a tool call line in the live progress surface.
+fn tool_label(tool: &str, args: &serde_json::Value) -> String {
+    let pick = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
+            .unwrap_or_default()
+    };
+    let with = |name: &str, detail: &str| {
+        if detail.is_empty() {
+            name.to_string()
+        } else {
+            let c: String = detail.chars().take(24).collect();
+            format!("{name}「{}」", c)
+        }
+    };
+    match tool {
+        "paper_read" => with("阅读文献", pick(&["title", "paper_id", "id"])),
+        "paper_search" | "search_library" => with("检索文献库", pick(&["query", "keyword"])),
+        "note_read" => with("阅读笔记", pick(&["title", "note_id", "id"])),
+        "knowledge_query" => with("查知识库", pick(&["query"])),
+        "memory_read" | "memory_recall" => "回忆".to_string(),
+        "web_search" => with("联网搜索", pick(&["query"])),
+        "web_fetch" => "打开网页".to_string(),
+        "task_list" | "task_output" => "查看任务".to_string(),
+        other => other.to_string(),
     }
 }
 

@@ -68,6 +68,7 @@ async fn run(
     let sink: Arc<dyn ReplySink> = Arc::new(FeishuSink {
         client: http_client,
         cfg: cfg.clone(),
+        cards: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     let dispatcher = EventDispatcher::new(EventDispatcherConfig::new(), logger);
@@ -517,6 +518,116 @@ fn is_non_text_user_message(payload: &serde_json::Value) -> bool {
 struct FeishuSink {
     client: feishu_sdk::Client,
     cfg: FeishuBotConfig,
+    /// In-flight progress cards: chat_id → card state. One per chat at
+    /// a time (the per-chat lock serializes remote turns).
+    cards: Arc<std::sync::Mutex<std::collections::HashMap<String, CardState>>>,
+}
+
+struct CardState {
+    message_id: String,
+    preview: String,
+}
+
+// ---------------------------------------------------------------- progress cards
+// Interactive cards + message PATCH give feishu a live "working" surface:
+// the card is created when the turn starts, patched as tool/reasoning
+// events stream in, and finalized with the reply.
+
+fn md_div(content: &str) -> serde_json::Value {
+    serde_json::json!({"tag": "div", "text": {"tag": "lark_md", "content": content}})
+}
+
+fn note_el(text: &str) -> serde_json::Value {
+    serde_json::json!({"tag": "note", "elements": [{"tag": "plain_text", "content": text}]})
+}
+
+fn hr_el() -> serde_json::Value {
+    serde_json::json!({"tag": "hr"})
+}
+
+fn card_json(header: &str, template: &str, elements: Vec<serde_json::Value>) -> String {
+    serde_json::json!({
+        "config": { "wide_screen_mode": true },
+        "header": { "template": template, "title": { "tag": "plain_text", "content": header } },
+        "elements": elements,
+    })
+    .to_string()
+}
+
+/// The in-progress card: prompt preview, tool action lines with live
+/// checkmarks, latest thinking snippet, streaming answer preview, footer.
+fn progress_card(preview: &str, p: &crate::remote::router::RemoteProgress) -> String {
+    let mut els = vec![md_div(&format!("「{preview}」")), hr_el()];
+    for a in &p.actions {
+        let status = if a.done {
+            match a.duration_ms {
+                Some(d) => format!(" ✅ {:.1}s", d as f64 / 1000.0),
+                None => " ✅".to_string(),
+            }
+        } else {
+            " ⏳".to_string()
+        };
+        els.push(md_div(&format!("{}{status}", a.label)));
+    }
+    if !p.thinking_so_far.is_empty() && p.answer_so_far.is_empty() {
+        let tail: String = p
+            .thinking_so_far
+            .chars()
+            .rev()
+            .take(120)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        els.push(md_div(&format!("🧠 {tail}")));
+    }
+    if !p.answer_so_far.is_empty() {
+        els.push(hr_el());
+        els.push(md_div(&p.answer_so_far));
+    }
+    els.push(note_el(&format!("已用时 {}s · 思库远程助手", p.elapsed_secs())));
+    card_json("⏳ 思库正在处理", "blue", els)
+}
+
+async fn card_create(cfg: &FeishuBotConfig, chat_id: &str, content: &str) -> Result<String, String> {
+    let token = tenant_token(cfg).await?;
+    let v: serde_json::Value = reqwest::Client::new()
+        .post("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id")
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "receive_id": chat_id,
+            "msg_type": "interactive",
+            "content": content,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("飞书卡片发送失败: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("飞书卡片响应解析失败: {e}"))?;
+    let data = feishu_data(&v, "发送卡片")?;
+    data.get("message_id")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "飞书卡片响应缺少 message_id".to_string())
+}
+
+async fn card_update(cfg: &FeishuBotConfig, message_id: &str, content: &str) -> Result<(), String> {
+    let token = tenant_token(cfg).await?;
+    let v: serde_json::Value = reqwest::Client::new()
+        .patch(format!(
+            "https://open.feishu.cn/open-apis/im/v1/messages/{message_id}"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "content": content }))
+        .send()
+        .await
+        .map_err(|e| format!("飞书卡片更新失败: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("飞书卡片更新响应解析失败: {e}"))?;
+    feishu_data(&v, "更新卡片")?;
+    Ok(())
 }
 
 /// Group name via im/v1/chats/{chat_id}; member name via
@@ -643,6 +754,89 @@ impl ReplySink for FeishuSink {
             }
         }
         Ok(())
+    }
+
+    async fn progress_start(&self, chat_id: &str, preview: &str) -> Result<(), String> {
+        let card = progress_card(preview, &crate::remote::router::RemoteProgress::default());
+        match card_create(&self.cfg, chat_id, &card).await {
+            Ok(message_id) => {
+                if let Ok(mut cards) = self.cards.lock() {
+                    cards.insert(
+                        chat_id.to_string(),
+                        CardState {
+                            message_id,
+                            preview: preview.to_string(),
+                        },
+                    );
+                }
+            }
+            Err(e) => {
+                // No card → the router's plain-text fallback still works.
+                tracing::warn!(error = %e, "feishu progress card create failed");
+            }
+        }
+        Ok(())
+    }
+
+    async fn progress_update(
+        &self,
+        chat_id: &str,
+        progress: &crate::remote::router::RemoteProgress,
+    ) -> Result<(), String> {
+        let state = self
+            .cards
+            .lock()
+            .ok()
+            .and_then(|cards| cards.get(chat_id).map(|c| (c.message_id.clone(), c.preview.clone())));
+        let Some((message_id, preview)) = state else {
+            return Ok(());
+        };
+        // The card is a nicety, never a blocker: update failures are logged
+        // and the final answer still lands via progress_finish/send_text.
+        if let Err(e) = card_update(&self.cfg, &message_id, &progress_card(&preview, progress)).await {
+            tracing::warn!(error = %e, "feishu progress card update failed");
+        }
+        Ok(())
+    }
+
+    async fn progress_finish(
+        &self,
+        chat_id: &str,
+        reply: &str,
+        ok: bool,
+        progress: &crate::remote::router::RemoteProgress,
+    ) -> Result<bool, String> {
+        let state = self
+            .cards
+            .lock()
+            .ok()
+            .and_then(|mut cards| cards.remove(chat_id));
+        let Some(CardState { message_id, .. }) = state else {
+            return Ok(false);
+        };
+        // Long replies overflow the card body: finalize the card with a
+        // pointer and let the router send the text chunks as usual.
+        const FINAL_CARD_MAX: usize = 2500;
+        let footer = format!(
+            "用时 {}s · {} 次工具调用",
+            progress.elapsed_secs(),
+            progress.actions.len()
+        );
+        let (header, template, body, handled) = if !ok {
+            ("❌ 处理失败", "red", reply.to_string(), true)
+        } else if reply.len() <= FINAL_CARD_MAX {
+            ("✅ 已完成", "green", reply.to_string(), true)
+        } else {
+            (
+                "✅ 已完成",
+                "green",
+                "回复较长，分条发送：".to_string(),
+                false,
+            )
+        };
+        let card = card_json(header, template, vec![md_div(&body), hr_el(), note_el(&footer)]);
+        card_update(&self.cfg, &message_id, &card).await?;
+        Ok(handled)
     }
 }
 

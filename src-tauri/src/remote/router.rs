@@ -61,6 +61,17 @@ pub struct InboundMessage {
 #[async_trait::async_trait]
 pub trait ReplySink: Send + Sync {
     async fn send_text(&self, chat_id: &str, text: &str) -> Result<(), String>;
+    /// Best-effort display names for pairing rows and session titles:
+    /// (chat/group name, sender name). Channels without a directory API
+    /// (weixin iLink) return (None, None).
+    async fn resolve_names(
+        &self,
+        _chat_id: &str,
+        _user_id: &str,
+        _kind: ChatKind,
+    ) -> (Option<String>, Option<String>) {
+        (None, None)
+    }
 }
 
 // ---------------------------------------------------------------- dedup
@@ -341,6 +352,14 @@ async fn ensure_paired(
 
     let now = crate::core::time::now_iso();
     let Some((user_name, approved, session_id)) = row else {
+        // Resolve display names once at pairing time (feishu directory APIs);
+        // failures fall back to raw ids without blocking pairing.
+        let (_chat_name, resolved_user) = sink
+            .resolve_names(&meta.chat_id, &meta.user_id, meta.kind)
+            .await;
+        let display_user = resolved_user
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| meta.user_name.clone());
         sqlx::query(
             "INSERT INTO remote_chats (channel, chat_id, user_id, user_name, session_id, approved, created_at, updated_at)
              VALUES (?, ?, ?, ?, NULL, 0, ?, ?)",
@@ -348,14 +367,14 @@ async fn ensure_paired(
         .bind(meta.channel)
         .bind(&meta.chat_id)
         .bind(&meta.user_id)
-        .bind(&meta.user_name)
+        .bind(&display_user)
         .bind(&now)
         .bind(&now)
         .execute(db)
         .await
         .map_err(|e| format!("db error: {e}"))?;
         let _ = app.emit("remote:pairing", ());
-        let who = if meta.user_name.is_empty() { "你" } else { &meta.user_name };
+        let who = if display_user.is_empty() { "你" } else { &display_user };
         let _ = sink
             .send_text(
                 &meta.chat_id,
@@ -415,6 +434,7 @@ async fn ensure_paired(
     }
 
     if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+        maybe_refresh_session_title(db, meta, sink, &sid).await;
         return Ok(Some(sid));
     }
 
@@ -430,8 +450,16 @@ async fn ensure_paired(
     .await
     .map_err(|e| format!("db error: {e}"))?;
     let sid = match existing {
-        Some(s) => s,
-        None => create_remote_session(db, meta).await?,
+        Some(s) => {
+            maybe_refresh_session_title(db, meta, sink, &s).await;
+            s
+        }
+        None => {
+            let (chat_name, resolved_user) = sink
+                .resolve_names(&meta.chat_id, &meta.user_id, meta.kind)
+                .await;
+            create_remote_session(db, meta, chat_name, resolved_user).await?
+        }
     };
     // Stamp every row of the chat so later members skip the lookup.
     sqlx::query("UPDATE remote_chats SET session_id = ?, updated_at = ? WHERE channel = ? AND chat_id = ?")
@@ -445,16 +473,72 @@ async fn ensure_paired(
     Ok(Some(sid))
 }
 
-async fn create_remote_session(db: &SqlitePool, meta: &InboundMessage) -> Result<String, String> {
+/// Sessions created before directory-name resolution carry raw-id titles
+/// like "飞书 · oc_xxx". Refresh once: the raw id in the title is the stale
+/// marker, and a successful rename removes it so this never fires twice.
+async fn maybe_refresh_session_title(
+    db: &SqlitePool,
+    meta: &InboundMessage,
+    sink: &Arc<dyn ReplySink>,
+    session_id: &str,
+) {
+    let title = sqlx::query_scalar::<_, String>("SELECT title FROM chat_sessions WHERE id = ?")
+        .bind(session_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+    let Some(title) = title else { return };
+    if !title.contains(&meta.chat_id) {
+        return;
+    }
+    let (chat_name, resolved_user) = sink
+        .resolve_names(&meta.chat_id, &meta.user_id, meta.kind)
+        .await;
+    let new_title = remote_session_title(meta, chat_name, resolved_user);
+    if new_title != title && !new_title.ends_with(&meta.chat_id) {
+        let _ = sqlx::query("UPDATE chat_sessions SET title = ?, updated_at = ? WHERE id = ?")
+            .bind(&new_title)
+            .bind(crate::core::time::now_iso())
+            .bind(session_id)
+            .execute(db)
+            .await;
+    }
+}
+
+/// Remote session title: groups by chat name, private chats by counterpart
+/// name; everything falls back to the raw chat id.
+fn remote_session_title(
+    meta: &InboundMessage,
+    chat_name: Option<String>,
+    resolved_user: Option<String>,
+) -> String {
+    let label = channel_label(meta.channel);
+    let who = match meta.kind {
+        ChatKind::Group => chat_name
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| meta.chat_id.clone()),
+        ChatKind::Private => resolved_user
+            .filter(|n| !n.is_empty())
+            .or_else(|| chat_name.filter(|n| !n.is_empty()))
+            .or_else(|| {
+                let n = meta.user_name.clone();
+                (!n.is_empty()).then_some(n)
+            })
+            .unwrap_or_else(|| meta.chat_id.clone()),
+    };
+    format!("{label} · {who}")
+}
+
+async fn create_remote_session(
+    db: &SqlitePool,
+    meta: &InboundMessage,
+    chat_name: Option<String>,
+    resolved_user: Option<String>,
+) -> Result<String, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = crate::core::time::now_iso();
-    let label = channel_label(meta.channel);
-    let who = if meta.user_name.is_empty() {
-        &meta.chat_id
-    } else {
-        &meta.user_name
-    };
-    let title = format!("{label} · {who}");
+    let title = remote_session_title(meta, chat_name, resolved_user);
     let context = serde_json::json!({
         "remote": true,
         "channel": meta.channel,

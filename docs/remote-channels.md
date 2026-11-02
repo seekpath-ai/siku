@@ -86,7 +86,7 @@ CREATE TABLE remote_chats (           -- 设备本地表，不进 CRR 同步
 2. **任务触发 + 完成推送**：远程发"帮我综述 xxx"→ 后台跑综述/分析任务 → 完成主动推 IM。需打通任务系统与渠道回发（reply 按 chat_id 主动发，不再依赖当轮上下文）。
 3. **远程消息排队**：生成中再发的消息目前吃"稍后再发"；改为每聊天一个队列，回合结束自动接续下一条。
 4. **会话体验打磨**：对话列表加渠道图标、远程会话标识。**会话标题人性化**（两级，均认可）：
-   - 第 1 级（建会话时自动解析名称）：飞书调 `GET /open-apis/im/v1/chats/{chat_id}`（需 `im:chat` 权限）拿群名做标题（"飞书 · 课题三组"），私聊调用户信息接口拿姓名；微信用 getupdates 里的发送者昵称。解决现状标题是 chat_id 裸串的问题。
+   - 第 1 级（建会话时自动解析名称）：✅ 已实现——`ReplySink::resolve_names`（默认空实现），飞书调 `im/v1/chats/{chat_id}` 拿群名、`contact/v3/users/{open_id}` 拿成员名（需 `im:chat:readonly`、`contact:user.base:readonly` 权限并重新发布，缺权限降级为 id 并记 warn 日志）；群标题用群名、私聊用对方姓名；存量裸 id 标题在下次消息时一次性回填。**微信 iLink 协议拿不到昵称**（官方插件也只用 from_user_id），微信标题维持 id。
    - 第 2 级（会话内反查群详情）：**入口仅放对话列表右键菜单**——远程会话右键加「查看群信息」「查看群文件」两项（不做对话页头部图标、不进设置页），点击开居中模态框（复用 TaskCenterDialog 交互范式）：
      - 「查看群信息」小模态框（~400px）：实时调 `/im/v1/chats/{chat_id}` + `/members`，展示群名、群主、成员数、成员列表。仅飞书可做，微信 iLink 无群概念。
      - 「查看群文件」大模态框（~640px）：调 `/im/v1/messages?container_id_type=chat&container_id={chat_id}` 筛 file/image 消息，列表展示文件名/大小/发送者/时间（倒序），每行操作「导入文献库」（PDF，走现成导入管线）或「另存为」，行内显示进度。下载走 `im/v1/messages/{id}/resources/{file_key}`，与第 5 项媒体消息共用接收管线。群文件标签页的云文档（Drive 体系）不做。

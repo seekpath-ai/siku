@@ -64,7 +64,10 @@ async fn run(
     let http_client = feishu_sdk::Client::builder(config.clone())
         .build()
         .map_err(|e| format!("feishu client init failed: {e}"))?;
-    let sink: Arc<dyn ReplySink> = Arc::new(FeishuSink { client: http_client });
+    let sink: Arc<dyn ReplySink> = Arc::new(FeishuSink {
+        client: http_client,
+        cfg: cfg.clone(),
+    });
 
     let dispatcher = EventDispatcher::new(EventDispatcherConfig::new(), logger);
     dispatcher
@@ -105,9 +108,9 @@ struct BotInfo {
     app_name: String,
 }
 
-/// tenant_access_token → bot/v3/info. Two tiny REST calls; the SDK keeps its
-/// token handling internal, so we do this directly.
-async fn fetch_bot_info(cfg: &FeishuChannelConfig) -> Result<BotInfo, String> {
+/// tenant_access_token, split out of fetch_bot_info so name resolution can
+/// reuse it.
+async fn tenant_token(cfg: &FeishuChannelConfig) -> Result<String, String> {
     let http = reqwest::Client::new();
     let token_resp: serde_json::Value = http
         .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
@@ -121,18 +124,19 @@ async fn fetch_bot_info(cfg: &FeishuChannelConfig) -> Result<BotInfo, String> {
         .json()
         .await
         .map_err(|e| format!("飞书令牌响应解析失败: {e}"))?;
-    let token = token_resp
+    token_resp
         .get("tenant_access_token")
         .and_then(|t| t.as_str())
         .filter(|t| !t.is_empty())
-        .ok_or_else(|| {
-            format!(
-                "飞书鉴权失败（请检查 App ID / App Secret）：{}",
-                token_resp
-            )
-        })?
-        .to_string();
+        .map(|t| t.to_string())
+        .ok_or_else(|| format!("飞书鉴权失败（请检查 App ID / App Secret）：{}", token_resp))
+}
 
+/// tenant_access_token → bot/v3/info. Two tiny REST calls; the SDK keeps its
+/// token handling internal, so we do this directly.
+async fn fetch_bot_info(cfg: &FeishuChannelConfig) -> Result<BotInfo, String> {
+    let token = tenant_token(cfg).await?;
+    let http = reqwest::Client::new();
     let info: serde_json::Value = http
         .get("https://open.feishu.cn/open-apis/bot/v3/info")
         .bearer_auth(token)
@@ -316,10 +320,111 @@ fn is_non_text_user_message(payload: &serde_json::Value) -> bool {
 
 struct FeishuSink {
     client: feishu_sdk::Client,
+    cfg: FeishuChannelConfig,
+}
+
+/// Group name via im/v1/chats/{chat_id}; member name via
+/// contact/v3/users/{open_id}. Both need extra scopes (im:chat:readonly,
+/// contact:user.base:readonly) — failures degrade to None, never block.
+async fn fetch_feishu_names(
+    cfg: &FeishuChannelConfig,
+    chat_id: &str,
+    user_id: &str,
+    kind: ChatKind,
+) -> (Option<String>, Option<String>) {
+    let token = match tenant_token(cfg).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "feishu name resolution: token failed");
+            return (None, None);
+        }
+    };
+    let http = reqwest::Client::new();
+
+    let chat_name = if kind == ChatKind::Group {
+        match http
+            .get(format!("https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status().map_err(|e| e))
+        {
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(v) => {
+                    let name = v
+                        .pointer("/data/name")
+                        .and_then(|n| n.as_str())
+                        .filter(|n| !n.is_empty())
+                        .map(|n| n.to_string());
+                    if name.is_none() {
+                        tracing::warn!(body = %v, "feishu chat info: no name (check im:chat scope)");
+                    }
+                    name
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "feishu chat info parse failed");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "feishu chat info request failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let user_name = if !user_id.is_empty() {
+        match http
+            .get(format!(
+                "https://open.feishu.cn/open-apis/contact/v3/users/{user_id}?user_id_type=open_id"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status().map_err(|e| e))
+        {
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(v) => {
+                    let name = v
+                        .pointer("/data/user/name")
+                        .and_then(|n| n.as_str())
+                        .filter(|n| !n.is_empty())
+                        .map(|n| n.to_string());
+                    if name.is_none() {
+                        tracing::warn!(body = %v, "feishu user info: no name (check contact scope)");
+                    }
+                    name
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "feishu user info parse failed");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "feishu user info request failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    (chat_name, user_name)
 }
 
 #[async_trait::async_trait]
 impl ReplySink for FeishuSink {
+    async fn resolve_names(
+        &self,
+        chat_id: &str,
+        user_id: &str,
+        kind: ChatKind,
+    ) -> (Option<String>, Option<String>) {
+        fetch_feishu_names(&self.cfg, chat_id, user_id, kind).await
+    }
+
     async fn send_text(&self, chat_id: &str, text: &str) -> Result<(), String> {
         for chunk in chunk_text(text, 4000) {
             let query = feishu_sdk::api::SendMessageQuery {

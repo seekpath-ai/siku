@@ -9,6 +9,7 @@ import {
   remotePairingSet,
   remotePairings,
   remoteStatus,
+  remoteTakeover,
   remoteWeixinConfig,
   remoteWeixinLoginStart,
   remoteWeixinLoginVerify,
@@ -34,6 +35,7 @@ export function RemoteSettings() {
   const [needVerify, setNeedVerify] = useState(false);
   const [verifyCode, setVerifyCode] = useState('');
   const [loginBusy, setLoginBusy] = useState(false);
+  const [takingOver, setTakingOver] = useState(false);
 
   const loadPairings = useCallback(async () => {
     try {
@@ -119,8 +121,20 @@ export function RemoteSettings() {
 
   const feishuStatus = status.find((s) => s.channel === 'feishu');
   const weixinStatus = status.find((s) => s.channel === 'weixin');
+  const standbyHolder = status.find((s) => s.role === 'standby')?.holder;
   const pending = pairings.filter((p) => !p.approved);
   const approved = pairings.filter((p) => p.approved);
+
+  const takeover = async () => {
+    setTakingOver(true);
+    try {
+      await remoteTakeover();
+    } catch (e) {
+      console.error('remote takeover:', e);
+    } finally {
+      setTakingOver(false);
+    }
+  };
 
   if (loading) {
     return (
@@ -135,9 +149,26 @@ export function RemoteSettings() {
       <div>
         <h2 className="text-base font-semibold text-text-primary">远程接入</h2>
         <p className="text-xs text-text-secondary/60 mt-1">
-          思库运行期间，通过飞书机器人远程对话：查询笔记、文献，或让智能体处理任务。远程会话使用只读工具集，并显示在主对话列表中。
+          思库运行期间，通过飞书/微信机器人远程对话：查询笔记、文献，或让智能体处理任务。配置与配对随账号同步漫游，同时只有一台在线设备持有连接，其它设备自动待机。远程会话使用只读工具集，并显示在主对话列表中。
         </p>
       </div>
+
+      {/* Standby banner: another device holds the connection */}
+      {standbyHolder && (
+        <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-3 flex items-center gap-3">
+          <div className="flex-1 min-w-0 text-sm text-text-secondary">
+            远程接入当前由 <span className="text-text-primary font-medium">{standbyHolder}</span> 接管，本机处于待机。
+          </div>
+          <button
+            onClick={takeover}
+            disabled={takingOver}
+            className="h-8 px-3 rounded-lg bg-primary text-white text-sm disabled:opacity-40 flex items-center gap-1.5 shrink-0"
+          >
+            {takingOver && <Loader2 size={13} className="animate-spin" />}
+            在本机接管
+          </button>
+        </div>
+      )}
 
       {/* Feishu channel */}
       <div className="rounded-lg border border-surface-hover bg-surface px-4 py-3 space-y-3">
@@ -205,7 +236,7 @@ export function RemoteSettings() {
           <div className="flex-1 min-w-0">
             <div className="text-sm font-medium text-text-primary">微信 ClawBot</div>
             <div className="text-xs text-text-secondary/60 mt-0.5">
-              扫码将微信连接到本机思库，之后在微信 ClawBot 里直接发消息对话。需微信 8.0.70+。
+              扫码将微信绑定到思库账号，账号下各设备共享该绑定，无需重复扫码。之后在微信 ClawBot 里直接发消息对话。需微信 8.0.70+。
             </div>
           </div>
           {weixinStatus && (

@@ -205,6 +205,91 @@ pub async fn migrate_legacy_account_settings(db: &SqlitePool) -> Result<(), Stri
     Ok(())
 }
 
+// ---------------------------------------------------------------- remote channels (synced)
+
+pub const REMOTE_WEIXIN_STATE_KEY: &str = "remote_weixin_state";
+pub const REMOTE_HOLDER_KEY: &str = "remote_holder";
+
+/// Load the synced weixin runtime state (long-poll cursor + context tokens).
+pub async fn load_weixin_state(
+    db: &SqlitePool,
+) -> Result<crate::core::models::WeixinChannelState, String> {
+    match get_setting(db, REMOTE_WEIXIN_STATE_KEY).await? {
+        Some(v) => serde_json::from_str(&v).map_err(|e| format!("invalid weixin state: {e}")),
+        None => Ok(Default::default()),
+    }
+}
+
+pub async fn save_weixin_state(
+    db: &SqlitePool,
+    state: &crate::core::models::WeixinChannelState,
+) -> Result<(), String> {
+    let v = serde_json::to_string(state).map_err(|e| format!("json: {e}"))?;
+    set_setting(db, REMOTE_WEIXIN_STATE_KEY, &v).await
+}
+
+/// The manual-takeover record, if any.
+pub async fn load_remote_holder(
+    db: &SqlitePool,
+) -> Result<Option<crate::core::models::RemoteHolder>, String> {
+    match get_setting(db, REMOTE_HOLDER_KEY).await? {
+        Some(v) => serde_json::from_str(&v)
+            .map(Some)
+            .map_err(|e| format!("invalid remote holder: {e}")),
+        None => Ok(None),
+    }
+}
+
+pub async fn save_remote_holder(
+    db: &SqlitePool,
+    holder: &crate::core::models::RemoteHolder,
+) -> Result<(), String> {
+    let v = serde_json::to_string(holder).map_err(|e| format!("json: {e}"))?;
+    set_setting(db, REMOTE_HOLDER_KEY, &v).await
+}
+
+/// One-time migration: remote channel config used to live in device-local
+/// settings, forcing a fresh WeChat QR bind on every machine — and WeChat
+/// replaces the previous binding on re-bind. Move it into the synced
+/// `app_settings.remote` so the gateway roams; the constantly-changing
+/// cursor/context tokens go to their own synced row so their churn cannot
+/// clobber unrelated settings edits via whole-blob last-writer-wins.
+/// NOTE: unlike account credentials (see migrate_legacy_account_settings),
+/// bot tokens MAY roam — they are protected by the account sync key, not
+/// the root of trust themselves.
+pub async fn migrate_remote_settings(db: &SqlitePool) -> Result<(), String> {
+    let mut app = load_app_settings(db).await?;
+    let has_synced =
+        !app.remote.feishu.app_id.is_empty() || !app.remote.weixin.bot_token.is_empty();
+    if has_synced {
+        return Ok(());
+    }
+    let legacy = load_device_settings(db).await?.remote;
+    let has_legacy = !legacy.feishu.app_id.is_empty()
+        || !legacy.weixin.bot_token.is_empty()
+        || legacy.feishu.enabled
+        || legacy.weixin.enabled;
+    if !has_legacy {
+        return Ok(());
+    }
+    tracing::info!("migrating remote channel config to synced settings");
+    app.remote = legacy.clone();
+    app.remote.weixin.get_updates_buf = String::new();
+    app.remote.weixin.context_tokens = Default::default();
+    save_app_settings(db, &app).await?;
+    if !legacy.weixin.get_updates_buf.is_empty() || !legacy.weixin.context_tokens.is_empty() {
+        save_weixin_state(
+            db,
+            &crate::core::models::WeixinChannelState {
+                get_updates_buf: legacy.weixin.get_updates_buf.clone(),
+                context_tokens: legacy.weixin.context_tokens.clone(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Build LLM config from the unified provider pool.
 pub async fn load_llm_config(db: &SqlitePool) -> Result<crate::ai::llm::LlmConfig, String> {
     crate::core::llm_provider_service::load_default_llm_config(db).await

@@ -1,6 +1,13 @@
-//! Remote IM channels: let the user talk to this device's agent from
+//! Remote IM channels: let the user talk to the account's agent from
 //! feishu/weixin while the app is running. All connections are outbound
 //! (websocket/long-poll), so no public endpoint is needed.
+//!
+//! The connection is single-active across the account's devices: the holder
+//! is elected deterministically from relay room presence (lowest online
+//! device id wins), optionally overridden by a synced `remote_holder`
+//! record written on manual takeover. Config roams via synced settings, so
+//! any device can take over without re-binding (crucial for WeChat, where
+//! a fresh QR login replaces the previous binding).
 
 pub mod feishu;
 pub mod router;
@@ -13,12 +20,20 @@ use tokio::sync::Mutex;
 
 pub use router::is_remote_context;
 
+/// How often the arbiter re-evaluates presence (also the worst-case delay
+/// for noticing config/holder changes synced from other devices).
+const ARBITER_INTERVAL_SECS: u64 = 45;
+
 #[derive(Clone, serde::Serialize)]
 pub struct ChannelStatusInfo {
     pub channel: String,
     pub enabled: bool,
     pub connected: bool,
     pub detail: String,
+    /// "unknown" | "active" | "standby" — single-active arbitration outcome.
+    pub role: String,
+    /// Display name of the device holding the connection (standby only).
+    pub holder: String,
 }
 
 struct ChannelRuntime {
@@ -31,6 +46,28 @@ struct ChannelSlot {
     enabled: bool,
     connected: bool,
     detail: String,
+    /// Fingerprint of the last applied (want, config) pair. Periodic
+    /// arbitration must not restart a healthy connection, so sync_one is
+    /// skipped while the signature is unchanged.
+    signature: Option<String>,
+}
+
+#[derive(Clone, Default, PartialEq)]
+enum Role {
+    #[default]
+    Unknown,
+    Active,
+    Standby { holder_id: String, holder_name: String },
+}
+
+impl Role {
+    fn label(&self) -> &'static str {
+        match self {
+            Role::Unknown => "unknown",
+            Role::Active => "active",
+            Role::Standby { .. } => "standby",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -39,6 +76,8 @@ struct Inner {
     weixin: ChannelSlot,
     /// Active QR login flow (cancel + verify-code slot), at most one.
     weixin_login: Option<(tokio_util::sync::CancellationToken, Arc<weixin::LoginState>)>,
+    role: Role,
+    arbiter: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[derive(Clone, Default)]
@@ -47,46 +86,201 @@ pub struct RemoteManager {
 }
 
 impl RemoteManager {
-    /// Start/stop channel tasks so they match the device settings. Called at
-    /// startup and after every settings save.
+    /// Re-evaluate arbitration, then start/stop channel tasks to match.
+    /// Called at startup, after every settings save, and by the arbiter.
     pub async fn sync_config(&self, db: &sqlx::SqlitePool, app: &AppHandle) {
-        let remote = crate::core::settings_service::cached_device_settings().remote;
+        self.evaluate(db).await;
+        self.apply_channels(db, app).await;
+    }
+
+    /// Periodic presence re-evaluation. Runs until app shutdown.
+    pub fn spawn_arbiter(&self, db: sqlx::SqlitePool, app: AppHandle) {
+        let manager = self.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let token = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(ARBITER_INTERVAL_SECS)) => {
+                        manager.sync_config(&db, &app).await;
+                    }
+                }
+            }
+        });
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            inner.lock().await.arbiter = Some(cancel);
+        });
+    }
+
+    /// Manual takeover: write this device as the preferred holder into the
+    /// synced settings, then re-evaluate immediately. Other devices honor
+    /// the record while this device is online in the relay room.
+    pub async fn takeover(&self, db: &sqlx::SqlitePool, app: &AppHandle) -> Result<(), String> {
+        let device_id = crate::sync::onboarding::ensure_device_id(db)
+            .await
+            .map_err(|e| e.to_string())?;
+        let device_name = crate::core::settings_service::get_device_setting(
+            db,
+            crate::commands::account::ACCOUNT_DEVICE_NAME_KEY,
+        )
+        .await?
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| short_id(&device_id));
+        crate::core::settings_service::save_remote_holder(
+            db,
+            &crate::core::models::RemoteHolder {
+                device_id,
+                device_name,
+                ts: crate::core::time::now_iso(),
+            },
+        )
+        .await?;
+        self.sync_config(db, app).await;
+        Ok(())
+    }
+
+    /// Decide this device's role. Presence failure keeps the previous role
+    /// (hysteresis): an Active device does not drop its connection on a
+    /// transient relay outage, and a Standby device does not connect —
+    /// double-replies are worse than a temporary outage.
+    async fn evaluate(&self, db: &sqlx::SqlitePool) {
+        let own_id = crate::sync::onboarding::ensure_device_id(db)
+            .await
+            .unwrap_or_default();
+
+        let role = match crate::commands::account::fetch_account_devices(db).await {
+            Ok(devices) => {
+                let override_holder = crate::core::settings_service::load_remote_holder(db)
+                    .await
+                    .ok()
+                    .flatten();
+                let online = |id: &str| devices.iter().any(|d| d.device_id == id && d.online);
+                let holder_id = match &override_holder {
+                    // Manual override wins while its device is online (own
+                    // device counts as online even if the relay is slow to
+                    // notice us).
+                    Some(h) if h.device_id == own_id || online(&h.device_id) => {
+                        h.device_id.clone()
+                    }
+                    _ => {
+                        let mut candidates: Vec<&str> = devices
+                            .iter()
+                            .filter(|d| d.online)
+                            .map(|d| d.device_id.as_str())
+                            .collect();
+                        if !own_id.is_empty() {
+                            candidates.push(&own_id);
+                        }
+                        candidates.sort();
+                        candidates.dedup();
+                        candidates.first().map(|s| s.to_string()).unwrap_or_default()
+                    }
+                };
+                if holder_id.is_empty() || holder_id == own_id {
+                    Role::Active
+                } else {
+                    let holder_name = devices
+                        .iter()
+                        .find(|d| d.device_id == holder_id)
+                        .map(|d| d.name.clone())
+                        .filter(|n| !n.is_empty())
+                        .or_else(|| {
+                            override_holder
+                                .filter(|h| h.device_id == holder_id)
+                                .map(|h| h.device_name.clone())
+                        })
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| short_id(&holder_id));
+                    Role::Standby { holder_id, holder_name }
+                }
+            }
+            Err(e) => {
+                if e == "未登录同步账号" {
+                    // No sync account: single-device legacy behavior.
+                    Role::Active
+                } else {
+                    tracing::warn!(error = %e, "remote arbitration: presence query failed, keeping previous role");
+                    return;
+                }
+            }
+        };
+
+        let mut inner = self.inner.lock().await;
+        if inner.role != role {
+            tracing::info!(role = role.label(), "remote arbitration role changed");
+            inner.role = role;
+        }
+    }
+
+    /// Start/stop channel tasks so they match the synced config and the
+    /// current role. Only the Active device connects.
+    async fn apply_channels(&self, db: &sqlx::SqlitePool, app: &AppHandle) {
+        let remote = crate::core::settings_service::cached_settings().remote;
         let feishu = remote.feishu.clone();
         let weixin = remote.weixin.clone();
 
         let mut inner = self.inner.lock().await;
+        let active = inner.role == Role::Active;
+        let standby_detail = match &inner.role {
+            Role::Standby { holder_name, .. } => Some(format!("由 {holder_name} 接管")),
+            _ => None,
+        };
+
         Self::sync_one(
             &mut inner.feishu,
-            feishu.enabled && !feishu.app_id.is_empty() && !feishu.app_secret.is_empty(),
+            active && feishu.enabled && !feishu.app_id.is_empty() && !feishu.app_secret.is_empty(),
+            format!("{}:{}:{}", feishu.enabled, feishu.app_id, feishu.app_secret),
+            standby_detail.clone(),
             |cancel| feishu::spawn(db.clone(), app.clone(), self.clone(), feishu, cancel),
         );
         Self::sync_one(
             &mut inner.weixin,
-            weixin.enabled && !weixin.bot_token.is_empty(),
+            active && weixin.enabled && !weixin.bot_token.is_empty(),
+            format!("{}:{}", weixin.enabled, weixin.bot_token),
+            standby_detail,
             |cancel| weixin::spawn(db.clone(), app.clone(), self.clone(), weixin, cancel),
         );
         drop(inner);
         self.emit_status(app).await;
     }
 
-    /// Generic start/restart/stop for one channel slot. A live task is always
-    /// restarted when the channel is wanted, so credential edits take effect.
+    /// Generic start/restart/stop for one channel slot. A healthy channel
+    /// is left running while its (want, config) signature is unchanged.
     fn sync_one(
         slot: &mut ChannelSlot,
         want: bool,
+        fingerprint: String,
+        standby_detail: Option<String>,
         spawn: impl FnOnce(tokio_util::sync::CancellationToken),
     ) {
         slot.enabled = want;
+        let standby = standby_detail.is_some();
+        if let Some(detail) = standby_detail {
+            if !want {
+                slot.connected = false;
+                slot.detail = detail;
+            }
+        }
+        let signature = format!("{want}:{fingerprint}");
+        if slot.signature.as_deref() == Some(signature.as_str()) {
+            return;
+        }
+        slot.signature = Some(signature);
         if let Some(rt) = slot.runtime.take() {
             rt.cancel.cancel();
         }
         if want {
+            slot.detail.clear();
             let cancel = tokio_util::sync::CancellationToken::new();
             spawn(cancel.clone());
             slot.runtime = Some(ChannelRuntime { cancel });
         } else {
             slot.connected = false;
-            slot.detail.clear();
+            if !standby {
+                slot.detail.clear();
+            }
         }
     }
 
@@ -153,18 +347,27 @@ impl RemoteManager {
 
     pub async fn status(&self) -> Vec<ChannelStatusInfo> {
         let inner = self.inner.lock().await;
+        let role = inner.role.label().to_string();
+        let holder = match &inner.role {
+            Role::Standby { holder_name, .. } => holder_name.clone(),
+            _ => String::new(),
+        };
         vec![
             ChannelStatusInfo {
                 channel: "feishu".to_string(),
                 enabled: inner.feishu.enabled,
                 connected: inner.feishu.connected,
                 detail: inner.feishu.detail.clone(),
+                role: role.clone(),
+                holder: holder.clone(),
             },
             ChannelStatusInfo {
                 channel: "weixin".to_string(),
                 enabled: inner.weixin.enabled,
                 connected: inner.weixin.connected,
                 detail: inner.weixin.detail.clone(),
+                role,
+                holder,
             },
         ]
     }
@@ -173,4 +376,8 @@ impl RemoteManager {
         let status = self.status().await;
         let _ = app.emit("remote:status", status);
     }
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }

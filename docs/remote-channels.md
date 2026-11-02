@@ -38,7 +38,7 @@
 - **配对绑定**：陌生人首发消息 → 回复"请在思库设置中确认配对" → 设置页确认后入白名单。配对键是 `(channel, chat_id, user_id)`，**按人配对**（已实现）：群内每位成员需单独确认；同群已确认成员共享一个远程会话（session_id 落在该群所有成员行上）。群白名单由此隐含达成：某群没有任何已确认成员时，该群 @ 机器人只会收到配对提示，无法对话；设置页删除全部成员行即等效拉黑该群。
 
 ```sql
-CREATE TABLE remote_chats (           -- 设备本地表，不进 CRR 同步
+CREATE TABLE remote_chats (           -- 同步表（OPTIONAL_SYNC_TABLES）：配对状态随网关漫游
   channel TEXT NOT NULL,              -- 'feishu' | 'weixin'
   chat_id TEXT NOT NULL,              -- 外部会话 id
   user_id TEXT NOT NULL,              -- 外部用户 id（配对键的一部分）
@@ -51,7 +51,9 @@ CREATE TABLE remote_chats (           -- 设备本地表，不进 CRR 同步
 );
 ```
 
-- **渠道配置**（AppID/Secret、iLink token、开关）存 `DeviceAppSettings`（设备本地、不同步）。
+- **渠道配置**（AppID/Secret、iLink token、开关）存**同步** `app_settings.remote`：账号下设备漫游，微信扫码一次全账号共享（重扫会替换旧绑定，漫游是硬需求）。安全性依据：同步通道本身 E2E 加密（relay 只存密文），bot token 与对话内容同级保护；与"账号凭证绝不进同步表"不冲突——账号 token/同步密钥是信任根，bot token 是被保护的内容。
+- **微信运行时态**（长轮询游标、context_tokens）单独存同步行 `remote_weixin_state`：游标每个轮询周期都可能前进，若埋在 app_settings 整 blob 里，LWW 会冲掉其它设备对无关设置的编辑。checkpoint 15s 节流 + 退出时终写。
+- **单活仲裁**（`remote/mod.rs`）：连接同一时刻只允许一台设备持有。holder 确定性选举——relay 房间 presence（`api/devices` 返回 online 标记）中 device_id 最小者，所有设备独立计算同一结果，无锁无心跳；同步行 `remote_holder` 提供手动接管覆盖（设置页「在本机接管」），override 设备在线时优先。仲裁器每 45s 重估，presence 查询失败保持原角色（宁停勿双）；未登录同步账号时按单设备旧行为直连。渠道任务按 (want, config指纹) 跳过不变重启，健康连接不被 45s 周期打断。
 - **限流**：每用户 10 条/分钟滑动窗口；消息 ID 24h 去重（内存 LRU + app_data json 持久化）。
 
 ## 4. 渠道协议要点

@@ -2816,6 +2816,10 @@ export interface RemoteChannelStatus {
   enabled: boolean;
   connected: boolean;
   detail: string;
+  /** "unknown" | "active" | "standby" — single-active arbitration outcome. */
+  role: string;
+  /** Display name of the device holding the connection (standby only). */
+  holder: string;
 }
 
 export interface FeishuChannelConfig {
@@ -2836,6 +2840,10 @@ export interface RemotePairing {
 
 export async function remoteStatus(): Promise<RemoteChannelStatus[]> {
   return invoke<RemoteChannelStatus[]>('remote_status');
+}
+
+export async function remoteTakeover(): Promise<void> {
+  return invoke<void>('remote_takeover');
 }
 
 export async function remoteFeishuConfig(): Promise<FeishuChannelConfig> {

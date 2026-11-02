@@ -69,7 +69,7 @@ pub(crate) const CORE_SYNC_TABLES: &[&str] = &[
     // overlay rebuilt from the papers.authors/editor JSON columns (which do
     // sync via the papers table). See paper_service::rebuild_creators_for_papers.
 ];
-pub(crate) const OPTIONAL_SYNC_TABLES: &[&str] = &["chat_sessions", "chat_messages", "settings"];
+pub(crate) const OPTIONAL_SYNC_TABLES: &[&str] = &["chat_sessions", "chat_messages", "settings", "remote_chats"];
 
 /// Fixed uuid of the default vault: every device seeds the same id so the
 /// default vault converges to a single row when syncing.
@@ -1205,10 +1205,11 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     .execute(&db)
     .await?;
 
-    // Remote IM channel (feishu/weixin) chat bindings. Device-local on
-    // purpose: external ids and pairing state must not roam via sync.
-    // Pairing is per (channel, chat_id, user_id): in a group chat each member
-    // must be approved individually, while session_id is shared per chat.
+    // Remote IM channel (feishu/weixin) chat bindings. Synced (OPTIONAL) so
+    // pairing approvals roam with the remote gateway when another device
+    // takes over the connection. Pairing is per (channel, chat_id, user_id):
+    // in a group chat each member must be approved individually, while
+    // session_id is shared per chat.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS remote_chats (
             channel TEXT NOT NULL,

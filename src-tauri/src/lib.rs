@@ -519,6 +519,9 @@ pub fn run() {
                 // One-time migration: move legacy account credentials out of
                 // the syncable settings table into device-local settings.
                 let _ = core::settings_service::migrate_legacy_account_settings(&db).await;
+                // One-time migration: remote channel config moves from
+                // device-local settings into the synced app settings.
+                let _ = core::settings_service::migrate_remote_settings(&db).await;
                 let app_settings = core::settings_service::cached_settings();
 
                 let _ = handle2.emit("splash:phase", "正在初始化日志系统...");
@@ -568,10 +571,12 @@ pub fn run() {
                     remote: crate::remote::RemoteManager::default(),
                 });
 
-                // Start remote IM channels (feishu/weixin) if configured.
+                // Start remote IM channels (feishu/weixin) if configured,
+                // plus the single-active arbiter that re-evaluates presence.
                 {
                     let st = handle2.state::<AppState>();
                     st.remote.sync_config(&st.db, &handle2).await;
+                    st.remote.spawn_arbiter(st.db.clone(), handle2.clone());
                 }
 
                 // Start the cron scheduler (fires scheduled agent prompts).
@@ -898,6 +903,7 @@ pub fn run() {
             commands::remote::remote_chat_files,
             commands::remote::remote_chat_file_save,
             commands::remote::remote_chat_file_import,
+            commands::remote::remote_takeover,
             // Agent
             commands::agent::agent_create_session,
             commands::agent::agent_update_session,

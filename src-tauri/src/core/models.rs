@@ -632,6 +632,14 @@ pub struct AppSettings {
     /// Max sources discovered per topic per scan.
     #[serde(default = "default_research_discover_max_results")]
     pub research_discover_max_results: i32,
+
+    // ── Remote IM channels ──
+    /// Feishu/weixin bot credentials. Synced so the remote gateway roams
+    /// between this account's devices (single-active arbitration decides
+    /// which device actually connects). The sync channel is end-to-end
+    /// encrypted, so these secrets get the same protection as chat content.
+    #[serde(default)]
+    pub remote: RemoteSettings,
 }
 
 fn default_true() -> bool {
@@ -704,6 +712,30 @@ pub struct FeishuChannelConfig {
     pub app_id: String,
     #[serde(default)]
     pub app_secret: String,
+}
+
+/// WeChat runtime state that changes constantly while the channel runs
+/// (long-poll cursor, per-conversation context tokens). Stored as its own
+/// synced settings row (`remote_weixin_state`) instead of inside
+/// `app_settings`: the cursor advances every poll cycle, and burying it in
+/// the whole-blob settings row would let last-writer-wins clobber unrelated
+/// settings edits from other devices.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct WeixinChannelState {
+    #[serde(default)]
+    pub get_updates_buf: String,
+    #[serde(default)]
+    pub context_tokens: std::collections::HashMap<String, String>,
+}
+
+/// Which device currently holds the remote-channel connection. Written to
+/// the synced `remote_holder` settings row on manual takeover; presence
+/// (relay room membership) decides whether the record is honored.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RemoteHolder {
+    pub device_id: String,
+    pub device_name: String,
+    pub ts: String,
 }
 
 impl std::fmt::Debug for DeviceAppSettings {
@@ -800,6 +832,14 @@ impl std::fmt::Debug for AppSettings {
             .field(
                 "research_discover_max_results",
                 &self.research_discover_max_results,
+            )
+            .field(
+                "remote.feishu.app_secret",
+                &crate::core::redact::redact_api_key(&self.remote.feishu.app_secret),
+            )
+            .field(
+                "remote.weixin.bot_token",
+                &crate::core::redact::redact_api_key(&self.remote.weixin.bot_token),
             )
             .finish()
     }
@@ -913,6 +953,7 @@ impl Default for AppSettings {
             rag_max_context_tokens: default_rag_max_context_tokens(),
             research_auto_discover_interval_hours: default_research_auto_discover_interval_hours(),
             research_discover_max_results: default_research_discover_max_results(),
+            remote: RemoteSettings::default(),
         }
     }
 }

@@ -120,24 +120,38 @@ async fn run_monitor(
         token: cfg.bot_token.clone(),
         db: db.clone(),
     });
-    let mut buf = cfg.get_updates_buf.clone();
+    // The long-poll cursor lives in the synced `remote_weixin_state` row so
+    // a standby device taking over resumes where the previous holder left
+    // off — no replayed backlog, no missed messages.
+    let mut buf = crate::core::settings_service::load_weixin_state(&db)
+        .await
+        .map(|s| s.get_updates_buf)
+        .unwrap_or_default();
+    let mut checkpoint = BufCheckpoint::new(&db);
     let mut connected_once = false;
 
     loop {
         let poll = get_updates(&http, &base_url, &cfg.bot_token, &buf);
         let resp = tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),
+            _ = cancel.cancelled() => {
+                checkpoint.flush().await;
+                return Ok(());
+            }
             r = poll => r,
         };
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
                 if cancel.is_cancelled() {
+                    checkpoint.flush().await;
                     return Ok(());
                 }
                 tracing::warn!(error = %e, "weixin getupdates failed, retrying in 5s");
                 tokio::select! {
-                    _ = cancel.cancelled() => return Ok(()),
+                    _ = cancel.cancelled() => {
+                        checkpoint.flush().await;
+                        return Ok(());
+                    }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
                 }
                 continue;
@@ -156,7 +170,10 @@ async fn run_monitor(
                     )
                     .await;
                 tokio::select! {
-                    _ = cancel.cancelled() => return Ok(()),
+                    _ = cancel.cancelled() => {
+                        checkpoint.flush().await;
+                        return Ok(());
+                    }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(STALE_BACKOFF_SECS)) => {}
                 }
                 continue;
@@ -167,7 +184,10 @@ async fn run_monitor(
                 .unwrap_or("unknown");
             tracing::warn!(ret, errmsg, "weixin getupdates error, retrying in 5s");
             tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
+                _ = cancel.cancelled() => {
+                    checkpoint.flush().await;
+                    return Ok(());
+                }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
             }
             continue;
@@ -183,7 +203,7 @@ async fn run_monitor(
         if let Some(new_buf) = resp.get("get_updates_buf").and_then(|v| v.as_str()) {
             if !new_buf.is_empty() && new_buf != buf {
                 buf = new_buf.to_string();
-                persist_updates_buf(&db, &buf).await;
+                checkpoint.mark(&buf).await;
             }
         }
 
@@ -191,6 +211,41 @@ async fn run_monitor(
             for msg in msgs {
                 handle_inbound(&db, app, &sink, msg).await;
             }
+        }
+    }
+}
+
+/// Throttled checkpoint for the long-poll cursor: writing the synced
+/// settings row on every poll would spam the CRDT log during active chats,
+/// so writes are batched to one per interval and flushed on shutdown.
+struct BufCheckpoint<'a> {
+    db: &'a sqlx::SqlitePool,
+    last: std::time::Instant,
+    dirty: Option<String>,
+}
+
+impl BufCheckpoint<'_> {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+    fn new(db: &sqlx::SqlitePool) -> BufCheckpoint<'_> {
+        BufCheckpoint {
+            db,
+            last: std::time::Instant::now() - Self::INTERVAL,
+            dirty: None,
+        }
+    }
+
+    async fn mark(&mut self, buf: &str) {
+        self.dirty = Some(buf.to_string());
+        if self.last.elapsed() >= Self::INTERVAL {
+            self.flush().await;
+        }
+    }
+
+    async fn flush(&mut self) {
+        if let Some(buf) = self.dirty.take() {
+            persist_updates_buf(self.db, &buf).await;
+            self.last = std::time::Instant::now();
         }
     }
 }
@@ -355,15 +410,18 @@ async fn handle_inbound(
 }
 
 async fn persist_updates_buf(db: &sqlx::SqlitePool, buf: &str) {
-    if let Ok(mut settings) = crate::core::settings_service::load_device_settings(db).await {
-        settings.remote.weixin.get_updates_buf = buf.to_string();
-        let _ = crate::core::settings_service::save_device_settings(db, &settings).await;
+    if let Ok(mut state) = crate::core::settings_service::load_weixin_state(db).await {
+        if state.get_updates_buf == buf {
+            return;
+        }
+        state.get_updates_buf = buf.to_string();
+        let _ = crate::core::settings_service::save_weixin_state(db, &state).await;
     }
 }
 
 async fn save_context_token(db: &sqlx::SqlitePool, chat_id: &str, token: &str) {
-    if let Ok(mut settings) = crate::core::settings_service::load_device_settings(db).await {
-        let map = &mut settings.remote.weixin.context_tokens;
+    if let Ok(mut state) = crate::core::settings_service::load_weixin_state(db).await {
+        let map = &mut state.context_tokens;
         if map.get(chat_id) == Some(&token.to_string()) {
             return;
         }
@@ -375,7 +433,7 @@ async fn save_context_token(db: &sqlx::SqlitePool, chat_id: &str, token: &str) {
                 break;
             }
         }
-        let _ = crate::core::settings_service::save_device_settings(db, &settings).await;
+        let _ = crate::core::settings_service::save_weixin_state(db, &state).await;
     }
 }
 
@@ -391,10 +449,10 @@ struct WeixinSink {
 #[async_trait::async_trait]
 impl ReplySink for WeixinSink {
     async fn send_text(&self, chat_id: &str, text: &str) -> Result<(), String> {
-        let context_token = crate::core::settings_service::load_device_settings(&self.db)
+        let context_token = crate::core::settings_service::load_weixin_state(&self.db)
             .await
             .ok()
-            .and_then(|s| s.remote.weixin.context_tokens.get(chat_id).cloned());
+            .and_then(|s| s.context_tokens.get(chat_id).cloned());
         for chunk in chunk_text(text, SEND_CHUNK) {
             let mut msg = serde_json::json!({
                 "from_user_id": "",
@@ -660,16 +718,23 @@ async fn run_login(
                     return Err("登录失败：服务器未返回 bot_token".to_string());
                 }
                 let mut settings =
-                    crate::core::settings_service::load_device_settings(&db).await?;
+                    crate::core::settings_service::load_app_settings(&db).await?;
                 settings.remote.weixin = WeixinChannelConfig {
                     enabled: true,
                     bot_token,
                     ilink_bot_id,
                     ilink_user_id,
                     baseurl,
-                    ..settings.remote.weixin
+                    ..Default::default()
                 };
-                crate::core::settings_service::save_device_settings(&db, &settings).await?;
+                crate::core::settings_service::save_app_settings(&db, &settings).await?;
+                // Fresh binding: the old long-poll cursor and context tokens
+                // belong to the replaced session.
+                let _ = crate::core::settings_service::save_weixin_state(
+                    &db,
+                    &Default::default(),
+                )
+                .await;
                 emit_qr(app, None, Some("已连接微信".to_string()), false);
                 manager.sync_config(&db, app).await;
                 return Ok(());

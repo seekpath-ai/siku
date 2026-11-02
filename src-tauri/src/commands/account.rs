@@ -323,15 +323,15 @@ async fn stored_access_token(db: &sqlx::SqlitePool) -> Result<String, String> {
         .ok_or_else(|| "登录已过期，请重新登录".to_string())
 }
 
-async fn auth_request(
-    state: &AppState,
+pub(crate) async fn auth_request(
+    db: &sqlx::SqlitePool,
     relay_url: &str,
     method: reqwest::Method,
     path: &str,
     body: Option<serde_json::Value>,
 ) -> Result<(reqwest::StatusCode, String), String> {
     let base_url = crate::sync::onboarding::normalize_http_base(relay_url);
-    let token = stored_access_token(&state.db).await?;
+    let token = stored_access_token(db).await?;
     let url = format!("{}/{}", base_url.trim_end_matches('/'), path);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -347,7 +347,7 @@ async fn auth_request(
 
     if status == reqwest::StatusCode::UNAUTHORIZED {
         // Access token expired: try to refresh once and retry the original request.
-        let new_token = refresh_access_token(&state.db, relay_url).await?;
+        let new_token = refresh_access_token(db, relay_url).await?;
         let mut req2 = client
             .request(method, format!("{}/{}", base_url.trim_end_matches('/'), path))
             .header("Authorization", format!("Bearer {new_token}"));
@@ -378,7 +378,28 @@ pub async fn device_list(
     state: State<'_, AppState>,
     relay_url: String,
 ) -> Result<Vec<DeviceRow>, String> {
-    let (_, text) = auth_request(&state, &relay_url, reqwest::Method::GET, "api/devices", None).await?;
+    let (_, text) = auth_request(&state.db, &relay_url, reqwest::Method::GET, "api/devices", None).await?;
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| DeviceRow {
+            device_id: r.get("device_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            name: r.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            online: r.get("online").and_then(|v| v.as_bool()).unwrap_or(false),
+        })
+        .collect())
+}
+
+/// Same query for backend consumers (remote-channel arbitration): read the
+/// stored relay url instead of taking it as a command argument.
+pub(crate) async fn fetch_account_devices(
+    db: &sqlx::SqlitePool,
+) -> Result<Vec<DeviceRow>, String> {
+    let relay_url = settings_service::get_device_setting(db, ACCOUNT_RELAY_URL_KEY)
+        .await?
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| "未登录同步账号".to_string())?;
+    let (_, text) = auth_request(db, &relay_url, reqwest::Method::GET, "api/devices", None).await?;
     let rows: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
     Ok(rows
         .into_iter()
@@ -400,7 +421,7 @@ pub async fn device_remove(
     device_id: String,
 ) -> Result<(), String> {
     auth_request(
-        &state,
+        &state.db,
         &relay_url,
         reqwest::Method::DELETE,
         &format!("api/devices/{}", device_id),
@@ -419,7 +440,7 @@ pub async fn device_rename(
     name: String,
 ) -> Result<(), String> {
     auth_request(
-        &state,
+        &state.db,
         &relay_url,
         reqwest::Method::PATCH,
         &format!("api/devices/{}", device_id),
@@ -503,7 +524,7 @@ pub async fn storage_status(
     relay_url: String,
 ) -> Result<StorageStatus, String> {
     let (_, text) =
-        auth_request(&state, &relay_url, reqwest::Method::GET, "api/storage", None).await?;
+        auth_request(&state.db, &relay_url, reqwest::Method::GET, "api/storage", None).await?;
     serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
 }
 
@@ -514,7 +535,7 @@ pub async fn storage_plans(
     relay_url: String,
 ) -> Result<Vec<StoragePlan>, String> {
     let (_, text) =
-        auth_request(&state, &relay_url, reqwest::Method::GET, "api/plans", None).await?;
+        auth_request(&state.db, &relay_url, reqwest::Method::GET, "api/plans", None).await?;
     serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
 }
 
@@ -530,7 +551,7 @@ pub async fn storage_order_create(
     channel: Option<String>,
 ) -> Result<StorageOrderCreateResult, String> {
     let (_, text) = auth_request(
-        &state,
+        &state.db,
         &relay_url,
         reqwest::Method::POST,
         "api/storage/orders",
@@ -547,7 +568,7 @@ pub async fn storage_order_list(
     relay_url: String,
 ) -> Result<Vec<StorageOrder>, String> {
     let (_, text) =
-        auth_request(&state, &relay_url, reqwest::Method::GET, "api/storage/orders", None).await?;
+        auth_request(&state.db, &relay_url, reqwest::Method::GET, "api/storage/orders", None).await?;
     serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
 }
 
@@ -559,7 +580,7 @@ pub async fn storage_order_status(
     order_id: String,
 ) -> Result<StorageOrder, String> {
     let (_, text) = auth_request(
-        &state,
+        &state.db,
         &relay_url,
         reqwest::Method::GET,
         &format!("api/storage/orders/{order_id}/status"),

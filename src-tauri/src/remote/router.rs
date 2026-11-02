@@ -16,14 +16,12 @@ use crate::AppState;
 /// System-prompt addendum appended to remote sessions at runtime (see
 /// `run_agent_turn`). Remote users read plain chat text: app-internal links
 /// and local paths are meaningless to them.
-pub const REMOTE_PROMPT_ADDENDUM: &str = "你正通过即时通讯软件（微信/飞书）远程服务用户。\
+pub const REMOTE_PROMPT_ADDENDUM: &str = "你正通过即时通讯软件（微信/飞书）远程服务用户，与思库应用内的对话能力一致。\
 回复必须是纯文本：不要输出 siku-reader:// 等应用内链接，不要输出本地文件路径，\
 不要输出图片标记。引用文献或笔记时给出标题即可。回复控制在手机可阅读的长度，\
-内容较多时先给结论，并提示用户可以追问细节。";
-
-/// Read-only tool set for remote sessions. No bash/file writes: there is no
-/// approval UI on the remote side.
-const REMOTE_TOOLS_JSON: &str = r#"["paper_search","paper_read","search_library","note_read","knowledge_query","memory_read","memory_recall","web_search","web_fetch","task_list","task_output"]"#;
+内容较多时先给结论，并提示用户可以追问细节。\
+用户可能远程发来文件：消息中会附带文件的保存路径和已提取的内容，\
+用户要求入库时可用 paper_import 导入（仅限文献 PDF），但回复中不要暴露路径。";
 
 const DEBOUNCE_MS: u64 = 600;
 const RATE_LIMIT_PER_MIN: usize = 10;
@@ -89,6 +87,12 @@ pub trait ReplySink: Send + Sync {
         _kind: ChatKind,
     ) -> (Option<String>, Option<String>) {
         (None, None)
+    }
+    /// Materialize a file attachment to a local path for import. Channels
+    /// that already store inbound files locally (weixin) return their path;
+    /// feishu downloads on demand. Default: unsupported.
+    async fn resolve_file_media(&self, _media: &MediaRef) -> Result<std::path::PathBuf, String> {
+        Err("渠道不支持文件解析".to_string())
     }
     /// A remote turn started: channels with live UI (feishu card) create
     /// their progress surface; channels with delayed acks (weixin) arm them.
@@ -372,22 +376,62 @@ async fn process_batch(
         }
     };
 
-    // File messages never reach the agent (remote tools are read-only and
-    // cannot open attachments); answer with guidance instead.
+    // File messages: save the attachment, extract its text with the same
+    // document pipeline chat attachments use, and hand both path and content
+    // to a normal agent turn. No auto-import — the agent decides (e.g.
+    // paper_import when the user asks to add a PDF to the library).
     if let Some(media) = &meta.media {
         if media.kind == "file" {
-            let guidance = match channel_kind(&meta.channel) {
-                "feishu" => format!(
-                    "已收到文件《{}》。在思库对话列表右键本会话 →「查看群文件」，可将其导入文献库或另存到本地。",
-                    media.name
-                ),
-                _ => format!(
-                    "已收到文件《{}》，已保存到思库数据目录，请在思库应用内处理。",
-                    media.name
-                ),
-            };
-            let _ = sink.send_text(&meta.chat_id, &guidance).await;
-            return;
+            match sink.resolve_file_media(media).await {
+                Ok(path) => {
+                    // Keep every inbound file under remote_downloads so the
+                    // agent can come back to it in later turns (feishu
+                    // resolves into a volatile temp dir).
+                    let downloads = state.app_data_dir.join("remote_downloads");
+                    let path = if path.starts_with(&downloads) {
+                        path
+                    } else {
+                        let target =
+                            downloads.join(format!("{}_{}", uuid::Uuid::new_v4(), media.name));
+                        match std::fs::create_dir_all(&downloads)
+                            .and_then(|_| std::fs::copy(&path, &target).map(|_| ()))
+                        {
+                            Ok(()) => {
+                                let _ = std::fs::remove_file(&path);
+                                target
+                            }
+                            Err(_) => path,
+                        }
+                    };
+                    let cache_dir = downloads.join(".siku-cache");
+                    let read_path = path.clone();
+                    let extracted = tokio::task::spawn_blocking(move || {
+                        crate::core::document_text::read_document_text(&read_path, &cache_dir)
+                    })
+                    .await
+                    .map_err(|e| format!("task join: {e}"))
+                    .and_then(|r| r);
+                    let user_note = text.trim().to_string();
+                    let body = match extracted {
+                        Ok(content) => format!("文件内容提取如下：\n{content}"),
+                        Err(e) => format!(
+                            "文件内容提取失败（{e}）。可建议用户在思库应用内处理；\
+                             若用户要求入库且是文献 PDF，可用 paper_import 导入该路径。"
+                        ),
+                    };
+                    text = if user_note.is_empty() {
+                        format!("（用户发来文件《{}》，已保存到本机：{}。{body}）", media.name, path.display())
+                    } else {
+                        format!("{user_note}\n\n（附件《{}》已保存到本机：{}。{body}）", media.name, path.display())
+                    };
+                }
+                Err(_) => {
+                    let _ = sink
+                        .send_text(&meta.chat_id, &file_fallback_text(&meta, &media.name))
+                        .await;
+                    return;
+                }
+            }
         }
     }
 
@@ -647,6 +691,19 @@ fn channel_label(channel: &str) -> String {
     }
 }
 
+/// Fallback reply for file messages that cannot be auto-imported
+/// (non-PDF, or import failure).
+fn file_fallback_text(meta: &InboundMessage, name: &str) -> String {
+    match channel_kind(&meta.channel) {
+        "feishu" => format!(
+            "已收到文件《{name}》。在思库对话列表右键本会话 →「查看群文件」，可将其导入文献库或另存到本地。"
+        ),
+        _ => format!(
+            "已收到文件《{name}》，已保存到思库数据目录，请在思库应用内处理。"
+        ),
+    }
+}
+
 /// Channel family without the bot-instance suffix ("feishu:cli_x" → "feishu").
 pub fn channel_kind(channel: &str) -> &str {
     channel.split(':').next().unwrap_or(channel)
@@ -875,14 +932,15 @@ async fn create_remote_session(
     })
     .to_string();
     sqlx::query(
-        // Same NULL convention as create_chat_session: legacy column DEFAULTs
-        // must not leak in — NULL follows the global defaults.
+        // tools_enabled NULL = the full built-in tool set, same as local
+        // chat sessions — remote access is the user driving their own
+        // machine. Approval is forced to Auto at turn time (see
+        // build_agent_config): the remote side has no approval UI.
         "INSERT INTO chat_sessions (id, title, mode, agent_mode, tools_enabled, system_prompt, context, paper_ids, max_tokens, max_loops, context_budget, created_at, updated_at)
-         VALUES (?, ?, 'qa', 'chat', ?, NULL, ?, '[]', NULL, NULL, NULL, ?, ?)",
+         VALUES (?, ?, 'qa', 'chat', NULL, NULL, ?, '[]', NULL, NULL, NULL, ?, ?)",
     )
     .bind(&id)
     .bind(&title)
-    .bind(REMOTE_TOOLS_JSON)
     .bind(&context)
     .bind(&now)
     .bind(&now)

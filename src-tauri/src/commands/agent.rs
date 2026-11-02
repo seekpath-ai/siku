@@ -308,7 +308,7 @@ async fn build_agent_config(
     let app_settings = settings_service::load_app_settings(&state.db).await?;
 
     // NULL/unparsable → None → all tools (legacy default); "[]" → explicitly none.
-    let tools: Option<Vec<String>> = serde_json::from_str(&session.tools_enabled).unwrap_or(None);
+    let mut tools: Option<Vec<String>> = serde_json::from_str(&session.tools_enabled).unwrap_or(None);
 
     // Prefer provider pool references; fallback to legacy embedded llm_models.
     let mut llm_models: Vec<LlmConfigBlock> = Vec::new();
@@ -351,6 +351,22 @@ async fn build_agent_config(
             pet.unwrap_or_else(|| app_settings.default_approval.clone())
         }
     };
+
+    // Remote (IM-originated) sessions: the user is driving their own machine
+    // through WeChat/Feishu, so they get the full tool set and approval is
+    // forced to Auto — there is no approval UI on the remote side, and a
+    // Manual global default would otherwise stall every write/bash call
+    // until the approval timeout. Group-chat safety stays at the pairing
+    // layer (each member must be approved individually in 设置 → 远程接入).
+    let mut approval = approval;
+    if crate::remote::router::is_remote_context(session.context.as_deref().unwrap_or("")) {
+        tools = None;
+        approval = ApprovalConfig {
+            mode: crate::ai::agent::config::ApprovalMode::Auto,
+            expire_sec: None,
+            whitelist: None,
+        };
+    }
 
     let mut config = AgentConfig {
         display_name: session.title.clone(),

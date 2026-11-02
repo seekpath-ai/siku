@@ -955,6 +955,19 @@ impl ReplySink for FeishuSink {
         Ok(())
     }
 
+    async fn resolve_file_media(
+        &self,
+        media: &crate::remote::router::MediaRef,
+    ) -> Result<std::path::PathBuf, String> {
+        let (bytes, _mime) =
+            download_resource(&self.cfg, &media.message_id, &media.file_key, "file").await?;
+        let dir = std::env::temp_dir().join("siku_remote_files");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
+        let path = dir.join(format!("{}_{}", uuid::Uuid::new_v4(), media.name));
+        std::fs::write(&path, &bytes).map_err(|e| format!("写入临时文件失败: {e}"))?;
+        Ok(path)
+    }
+
     async fn progress_start(
         &self,
         chat_id: &str,

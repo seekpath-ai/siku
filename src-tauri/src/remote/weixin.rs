@@ -352,8 +352,10 @@ async fn handle_inbound(
                         }
                     }
                 }
-                // FILE: download + decrypt, stash under remote_downloads and
-                // let the router answer with guidance.
+                // FILE: download + decrypt, stash under remote_downloads;
+                // the router auto-imports PDFs into the library (the saved
+                // path rides in MediaRef.file_key) and answers other types
+                // with manual-handling guidance.
                 Some(4) => {
                     let media_ref = item.get("file_item").and_then(|i| i.get("media"));
                     let name = item
@@ -365,17 +367,20 @@ async fn handle_inbound(
                         match cdn_download(m, None).await {
                             Ok(bytes) => {
                                 let dir = app.state::<crate::AppState>().app_data_dir.join("remote_downloads");
+                                let mut saved_path = String::new();
                                 if std::fs::create_dir_all(&dir).is_ok() {
                                     let path = dir.join(format!("{}_{}", uuid::Uuid::new_v4(), name));
                                     if let Err(e) = std::fs::write(&path, &bytes) {
                                         tracing::warn!(error = %e, "weixin file save failed");
+                                    } else {
+                                        saved_path = path.to_string_lossy().to_string();
                                     }
                                 }
                                 media = Some(crate::remote::router::MediaRef {
                                     kind: "file".to_string(),
                                     name: name.clone(),
                                     message_id: String::new(),
-                                    file_key: String::new(),
+                                    file_key: saved_path,
                                     extra_image_keys: Vec::new(),
                                 });
                             }
@@ -484,6 +489,18 @@ const HEARTBEAT_SECS: u64 = 15;
 impl ReplySink for WeixinSink {
     async fn send_text(&self, chat_id: &str, text: &str) -> Result<(), String> {
         send_text_raw(&self.http, &self.base_url, &self.token, &self.db, chat_id, text).await
+    }
+
+    async fn resolve_file_media(
+        &self,
+        media: &crate::remote::router::MediaRef,
+    ) -> Result<std::path::PathBuf, String> {
+        // Inbound files are written to remote_downloads at receive time;
+        // the path rides in file_key.
+        if media.file_key.is_empty() {
+            return Err("文件保存失败，请重发一次".to_string());
+        }
+        Ok(std::path::PathBuf::from(&media.file_key))
     }
 
     async fn progress_start(

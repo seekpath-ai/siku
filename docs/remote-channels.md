@@ -10,7 +10,7 @@
 - 发起任务处理（阶段三，暂缓）
 - 远程会话在思库对话列表中可见可回溯（复用 `chat_sessions`/`chat_messages`）
 
-远程会话复用现有"对话"智能体，但工具集裁剪为只读——远程没有审批卡 UI，安全模型前置。
+远程会话复用现有"对话"智能体，**工具集与本地对话一致（全量内置工具）**——远程是用户自己驱动自己的电脑；审批强制 Auto（远程没有审批卡 UI）。安全边界只保留在配对层：群内每位成员需单独确认。
 
 ## 2. 总体架构
 
@@ -34,7 +34,7 @@
 ## 3. 会话与安全模型
 
 - **会话映射**：每个 (channel, external_chat_id) 惰性创建 `chat_sessions` 行，配置克隆用户默认对话智能体，`domain = 'remote'` 标记，`context` 存渠道信息。`RunningTurnGuard` 保证同一远程聊天串行。
-- **工具裁剪**：`ToolRegistry::retain()` 白名单：`note_read`、`paper_search`、`paper_read`、`library_search`、`knowledge`、`memory_recall`、`web_search`、`web_fetch`、`tasks`（只读类）。排除 `bash`、一切写工具。
+- **工具与审批**：`tools_enabled = NULL`（全量内置工具，与本地对话一致，含 bash/写工具）；`build_agent_config` 识别 `context.remote` 后强制 `ApprovalMode::Auto`（远程无审批卡 UI，避免回合卡审批超时），同时无视历史会话上遗留的只读 tools 白名单。
 - **配对绑定**：陌生人首发消息 → 回复"请在思库设置中确认配对" → 设置页确认后入白名单。配对键是 `(channel, chat_id, user_id)`，**按人配对**（已实现）：群内每位成员需单独确认；同群已确认成员共享一个远程会话（session_id 落在该群所有成员行上）。群白名单由此隐含达成：某群没有任何已确认成员时，该群 @ 机器人只会收到配对提示，无法对话；设置页删除全部成员行即等效拉黑该群。
 
 ```sql
@@ -94,8 +94,8 @@ CREATE TABLE remote_chats (           -- 同步表（OPTIONAL_SYNC_TABLES）：�
      - 「查看群信息」小模态框（~400px）：实时调 `/im/v1/chats/{chat_id}` + `/members`，展示群名、群主、成员数、成员列表。仅飞书可做，微信 iLink 无群概念。
      - 「查看群文件」大模态框（~640px）：调 `/im/v1/messages?container_id_type=chat&container_id={chat_id}` 筛 file/image 消息，列表展示文件名/大小/时间（倒序，封顶 200 条），每行操作「导入文献库」（PDF，走现成导入管线）或「另存为」，行内显示进度。下载走 `im/v1/messages/{id}/resources/{file_key}`，与第 5 项媒体消息共用接收管线。群文件标签页的云文档（Drive 体系）不做。**已实现**：右键菜单仅在远程飞书非私聊会话显示（context JSON 新增 `kind` 字段）；命令 `remote_chat_info/files/file_save/file_import`。
 5. **媒体消息**：✅ 已实现入站侧——
-   - 飞书图片：`resources` 下载 → base64 → 视觉输入（`run_agent_turn` attachments，模型不支持视觉时回明确错误）；图文混排（post）：段落标签解析，text/a 段拼文本、at 段保留"@名字"上下文（机器人自身 mention 剔除）、img 段逐张下载进视觉输入（多图支持）；文件：路由层短路回执，引导"右键会话→查看群文件"导入/另存；其它类型（语音/视频/表情）回不支持提示（仍受群@策略约束）。
-   - 微信图片/文件：CDN 下载（`full_url` 优先，否则 `encrypt_query_param` 拼 `novac2c.cdn.weixin.qq.com/c2c/download`）+ AES-128-ECB 解密（密钥两种编码：base64(raw16) / base64(hex32)，图片另有 aeskey hex 优先；RustCrypto `aes`+`ecb` 纯 Rust 实现）；图片进视觉输入，文件存 `app_data/remote_downloads/` 并回执。**语音**：直接读 `voice_item.text`（微信服务端自动转写，官方插件同路径），无需 silk 解码；无转写结果时回执引导发文字。
+   - 飞书图片：`resources` 下载 → base64 → 视觉输入（`run_agent_turn` attachments，模型不支持视觉时回明确错误）；图文混排（post）：段落标签解析，text/a 段拼文本、at 段保留"@名字"上下文（机器人自身 mention 剔除）、img 段逐张下载进视觉输入（多图支持）；**文件**：`resolve_file_media` 落盘并统一归置 `remote_downloads/` → 走正常 agent 回合，回合文本携带保存路径 + `read_document_text` 提取的内容（与本地对话附件同一管线，超限自动缓存并分页）；**不自动导入**——用户要求入库时 agent 自行用 `paper_import`（仅文献 PDF）；落盘失败回执引导手动处理；其它类型（语音/视频/表情）回不支持提示（仍受群@策略约束）。
+   - 微信图片/文件：CDN 下载（`full_url` 优先，否则 `encrypt_query_param` 拼 `novac2c.cdn.weixin.qq.com/c2c/download`）+ AES-128-ECB 解密（密钥两种编码：base64(raw16) / base64(hex32)，图片另有 aeskey hex 优先；RustCrypto `aes`+`ecb` 纯 Rust 实现）；图片进视觉输入，文件落盘 `remote_downloads/`（路径存 MediaRef.file_key）后**PDF 自动导入文献库**（同飞书管线），非 PDF 保留手动处理回执。**语音**：直接读 `voice_item.text`（微信服务端自动转写，官方插件同路径），无需 silk 解码；无转写结果时回执引导发文字。
    - 未做（暂不评估）：出站媒体（远程工具只读，agent 不产出文件）、飞书卡片远程审批。
 6. **工作状态展示**：✅ 已实现——
    - **共用进度管线**（`router.rs`）：回合开始挂 `app.listen("agent:event")` 按 session_id 过滤，聚合 `RemoteProgress`（工具行动态含耗时、流式正文/推理摘要、计时），2s 节流推 `ReplySink::progress_update`；`progress_start`/`progress_finish` 负责建/收，finish 返回 true 时跳过纯文本补发。

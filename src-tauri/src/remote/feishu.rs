@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use feishu_sdk::core::{new_logger, Config, LogLevel, RequestOptions};
 use feishu_sdk::event::{
-    Event, EventDispatcher, EventDispatcherConfig, EventHandler, EventHandlerResult,
+    Event, EventDispatcher, EventDispatcherConfig, EventHandler, EventHandlerResult, EventResp,
 };
 use feishu_sdk::ws::StreamClient;
 use tauri::{AppHandle, Manager as _};
@@ -88,7 +88,6 @@ async fn run(
     dispatcher
         .register_handler(Box::new(FeishuCardActionHandler {
             app: app.clone(),
-            cfg: cfg.clone(),
             cards,
             sink: sink.clone(),
             instance_channel: format!("feishu:{}", cfg.app_id),
@@ -532,7 +531,6 @@ fn is_non_text_user_message(payload: &serde_json::Value) -> bool {
 
 struct FeishuCardActionHandler {
     app: AppHandle,
-    cfg: FeishuBotConfig,
     cards: CardRegistry,
     sink: Arc<dyn ReplySink>,
     instance_channel: String,
@@ -582,21 +580,39 @@ impl EventHandler for FeishuCardActionHandler {
             match action {
                 "stop" => self.handle_stop(chat_id, state).await,
                 "retry" => self.handle_retry(chat_id, operator, state).await,
-                "toggle_thinking" => self.handle_toggle(chat_id).await,
-                _ => {}
+                // Idempotent target-state toggles: card callbacks are
+                // delivered at-least-once, and a blind flip applied twice
+                // shows as "thinking flashes then collapses again".
+                "expand_thinking" => self.handle_set_thinking(chat_id, true).await,
+                "collapse_thinking" => self.handle_set_thinking(chat_id, false).await,
+                // Legacy value on cards rendered before the idempotent fix.
+                "toggle_thinking" => self.handle_set_thinking(chat_id, true).await,
+                _ => Ok(None),
             }
-            Ok(None)
         })
     }
 }
 
+/// Build a card.action.trigger response that replaces the clicked card with
+/// `card_json` immediately, as the callback answer itself — no separate
+/// PATCH round-trip, no ack-timeout window for redelivery, and state/UI can
+/// never desync (the response IS the new card).
+fn card_action_resp(card_json: &str) -> EventHandlerResult {
+    let Ok(data) = serde_json::from_str::<serde_json::Value>(card_json) else {
+        return Ok(None);
+    };
+    let body = serde_json::json!({ "card": { "type": "raw", "data": data } });
+    Ok(Some(EventResp::ok(body.to_string().into_bytes())))
+}
+
 impl FeishuCardActionHandler {
     /// Cancel the engine turn. The router's progress_finish renders the
-    /// final stopped card once the cancelled reply row lands; we patch a
-    /// "stopping" hint immediately so the button feels responsive.
-    async fn handle_stop(&self, chat_id: &str, mut state: CardState) {
+    /// final stopped card once the cancelled reply row lands; the callback
+    /// answer carries a "stopping" card immediately so the button feels
+    /// responsive.
+    async fn handle_stop(&self, chat_id: &str, mut state: CardState) -> EventHandlerResult {
         if state.finished {
-            return;
+            return Ok(None);
         }
         {
             let app_state = self.app.state::<crate::AppState>();
@@ -614,43 +630,63 @@ impl FeishuCardActionHandler {
             "orange",
             vec![md_div(&state.preview), note_el("思库远程助手")],
         );
-        let _ = card_update(&self.cfg, &state.message_id, &hint).await;
+        card_action_resp(&hint)
     }
 
-    /// Re-run the same prompt through the normal pipeline. The old card
-    /// gets a retried marker; the new turn creates its own progress card.
-    async fn handle_retry(&self, chat_id: &str, operator: &str, mut state: CardState) {
+    /// Re-run the same prompt through the normal pipeline. The old card is
+    /// replaced (in the callback answer) with its retried marker; the new
+    /// turn creates its own progress card. Guarded against double-clicks and
+    /// redelivered callbacks: only the first retry enqueues a turn.
+    async fn handle_retry(&self, chat_id: &str, operator: &str, state: CardState) -> EventHandlerResult {
         if !state.finished {
-            return;
+            return Ok(None);
         }
-        state.footer = format!("{} · 已重试 ↻", state.footer);
-        let _ = card_update(&self.cfg, &state.message_id, &final_card(&state)).await;
-        let inbound = InboundMessage {
-            channel: self.instance_channel.clone(),
-            chat_id: chat_id.to_string(),
-            kind: state.kind,
-            user_id: operator.to_string(),
-            user_name: String::new(),
-            msg_id: String::new(), // synthetic click: no dedup entry
-            text: state.prompt.clone(),
-            images: Vec::new(),
-            media: None,
-        };
-        router::enqueue(self.app.clone(), inbound, self.sink.clone()).await;
-    }
-
-    async fn handle_toggle(&self, chat_id: &str) {
-        let (message_id, card) = {
+        let (card, inbound) = {
             let Ok(mut cards) = self.cards.lock() else {
-                return;
+                return Ok(None);
             };
             let Some(state) = cards.get_mut(chat_id) else {
-                return;
+                return Ok(None);
             };
-            state.thinking_expanded = !state.thinking_expanded;
-            (state.message_id.clone(), final_card(state))
+            if state.retried {
+                return Ok(None);
+            }
+            state.retried = true;
+            state.footer = format!("{} · 已重试 ↻", state.footer);
+            let inbound = InboundMessage {
+                channel: self.instance_channel.clone(),
+                chat_id: chat_id.to_string(),
+                kind: state.kind,
+                user_id: operator.to_string(),
+                user_name: String::new(),
+                msg_id: String::new(), // synthetic click: no dedup entry
+                text: state.prompt.clone(),
+                images: Vec::new(),
+                media: None,
+            };
+            (final_card(state), inbound)
         };
-        let _ = card_update(&self.cfg, &message_id, &card).await;
+        router::enqueue(self.app.clone(), inbound, self.sink.clone()).await;
+        card_action_resp(&card)
+    }
+
+    /// Set the thinking section to the requested state (idempotent:
+    /// duplicate callback deliveries re-apply the same state invisibly).
+    async fn handle_set_thinking(&self, chat_id: &str, expanded: bool) -> EventHandlerResult {
+        let card = {
+            let Ok(mut cards) = self.cards.lock() else {
+                return Ok(None);
+            };
+            let Some(state) = cards.get_mut(chat_id) else {
+                return Ok(None);
+            };
+            if state.thinking_expanded == expanded {
+                return Ok(None); // already in the target state — no re-render
+            }
+            state.thinking_expanded = expanded;
+            final_card(state)
+        };
+        card_action_resp(&card)
     }
 }
 
@@ -686,6 +722,9 @@ struct CardState {
     /// renders the stopped header instead of the success one.
     stopped: bool,
     thinking_expanded: bool,
+    /// Retry already dispatched for this card: further clicks are ignored
+    /// (double-click / redelivered callback must not enqueue duplicate turns).
+    retried: bool,
 }
 
 // ---------------------------------------------------------------- progress cards
@@ -739,13 +778,20 @@ fn final_card(state: &CardState) -> String {
         ("❌ 处理失败", "red")
     };
     let mut els = vec![md_div(&state.reply), hr_el(), note_el(&state.footer)];
-    let mut buttons: Vec<(&str, &str, &str)> = vec![("重试", "primary", "retry")];
+    // "重试" on a successful reply reads as "the last attempt failed" —
+    // label it 重新生成 there and keep 重试 for actual failures.
+    let retry_label = if state.ok || state.stopped {
+        "重新生成"
+    } else {
+        "重试"
+    };
+    let mut buttons: Vec<(&str, &str, &str)> = vec![(retry_label, "primary", "retry")];
     if !state.thinking.is_empty() {
         if state.thinking_expanded {
             els.push(md_div(&format!("**思考过程**\n{}", state.thinking)));
-            buttons.push(("收起思考过程", "default", "toggle_thinking"));
+            buttons.push(("收起思考过程", "default", "collapse_thinking"));
         } else {
-            buttons.push(("思考过程", "default", "toggle_thinking"));
+            buttons.push(("思考过程", "default", "expand_thinking"));
         }
     }
     els.push(buttons_el(&buttons));
@@ -995,6 +1041,7 @@ impl ReplySink for FeishuSink {
                             footer: String::new(),
                             stopped: false,
                             thinking_expanded: false,
+                            retried: false,
                         },
                     );
                 }

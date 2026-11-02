@@ -128,6 +128,26 @@ impl Write for SizeRollingFileAppender {
     }
 }
 
+/// RFC3339 timestamps in local time (with UTC offset) so log lines match
+/// the rotation filenames (chrono::Local) and read naturally for the user.
+/// chrono-based: tracing-subscriber's own LocalTime silently stays on UTC
+/// in multi-threaded processes (time crate soundness rule).
+#[derive(Clone)]
+struct ChronoLocalTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for ChronoLocalTimer {
+    fn format_time(
+        &self,
+        w: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        write!(
+            w,
+            "{}",
+            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f%:z")
+        )
+    }
+}
+
 pub fn init(app_handle: &tauri::AppHandle, settings: &AppSettings) -> anyhow::Result<()> {
     let app_data_dir = app_handle
         .path()
@@ -156,12 +176,15 @@ pub fn init(app_handle: &tauri::AppHandle, settings: &AppSettings) -> anyhow::Re
         }
     }
 
+    let timer = ChronoLocalTimer;
     let file_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
+        .with_timer(timer.clone())
         .with_writer(non_blocking);
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
+        .with_timer(timer)
         .with_writer(std::io::stderr);
 
     tracing_subscriber::registry()

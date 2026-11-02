@@ -23,6 +23,16 @@ pub const REMOTE_PROMPT_ADDENDUM: &str = "你正通过即时通讯软件（微�
 用户可能远程发来文件：消息中会附带文件的保存路径和已提取的内容，\
 用户要求入库时可用 paper_import 导入（仅限文献 PDF），但回复中不要暴露路径。";
 
+/// Read-only tool set applied per-turn for members paired with the
+/// "readonly" grant (the default for group members). Group sessions are
+/// shared across members, so the restriction travels with the turn, not the
+/// session row.
+const READONLY_TOOLS_JSON: &str = r#"["paper_search","paper_read","search_library","note_read","knowledge_query","memory_read","memory_recall","web_search","web_fetch","task_list","task_output"]"#;
+
+/// Grant levels stored in remote_chats.grant_level.
+pub const GRANT_FULL: &str = "full";
+pub const GRANT_READONLY: &str = "readonly";
+
 const DEBOUNCE_MS: u64 = 600;
 const RATE_LIMIT_PER_MIN: usize = 10;
 const SEEN_CAP: usize = 2048;
@@ -356,13 +366,20 @@ async fn process_batch(
 
     // Pairing stays outside the queue: a stranger gets the pairing notice
     // immediately instead of waiting behind a running turn.
-    let session_id = match ensure_paired(&db, &app, &meta, &sink).await {
-        Ok(Some(sid)) => sid,
+    let (session_id, grant) = match ensure_paired(&db, &app, &meta, &sink).await {
+        Ok(Some(pair)) => pair,
         Ok(None) => return, // pairing notice already handled
         Err(e) => {
             tracing::error!(error = %e, "remote pairing check failed");
             return;
         }
+    };
+    // Read-only members (the default for group pairings) get a per-turn
+    // read-only tool set; the shared group session itself keeps full tools.
+    let tools_override: Option<Vec<String>> = if grant == GRANT_READONLY {
+        serde_json::from_str(READONLY_TOOLS_JSON).ok()
+    } else {
+        None
     };
 
     let lock = chat_lock(&format!("{}:{}", meta.channel, meta.chat_id)).await;
@@ -470,6 +487,7 @@ async fn process_batch(
         session_id.clone(),
         text.clone(),
         if images.is_empty() { None } else { Some(images) },
+        tools_override,
     )
     .await;
 
@@ -711,18 +729,19 @@ pub fn channel_kind(channel: &str) -> &str {
 
 // ---------------------------------------------------------------- pairing
 
-/// Returns Ok(Some(session_id)) when the SENDER is paired; Ok(None) when not
-/// approved yet (notice handled here). Pairing is per (channel, chat_id,
-/// user_id): in a group every member pairs individually, while the backing
-/// chat session is shared across the group's approved members.
+/// Returns Ok(Some((session_id, grant_level))) when the SENDER is paired;
+/// Ok(None) when not approved yet (notice handled here). Pairing is per
+/// (channel, chat_id, user_id): in a group every member pairs individually,
+/// while the backing chat session is shared across the group's approved
+/// members. New pairings default to readonly in groups, full in private.
 async fn ensure_paired(
     db: &SqlitePool,
     app: &AppHandle,
     meta: &InboundMessage,
     sink: &Arc<dyn ReplySink>,
-) -> Result<Option<String>, String> {
-    let row = sqlx::query_as::<_, (String, i64, Option<String>)>(
-        "SELECT user_name, approved, session_id FROM remote_chats
+) -> Result<Option<(String, String)>, String> {
+    let row = sqlx::query_as::<_, (String, i64, Option<String>, String)>(
+        "SELECT user_name, approved, session_id, grant_level FROM remote_chats
          WHERE channel = ? AND chat_id = ? AND user_id = ?",
     )
      .bind(&meta.channel)
@@ -733,7 +752,7 @@ async fn ensure_paired(
     .map_err(|e| format!("db error: {e}"))?;
 
     let now = crate::core::time::now_iso();
-    let Some((user_name, approved, session_id)) = row else {
+    let Some((user_name, approved, session_id, grant_level)) = row else {
         // Resolve display names once at pairing time (feishu directory APIs);
         // failures fall back to raw ids without blocking pairing.
         let (_chat_name, resolved_user) = sink
@@ -742,14 +761,19 @@ async fn ensure_paired(
         let display_user = resolved_user
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| meta.user_name.clone());
+        let default_grant = match meta.kind {
+            ChatKind::Group => GRANT_READONLY,
+            ChatKind::Private => GRANT_FULL,
+        };
         sqlx::query(
-            "INSERT INTO remote_chats (channel, chat_id, user_id, user_name, session_id, approved, created_at, updated_at)
-             VALUES (?, ?, ?, ?, NULL, 0, ?, ?)",
+            "INSERT INTO remote_chats (channel, chat_id, user_id, user_name, session_id, approved, grant_level, created_at, updated_at)
+             VALUES (?, ?, ?, ?, NULL, 0, ?, ?, ?)",
         )
          .bind(&meta.channel)
         .bind(&meta.chat_id)
         .bind(&meta.user_id)
         .bind(&display_user)
+        .bind(default_grant)
         .bind(&now)
         .bind(&now)
         .execute(db)
@@ -817,7 +841,7 @@ async fn ensure_paired(
 
     if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
         maybe_refresh_session_title(db, meta, sink, &sid).await;
-        return Ok(Some(sid));
+        return Ok(Some((sid, grant_level)));
     }
 
     // The chat session is shared: reuse any approved member's session for
@@ -852,7 +876,7 @@ async fn ensure_paired(
         .execute(db)
         .await
         .map_err(|e| format!("db error: {e}"))?;
-    Ok(Some(sid))
+    Ok(Some((sid, grant_level)))
 }
 
 /// Sessions created before directory-name resolution carry raw-id titles
@@ -932,12 +956,15 @@ async fn create_remote_session(
     })
     .to_string();
     sqlx::query(
-        // tools_enabled NULL = the full built-in tool set, same as local
-        // chat sessions — remote access is the user driving their own
-        // machine. Approval is forced to Auto at turn time (see
-        // build_agent_config): the remote side has no approval UI.
+        // tools_enabled stores the JSON string "null": the column is NOT
+        // NULL, and build_agent_config parses JSON null → None → the full
+        // built-in tool set, same convention as UI-created chat sessions
+        // (serde_json::to_string of Option<Vec<String>>). Remote access is
+        // the user driving their own machine; approval is forced to Auto at
+        // turn time (see build_agent_config): the remote side has no
+        // approval UI.
         "INSERT INTO chat_sessions (id, title, mode, agent_mode, tools_enabled, system_prompt, context, paper_ids, max_tokens, max_loops, context_budget, created_at, updated_at)
-         VALUES (?, ?, 'qa', 'chat', NULL, NULL, ?, '[]', NULL, NULL, NULL, ?, ?)",
+         VALUES (?, ?, 'qa', 'chat', 'null', NULL, ?, '[]', NULL, NULL, NULL, ?, ?)",
     )
     .bind(&id)
     .bind(&title)

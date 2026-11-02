@@ -2836,6 +2836,7 @@ export interface RemotePairing {
   user_id: string;
   user_name: string;
   approved: number;
+  grant_level: string;
   created_at: string;
   updated_at: string;
 }
@@ -2871,6 +2872,10 @@ export async function remotePairings(): Promise<RemotePairing[]> {
 
 export async function remotePairingSet(channel: string, chatId: string, userId: string, approved: boolean): Promise<void> {
   return invoke<void>('remote_pairing_set', { channel, chatId, userId, approved });
+}
+
+export async function remotePairingSetGrant(channel: string, chatId: string, userId: string, grant: 'full' | 'readonly'): Promise<void> {
+  return invoke<void>('remote_pairing_set_grant', { channel, chatId, userId, grant });
 }
 
 export async function remotePairingDelete(channel: string, chatId: string, userId: string): Promise<void> {

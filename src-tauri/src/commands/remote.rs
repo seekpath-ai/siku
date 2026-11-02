@@ -156,6 +156,7 @@ pub struct PairingRow {
     pub user_id: String,
     pub user_name: String,
     pub approved: i64,
+    pub grant_level: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -164,7 +165,7 @@ pub struct PairingRow {
 #[instrument(skip(state))]
 pub async fn remote_pairings(state: State<'_, AppState>) -> Result<Vec<PairingRow>, String> {
     sqlx::query_as::<_, PairingRow>(
-        "SELECT channel, chat_id, user_id, user_name, approved, created_at, updated_at
+        "SELECT channel, chat_id, user_id, user_name, approved, grant_level, created_at, updated_at
          FROM remote_chats ORDER BY approved ASC, updated_at DESC",
     )
     .fetch_all(&state.db)
@@ -186,6 +187,37 @@ pub async fn remote_pairing_set(
         "UPDATE remote_chats SET approved = ?, updated_at = ? WHERE channel = ? AND chat_id = ? AND user_id = ?",
     )
     .bind(approved as i64)
+    .bind(crate::core::time::now_iso())
+    .bind(&channel)
+    .bind(&chat_id)
+    .bind(&user_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| format!("db error: {e}"))?;
+    let _ = app.emit("remote:pairing", ());
+    Ok(())
+}
+
+/// Change a paired member's grant: "full" = all tools, "readonly" = the
+/// per-turn read-only set. Takes effect on the member's next message.
+#[tauri::command]
+#[instrument(skip(state, app))]
+pub async fn remote_pairing_set_grant(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    channel: String,
+    chat_id: String,
+    user_id: String,
+    grant: String,
+) -> Result<(), String> {
+    let grant = match grant.as_str() {
+        "full" | "readonly" => grant,
+        _ => return Err("无效的授权级别".to_string()),
+    };
+    sqlx::query(
+        "UPDATE remote_chats SET grant_level = ?, updated_at = ? WHERE channel = ? AND chat_id = ? AND user_id = ?",
+    )
+    .bind(&grant)
     .bind(crate::core::time::now_iso())
     .bind(&channel)
     .bind(&chat_id)

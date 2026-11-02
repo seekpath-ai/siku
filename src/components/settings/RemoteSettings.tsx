@@ -8,6 +8,7 @@ import {
   remoteFeishuBots,
   remotePairingDelete,
   remotePairingSet,
+  remotePairingSetGrant,
   remotePairings,
   remoteStatus,
   remoteTakeover,
@@ -422,10 +423,24 @@ export function RemoteSettings() {
                   <span className="text-text-secondary/60">（会话 {p.chat_id}）</span>
                 </div>
                 <button
-                  onClick={() => remotePairingSet(p.channel, p.chat_id, p.user_id, true).then(loadPairings)}
+                  onClick={() =>
+                    remotePairingSetGrant(p.channel, p.chat_id, p.user_id, 'full')
+                      .then(() => remotePairingSet(p.channel, p.chat_id, p.user_id, true))
+                      .then(loadPairings)
+                  }
                   className="h-7 px-2.5 rounded-lg bg-primary text-white text-xs"
                 >
-                  允许
+                  允许·全部
+                </button>
+                <button
+                  onClick={() =>
+                    remotePairingSetGrant(p.channel, p.chat_id, p.user_id, 'readonly')
+                      .then(() => remotePairingSet(p.channel, p.chat_id, p.user_id, true))
+                      .then(loadPairings)
+                  }
+                  className="h-7 px-2.5 rounded-lg border border-primary/50 text-primary text-xs hover:bg-primary/10"
+                >
+                  允许·只读
                 </button>
                 <button
                   onClick={() => remotePairingDelete(p.channel, p.chat_id, p.user_id).then(loadPairings)}
@@ -436,7 +451,9 @@ export function RemoteSettings() {
               </div>
             ))}
           </div>
-          <div className="mt-2 text-[11px] text-text-secondary/60">群聊按成员逐个确认；同群已确认成员共享一个远程会话。</div>
+          <div className="mt-2 text-[11px] text-text-secondary/60">
+            群聊按成员逐个确认；同群已确认成员共享一个远程会话。「全部」可使用包括命令执行在内的全部工具，「只读」仅能查询文献/笔记/知识库。
+          </div>
         </div>
       )}
 
@@ -451,6 +468,23 @@ export function RemoteSettings() {
                   {channelLabel(p.channel)}{' '}
                   <span className="text-text-primary">{p.user_name || p.user_id}</span>
                   <span className="text-text-secondary/60">（会话 {p.chat_id}）</span>
+                </div>
+                <div className="flex rounded-lg border border-surface-hover overflow-hidden text-xs">
+                  {(['full', 'readonly'] as const).map((g) => (
+                    <button
+                      key={g}
+                      onClick={() =>
+                        remotePairingSetGrant(p.channel, p.chat_id, p.user_id, g).then(loadPairings)
+                      }
+                      className={`h-7 px-2.5 ${
+                        (p.grant_level || 'full') === g
+                          ? 'bg-primary text-white'
+                          : 'text-text-secondary hover:text-text-primary'
+                      }`}
+                    >
+                      {g === 'full' ? '全部' : '只读'}
+                    </button>
+                  ))}
                 </div>
                 <button
                   onClick={() => remotePairingDelete(p.channel, p.chat_id, p.user_id).then(loadPairings)}

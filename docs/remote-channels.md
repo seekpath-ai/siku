@@ -34,7 +34,7 @@
 ## 3. 会话与安全模型
 
 - **会话映射**：每个 (channel, external_chat_id) 惰性创建 `chat_sessions` 行，配置克隆用户默认对话智能体，`domain = 'remote'` 标记，`context` 存渠道信息。`RunningTurnGuard` 保证同一远程聊天串行。
-- **工具与审批**：`tools_enabled = NULL`（全量内置工具，与本地对话一致，含 bash/写工具）；`build_agent_config` 识别 `context.remote` 后强制 `ApprovalMode::Auto`（远程无审批卡 UI，避免回合卡审批超时），同时无视历史会话上遗留的只读 tools 白名单。
+- **工具与审批**：会话 `tools_enabled = NULL`（全量内置工具，与本地对话一致，含 bash/写工具）；`build_agent_config` 识别 `context.remote` 后强制 `ApprovalMode::Auto`（远程无审批卡 UI，避免回合卡审批超时），同时无视历史会话上遗留的只读 tools 白名单。**按成员授权收窄**：`remote_chats.grant_level`（`'full' | 'readonly'`），readonly 成员的回合由路由层向 `run_agent_turn` 传 `tools_override`（只读工具集）——群会话多名成员共享一行会话，限制必须按回合而非按会话。新配对默认值：群成员 readonly、私聊 full；存量行迁移默认 full。设置页配对确认时可二选一（允许·全部/允许·只读），已配对成员随时切换。
 - **配对绑定**：陌生人首发消息 → 回复"请在思库设置中确认配对" → 设置页确认后入白名单。配对键是 `(channel, chat_id, user_id)`，**按人配对**（已实现）：群内每位成员需单独确认；同群已确认成员共享一个远程会话（session_id 落在该群所有成员行上）。群白名单由此隐含达成：某群没有任何已确认成员时，该群 @ 机器人只会收到配对提示，无法对话；设置页删除全部成员行即等效拉黑该群。
 
 ```sql
@@ -45,6 +45,7 @@ CREATE TABLE remote_chats (           -- 同步表（OPTIONAL_SYNC_TABLES）：�
   user_name TEXT NOT NULL DEFAULT '',
   session_id TEXT,                    -- 群共享：同 chat_id 各行持有同一会话
   approved INTEGER NOT NULL DEFAULT 0,
+  grant_level TEXT NOT NULL DEFAULT 'full',  -- 'full' 全量工具 | 'readonly' 只读工具集（按回合生效）
   created_at TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (channel, chat_id, user_id)

@@ -970,6 +970,7 @@ pub(crate) async fn run_agent_turn(
     session_id: String,
     content: String,
     attachments: Option<Vec<crate::ai::llm::ImageAttachment>>,
+    tools_override: Option<Vec<String>>,
 ) -> Result<(), String> {
     // Reject a second concurrent turn for the same session (user double-send,
     // cron firing mid-turn, pet windows). The guard lives until the spawned
@@ -990,6 +991,12 @@ pub(crate) async fn run_agent_turn(
     .ok_or_else(|| "session not found".to_string())?;
 
     let mut config = build_agent_config(&state, &session).await?;
+    // Per-turn tool override (remote IM per-member grants: a read-only
+    // group member shares the group's session, so the restriction cannot
+    // live on the session row — it is applied to this turn only).
+    if let Some(tools) = tools_override {
+        config.tools = Some(tools);
+    }
     // Domain (pet) sessions: resolve the system prompt at RUNTIME so prompt
     // edits in settings apply to existing sessions without recreating them.
     if let Some(domain_id) = session.domain.as_deref() {
@@ -1680,7 +1687,7 @@ pub async fn agent_send_message(
     content: String,
     attachments: Option<Vec<crate::ai::llm::ImageAttachment>>,
 ) -> Result<(), String> {
-    run_agent_turn(&state, &app_handle, session_id, content, attachments).await
+    run_agent_turn(&state, &app_handle, session_id, content, attachments, None).await
 }
 
 /// Answer a pending AskUserQuestion dialog for a session.

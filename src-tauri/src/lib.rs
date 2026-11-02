@@ -902,6 +902,7 @@ pub fn run() {
             commands::remote::remote_weixin_logout,
             commands::remote::remote_pairings,
             commands::remote::remote_pairing_set,
+            commands::remote::remote_pairing_set_grant,
             commands::remote::remote_pairing_delete,
             commands::remote::remote_chat_info,
             commands::remote::remote_chat_files,

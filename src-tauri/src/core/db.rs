@@ -161,6 +161,7 @@ const REMOTE_CHATS_SCHEMA: &str = "CREATE TABLE remote_chats (
     user_name TEXT NOT NULL DEFAULT '',
     session_id TEXT,
     approved INTEGER NOT NULL DEFAULT 0,
+    grant_level TEXT NOT NULL DEFAULT 'full',
     created_at TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (channel, chat_id, user_id)
@@ -169,7 +170,8 @@ const REMOTE_CHATS_SCHEMA: &str = "CREATE TABLE remote_chats (
 /// Rebuild remote_chats when its shape is stale: either the primary key is
 /// still (channel, chat_id) — pairing became per-member (channel, chat_id,
 /// user_id) — or NOT NULL columns lack DEFAULT values, which CRR
-/// registration rejects. Table is tiny, so rename-and-copy is enough.
+/// registration rejects, or the `grant_level` column is missing (added with
+/// per-member tool grants). Table is tiny, so rename-and-copy is enough.
 async fn migrate_remote_chats_schema(db: &Db) -> anyhow::Result<()> {
     let rows = sqlx::query("PRAGMA table_info(remote_chats)")
         .fetch_all(db)
@@ -183,7 +185,12 @@ async fn migrate_remote_chats_schema(db: &Db) -> anyhow::Result<()> {
         r.try_get::<i64, _>("notnull").unwrap_or(0) == 1
             && r.try_get::<Option<String>, _>("dflt_value").unwrap_or(None).is_none()
     });
-    if user_in_pk && !defaultless_not_null {
+    let has_grant = rows.iter().any(|r| {
+        r.try_get::<String, _>("name")
+            .map(|n| n == "grant_level")
+            .unwrap_or(false)
+    });
+    if user_in_pk && !defaultless_not_null && has_grant {
         return Ok(());
     }
     info!("running migration: rebuild remote_chats to the CRR-compatible shape");
@@ -1226,6 +1233,7 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
             approved INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL DEFAULT '',
+            grant_level TEXT NOT NULL DEFAULT 'full',
             PRIMARY KEY (channel, chat_id, user_id)
         )"
     )

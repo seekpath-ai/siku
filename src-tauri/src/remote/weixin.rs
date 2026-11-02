@@ -304,6 +304,7 @@ async fn handle_inbound(
     let mut text = String::new();
     let mut images: Vec<crate::ai::llm::ImageAttachment> = Vec::new();
     let mut media: Option<crate::remote::router::MediaRef> = None;
+    let mut voice_without_text = false;
     if let Some(items) = msg.get("item_list").and_then(|v| v.as_array()) {
         for item in items {
             match item.get("type").and_then(|v| v.as_i64()) {
@@ -313,6 +314,20 @@ async fn handle_inbound(
                             text.push('\n');
                         }
                         text.push_str(t);
+                    }
+                }
+                // VOICE: WeChat transcribes server-side; the result rides in
+                // voice_item.text — the same field the official plugin
+                // reads. No silk decoding needed for the common case.
+                Some(3) => {
+                    match item.pointer("/voice_item/text").and_then(|v| v.as_str()) {
+                        Some(t) if !t.is_empty() => {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(t);
+                        }
+                        _ => voice_without_text = true,
                     }
                 }
                 // IMAGE: download + AES-128-ECB decrypt, feed the vision turn.
@@ -376,6 +391,11 @@ async fn handle_inbound(
     }
     let text = text.trim().to_string();
     if text.is_empty() && images.is_empty() && media.is_none() {
+        if voice_without_text {
+            let _ = sink
+                .send_text(from, "收到了你的语音，但这条没有转文字结果，我这边无法识别，麻烦再发一次文字～")
+                .await;
+        }
         return;
     }
     let msg_id = msg

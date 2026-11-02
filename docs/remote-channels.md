@@ -95,8 +95,8 @@ CREATE TABLE remote_chats (           -- 同步表（OPTIONAL_SYNC_TABLES）：�
      - 「查看群文件」大模态框（~640px）：调 `/im/v1/messages?container_id_type=chat&container_id={chat_id}` 筛 file/image 消息，列表展示文件名/大小/时间（倒序，封顶 200 条），每行操作「导入文献库」（PDF，走现成导入管线）或「另存为」，行内显示进度。下载走 `im/v1/messages/{id}/resources/{file_key}`，与第 5 项媒体消息共用接收管线。群文件标签页的云文档（Drive 体系）不做。**已实现**：右键菜单仅在远程飞书非私聊会话显示（context JSON 新增 `kind` 字段）；命令 `remote_chat_info/files/file_save/file_import`。
 5. **媒体消息**：✅ 已实现入站侧——
    - 飞书图片：`resources` 下载 → base64 → 视觉输入（`run_agent_turn` attachments，模型不支持视觉时回明确错误）；图文混排（post）：段落标签解析，text/a 段拼文本、at 段保留"@名字"上下文（机器人自身 mention 剔除）、img 段逐张下载进视觉输入（多图支持）；文件：路由层短路回执，引导"右键会话→查看群文件"导入/另存；其它类型（语音/视频/表情）回不支持提示（仍受群@策略约束）。
-   - 微信图片/文件：CDN 下载（`full_url` 优先，否则 `encrypt_query_param` 拼 `novac2c.cdn.weixin.qq.com/c2c/download`）+ AES-128-ECB 解密（密钥两种编码：base64(raw16) / base64(hex32)，图片另有 aeskey hex 优先；RustCrypto `aes`+`ecb` 纯 Rust 实现）；图片进视觉输入，文件存 `app_data/remote_downloads/` 并回执。
-   - 未做（暂不评估）：出站媒体（远程工具只读，agent 不产出文件）、飞书卡片远程审批、微信语音 silk 转码。
+   - 微信图片/文件：CDN 下载（`full_url` 优先，否则 `encrypt_query_param` 拼 `novac2c.cdn.weixin.qq.com/c2c/download`）+ AES-128-ECB 解密（密钥两种编码：base64(raw16) / base64(hex32)，图片另有 aeskey hex 优先；RustCrypto `aes`+`ecb` 纯 Rust 实现）；图片进视觉输入，文件存 `app_data/remote_downloads/` 并回执。**语音**：直接读 `voice_item.text`（微信服务端自动转写，官方插件同路径），无需 silk 解码；无转写结果时回执引导发文字。
+   - 未做（暂不评估）：出站媒体（远程工具只读，agent 不产出文件）、飞书卡片远程审批。
 6. **工作状态展示**：✅ 已实现——
    - **共用进度管线**（`router.rs`）：回合开始挂 `app.listen("agent:event")` 按 session_id 过滤，聚合 `RemoteProgress`（工具行动态含耗时、流式正文/推理摘要、计时），2s 节流推 `ReplySink::progress_update`；`progress_start`/`progress_finish` 负责建/收，finish 返回 true 时跳过纯文本补发。
    - **飞书活卡片**：interactive 卡片 + `PATCH /im/v1/messages/{id}` 原地更新。回合开始发卡（问题摘要+计时）→ 工具行实时追加（中文化标签：阅读文献/检索文献库/联网搜索…，完成打勾+耗时）→ 流式正文预览 → 完成 PATCH 为 ✅ 绿卡（正文+用时+工具数）/失败红卡；>2500 字降级"分条发送"。卡片创建失败自动回退纯文本。

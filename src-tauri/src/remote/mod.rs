@@ -78,6 +78,10 @@ struct Inner {
     /// Active QR login flow (cancel + verify-code slot), at most one.
     weixin_login: Option<(tokio_util::sync::CancellationToken, Arc<weixin::LoginState>)>,
     role: Role,
+    /// Logged out after having had an account: channels are forced off with
+    /// an explanatory detail ("登录账号后启用"). Distinct from never-logged-in
+    /// (no relay configured), which keeps the legacy direct-connect behavior.
+    logged_out: bool,
     arbiter: Option<tokio_util::sync::CancellationToken>,
 }
 
@@ -199,8 +203,18 @@ impl RemoteManager {
             }
             Err(e) => {
                 if e == "未登录同步账号" {
-                    // No sync account: single-device legacy behavior.
+                    // No sync account configured: single-device legacy behavior.
+                    self.inner.lock().await.logged_out = false;
                     Role::Active
+                } else if e == "登录已过期，请重新登录" {
+                    // Logged out after having had an account: force channels
+                    // OFF. Hysteresis must not apply — staying Active on a
+                    // logged-out device could double-hold the connection with
+                    // the user's other still-logged-in devices.
+                    let mut inner = self.inner.lock().await;
+                    inner.logged_out = true;
+                    inner.role = Role::Unknown;
+                    return;
                 } else {
                     tracing::warn!(error = %e, "remote arbitration: presence query failed, keeping previous role");
                     return;
@@ -209,6 +223,7 @@ impl RemoteManager {
         };
 
         let mut inner = self.inner.lock().await;
+        inner.logged_out = false;
         if inner.role != role {
             tracing::info!(role = role.label(), "remote arbitration role changed");
             inner.role = role;
@@ -228,6 +243,7 @@ impl RemoteManager {
         let active = inner.role == Role::Active;
         let standby_detail = match &inner.role {
             Role::Standby { holder_name, .. } => Some(format!("由 {holder_name} 接管")),
+            Role::Unknown if inner.logged_out => Some("登录账号后启用".to_string()),
             _ => None,
         };
 

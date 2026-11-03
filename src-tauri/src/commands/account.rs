@@ -287,6 +287,7 @@ pub async fn auth_login(
 pub async fn auth_logout(
     state: State<'_, AppState>,
     sync_state: State<'_, crate::commands::sync::SyncState>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     // Stop background sync before clearing credentials: the auto-sync proxy
     // and host loop stop via flags, and every live engine is stopped
@@ -319,6 +320,10 @@ pub async fn auth_logout(
     let _ = settings_service::set_device_setting(db, ACCOUNT_REFRESH_TOKEN_KEY, "").await;
     let _ = settings_service::set_device_setting(db, ACCOUNT_USER_ID_KEY, "").await;
     let _ = settings_service::set_device_setting(db, ACCOUNT_EMAIL_KEY, "").await;
+
+    // Credentials cleared: remote channels must turn off now (force-off in
+    // `evaluate`), not whenever the arbiter's next 45s tick happens.
+    state.remote.sync_config(&state.db, &app).await;
     Ok(())
 }
 

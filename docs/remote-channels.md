@@ -63,7 +63,7 @@ CREATE TABLE remote_chats (           -- 同步表（OPTIONAL_SYNC_TABLES）：�
 
 **飞书**（官方稳定 API）
 
-- 用户在 open.feishu.cn 建自建应用拿 AppID/Secret；订阅 `im.message.receive_v1`，权限 `im:message`、`im:message:send`。
+- 用户在 open.feishu.cn 建自建应用拿 AppID/Secret；订阅 `im.message.receive_v1`，权限 `im:message`、`im:message:send`、`contact:user.base:readonly`（成员昵称解析）、`im:chat`（群名/群信息/群文件）。
 - WS 长连接由 SDK 维护，断线自动重连；群聊默认仅响应 @；Markdown 回复自动转 post 富文本。
 
 **微信 iLink**（官方通道，已完整放量；阶段二）

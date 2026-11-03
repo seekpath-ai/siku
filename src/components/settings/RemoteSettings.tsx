@@ -25,15 +25,27 @@ function channelLabel(channel: string): string {
   return CHANNEL_LABEL[channel.split(':')[0]] ?? channel;
 }
 
+/** 配对时间短格式：MM-DD HH:mm；解析失败原样返回。 */
+function fmtPairTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 /** Unified status chip: 未启用 灰 / 待机或异常 琥珀 / 已连接 绿. */
 function StatusChip({ st }: { st?: RemoteChannelStatus }) {
   if (!st) return null;
   const cls = st.connected
     ? 'bg-green-500/10 text-green-500'
-    : st.enabled
+    : st.enabled || st.role === 'standby'
       ? 'bg-amber-500/10 text-amber-500'
       : 'bg-surface-hover text-text-secondary/60';
-  const text = st.connected ? st.detail || '已连接' : st.enabled ? st.detail || '未连接' : '未启用';
+  // 未连接时优先显示渠道上报的详情（待机接管、连接失效重试等），
+  // 其次按启用状态兜底——待机角色的 enabled=false 不应显示成"未启用"。
+  const text = st.connected
+    ? st.detail || '已连接'
+    : st.detail || (st.enabled ? '未连接' : '未启用');
   return <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${cls}`}>{text}</span>;
 }
 
@@ -265,7 +277,7 @@ export function RemoteSettings() {
               <HintIcon>
                 <div className="space-y-2">
                   <p>
-                    在 <a className="text-primary" href="https://open.feishu.cn/app" target="_blank" rel="noreferrer">飞书开放平台</a> 创建企业自建应用，启用机器人能力；「事件订阅」选择使用长连接接收事件，添加 <code className="px-1 rounded bg-background text-text-primary font-mono text-[11px]">im.message.receive_v1</code>；权限需包含 <code className="px-1 rounded bg-background text-text-primary font-mono text-[11px]">im:message</code> 与 <code className="px-1 rounded bg-background text-text-primary font-mono text-[11px]">im:message:send</code>。可添加多个机器人（跨租户或同租户多应用）。
+                    在 <a className="text-primary" href="https://open.feishu.cn/app" target="_blank" rel="noreferrer">飞书开放平台</a> 创建企业自建应用，启用机器人能力；「事件订阅」选择使用长连接接收事件，添加 <code className="px-1 rounded bg-background text-text-primary font-mono text-[11px]">im.message.receive_v1</code>；权限需包含 <code className="px-1 rounded bg-background text-text-primary font-mono text-[11px]">im:message</code> 与 <code className="px-1 rounded bg-background text-text-primary font-mono text-[11px]">im:message:send</code>；另需 <code className="px-1 rounded bg-background text-text-primary font-mono text-[11px]">contact:user.base:readonly</code>（获取用户基本信息，用于成员昵称解析）与 <code className="px-1 rounded bg-background text-text-primary font-mono text-[11px]">im:chat</code>（获取与更新群组信息，用于群名/群信息/群文件）。可添加多个机器人（跨租户或同租户多应用）。
                   </p>
                   <p>卡片按钮（停止 / 重新生成 / 思考过程）需额外订阅「卡片回传交互」回调：</p>
                   <ol className="list-decimal pl-4 space-y-1">
@@ -450,10 +462,19 @@ export function RemoteSettings() {
           <div className="space-y-2">
             {pending.map((p) => (
               <div key={`${p.channel}:${p.chat_id}:${p.user_id}`} className="flex items-center gap-3 text-sm">
-                <div className="flex-1 min-w-0 text-text-secondary">
-                  {channelLabel(p.channel)}{' '}
-                  <span className="text-text-primary">{p.user_name || p.user_id}</span>
-                  <span className="text-text-secondary/60">（会话 {p.chat_id}）</span>
+                <div className="flex-1 min-w-0 flex items-baseline gap-2 whitespace-nowrap overflow-hidden">
+                  <span className="shrink-0 text-text-secondary">{channelLabel(p.channel)}</span>
+                  <span className="truncate font-mono text-xs text-text-primary" title={p.user_id}>
+                    {p.user_name || p.user_id}
+                  </span>
+                  {p.chat_id !== p.user_id && (
+                    <span className="truncate font-mono text-[11px] text-text-secondary/60" title={p.chat_id}>
+                      会话 {p.chat_id}
+                    </span>
+                  )}
+                  <span className="shrink-0 text-[11px] text-text-secondary/50" title={`配对请求时间 ${p.created_at}`}>
+                    {fmtPairTime(p.created_at)}
+                  </span>
                 </div>
                 <button
                   onClick={() =>
@@ -497,10 +518,19 @@ export function RemoteSettings() {
           <div className="space-y-2">
             {approved.map((p) => (
               <div key={`${p.channel}:${p.chat_id}:${p.user_id}`} className="flex items-center gap-3 text-sm">
-                <div className="flex-1 min-w-0 text-text-secondary">
-                  {channelLabel(p.channel)}{' '}
-                  <span className="text-text-primary">{p.user_name || p.user_id}</span>
-                  <span className="text-text-secondary/60">（会话 {p.chat_id}）</span>
+                <div className="flex-1 min-w-0 flex items-baseline gap-2 whitespace-nowrap overflow-hidden">
+                  <span className="shrink-0 text-text-secondary">{channelLabel(p.channel)}</span>
+                  <span className="truncate font-mono text-xs text-text-primary" title={p.user_id}>
+                    {p.user_name || p.user_id}
+                  </span>
+                  {p.chat_id !== p.user_id && (
+                    <span className="truncate font-mono text-[11px] text-text-secondary/60" title={p.chat_id}>
+                      会话 {p.chat_id}
+                    </span>
+                  )}
+                  <span className="shrink-0 text-[11px] text-text-secondary/50" title={`配对时间 ${p.created_at}`}>
+                    配对于 {fmtPairTime(p.created_at)}
+                  </span>
                 </div>
                 <div className="flex rounded-lg border border-surface-hover overflow-hidden text-xs">
                   {(['full', 'readonly'] as const).map((g) => (

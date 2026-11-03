@@ -422,7 +422,6 @@ async fn apply_changes_inner(
 }
 
 /// Get the current CR-SQLite database version.
-#[allow(dead_code)] // kept for diagnostics/debugging
 #[instrument(skip(db))]
 pub async fn current_db_version(db: &SqlitePool) -> Result<i64> {
     let row: (i64,) = sqlx::query_as("SELECT crsql_db_version()")

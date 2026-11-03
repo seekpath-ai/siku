@@ -6533,6 +6533,7 @@ dependencies = [
  "encoding_rs",
  "fastembed",
  "feishu-sdk",
+ "flate2",
  "futures",
  "hex",
  "hmac",

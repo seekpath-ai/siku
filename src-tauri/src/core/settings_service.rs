@@ -358,14 +358,26 @@ pub async fn migrate_remote_settings(db: &SqlitePool) -> Result<(), String> {
 /// rows when the bot list holds exactly one bot — their channel meant that
 /// app. With zero or several bots the rows are left alone (members re-pair
 /// on their next message, same as a fresh install).
+/// The move is delete + insert, NOT a PK-changing UPDATE: crsql records such
+/// an update only under the new key, leaving the bare-key row orphaned on
+/// every peer (production: the same pairing listed twice after sync). The
+/// INSERT is OR IGNORE so an already-paired suffixed row keeps its own
+/// grant/session; the explicit DELETE propagates the bare row's removal.
 pub async fn migrate_feishu_instance_channels(db: &SqlitePool) -> Result<(), String> {
     let remote = load_remote_config(db).await?;
     if remote.feishu_bots.len() != 1 {
         return Ok(());
     }
     let channel = format!("feishu:{}", remote.feishu_bots[0].app_id);
-    sqlx::query("UPDATE remote_chats SET channel = ? WHERE channel = 'feishu'")
-        .bind(&channel)
+    sqlx::query(
+        "INSERT OR IGNORE INTO remote_chats (channel, chat_id, user_id, user_name, session_id, approved, grant_level, created_at, updated_at)
+         SELECT ?, chat_id, user_id, user_name, session_id, approved, grant_level, created_at, updated_at FROM remote_chats WHERE channel = 'feishu'",
+    )
+    .bind(&channel)
+    .execute(db)
+    .await
+    .map_err(|e| format!("db error: {e}"))?;
+    sqlx::query("DELETE FROM remote_chats WHERE channel = 'feishu'")
         .execute(db)
         .await
         .map_err(|e| format!("db error: {e}"))?;

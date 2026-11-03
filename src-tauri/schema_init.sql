@@ -698,3 +698,178 @@ CREATE TABLE IF NOT EXISTS sync_outbox (
     message_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sync_outbox_peer ON sync_outbox(to_device_id);
+
+-- AI 表格列 / 文献分类 / 综述：与 CORE_SYNC_TABLES 同步集对齐（含后续迁移新增列的最终形态）
+CREATE TABLE IF NOT EXISTS ai_table_cells (
+    paper_id TEXT NOT NULL,
+    column_key TEXT NOT NULL,
+    value TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'done',
+    edited INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    meta_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (paper_id, column_key)
+);
+CREATE TABLE IF NOT EXISTS ai_table_term_cache (
+    column_key TEXT PRIMARY KEY NOT NULL,
+    terms_json TEXT NOT NULL DEFAULT '[]',
+    source TEXT NOT NULL DEFAULT 'ai',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS ai_table_cell_evidence (
+    paper_id TEXT NOT NULL,
+    column_key TEXT NOT NULL,
+    refs_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (paper_id, column_key)
+);
+CREATE TABLE IF NOT EXISTS ai_table_presets (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    columns_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS ai_classify_runs (
+    id TEXT PRIMARY KEY NOT NULL,
+    scope_kind TEXT NOT NULL DEFAULT 'selection',
+    scope_id TEXT,
+    dimension TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT 'collection',
+    engine TEXT NOT NULL DEFAULT 'batch',
+    sample_size INTEGER,
+    paper_ids_json TEXT NOT NULL DEFAULT '[]',
+    groups_json TEXT NOT NULL DEFAULT '[]',
+    provider_id TEXT,
+    status TEXT NOT NULL DEFAULT 'draft',
+    threshold REAL NOT NULL DEFAULT 0.75,
+    two_level INTEGER NOT NULL DEFAULT 0,
+    skip_existing INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT '',
+    applied_at TEXT,
+    undone_at TEXT
+);
+CREATE TABLE IF NOT EXISTS ai_classify_items (
+    run_id TEXT NOT NULL,
+    paper_id TEXT NOT NULL,
+    group_name TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'proposed',
+    edited INTEGER NOT NULL DEFAULT 0,
+    labels_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (run_id, paper_id)
+);
+CREATE TABLE IF NOT EXISTS ai_classify_applied (
+    run_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    target_name TEXT NOT NULL DEFAULT '',
+    paper_id TEXT NOT NULL DEFAULT '',
+    created_new INTEGER NOT NULL DEFAULT 0,
+    link_created INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, kind, target_id, paper_id)
+);
+CREATE TABLE IF NOT EXISTS ai_classify_rules (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    dimension TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT 'collection',
+    scope_kind TEXT NOT NULL DEFAULT 'all',
+    scope_id TEXT,
+    max_groups INTEGER NOT NULL DEFAULT 8,
+    threshold REAL NOT NULL DEFAULT 0.85,
+    two_level INTEGER NOT NULL DEFAULT 1,
+    reuse_existing INTEGER NOT NULL DEFAULT 1,
+    cron TEXT NOT NULL DEFAULT '0 9 * * *',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    provider_id TEXT,
+    last_run_at TEXT,
+    last_result TEXT,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS ai_classify_vocab (
+    id TEXT PRIMARY KEY NOT NULL,
+    dimension TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'staged',
+    source TEXT NOT NULL DEFAULT 'ai',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS review_runs (
+    id TEXT PRIMARY KEY NOT NULL,
+    status TEXT NOT NULL DEFAULT 'created',
+    stage TEXT NOT NULL DEFAULT 'read',
+    question TEXT NOT NULL DEFAULT '',
+    scope TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT '中文',
+    target_words INTEGER NOT NULL DEFAULT 4000,
+    provider_id TEXT,
+    paper_ids_json TEXT NOT NULL DEFAULT '[]',
+    synthesis_json TEXT,
+    outline_json TEXT NOT NULL DEFAULT '[]',
+    evidence_registry_json TEXT NOT NULL DEFAULT '[]',
+    final_raw_markdown TEXT,
+    audit_json TEXT,
+    warnings_json TEXT NOT NULL DEFAULT '[]',
+    note_id TEXT,
+    error TEXT,
+    cancelled INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS review_paper_cards (
+    run_id TEXT NOT NULL,
+    paper_id TEXT NOT NULL,
+    paper_index INTEGER NOT NULL DEFAULT 0,
+    title TEXT NOT NULL DEFAULT '',
+    authors TEXT NOT NULL DEFAULT '[]',
+    year INTEGER,
+    journal TEXT,
+    doi TEXT,
+    url TEXT,
+    abstract_text TEXT NOT NULL DEFAULT '',
+    source_chunks_json TEXT NOT NULL DEFAULT '[]',
+    source_kind TEXT NOT NULL DEFAULT 'unusable',
+    status TEXT NOT NULL DEFAULT 'pending',
+    chunk_count INTEGER NOT NULL DEFAULT 0,
+    abstract_chars INTEGER NOT NULL DEFAULT 0,
+    card_json TEXT,
+    cache_key TEXT NOT NULL DEFAULT '',
+    index_fingerprint TEXT NOT NULL DEFAULT '',
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (run_id, paper_id)
+);
+CREATE INDEX IF NOT EXISTS idx_review_cards_cache ON review_paper_cards(paper_id, cache_key, status);
+CREATE TABLE IF NOT EXISTS review_sections (
+    run_id TEXT NOT NULL,
+    section_index INTEGER NOT NULL,
+    plan_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    raw_markdown TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (run_id, section_index)
+);
+
+-- 远程接入配对/授权（OPTIONAL_SYNC_TABLES 成员，测试注册用）
+CREATE TABLE IF NOT EXISTS remote_chats (
+    channel TEXT NOT NULL DEFAULT '',
+    chat_id TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL DEFAULT '',
+    user_name TEXT NOT NULL DEFAULT '',
+    session_id TEXT,
+    approved INTEGER NOT NULL DEFAULT 0,
+    grant_level TEXT NOT NULL DEFAULT 'full',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (channel, chat_id, user_id)
+);

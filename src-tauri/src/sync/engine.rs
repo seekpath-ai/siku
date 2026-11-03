@@ -7,7 +7,7 @@ use crate::sync::attachments::{
     write_blob_from_base64, write_incoming_chunk, MAX_CHUNKED_BLOB_BYTES,
     MAX_MAILBOX_BLOB_BYTES, PROACTIVE_PUSH_CHUNK_MAX_BYTES, RELAY_MAX_FRAME_BYTES,
 };
-use crate::sync::crdt::{apply_changes, export_changes_since, export_own_changes_since, ChangesetMessage, CrsqlChange};
+use crate::sync::crdt::{apply_changes, current_db_version, export_changes_since, export_own_changes_since, ChangesetMessage, CrsqlChange};
 use crate::sync::mailbox_client::MailboxClient;
 use crate::sync::types::MailboxMessage;
 use crate::sync::webrtc_peer::SyncSession;
@@ -130,6 +130,15 @@ pub enum SyncMessage {
     Changeset(ChangesetMessage),
     #[serde(rename = "full_snapshot")]
     FullSnapshot { statements: Vec<String> },
+    /// zlib-compressed changeset: base64 of the deflated `ChangesetMessage`
+    /// JSON. Mailbox full-history snapshots only — incremental slices stay
+    /// plain JSON so receivers on older builds never lose live changes (they
+    /// skip this unknown variant, which is safe: the snapshot is a periodic
+    /// redundancy refresh, not the primary channel). Receivers inflate it
+    /// back to `Changeset` inside `decrypt_mailbox_message`, so no other
+    /// code path ever sees this variant.
+    #[serde(rename = "changeset_zlib")]
+    CompressedChangeset { data: String },
     #[serde(rename = "chunk")]
     Chunk {
         id: String,
@@ -176,6 +185,7 @@ impl SyncMessage {
         match self {
             SyncMessage::Changeset(_) => "changeset",
             SyncMessage::FullSnapshot { .. } => "full_snapshot",
+            SyncMessage::CompressedChangeset { .. } => "changeset_zlib",
             SyncMessage::Chunk { .. } => "chunk",
             SyncMessage::Pull => "pull",
             SyncMessage::AttachmentRequest { .. } => "attachment_request",
@@ -1127,6 +1137,19 @@ impl SyncEngine {
                             warn!(error = %e, "apply changeset failed");
                         }
                     }
+                    // Mailbox-only wire format; inflate defensively if a peer
+                    // ever sends it over the DataChannel.
+                    Ok(env @ SyncMessage::CompressedChangeset { .. }) => {
+                        match inflate_envelope(env) {
+                            Ok(SyncMessage::Changeset(cs)) => {
+                                if let Err(e) = engine.handle_changeset(cs).await {
+                                    warn!(error = %e, "apply compressed changeset failed");
+                                }
+                            }
+                            Ok(other) => warn!(kind = other.kind_name(), "unexpected inflated message"),
+                            Err(e) => warn!(error = %e, "inflate compressed changeset failed"),
+                        }
+                    }
                     Ok(SyncMessage::FullSnapshot { statements }) => {
                         match crate::sync::crdt::apply_full_snapshot(&engine.db, &statements).await {
                             Ok(applied) => {
@@ -1594,56 +1617,163 @@ pub async fn deliver_changes_mailbox(
     Ok(cursor)
 }
 
-/// Serialized mailbox snapshot larger than this is skipped (P2P covers those
-/// libraries). Must fit one relay frame: ~4/3 of this on the wire stays under
-/// the relay's 16 MiB hard cap — the old 12MB value produced ~16.0MB frames,
-/// right at/over the cap, so a large enough snapshot killed the connection
-/// exactly like an oversized changeset.
-const MAX_MAILBOX_SNAPSHOT_BYTES: usize = MAX_MAILBOX_JSON_BYTES;
+/// device_settings keys tracking the last full-snapshot deposit: the exported
+/// db_version watermark and the wall-clock time. Together they gate the
+/// expensive full-history scan — unchanged data is re-deposited only to
+/// refresh the archive's 7-day TTL, at roughly half that interval for margin.
+const SNAPSHOT_DB_VERSION_KEY: &str = "sync.snapshot.db_version";
+const SNAPSHOT_AT_KEY: &str = "sync.snapshot.at";
+const SNAPSHOT_TTL_REFRESH_SECS: i64 = 3 * 24 * 3600;
+
+/// Serialize a changeset, zlib-deflate it and wrap it in the compressed
+/// envelope. Returns the final wire JSON (base64 payload included).
+fn compressed_changeset_envelope(cs: &ChangesetMessage) -> Result<String> {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    let json = serde_json::to_string(cs).context("serialize changeset")?;
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(json.as_bytes()).context("compress changeset")?;
+    let zipped = enc.finish().context("finish changeset compression")?;
+    serde_json::to_string(&SyncMessage::CompressedChangeset {
+        data: base64::engine::general_purpose::STANDARD.encode(&zipped),
+    })
+    .context("serialize compressed envelope")
+}
+
+/// Inflate a compressed changeset envelope back to the plain `Changeset`
+/// variant so every downstream consumer is compression-agnostic.
+fn inflate_envelope(env: SyncMessage) -> Result<SyncMessage> {
+    use base64::Engine as _;
+    use std::io::Read as _;
+    let SyncMessage::CompressedChangeset { data } = env else {
+        return Ok(env);
+    };
+    let zipped = base64::engine::general_purpose::STANDARD
+        .decode(&data)
+        .context("decode compressed changeset")?;
+    let mut json = String::new();
+    flate2::read::ZlibDecoder::new(&zipped[..])
+        .read_to_string(&mut json)
+        .context("decompress changeset")?;
+    let cs = serde_json::from_str(&json).context("parse compressed changeset")?;
+    Ok(SyncMessage::Changeset(cs))
+}
 
 /// Export the full change history (everything in `crsql_changes` since
 /// db_version 0 — including tombstones, which CR-SQLite backfills for
-/// pre-CRR rows at registration), encrypt it as a regular changeset, and
-/// deposit it into the ACCOUNT-LEVEL archive so any device of the account —
-/// including one that never had a P2P session — can pick up the complete
-/// library and rows the archive may have pruned. The receiver applies it
-/// through the same cr-sqlite merge as incremental sync (delete-wins
-/// preserved), so refreshing the archive can no longer resurrect rows a peer
-/// deleted. Deliberately does NOT touch `sync.cursor.sent.*`: the delta
-/// cursor is managed exclusively by `deliver_changes_mailbox`.
+/// pre-CRR rows at registration), encrypt it as a changeset, and deposit it
+/// into the ACCOUNT-LEVEL archive so any device of the account — including
+/// one that never had a P2P session — can pick up the complete library and
+/// rows the archive may have pruned. The receiver applies it through the
+/// same cr-sqlite merge as incremental sync (delete-wins preserved), so
+/// refreshing the archive can no longer resurrect rows a peer deleted.
+/// Deliberately does NOT touch `sync.cursor.sent.*`: the delta cursor is
+/// managed exclusively by `deliver_changes_mailbox`.
+///
+/// The payload is zlib-compressed (history JSON compresses ~8x); if even the
+/// compressed envelope exceeds the relay frame budget it is sliced at row
+/// boundaries like the incremental path. The whole export is skipped when
+/// nothing changed since the last acked deposit and that deposit is still
+/// well within the archive TTL — an idle account otherwise pays a full-table
+/// scan + serialization on every connect (production: 46k rows / 44MB / 20s).
 pub async fn deliver_full_snapshot_mailbox(
     db: &SqlitePool,
     relay: &crate::sync::relay_client::RelayClient,
     key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],
 ) -> Result<()> {
     use base64::Engine as _;
+
+    let last_version = crate::core::settings_service::get_device_setting(db, SNAPSHOT_DB_VERSION_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok());
+    let last_fresh = crate::core::settings_service::get_device_setting(db, SNAPSHOT_AT_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| chrono::DateTime::parse_from_rfc3339(&v).ok())
+        .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds() < SNAPSHOT_TTL_REFRESH_SECS)
+        .unwrap_or(false);
+    // Cheap gate first: crsql_db_version is O(1), the full-history scan below
+    // is not — skip it entirely when nothing changed since the last deposit.
+    if last_fresh && last_version == Some(current_db_version(db).await?) {
+        return Ok(());
+    }
+
     let changes = export_changes_since(db, 0).await?;
     if changes.changes.is_empty() {
         return Ok(());
     }
-    let json = serde_json::to_string(&SyncMessage::Changeset(changes))?;
-    if json.len() > MAX_MAILBOX_SNAPSHOT_BYTES {
-        warn!(
-            bytes = json.len(),
-            "full-history changeset too large for mailbox; skipping (P2P will carry it)"
-        );
-        return Ok(());
+    let exported_to = changes.to_db_version;
+    let rows = changes.changes.len();
+
+    // Fast path: one compressed envelope covers the whole history. Fallback:
+    // slice the raw export by the same row-boundary budget as the incremental
+    // path and compress each slice — the archive never hits the frame cap no
+    // matter how large the library grows.
+    let single = compressed_changeset_envelope(&changes)?;
+    let envelopes = if single.len() <= MAX_MAILBOX_JSON_BYTES {
+        vec![single]
+    } else {
+        let mut out = Vec::new();
+        for slice in split_changeset_by_budget(changes, MAILBOX_CHANGESET_BUDGET_BYTES) {
+            let env = compressed_changeset_envelope(&slice)?;
+            if env.len() > MAX_MAILBOX_JSON_BYTES {
+                // A single incompressible row bigger than the whole budget:
+                // no frame can ever carry it. Skip the slice (a live P2P
+                // session chunks rows of any size) instead of poisoning the
+                // archive deposit; the watermark below is NOT recorded, so
+                // the next tick retries.
+                warn!(rows = slice.changes.len(), "snapshot slice exceeds relay frame cap even compressed; skipping");
+                return Ok(());
+            }
+            out.push(env);
+        }
+        out
+    };
+    let n_slices = envelopes.len();
+    for (i, envelope) in envelopes.into_iter().enumerate() {
+        let bytes = envelope.len();
+        let (ciphertext, nonce) =
+            crate::sync::crypto::encrypt_bytes(key, envelope.as_bytes()).map_err(anyhow::Error::msg)?;
+        let payload = crate::sync::types::MailboxDepositPayload {
+            to_device_id: String::new(), // account-level archive
+            ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+            nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
+            ttl_seconds: Some(7 * 24 * 3600),
+            message_id: Some(uuid::Uuid::new_v4().to_string()),
+            dedup_key: None,
+        };
+        // Record the skip-watermark only when every slice is durably stored;
+        // an unacknowledged deposit retries on the next tick instead of
+        // suppressing refreshes for data that never landed.
+        match relay.deposit_await_ack(payload, MAILBOX_ACK_TIMEOUT).await {
+            Ok(()) => {
+                set_quota_exceeded(false);
+                info!(rows, bytes, slice = i + 1, n_slices, "snapshot slice deposited to account archive (acked)");
+            }
+            Err(e) => {
+                if e.is_quota_exceeded() {
+                    set_quota_exceeded(true);
+                }
+                warn!(error = %e, slice = i + 1, n_slices, "snapshot deposit unacknowledged; will retry on next tick");
+                return Ok(());
+            }
+        }
     }
-    let (ciphertext, nonce) =
-        crate::sync::crypto::encrypt_bytes(key, json.as_bytes()).map_err(anyhow::Error::msg)?;
-    relay
-        .send(crate::sync::types::RelayClientMsg::MailboxDeposit {
-            payload: crate::sync::types::MailboxDepositPayload {
-                to_device_id: String::new(), // account-level archive
-                ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
-                nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
-                ttl_seconds: Some(7 * 24 * 3600),
-                message_id: Some(uuid::Uuid::new_v4().to_string()),
-                dedup_key: None,
-            },
-        })
-        .context("deposit full-history changeset to account archive")?;
-    info!(bytes = json.len(), "full-history changeset deposited to account archive");
+    let _ = crate::core::settings_service::set_device_setting(
+        db,
+        SNAPSHOT_DB_VERSION_KEY,
+        &exported_to.to_string(),
+    )
+    .await;
+    let _ = crate::core::settings_service::set_device_setting(
+        db,
+        SNAPSHOT_AT_KEY,
+        &crate::core::time::now_iso(),
+    )
+    .await;
     Ok(())
 }
 
@@ -1661,7 +1791,8 @@ pub async fn decrypt_mailbox_message(
         .context("decode ciphertext")?;
     let plaintext = crate::sync::crypto::decrypt_bytes(key, &nonce, &ciphertext)
         .map_err(anyhow::Error::msg)?;
-    serde_json::from_slice(&plaintext).context("parse changeset")
+    let envelope: SyncMessage = serde_json::from_slice(&plaintext).context("parse changeset")?;
+    inflate_envelope(envelope)
 }
 
 /// Decrypt one mailbox message and apply its changeset locally. Returns the
@@ -3279,6 +3410,46 @@ mod tests {
         sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
         db_a.close().await;
         db_b.close().await;
+        Ok(())
+    }
+
+    /// The mailbox snapshot's compressed envelope must inflate back to the
+    /// exact changeset — receivers never see the wire compression.
+    #[test]
+    fn compressed_changeset_envelope_roundtrips() -> anyhow::Result<()> {
+        let cs = ChangesetMessage {
+            changes: vec![CrsqlChange {
+                table: "notes".to_string(),
+                pk: b"pk-bytes".to_vec(),
+                cid: "title".to_string(),
+                val: Some("hello 压缩".to_string()),
+                col_version: 3,
+                db_version: 7,
+                site_id: vec![1, 2, 3],
+                cl: 1,
+                seq: 0,
+            }],
+            from_db_version: 0,
+            to_db_version: 7,
+        };
+        let env = compressed_changeset_envelope(&cs)?;
+        let parsed: SyncMessage = serde_json::from_str(&env)?;
+        assert!(
+            matches!(parsed, SyncMessage::CompressedChangeset { .. }),
+            "snapshot envelope must use the compressed variant"
+        );
+        match inflate_envelope(parsed)? {
+            SyncMessage::Changeset(back) => {
+                assert_eq!(back.to_db_version, 7);
+                assert_eq!(back.changes.len(), 1);
+                assert_eq!(back.changes[0].table, "notes");
+                assert_eq!(back.changes[0].val.as_deref(), Some("hello 压缩"));
+            }
+            _ => anyhow::bail!("expected inflated changeset"),
+        }
+        // Plain envelopes pass through untouched.
+        let plain = SyncMessage::Pull;
+        assert!(matches!(inflate_envelope(plain)?, SyncMessage::Pull));
         Ok(())
     }
 

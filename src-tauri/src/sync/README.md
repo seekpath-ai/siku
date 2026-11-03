@@ -43,7 +43,7 @@ changeset 投递同样受帧上限约束：`deliver_changes_mailbox` 按 6MB JSO
 - 不同步：agent_memories_local（本机记忆，设备环境类事实，同步会在其它设备注入错误真值）、creators（接收端从 papers.authors 重建）、device_settings、paper_paragraphs 等解析索引、搜索索引、LLM 提供商等设备本地数据。
 - 笔记图片：写入笔记时 snapshots/ 绝对路径被改写为 blobs/ 引用并登记主动推送（mark_blob_pending_push）；启动时 migrate_note_snapshot_refs 自愈老笔记的残留绝对路径。
 - 冲突解决：cr-sqlite 默认 col_version 合并 + 应用前按 `updated_at` 的 LWW 过滤；删除为 delete-wins（已知取舍：peer 旧删除会覆盖本地新编辑）。
-- 首次连接与周期存档刷新发送**全量历史 changeset**（从 `crsql_changes` 以 db_version 0 导出，含 tombstone），接收侧走与增量完全相同的 `apply_changes` 合并路径——已删除的行不会被快照复活。快照经 zlib 压缩后以 `changeset_zlib` 信封投递（`decrypt_mailbox_message` 解压归一化为普通 changeset，下游无感；旧版本收到该变体仅跳过，增量主通道不受影响），压缩后仍超 8MB 帧预算时按行边界切片投递。自上次成功投递以来无新变更且距上次投递不足 3 天（TTL 7 天的一半）时整轮跳过，避免每次连接都全表扫描。旧版 `FullSnapshot`（INSERT OR IGNORE）消息仍被接收侧兼容处理，但插入前会按 `crsql_changes` 中的删除标记过滤。之后按 per-peer 游标增量推送。
+- 首次连接与周期检查投递**checkpoint**（从 `crsql_changes` 以 db_version 0 导出的全量历史 changeset，含 tombstone），接收侧走与增量完全相同的 `apply_changes` 合并路径——已删除的行不会被快照复活。checkpoint 经 zlib 压缩后以 `changeset_zlib` 信封投递（`decrypt_mailbox_message` 解压归一化为普通 changeset，下游无感；旧版本收到该变体仅跳过，增量主通道不受影响），压缩后仍超 8MB 帧预算时按行边界切片投递。relay 协议 v3 起账号存档是**持久状态存储**：增量 WAL（不显式传 TTL 的账号级消息）永不过期也不设条数上限，checkpoint 切片携带 slot 元数据（group/index/total），末片落库时 relay 在一个事务内换代（删除旧一代 checkpoint）并回收其覆盖的 WAL（带 dedup_key 的 blob 消息不在回收范围）；触发节奏是 WAL 驱动——距上次 checkpoint 新增 ≥1500 行或估算 ≥8MB 才重新导出，闲置账户零开销。老 relay（v2）退化为 TTL 续期模式：有变更或距上次投递 ≥3 天（TTL 7 天的一半）时重传。旧版 `FullSnapshot`（INSERT OR IGNORE）消息仍被接收侧兼容处理，但插入前会按 `crsql_changes` 中的删除标记过滤。之后按 per-peer 游标增量推送。
 
 ## 安全说明
 

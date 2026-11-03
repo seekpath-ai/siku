@@ -111,6 +111,7 @@ impl MailboxClient {
                     ttl_seconds: ttl_seconds.or(Some(DEFAULT_TTL_SECONDS)),
                     message_id: None,
                     dedup_key,
+                    slot: None,
                 },
             })
             .context("send mailbox deposit")
@@ -141,6 +142,7 @@ impl MailboxClient {
                     ttl_seconds: ttl_seconds.or(Some(DEFAULT_TTL_SECONDS)),
                     message_id,
                     dedup_key: None,
+                    slot: None,
                 },
                 timeout,
             )

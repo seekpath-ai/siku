@@ -132,6 +132,19 @@ pub struct MailboxDepositPayload {
     /// Ignored by relays that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedup_key: Option<String>,
+    /// State-slot metadata (relay protocol v3+): this deposit is one slice of
+    /// a checkpoint group. Account-level deposits only. Relays that predate
+    /// v3 ignore the field and treat the deposit as a legacy TTL'd message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<SlotMeta>,
+}
+
+/// One slice of a checkpoint group; see `MailboxDepositPayload::slot`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlotMeta {
+    pub group: String,
+    pub index: u32,
+    pub total: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

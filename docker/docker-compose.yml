@@ -34,6 +34,13 @@ services:
       # 公网可达的 relay 地址（用于支付宝 notify/return 回调），如
       # https://relay.seekpath.com.cn；不配置则在线支付不可用。
       RELAY_PUBLIC_BASE: ${RELAY_PUBLIC_BASE:-}
+      # 注册验证码邮件（如阿里企业邮箱 smtp.qiye.aliyun.com:465）。
+      # 不配置则注册保持无验证码的旧流程。
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-465}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
     volumes:
       - siku-relay-data:/data
 

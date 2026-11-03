@@ -570,14 +570,12 @@ pub async fn spawn_auto_sync_proxy(
                 tokio::time::interval(std::time::Duration::from_secs(10));
             mailbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            // Also drop a FULL SNAPSHOT into the archive on connect and then
-            // every ~2h. The delta path (crsql_changes) can still lose rows
-            // when the relay archive prunes old changesets (7-day TTL /
-            // 2000-message cap) after this device's cursor already advanced
-            // past them — a device that comes online later would never see
-            // them, e.g. an old "我的图书馆" folder row or its notes. The
-            // snapshot is INSERT OR IGNORE, so it is idempotent and simply
-            // fills whatever the peer is missing.
+            // Checkpoint the account archive on connect and then every ~2h.
+            // On v3 relays the WAL is durable, so this is pure compaction —
+            // it fires only when the WAL grew past the checkpoint thresholds
+            // (see deliver_full_snapshot_mailbox). On legacy relays the
+            // snapshot doubles as the durability net against the 7-day TTL,
+            // re-deposited on change or every ~3 days.
             if let Some(key) = &mailbox_key {
                 if let Err(e) =
                     crate::sync::engine::deliver_full_snapshot_mailbox(&db, &relay, key).await
@@ -862,9 +860,9 @@ pub async fn spawn_auto_sync_proxy(
                                 },
                             })
                             .ok();
-                        // Refresh the account archive's full snapshot so a
-                        // device that connects days later still finds one
-                        // before the 7-day TTL prunes the connect-time copy.
+                        // Periodic checkpoint check (every ~2h): cheap gate,
+                        // deposits only when the WAL grew enough (v3) or the
+                        // TTL needs refreshing (legacy relay).
                         snapshot_ticks += 1;
                         if snapshot_ticks % 720 == 0 {
                             if let Some(key) = &mailbox_key {

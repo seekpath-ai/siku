@@ -2028,8 +2028,13 @@ export interface AccountDeviceRow {
   online?: boolean;
 }
 
-export async function authRegister(relayUrl: string, email: string, password: string): Promise<void> {
-  return invoke<void>('auth_register', { relayUrl, email, password });
+export async function authRegister(relayUrl: string, email: string, password: string, code?: string): Promise<void> {
+  return invoke<void>('auth_register', { relayUrl, email, password, code: code || null });
+}
+
+/** 发送注册验证码到邮箱（relay 需配置 SMTP）。 */
+export async function authSendRegisterCode(relayUrl: string, email: string): Promise<void> {
+  return invoke<void>('auth_send_register_code', { relayUrl, email });
 }
 
 export async function authLogin(relayUrl: string, email: string, password: string, deviceName: string): Promise<AuthInfo> {

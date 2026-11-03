@@ -118,22 +118,39 @@ impl Auth {
     }
 }
 
-/// Password hashing: PBKDF2-like iterated SHA-256 with a 16-byte random salt.
-///
-/// NOTE: This is a pragmatic choice to keep the service dependency-free; for
-/// production hardening swap in argon2id (see docs/production-sync-plan.md).
-const HASH_ITERATIONS: u32 = 100_000;
-
+/// Password hashing: argon2id (PHC string format). Legacy rows carry
+/// `sha256$<iterations>$<salt>$<hash>` (iterated SHA-256); they still verify,
+/// and `is_legacy_hash` lets the login path transparently re-hash them.
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
-    let mut salt = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut salt);
-    let hash = iterated_hash(password.as_bytes(), &salt, HASH_ITERATIONS);
-    let salt_b64 = base64_encode(&salt);
-    let hash_b64 = base64_encode(&hash);
-    Ok(format!("sha256${HASH_ITERATIONS}${salt_b64}${hash_b64}"))
+    use argon2::password_hash::{PasswordHasher, SaltString};
+    let salt = SaltString::generate(&mut rand::rngs::OsRng);
+    let hash = argon2::Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("password hash failed: {e}"))?;
+    Ok(hash.to_string())
 }
 
 pub fn verify_password(password: &str, stored: &str) -> anyhow::Result<()> {
+    if is_legacy_hash(stored) {
+        return verify_password_legacy(password, stored);
+    }
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    let parsed = PasswordHash::new(stored)
+        .map_err(|e| anyhow::anyhow!("bad password hash format: {e}"))?;
+    argon2::Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .map_err(|_| anyhow::anyhow!("invalid email or password"))
+}
+
+/// Whether the stored hash predates argon2id and should be re-hashed on the
+/// next successful login.
+pub fn is_legacy_hash(stored: &str) -> bool {
+    stored.starts_with("sha256$")
+}
+
+const HASH_ITERATIONS: u32 = 100_000;
+
+fn verify_password_legacy(password: &str, stored: &str) -> anyhow::Result<()> {
     let parts: Vec<&str> = stored.split('$').collect();
     if parts.len() != 4 || parts[0] != "sha256" {
         anyhow::bail!("unsupported password hash format");

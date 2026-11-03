@@ -18,6 +18,7 @@ mod auth;
 mod db;
 mod mailbox;
 mod pay;
+mod verify;
 
 // ── Configuration ──────────────────────────────────────────────────────────
 
@@ -147,6 +148,11 @@ struct MailboxDepositPayload {
     /// Legacy clients omit it and are never deduped.
     #[serde(default)]
     dedup_key: Option<String>,
+    /// State-slot metadata (protocol v3): this deposit is one slice of a
+    /// checkpoint group. Account-level only. Legacy clients omit it and their
+    /// deposits keep the legacy TTL semantics.
+    #[serde(default)]
+    slot: Option<mailbox::SlotMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,8 +242,10 @@ enum RelayServerMsg {
 }
 
 /// Relay protocol versions: 1 = legacy (no mailbox deposit acks), 2 = durable
-/// mailbox with `MailboxDepositAck`.
-const RELAY_PROTOCOL_VERSION: u32 = 2;
+/// mailbox with `MailboxDepositAck`, 3 = account-archive state slots:
+/// persistent WAL (no TTL on account-level deposits that omit `ttl_seconds`),
+/// checkpoint groups that replace older generations and purge covered WAL.
+const RELAY_PROTOCOL_VERSION: u32 = 3;
 
 /// Byte budget for one `MailboxBatch` frame. The websocket has no explicit
 /// max_message_size (tungstenite's 64MB default applies); a single frame
@@ -378,6 +386,10 @@ struct AppState {
     alipay: Option<pay::AlipayConfig>,
     /// 公网可达的 relay 地址（RELAY_PUBLIC_BASE），用于拼 notify/return URL。
     alipay_public_base: Option<String>,
+    /// 注册验证码（内存态，重启失效）与发信器（None = 未配置 SMTP，注册
+    /// 退化为无验证码的旧流程）。
+    codes: verify::VerificationCodes,
+    mailer: Option<verify::Mailer>,
 }
 
 impl AppState {
@@ -399,6 +411,10 @@ impl AppState {
         if alipay.is_some() && alipay_public_base.is_none() {
             warn!("RELAY_PUBLIC_BASE 未配置，支付宝在线支付不可用（下单不返回 pay_url）");
         }
+        let mailer = verify::Mailer::from_env();
+        if mailer.is_none() {
+            warn!("SMTP 未配置（SMTP_HOST/SMTP_USER/SMTP_PASS），注册退化为无验证码流程");
+        }
         Self {
             rooms: Mutex::new(HashMap::new()),
             db: db::Db::new(std::path::Path::new(&db_path)).expect("account db"),
@@ -410,6 +426,8 @@ impl AppState {
             payment_info: payment_info(),
             alipay,
             alipay_public_base,
+            codes: verify::VerificationCodes::new(),
+            mailer,
         }
     }
 
@@ -830,6 +848,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                             ttl_seconds,
                             message_id,
                             dedup_key,
+                            slot,
                         } = payload;
                         let ack_id = message_id.clone().unwrap_or_default();
                         let Some(room) = joined_room.as_ref() else {
@@ -853,6 +872,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
                             message_id,
                             quota_bytes,
                             dedup_key,
+                            slot,
                         ) {
                             Ok(id) => {
                                 info!(
@@ -978,6 +998,7 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/v1/signaling", get(signaling_handler))
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/register", post(api_register))
+        .route("/api/register/code", post(api_register_code))
         .route("/api/login", post(api_login))
         .route("/api/refresh", post(api_refresh))
         .route("/api/devices", get(api_list_devices))
@@ -1005,6 +1026,44 @@ fn app(state: Arc<AppState>) -> Router {
 struct RegisterRequest {
     email: String,
     password: String,
+    /// 邮箱验证码（配置了 SMTP 时必填）。见 /api/register/code。
+    #[serde(default)]
+    code: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RegisterCodeRequest {
+    email: String,
+}
+
+/// POST /api/register/code — 向邮箱发送注册验证码。幂等间隔 60s（同邮箱）。
+async fn api_register_code(
+    State(state): State<Arc<AppState>>,
+    axum::Json(req): axum::Json<RegisterCodeRequest>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let Some(mailer) = &state.mailer else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "email service not configured".to_string(),
+        ));
+    };
+    let email = verify::normalize_email(&req.email);
+    if !verify::is_valid_email(&email) {
+        return Err((StatusCode::BAD_REQUEST, "邮箱格式不正确".to_string()));
+    }
+    if state.db.get_user_by_email(&email).is_some() {
+        return Err((StatusCode::CONFLICT, "该邮箱已注册，请直接登录".to_string()));
+    }
+    let code = state
+        .codes
+        .issue(&email)
+        .map_err(|e| (StatusCode::TOO_MANY_REQUESTS, e))?;
+    mailer
+        .send_code(&email, &code)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("验证码发送失败: {e}")))?;
+    info!(email = %email, "registration code sent");
+    Ok(axum::Json(serde_json::json!({ "ok": true })))
 }
 
 #[derive(Serialize)]
@@ -1016,9 +1075,25 @@ async fn api_register(
     State(state): State<Arc<AppState>>,
     axum::Json(req): axum::Json<RegisterRequest>,
 ) -> Result<axum::Json<RegisterResponse>, (StatusCode, String)> {
+    let email = verify::normalize_email(&req.email);
+    if !verify::is_valid_email(&email) {
+        return Err((StatusCode::BAD_REQUEST, "邮箱格式不正确".to_string()));
+    }
+    // 配置了 SMTP 时注册必须持验证码（证明邮箱真实）；未配置时保持旧流程，
+    // 自建 relay 无邮件服务不致锁死注册。
+    if state.mailer.is_some() {
+        let code = req.code.as_deref().unwrap_or("").trim();
+        if code.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "请先获取邮箱验证码".to_string()));
+        }
+        state
+            .codes
+            .verify(&email, code)
+            .map_err(|e| (StatusCode::FORBIDDEN, e))?;
+    }
     let user_id = state
         .auth
-        .register(&state.db, &req.email.trim(), &req.password)
+        .register(&state.db, &email, &req.password)
         .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
     info!(user_id = %user_id, "account registered");
     Ok(axum::Json(RegisterResponse { user_id }))
@@ -1045,10 +1120,19 @@ async fn api_login(
     State(state): State<Arc<AppState>>,
     axum::Json(req): axum::Json<LoginRequest>,
 ) -> Result<axum::Json<LoginResponse>, (StatusCode, String)> {
+    let email = verify::normalize_email(&req.email);
     let user_id = state
         .auth
-        .login(&state.db, &req.email.trim(), &req.password)
+        .login(&state.db, &email, &req.password)
         .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+    // 旧格式（迭代 SHA-256）哈希在登录成功时透明迁移到 argon2id。
+    if let Some(user) = state.db.get_user(&user_id) {
+        if auth::is_legacy_hash(&user.password_hash) {
+            if let Ok(fresh) = auth::hash_password(&req.password) {
+                let _ = state.db.set_user_password_hash(&user_id, &fresh);
+            }
+        }
+    }
     let device_id = req.device_id.trim();
     let _ = state
         .db
@@ -2336,9 +2420,15 @@ mod tests {
         })
         .await
         .unwrap();
+        let protocol: u32 = hello
+            .split(r#""protocol":"#)
+            .nth(1)
+            .and_then(|rest| rest.trim_start_matches('"').split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
         assert!(
-            hello.contains(r#""protocol":2"#),
-            "join must be answered by server_hello with protocol 2, got: {hello}"
+            protocol >= 2,
+            "join must be answered by server_hello with protocol >= 2, got: {hello}"
         );
     }
 
@@ -2476,6 +2566,7 @@ mod tests {
                 None,
                 None,
                 1 << 30,
+                None,
                 None,
             )
             .unwrap();
@@ -3198,5 +3289,92 @@ mod tests {
             state.db.get_order(&order_id).unwrap().trade_no.as_deref(),
             Some("t1")
         );
+    }
+
+    /// 未配置 SMTP 时 /api/register/code 不可用，注册保持旧流程（无验证码）。
+    #[tokio::test]
+    async fn register_code_endpoint_requires_mailer() {
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let state = Arc::new(AppState::new());
+        assert!(state.mailer.is_none(), "tests must not pick up real SMTP env");
+        let (status, _) = http_json(
+            state.clone(),
+            "POST",
+            "/api/register/code",
+            None,
+            Some(serde_json::json!({ "email": "a@b.com" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        // 无验证码的旧流程注册仍然可用。
+        let (status, _) = http_json(
+            state.clone(),
+            "POST",
+            "/api/register",
+            None,
+            Some(serde_json::json!({ "email": "a@b.com", "password": "pw-123456" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// 注册与登录都规范化邮箱（trim+小写）：大小写差异不会分裂账号。
+    #[tokio::test]
+    async fn register_and_login_normalize_email() {
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let state = Arc::new(AppState::new());
+        let (status, _) = http_json(
+            state.clone(),
+            "POST",
+            "/api/register",
+            None,
+            Some(serde_json::json!({ "email": "  NewUser@Example.COM ", "password": "pw-123456" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let user = state.db.get_user_by_email("newuser@example.com").unwrap();
+        assert_eq!(user.email, "newuser@example.com");
+
+        let (status, json) = http_json(
+            state.clone(),
+            "POST",
+            "/api/login",
+            None,
+            Some(serde_json::json!({
+                "email": "NEWUSER@example.com",
+                "password": "pw-123456",
+                "device_id": "dev-x",
+                "device_name": "X"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["sync_key"], user.sync_key);
+    }
+
+    /// argon2id 哈希可验证；旧 sha256$ 格式仍能验证且被识别为 legacy。
+    #[test]
+    fn password_hash_argon2_and_legacy() {
+        let fresh = auth::hash_password("s3cret").unwrap();
+        assert!(!auth::is_legacy_hash(&fresh));
+        auth::verify_password("s3cret", &fresh).unwrap();
+        assert!(auth::verify_password("wrong", &fresh).is_err());
+
+        // 手工构造旧格式（与历史 hash_password 相同参数）。
+        let legacy = {
+            use sha2::Digest as _;
+            let salt = [7u8; 16];
+            let hash = (1..100_000u32).fold(
+                sha2::Sha256::digest([salt.as_slice(), b"s3cret".as_slice()].concat()).to_vec(),
+                |digest, _| sha2::Sha256::digest(&digest).to_vec(),
+            );
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            format!("sha256$100000${}${}", b64.encode(salt), b64.encode(hash))
+        };
+        assert!(auth::is_legacy_hash(&legacy));
+        auth::verify_password("s3cret", &legacy).unwrap();
+        assert!(auth::verify_password("wrong", &legacy).is_err());
     }
 }

@@ -22,6 +22,8 @@ uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 rsa = { version = "0.9", features = ["sha2"] }
 url = "2"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
+argon2 = "0.5"
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"

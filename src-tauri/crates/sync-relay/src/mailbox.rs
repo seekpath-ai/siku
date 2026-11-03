@@ -23,7 +23,15 @@ use uuid::Uuid;
 
 pub const DEFAULT_TTL_SECONDS: u64 = 7 * 24 * 3600; // 7 days
 const MAX_MESSAGES_PER_DEVICE: usize = 500;
-const MAX_ACCOUNT_MESSAGES: usize = 2000;
+
+/// `expires_at` sentinel for rows that never age out: committed state-slot
+/// slices and persistent account-archive WAL rows (deposits that omit
+/// `ttl_seconds`). SQLite INTEGER is i64, so the sentinel fits comfortably.
+pub const NEVER_EXPIRES: u64 = i64::MAX as u64;
+
+/// Slot slices of a checkpoint group that never completes (crashed/abandoned
+/// mid-upload) keep a finite TTL so they eventually clean themselves up.
+const INCOMPLETE_SLOT_TTL_SECS: u64 = 30 * 24 * 3600; // 30 days
 
 /// Per-device messages are re-delivered when a poll's delivery was never
 /// acked within this window (the relay or client may have died between poll
@@ -41,6 +49,17 @@ const MAX_SEEN_ENTRIES: usize = 100;
 /// account may poll it).
 pub const ACCOUNT_LEVEL_TARGET: &str = "";
 
+/// State-slot metadata of one checkpoint slice. A device checkpoints its full
+/// state as a group of slices sharing `group`; when the last slice lands the
+/// relay atomically commits the group (never expires), deletes the sender's
+/// older generations, and purges the sender's WAL rows older than the group.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SlotMeta {
+    pub group: String,
+    pub index: u32,
+    pub total: u32,
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS mailbox_messages (
     seq           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,7 +72,11 @@ CREATE TABLE IF NOT EXISTS mailbox_messages (
     expires_at    INTEGER NOT NULL,
     created_at    INTEGER NOT NULL,
     delivered_at  INTEGER,
-    seen          TEXT NOT NULL DEFAULT ''
+    seen          TEXT NOT NULL DEFAULT '',
+    slot_group    TEXT,
+    slot_index    INTEGER,
+    slot_total    INTEGER,
+    dedup_key     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_mailbox_room_to ON mailbox_messages(room_id, to_device_id);
 CREATE TABLE IF NOT EXISTS dedup_keys (
@@ -99,6 +122,35 @@ fn ensure_schema(conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
     if has_delivered_at == 0 {
         conn.execute_batch("ALTER TABLE mailbox_messages ADD COLUMN delivered_at INTEGER")?;
     }
+    // State-slot columns (relay protocol v3). NULL slot_group = WAL row.
+    // `dedup_key` mirrors the deposit's dedup key onto the row so a
+    // checkpoint's WAL purge can exclude content-addressed blob messages
+    // (a checkpoint covers row changes, never blobs).
+    for (col, decl) in [
+        ("slot_group", "TEXT"),
+        ("slot_index", "INTEGER"),
+        ("slot_total", "INTEGER"),
+        ("dedup_key", "TEXT"),
+    ] {
+        let has_col: i64 = conn
+            .prepare(&format!(
+                "SELECT count(*) FROM pragma_table_info('mailbox_messages') WHERE name = '{col}'"
+            ))?
+            .query_map([], |r| r.get(0))?
+            .next()
+            .transpose()?
+            .unwrap_or(0);
+        if has_col == 0 {
+            conn.execute_batch(&format!(
+                "ALTER TABLE mailbox_messages ADD COLUMN {col} {decl}"
+            ))?;
+        }
+    }
+    // The slot index references the migrated columns, so it can only be
+    // created AFTER the ALTERs above (an existing production db lacks them).
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_mailbox_slot ON mailbox_messages(room_id, from_device_id, slot_group)",
+    )?;
     Ok(())
 }
 
@@ -226,12 +278,33 @@ impl Mailbox {
     /// this is what makes "retry until acknowledged" safe. Returns the stored
     /// message id.
     ///
+    /// Expiry policy:
+    /// - Per-device queue rows: caller TTL, capped at `DEFAULT_TTL_SECONDS`.
+    /// - Account-level WAL rows (`slot: None`, no `ttl_seconds`): never
+    ///   expire — they are the durable replication log, reclaimed only by the
+    ///   sender's next checkpoint commit (or the byte quota).
+    /// - Account-level rows with an explicit TTL (legacy clients): honored,
+    ///   capped at 7 days — pre-v3 clients keep their old semantics.
+    /// - Slot slices: `INCOMPLETE_SLOT_TTL_SECS` until the group commits,
+    ///   then never expire.
+    ///
+    /// `slot` marks the message as one slice of a state checkpoint group and
+    /// is only valid for account-level deposits. Once every slice of the
+    /// group is stored, the group commits atomically: all its slices become
+    /// permanent, every older slot group of the same sender is deleted, and
+    /// the sender's WAL rows older than the group are purged (the checkpoint
+    /// covers them). A re-deposited slice (idempotent retry) still drives the
+    /// commit check, so a slice that was lost and re-sent completes the group.
+    ///
     /// `quota_bytes` caps the room's total stored bytes: a NEW message that
     /// would push usage past the quota is rejected with
     /// `Err("quota_exceeded")` (existing data is never deleted — it ages out
-    /// via TTL or ack). Idempotent replays bypass the quota check: they add
-    /// no bytes, and rejecting them would wedge the client's outbox on its
-    /// first message once the quota is full.
+    /// via TTL or ack, or is reclaimed by a checkpoint commit). Idempotent
+    /// replays bypass the quota check: they add no bytes, and rejecting them
+    /// would wedge the client's outbox on its first message once the quota is
+    /// full. For slot deposits the quota check subtracts the sender's other
+    /// slot groups: a checkpoint replaces them on commit, so it must not be
+    /// rejected for transiently double-counting the outgoing generation.
     ///
     /// `dedup_key` is an opaque content key (clients use
     /// `HMAC(sync_key, blob_hash)` for blob payloads, so the relay cannot
@@ -251,13 +324,33 @@ impl Mailbox {
         message_id: Option<String>,
         quota_bytes: i64,
         dedup_key: Option<String>,
+        slot: Option<SlotMeta>,
     ) -> Result<String, String> {
         let id = message_id
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let ttl = ttl_seconds.unwrap_or(DEFAULT_TTL_SECONDS).min(DEFAULT_TTL_SECONDS);
         let ts = now();
-        let expires_at = ts + ttl;
+
+        if let Some(s) = &slot {
+            if to_device_id != ACCOUNT_LEVEL_TARGET {
+                return Err("slot deposits must be account-level".to_string());
+            }
+            if s.group.is_empty() || s.group.len() > 64 || s.total == 0 || s.index >= s.total {
+                return Err("invalid slot meta".to_string());
+            }
+            if s.total > 4096 {
+                return Err("slot group too large".to_string());
+            }
+        }
+
+        let expires_at = if slot.is_some() {
+            ts + INCOMPLETE_SLOT_TTL_SECS
+        } else if to_device_id == ACCOUNT_LEVEL_TARGET && ttl_seconds.is_none() {
+            NEVER_EXPIRES
+        } else {
+            let ttl = ttl_seconds.unwrap_or(DEFAULT_TTL_SECONDS).min(DEFAULT_TTL_SECONDS);
+            ts + ttl
+        };
 
         if to_device_id != ACCOUNT_LEVEL_TARGET {
             let registered = self.registered.lock().unwrap();
@@ -270,7 +363,9 @@ impl Mailbox {
         Self::prune(&mut conn, ts);
 
         // Idempotent replay: the id is already stored, acknowledge without
-        // touching the quota (no new bytes are added).
+        // touching the quota (no new bytes are added). A slot slice still
+        // falls through to the commit check: this re-deposit may be the
+        // missing slice that completes its group.
         let already_stored: bool = conn
             .query_row(
                 "SELECT 1 FROM mailbox_messages WHERE id = ?1",
@@ -278,48 +373,64 @@ impl Mailbox {
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        if already_stored {
-            return Ok(id);
-        }
+        if !already_stored {
+            // Content-level dedup: another device already stored a message
+            // with this key — acknowledge without double-storing (no new
+            // bytes, so the quota is not touched either).
+            let dedup_hit = dedup_key
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .map(|k| {
+                    conn.query_row(
+                        "SELECT 1 FROM dedup_keys WHERE room_id = ?1 AND dedup_key = ?2 AND expires_at > ?3",
+                        rusqlite::params![room_id, k, ts],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if dedup_hit {
+                return Ok(id);
+            }
 
-        // Content-level dedup: another device already stored a message with
-        // this key — acknowledge without double-storing (no new bytes, so the
-        // quota is not touched either).
-        let dedup_hit = dedup_key
-            .as_deref()
-            .filter(|k| !k.is_empty())
-            .map(|k| {
-                conn.query_row(
-                    "SELECT 1 FROM dedup_keys WHERE room_id = ?1 AND dedup_key = ?2 AND expires_at > ?3",
-                    rusqlite::params![room_id, k, ts],
-                    |_| Ok(true),
+            // Quota check inside the lock so concurrent deposits cannot both
+            // pass. Slot deposits subtract the sender's COMMITTED generations
+            // (never-expiring slot rows): the commit of this group deletes
+            // them, so the checkpoint must not be rejected for transiently
+            // double-counting what it replaces. Incomplete groups still count
+            // in full — otherwise rotating abandoned groups could bypass the
+            // quota indefinitely.
+            let mut usage: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(LENGTH(ciphertext) + LENGTH(nonce)), 0)
+                     FROM mailbox_messages WHERE room_id = ?1",
+                    rusqlite::params![room_id],
+                    |r| r.get(0),
                 )
-                .unwrap_or(false)
-            })
-            .unwrap_or(false);
-        if dedup_hit {
-            return Ok(id);
-        }
+                .map_err(|e| e.to_string())?;
+            if let Some(s) = &slot {
+                let replaced: i64 = conn
+                    .query_row(
+                        "SELECT COALESCE(SUM(LENGTH(ciphertext) + LENGTH(nonce)), 0)
+                         FROM mailbox_messages
+                         WHERE room_id = ?1 AND from_device_id = ?2 AND to_device_id = ''
+                           AND slot_group IS NOT NULL AND slot_group != ?3 AND expires_at = ?4",
+                        rusqlite::params![room_id, from_device_id, s.group, NEVER_EXPIRES],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                usage = usage.saturating_sub(replaced);
+            }
+            let incoming = (ciphertext.len() + nonce.len()) as i64;
+            if usage + incoming > quota_bytes {
+                return Err("quota_exceeded".to_string());
+            }
 
-        // Quota check inside the lock so concurrent deposits cannot both pass.
-        let usage: i64 = conn
-            .query_row(
-                "SELECT COALESCE(SUM(LENGTH(ciphertext) + LENGTH(nonce)), 0)
-                 FROM mailbox_messages WHERE room_id = ?1",
-                rusqlite::params![room_id],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        let incoming = (ciphertext.len() + nonce.len()) as i64;
-        if usage + incoming > quota_bytes {
-            return Err("quota_exceeded".to_string());
-        }
-
-        let inserted = conn
-            .execute(
+            conn.execute(
                 "INSERT OR IGNORE INTO mailbox_messages
-                 (id, room_id, to_device_id, from_device_id, ciphertext, nonce, expires_at, created_at, seen)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '')",
+                 (id, room_id, to_device_id, from_device_id, ciphertext, nonce, expires_at, created_at, seen,
+                  slot_group, slot_index, slot_total, dedup_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '', ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     id,
                     room_id,
@@ -328,33 +439,99 @@ impl Mailbox {
                     ciphertext,
                     nonce,
                     expires_at,
-                    ts
+                    ts,
+                    slot.as_ref().map(|s| s.group.as_str()),
+                    slot.as_ref().map(|s| s.index),
+                    slot.as_ref().map(|s| s.total),
+                    dedup_key.as_deref().filter(|k| !k.is_empty()),
                 ],
             )
             .map_err(|e| e.to_string())?;
-        if inserted == 0 {
-            // Already stored (client retried with the same id) — idempotent
-            // success so the sender can safely advance its cursor.
-            return Ok(id);
+
+            // Record the content key so later deposits of the same blob (from
+            // any device of the account) dedupe instead of double-storing.
+            if let Some(k) = dedup_key.as_deref().filter(|k| !k.is_empty()) {
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO dedup_keys (room_id, dedup_key, expires_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![room_id, k, expires_at],
+                );
+            }
+
+            if to_device_id == ACCOUNT_LEVEL_TARGET {
+                // The depositor has already "seen" it (they created it).
+                Self::append_seen(&conn, &id, from_device_id);
+            } else {
+                Self::trim(&mut conn, room_id, to_device_id, MAX_MESSAGES_PER_DEVICE)?;
+            }
         }
 
-        // Record the content key so later deposits of the same blob (from any
-        // device of the account) dedupe instead of double-storing.
-        if let Some(k) = dedup_key.as_deref().filter(|k| !k.is_empty()) {
-            let _ = conn.execute(
-                "INSERT OR REPLACE INTO dedup_keys (room_id, dedup_key, expires_at) VALUES (?1, ?2, ?3)",
-                rusqlite::params![room_id, k, expires_at],
-            );
-        }
-
-        if to_device_id == ACCOUNT_LEVEL_TARGET {
-            // The depositor has already "seen" it (they created it).
-            Self::append_seen(&conn, &id, from_device_id);
-            Self::trim(&mut conn, room_id, ACCOUNT_LEVEL_TARGET, MAX_ACCOUNT_MESSAGES)?;
-        } else {
-            Self::trim(&mut conn, room_id, to_device_id, MAX_MESSAGES_PER_DEVICE)?;
+        if let Some(s) = &slot {
+            Self::maybe_commit_slot_group(&mut conn, room_id, from_device_id, s)?;
         }
         Ok(id)
+    }
+
+    /// Commit a checkpoint group once every slice is stored: make the group
+    /// permanent, delete the sender's older generations, and purge the
+    /// sender's WAL rows older than the group. Idempotent — safe to re-run on
+    /// retried deposits. Runs inside one transaction so a crash mid-commit
+    /// cannot leave the old generation deleted without the new one permanent.
+    fn maybe_commit_slot_group(
+        conn: &mut rusqlite::Connection,
+        room_id: &str,
+        from_device_id: &str,
+        slot: &SlotMeta,
+    ) -> Result<(), String> {
+        let stored: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT slot_index) FROM mailbox_messages
+                 WHERE room_id = ?1 AND from_device_id = ?2 AND to_device_id = ''
+                   AND slot_group = ?3",
+                rusqlite::params![room_id, from_device_id, slot.group],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if stored < slot.total as i64 {
+            return Ok(());
+        }
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE mailbox_messages SET expires_at = ?1
+             WHERE room_id = ?2 AND from_device_id = ?3 AND to_device_id = '' AND slot_group = ?4",
+            rusqlite::params![NEVER_EXPIRES, room_id, from_device_id, slot.group],
+        )
+        .map_err(|e| e.to_string())?;
+        // Older generations: committed ones and stale incomplete ones alike.
+        tx.execute(
+            "DELETE FROM mailbox_messages
+             WHERE room_id = ?1 AND from_device_id = ?2 AND to_device_id = ''
+               AND slot_group IS NOT NULL AND slot_group != ?3",
+            rusqlite::params![room_id, from_device_id, slot.group],
+        )
+        .map_err(|e| e.to_string())?;
+        // WAL rows this checkpoint covers (everything deposited before the
+        // group's first slice). Later WAL rows survive. Blob messages
+        // (dedup_key set) are NOT covered by a checkpoint — they age out on
+        // their own TTL and are re-served on request.
+        tx.execute(
+            "DELETE FROM mailbox_messages
+             WHERE room_id = ?1 AND from_device_id = ?2 AND to_device_id = ''
+               AND slot_group IS NULL AND dedup_key IS NULL
+               AND seq < (SELECT MIN(seq) FROM mailbox_messages
+                          WHERE room_id = ?1 AND from_device_id = ?2 AND to_device_id = ''
+                            AND slot_group = ?3)",
+            rusqlite::params![room_id, from_device_id, slot.group],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        tracing::info!(
+            room = %room_id,
+            from = %from_device_id,
+            group = %slot.group,
+            slices = slot.total,
+            "checkpoint group committed: older generation and covered WAL purged"
+        );
+        Ok(())
     }
 
     /// Take up to `max_count` pending messages for `device_id`: its own queue
@@ -547,7 +724,7 @@ mod tests {
             mb.ensure_device("room-a", "dev-b");
 
             id = mb
-                .deposit("room-a", "dev-a", "dev-b", "cipher-1".into(), "nonce-1".into(), None, None, TEST_QUOTA, None)
+                .deposit("room-a", "dev-a", "dev-b", "cipher-1".into(), "nonce-1".into(), None, None, TEST_QUOTA, None, None)
                 .unwrap();
             assert!(!id.is_empty(), "deposit must return the stored message id");
 
@@ -577,7 +754,7 @@ mod tests {
         let (_dir, mb) = temp_mailbox("unknown");
         mb.ensure_device("room-a", "dev-a");
         let err = mb
-            .deposit("room-a", "dev-a", "ghost", "c".into(), "n".into(), None, None, TEST_QUOTA, None)
+            .deposit("room-a", "dev-a", "ghost", "c".into(), "n".into(), None, None, TEST_QUOTA, None, None)
             .unwrap_err();
         assert!(err.contains("not in room"));
     }
@@ -588,7 +765,7 @@ mod tests {
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
         for i in 0..600 {
-            mb.deposit("room-a", "dev-a", "dev-b", format!("c{i}"), "n".into(), None, None, TEST_QUOTA, None)
+            mb.deposit("room-a", "dev-a", "dev-b", format!("c{i}"), "n".into(), None, None, TEST_QUOTA, None, None)
                 .unwrap();
         }
         let msgs = mb.poll("room-a", "dev-b", Some(1000));
@@ -601,9 +778,9 @@ mod tests {
         let (_dir, mb) = temp_mailbox("ack");
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
-        mb.deposit("room-a", "dev-a", "dev-b", "c1".into(), "n1".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c1".into(), "n1".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
-        mb.deposit("room-a", "dev-a", "dev-b", "c2".into(), "n2".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c2".into(), "n2".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
 
         let msgs = mb.poll("room-a", "dev-b", None);
@@ -611,7 +788,7 @@ mod tests {
         mb.ack("room-a", "dev-b", &[msgs[0].id.clone()]);
         // ack deletes the delivered row; the other delivered-but-unacked
         // message is not re-polled inside the redelivery window
-        mb.deposit("room-a", "dev-a", "dev-b", "c3".into(), "n3".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c3".into(), "n3".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
         let msgs2 = mb.poll("room-a", "dev-b", None);
         assert_eq!(msgs2.len(), 1);
@@ -635,6 +812,7 @@ mod tests {
             None,
             None,
             TEST_QUOTA,
+            None,
             None,
         )
         .unwrap();
@@ -674,7 +852,7 @@ mod tests {
                 "n".into(),
                 None,
                 None,
-                TEST_QUOTA, None,
+                TEST_QUOTA, None, None,
             )
             .unwrap();
         }
@@ -706,9 +884,9 @@ mod tests {
         let (_dir, mb) = temp_mailbox("mix");
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
-        mb.deposit("room-a", "dev-a", "dev-b", "device-msg".into(), "n".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "device-msg".into(), "n".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
-        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "account-msg".into(), "n".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "account-msg".into(), "n".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
 
         let msgs = mb.poll("room-a", "dev-b", None);
@@ -725,7 +903,7 @@ mod tests {
 
         {
             let mb = Mailbox::open(&path).unwrap();
-            mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "durable".into(), "n".into(), None, None, TEST_QUOTA, None)
+            mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "durable".into(), "n".into(), None, None, TEST_QUOTA, None, None)
                 .unwrap();
         } // dropped = "relay restarted"
         {
@@ -745,10 +923,10 @@ mod tests {
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
         let client_id = "client-msg-1".to_string();
-        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, Some(client_id.clone()), TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, Some(client_id.clone()), TEST_QUOTA, None, None)
             .unwrap();
         let id2 = mb
-            .deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, Some(client_id.clone()), TEST_QUOTA, None)
+            .deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, Some(client_id.clone()), TEST_QUOTA, None, None)
             .unwrap();
         assert_eq!(id2, client_id);
         assert_eq!(mb.poll("room-a", "dev-b", None).len(), 1, "duplicate id must not double-store");
@@ -760,7 +938,7 @@ mod tests {
         let (_dir, mb) = temp_mailbox("expiry");
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
-        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), Some(1), None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), Some(1), None, TEST_QUOTA, None, None)
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(mb.poll("room-a", "dev-b", None).is_empty(), "expired message must be pruned");
@@ -773,7 +951,7 @@ mod tests {
         let (_dir, mb) = temp_mailbox("markonly");
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
-        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
 
         let msgs = mb.poll("room-a", "dev-b", None);
@@ -799,7 +977,7 @@ mod tests {
         let (_dir, mb) = temp_mailbox("ackdel");
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
-        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
 
         let msgs = mb.poll("room-a", "dev-b", None);
@@ -820,7 +998,7 @@ mod tests {
         let (_dir, mb) = temp_mailbox("redeliver");
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
-        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
 
         let msgs = mb.poll("room-a", "dev-b", None);
@@ -856,7 +1034,7 @@ mod tests {
             mb.ensure_device("room-a", "dev-a");
             mb.ensure_device("room-a", "dev-b");
             id = mb
-                .deposit("room-a", "dev-a", "dev-b", "durable".into(), "n".into(), None, None, TEST_QUOTA, None)
+                .deposit("room-a", "dev-a", "dev-b", "durable".into(), "n".into(), None, None, TEST_QUOTA, None, None)
                 .unwrap();
             assert_eq!(mb.poll("room-a", "dev-b", None).len(), 1);
         } // dropped = "relay restarted" after poll, before the client's ack
@@ -879,10 +1057,10 @@ mod tests {
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
         let id1 = mb
-            .deposit("room-a", "dev-a", "dev-b", "c1".into(), "n".into(), None, Some(String::new()), TEST_QUOTA, None)
+            .deposit("room-a", "dev-a", "dev-b", "c1".into(), "n".into(), None, Some(String::new()), TEST_QUOTA, None, None)
             .unwrap();
         let id2 = mb
-            .deposit("room-a", "dev-a", "dev-b", "c2".into(), "n".into(), None, Some(String::new()), TEST_QUOTA, None)
+            .deposit("room-a", "dev-a", "dev-b", "c2".into(), "n".into(), None, Some(String::new()), TEST_QUOTA, None, None)
             .unwrap();
         assert!(!id1.is_empty() && !id2.is_empty());
         assert_ne!(id1, id2, "empty message_id must not collapse deposits into one row");
@@ -894,7 +1072,7 @@ mod tests {
     #[test]
     fn seen_list_is_capped() {
         let (_dir, mb) = temp_mailbox("seencap");
-        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c".into(), "n".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c".into(), "n".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
 
         for i in 0..(MAX_SEEN_ENTRIES + 20) {
@@ -924,7 +1102,7 @@ mod tests {
     #[test]
     fn poll_does_not_mark_account_messages_seen() {
         let (_dir, mb) = temp_mailbox("pollseen");
-        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c1".into(), "n".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c1".into(), "n".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
         mb.ensure_device("room-a", "dev-b");
 
@@ -953,7 +1131,7 @@ mod tests {
     #[test]
     fn ack_marks_account_message_seen_for_that_device_only() {
         let (_dir, mb) = temp_mailbox("ackseen");
-        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c1".into(), "n".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c1".into(), "n".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
         mb.ensure_device("room-a", "dev-b");
         mb.ensure_device("room-a", "dev-c");
@@ -979,9 +1157,9 @@ mod tests {
         let (_dir, mb) = temp_mailbox("ackmixed");
         mb.ensure_device("room-a", "dev-a");
         mb.ensure_device("room-a", "dev-b");
-        mb.deposit("room-a", "dev-a", "dev-b", "device-c".into(), "n".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "device-c".into(), "n".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
-        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "account-c".into(), "n".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "account-c".into(), "n".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
 
         let msgs = mb.poll("room-a", "dev-b", None);
@@ -1001,10 +1179,10 @@ mod tests {
         let (_dir, mb) = temp_mailbox("quota");
         let quota: i64 = 100;
         // Each message costs ciphertext + nonce bytes (5 + 1 = 6).
-        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "aaaaa".into(), "n".into(), None, None, quota, None)
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "aaaaa".into(), "n".into(), None, None, quota, None, None)
             .unwrap();
         let err = mb
-            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "x".repeat(200), "n".into(), None, None, quota, None)
+            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "x".repeat(200), "n".into(), None, None, quota, None, None)
             .unwrap_err();
         assert_eq!(err, "quota_exceeded");
         // The oversized message was NOT stored and the old one survived.
@@ -1023,17 +1201,17 @@ mod tests {
         let (_dir, mb) = temp_mailbox("quota-replay");
         let quota: i64 = 10;
         let id = mb
-            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "aaaaa".into(), "n".into(), None, Some("m-1".into()), quota, None)
+            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "aaaaa".into(), "n".into(), None, Some("m-1".into()), quota, None, None)
             .unwrap();
         assert_eq!(id, "m-1");
         // Usage (6) is already over a tighter quota of 1: a fresh deposit is
         // rejected, but replaying the stored id still succeeds.
         let err = mb
-            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "b".into(), "n".into(), None, Some("m-2".into()), 1, None)
+            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "b".into(), "n".into(), None, Some("m-2".into()), 1, None, None)
             .unwrap_err();
         assert_eq!(err, "quota_exceeded");
         let replayed = mb
-            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "aaaaa".into(), "n".into(), None, Some("m-1".into()), 1, None)
+            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "aaaaa".into(), "n".into(), None, Some("m-1".into()), 1, None, None)
             .unwrap();
         assert_eq!(replayed, "m-1");
         assert_eq!(mb.usage_bytes("room-a"), 6, "replay must not double-store");
@@ -1051,13 +1229,13 @@ mod tests {
 
         mb.deposit(
             "room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "blob-cipher".into(), "n".into(),
-            None, None, quota, Some("dk-1".into()),
+            None, None, quota, Some("dk-1".into()), None,
         )
         .unwrap();
         let id2 = mb
             .deposit(
                 "room-a", "dev-b", ACCOUNT_LEVEL_TARGET, "blob-cipher".into(), "n".into(),
-                None, None, quota, Some("dk-1".into()),
+                None, None, quota, Some("dk-1".into()), None,
             )
             .unwrap();
         assert!(!id2.is_empty(), "deduped deposit is still acknowledged");
@@ -1070,12 +1248,12 @@ mod tests {
         // A different key stores normally; no key at all is never deduped.
         mb.deposit(
             "room-a", "dev-b", ACCOUNT_LEVEL_TARGET, "other".into(), "n".into(),
-            None, None, quota, Some("dk-2".into()),
+            None, None, quota, Some("dk-2".into()), None,
         )
         .unwrap();
         mb.deposit(
             "room-a", "dev-b", ACCOUNT_LEVEL_TARGET, "other".into(), "n".into(),
-            None, None, quota, None,
+            None, None, quota, None, None,
         )
         .unwrap();
         assert_eq!(row_count(&mb, "room-a", ACCOUNT_LEVEL_TARGET), 3);
@@ -1088,20 +1266,20 @@ mod tests {
         let (_dir, mb) = temp_mailbox("dedup-quota");
         mb.deposit(
             "room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "aaaaa".into(), "n".into(),
-            None, None, TEST_QUOTA, Some("dk-1".into()),
+            None, None, TEST_QUOTA, Some("dk-1".into()), None,
         )
         .unwrap();
         // Room usage is 6, quota 1: fresh deposits fail, dedup hit succeeds.
         let err = mb
             .deposit(
                 "room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "b".into(), "n".into(),
-                None, None, 1, Some("dk-other".into()),
+                None, None, 1, Some("dk-other".into()), None,
             )
             .unwrap_err();
         assert_eq!(err, "quota_exceeded");
         mb.deposit(
             "room-a", "dev-b", ACCOUNT_LEVEL_TARGET, "aaaaa".into(), "n".into(),
-            None, None, 1, Some("dk-1".into()),
+            None, None, 1, Some("dk-1".into()), None,
         )
         .unwrap();
         assert_eq!(row_count(&mb, "room-a", ACCOUNT_LEVEL_TARGET), 1);
@@ -1113,13 +1291,13 @@ mod tests {
         let (_dir, mb) = temp_mailbox("dedup-expiry");
         mb.deposit(
             "room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c".into(), "n".into(),
-            Some(1), None, TEST_QUOTA, Some("dk-1".into()),
+            Some(1), None, TEST_QUOTA, Some("dk-1".into()), None,
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
         mb.deposit(
             "room-a", "dev-b", ACCOUNT_LEVEL_TARGET, "c".into(), "n".into(),
-            None, None, TEST_QUOTA, Some("dk-1".into()),
+            None, None, TEST_QUOTA, Some("dk-1".into()), None,
         )
         .unwrap();
         assert_eq!(row_count(&mb, "room-a", ACCOUNT_LEVEL_TARGET), 1, "expired key must not dedup");
@@ -1134,18 +1312,252 @@ mod tests {
         mb.ensure_device("room-a", "dev-b");
         assert_eq!(mb.usage_bytes("room-a"), 0);
         // Archive: 2 + 1 = 3 bytes.
-        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "aa".into(), "n".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "aa".into(), "n".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
         // Per-device queue: 3 + 1 = 4 bytes.
-        mb.deposit("room-a", "dev-a", "dev-b", "bbb".into(), "n".into(), None, None, TEST_QUOTA, None)
+        mb.deposit("room-a", "dev-a", "dev-b", "bbb".into(), "n".into(), None, None, TEST_QUOTA, None, None)
             .unwrap();
         assert_eq!(mb.usage_bytes("room-a"), 7);
         // A per-device deposit is rejected once usage + incoming > quota.
         let err = mb
-            .deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None, 8, None)
+            .deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None, 8, None, None)
             .unwrap_err();
         assert_eq!(err, "quota_exceeded", "per-device queues count against the quota");
         // Other rooms are unaffected.
         assert_eq!(mb.usage_bytes("room-b"), 0);
+    }
+
+    // ── State slots (protocol v3) ──────────────────────────────────────────
+
+    fn slot(group: &str, index: u32, total: u32) -> Option<SlotMeta> {
+        Some(SlotMeta {
+            group: group.into(),
+            index,
+            total,
+        })
+    }
+
+    /// expires_at of every account-level row of a sender, ordered by seq.
+    fn account_rows(mb: &Mailbox, room_id: &str, from: &str) -> Vec<(String, u64)> {
+        let conn = mb.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT ciphertext, expires_at FROM mailbox_messages
+                 WHERE room_id = ?1 AND from_device_id = ?2 AND to_device_id = ''
+                 ORDER BY seq",
+            )
+            .unwrap();
+        stmt.query_map(rusqlite::params![room_id, from], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
+    /// Committing a checkpoint group makes its slices permanent, deletes the
+    /// sender's older generation, and purges WAL rows older than the group.
+    #[test]
+    fn slot_commit_replaces_generation_and_purges_wal() {
+        let (_dir, mb) = temp_mailbox("slot-commit");
+        // WAL rows (no ttl → persistent) and a completed old generation.
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "wal-1".into(), "n".into(), None, None, TEST_QUOTA, None, None)
+            .unwrap();
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "old-state".into(), "n".into(), None, None, TEST_QUOTA, None, slot("gen-1", 0, 1))
+            .unwrap();
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "wal-2".into(), "n".into(), None, None, TEST_QUOTA, None, None)
+            .unwrap();
+        // Sanity: gen-1 committed immediately (single slice) and already
+        // purged the WAL it covered (wal-1).
+        assert_eq!(
+            account_rows(&mb, "room-a", "dev-a"),
+            vec![
+                ("old-state".to_string(), NEVER_EXPIRES),
+                ("wal-2".to_string(), NEVER_EXPIRES),
+            ]
+        );
+
+        // New two-slice checkpoint; WAL grows while it uploads.
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "new-s0".into(), "n".into(), None, None, TEST_QUOTA, None, slot("gen-2", 0, 2))
+            .unwrap();
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "wal-3".into(), "n".into(), None, None, TEST_QUOTA, None, None)
+            .unwrap();
+
+        // Final slice commits the group: old generation and the WAL it
+        // covers (wal-1, wal-2) are gone; wal-3 (deposited after the group
+        // started) survives; the group is permanent.
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "new-s1".into(), "n".into(), None, None, TEST_QUOTA, None, slot("gen-2", 1, 2))
+            .unwrap();
+        assert_eq!(
+            account_rows(&mb, "room-a", "dev-a"),
+            vec![
+                ("new-s0".to_string(), NEVER_EXPIRES),
+                ("wal-3".to_string(), NEVER_EXPIRES),
+                ("new-s1".to_string(), NEVER_EXPIRES),
+            ]
+        );
+    }
+
+    /// An incomplete group changes nothing: WAL and the old generation stay.
+    #[test]
+    fn slot_incomplete_group_is_inert() {
+        let (_dir, mb) = temp_mailbox("slot-partial");
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "old-state".into(), "n".into(), None, None, TEST_QUOTA, None, slot("gen-1", 0, 1))
+            .unwrap();
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "wal-1".into(), "n".into(), None, None, TEST_QUOTA, None, None)
+            .unwrap();
+        // Slice 0 of 2 arrives; slice 1 never does.
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "new-s0".into(), "n".into(), None, None, TEST_QUOTA, None, slot("gen-2", 0, 2))
+            .unwrap();
+        let rows = account_rows(&mb, "room-a", "dev-a");
+        assert_eq!(
+            rows.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(),
+            vec!["old-state", "wal-1", "new-s0"],
+            "incomplete group must not purge anything"
+        );
+        // The uncommitted slice keeps a finite TTL so it cleans itself up.
+        let new_exp = rows[2].1;
+        assert!(new_exp < NEVER_EXPIRES && new_exp > now());
+    }
+
+    /// Slices may arrive out of order or be retried: the commit fires when
+    /// the LAST MISSING slice lands, not necessarily the highest index.
+    #[test]
+    fn slot_commit_fires_on_completing_slice() {
+        let (_dir, mb) = temp_mailbox("slot-ooo");
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "wal-1".into(), "n".into(), None, None, TEST_QUOTA, None, None)
+            .unwrap();
+        // Final index first — group incomplete, nothing purged.
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "s1".into(), "n".into(), None, None, TEST_QUOTA, None, slot("g", 1, 2))
+            .unwrap();
+        assert_eq!(account_rows(&mb, "room-a", "dev-a").len(), 2);
+        // The missing slice completes the group → commit.
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "s0".into(), "n".into(), None, Some("s0-msg".into()), TEST_QUOTA, None, slot("g", 0, 2))
+            .unwrap();
+        let rows = account_rows(&mb, "room-a", "dev-a");
+        assert_eq!(
+            rows.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(),
+            vec!["s1", "s0"],
+            "covered WAL purged; group slices kept"
+        );
+        assert!(rows.iter().all(|(_, e)| *e == NEVER_EXPIRES));
+        // Retrying the slice with the SAME message id is an idempotent no-op.
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "s0".into(), "n".into(), None, Some("s0-msg".into()), TEST_QUOTA, None, slot("g", 0, 2))
+            .unwrap();
+        assert_eq!(account_rows(&mb, "room-a", "dev-a").len(), 2);
+    }
+
+    /// Slot deposits are account-level only and need sane meta.
+    #[test]
+    fn slot_validation() {
+        let (_dir, mb) = temp_mailbox("slot-validate");
+        mb.ensure_device("room-a", "dev-b");
+        let err = mb
+            .deposit("room-a", "dev-a", "dev-b", "c".into(), "n".into(), None, None, TEST_QUOTA, None, slot("g", 0, 1))
+            .unwrap_err();
+        assert!(err.contains("account-level"));
+        for bad in [slot("", 0, 1), slot("g", 0, 0), slot("g", 2, 2)] {
+            assert!(mb
+                .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "c".into(), "n".into(), None, None, TEST_QUOTA, None, bad)
+                .is_err());
+        }
+    }
+
+    /// Account-archive WAL rows that omit `ttl_seconds` never expire and are
+    /// NOT count-capped — the byte quota is the only bound. An explicit TTL
+    /// (legacy clients) is still honored and capped at 7 days.
+    #[test]
+    fn account_wal_persistent_and_uncapped() {
+        let (_dir, mb) = temp_mailbox("wal-persistent");
+        for i in 0..2100 {
+            mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, format!("c{i}"), "n".into(), None, None, TEST_QUOTA, None, None)
+                .unwrap();
+        }
+        assert_eq!(
+            row_count(&mb, "room-a", ACCOUNT_LEVEL_TARGET),
+            2100,
+            "no silent count cap on the account archive"
+        );
+        let rows = account_rows(&mb, "room-a", "dev-a");
+        assert!(rows.iter().all(|(_, e)| *e == NEVER_EXPIRES));
+
+        // Legacy explicit TTL: capped at 7 days.
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "legacy".into(), "n".into(), Some(999 * 24 * 3600), None, TEST_QUOTA, None, None)
+            .unwrap();
+        let legacy_exp = account_rows(&mb, "room-a", "dev-a").pop().unwrap().1;
+        assert_eq!(legacy_exp, now() + DEFAULT_TTL_SECONDS);
+    }
+
+    /// Blob messages (dedup_key set) are not WAL: a checkpoint commit must
+    /// not purge them — a checkpoint covers row changes, never blobs.
+    #[test]
+    fn slot_commit_preserves_blob_rows() {
+        let (_dir, mb) = temp_mailbox("slot-blob");
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "blob".into(), "n".into(), Some(7 * 24 * 3600), None, TEST_QUOTA, Some("dk-blob".into()), None)
+            .unwrap();
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "wal-1".into(), "n".into(), None, None, TEST_QUOTA, None, None)
+            .unwrap();
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "state".into(), "n".into(), None, None, TEST_QUOTA, None, slot("g", 0, 1))
+            .unwrap();
+        let rows = account_rows(&mb, "room-a", "dev-a");
+        assert_eq!(
+            rows.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(),
+            vec!["blob", "state"],
+            "blob row survives the checkpoint's WAL purge"
+        );
+    }
+
+    /// A pre-v3 database (current base schema, no slot columns) migrates in
+    /// place: the slot index is created only after the ALTERs.
+    #[test]
+    fn legacy_db_migrates_to_slot_schema() {
+        let dir = temp_dir("slot-migrate");
+        let path = dir.0.join("mailbox.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE mailbox_messages (
+                    seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id            TEXT NOT NULL UNIQUE,
+                    room_id       TEXT NOT NULL,
+                    to_device_id  TEXT NOT NULL DEFAULT '',
+                    from_device_id TEXT NOT NULL,
+                    ciphertext    TEXT NOT NULL,
+                    nonce         TEXT NOT NULL,
+                    expires_at    INTEGER NOT NULL,
+                    created_at    INTEGER NOT NULL,
+                    delivered_at  INTEGER,
+                    seen          TEXT NOT NULL DEFAULT ''
+                );",
+            )
+            .unwrap();
+        }
+        let mb = Mailbox::open(&path).unwrap();
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "state".into(), "n".into(), None, None, TEST_QUOTA, None, slot("g", 0, 1))
+            .unwrap();
+        let rows = account_rows(&mb, "room-a", "dev-a");
+        assert_eq!(rows, vec![("state".to_string(), NEVER_EXPIRES)]);
+    }
+
+    /// A checkpoint that replaces a large old generation must not be rejected
+    /// for transiently double-counting the outgoing generation's bytes.
+    #[test]
+    fn slot_quota_check_discounts_replaced_generation() {
+        let (_dir, mb) = temp_mailbox("slot-quota");
+        let big = "x".repeat(100);
+        // Committed generation: 101 bytes.
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, big.clone(), "n".into(), None, None, TEST_QUOTA, None, slot("gen-1", 0, 1))
+            .unwrap();
+        // Quota barely above one generation: the replacement still fits
+        // because the outgoing generation is discounted.
+        let quota = 105;
+        mb.deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, big, "n".into(), None, None, quota, None, slot("gen-2", 0, 1))
+            .unwrap();
+        assert_eq!(account_rows(&mb, "room-a", "dev-a").len(), 1);
+        // A plain WAL row does NOT get the discount and is rejected.
+        let err = mb
+            .deposit("room-a", "dev-a", ACCOUNT_LEVEL_TARGET, "y".repeat(100), "n".into(), None, None, quota, None, None)
+            .unwrap_err();
+        assert_eq!(err, "quota_exceeded");
     }
 }

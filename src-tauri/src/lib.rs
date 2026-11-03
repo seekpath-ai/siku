@@ -1118,6 +1118,7 @@ pub fn run() {
             // Sync PoC
             // Account
             commands::account::auth_register,
+            commands::account::auth_send_register_code,
             commands::account::auth_login,
             commands::account::auth_logout,
             commands::account::auth_status,

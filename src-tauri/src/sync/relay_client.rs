@@ -71,8 +71,10 @@ enum RelayProtocol {
     Unknown,
     /// Join sent; waiting for `ServerHello`.
     AwaitingHello,
-    /// Handshake received with protocol >= 2: mailbox deposit acks work.
-    V2OrLater,
+    /// Handshake received with protocol >= 2: mailbox deposit acks work. The
+    /// number is retained so callers can gate newer capabilities (v3 = state
+    /// slots) without another enum variant per version.
+    V2OrLater(u32),
     /// No handshake in time, or protocol < 2: a legacy relay that never acks
     /// deposits — `deposit_await_ack` fails fast instead of timing out.
     Legacy,
@@ -186,7 +188,7 @@ impl RelayClient {
                             // an unexpected type).
                             let mut proto = recv_protocol.lock().unwrap();
                             if payload.protocol >= 2 {
-                                *proto = RelayProtocol::V2OrLater;
+                                *proto = RelayProtocol::V2OrLater(payload.protocol);
                             } else {
                                 *proto = RelayProtocol::Legacy;
                                 warn!(
@@ -261,6 +263,23 @@ impl RelayClient {
                 warn!("relay 版本过旧，mailbox 确认不可用，请升级 relay");
             }
         });
+    }
+
+    /// ServerHello protocol version of this connection: `Some(v)` once the
+    /// handshake resolved (legacy relays report 1), `None` while unknown.
+    pub fn protocol_version(&self) -> Option<u32> {
+        match *self.protocol.lock().unwrap() {
+            RelayProtocol::V2OrLater(v) => Some(v),
+            RelayProtocol::Legacy => Some(1),
+            _ => None,
+        }
+    }
+
+    /// Relay protocol v3+: account-archive state slots — checkpoints replace
+    /// older generations and purge covered WAL, and account-level deposits
+    /// without an explicit TTL never expire.
+    pub fn supports_state_slots(&self) -> bool {
+        self.protocol_version().map(|v| v >= 3).unwrap_or(false)
     }
 
     /// Send a mailbox deposit and wait for the relay's `MailboxDepositAck`.
@@ -364,6 +383,13 @@ impl RelayClient {
     #[cfg(test)]
     pub fn force_legacy_relay(&self) {
         *self.protocol.lock().unwrap() = RelayProtocol::Legacy;
+    }
+
+    /// Test-only: pretend the ServerHello arrived with the given protocol
+    /// version (>= 2 means deposit acks work; >= 3 means state slots).
+    #[cfg(test)]
+    pub fn force_protocol(&self, version: u32) {
+        *self.protocol.lock().unwrap() = RelayProtocol::V2OrLater(version);
     }
 
     pub async fn expect_signal(&self) -> Result<crate::sync::types::RelaySignalPayload> {
@@ -471,6 +497,7 @@ mod tests {
                         ttl_seconds: None,
                         message_id: None,
                         dedup_key: None,
+                        slot: None,
                     },
                     Duration::from_secs(2),
                 )
@@ -504,6 +531,7 @@ mod tests {
                         ttl_seconds: None,
                         message_id: None,
                         dedup_key: None,
+                        slot: None,
                     },
                     Duration::from_secs(2),
                 )
@@ -525,6 +553,7 @@ mod tests {
                         ttl_seconds: None,
                         message_id: None,
                         dedup_key: None,
+                        slot: None,
                     },
                     Duration::from_millis(150),
                 )
@@ -575,6 +604,7 @@ mod tests {
                     ttl_seconds: None,
                     message_id: None,
                     dedup_key: None,
+                    slot: None,
                 },
                 Duration::from_secs(3),
             )
@@ -629,6 +659,7 @@ mod tests {
                     ttl_seconds: None,
                     message_id: None,
                     dedup_key: None,
+                    slot: None,
                 },
                 Duration::from_secs(3),
             )

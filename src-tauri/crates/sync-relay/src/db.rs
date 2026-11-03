@@ -100,10 +100,39 @@ impl Db {
                 Err(_) => Snapshot::default(),
             }
         };
-        Ok(Self {
+        let db = Self {
             inner: Mutex::new(snapshot),
             path: (path.as_os_str() != ":memory:").then(|| path.to_path_buf()),
-        })
+        };
+        db.normalize_emails();
+        Ok(db)
+    }
+
+    /// Emails are case-insensitive identifiers: lowercase every stored email
+    /// and rebuild the lookup map. Registered before normalization could
+    /// otherwise split one mailbox across two accounts.
+    fn normalize_emails(&self) {
+        let mut snap = self.inner.lock().unwrap();
+        let mut changed = false;
+        let mut rebuilt: HashMap<String, String> = HashMap::new();
+        for user in snap.users.values_mut() {
+            let normalized = user.email.trim().to_lowercase();
+            if normalized != user.email {
+                user.email = normalized;
+                changed = true;
+            }
+            if let Some(prev) = rebuilt.insert(user.email.clone(), user.id.clone()) {
+                if prev != user.id {
+                    // 两个账号的邮箱规范化后撞车：保留后扫到的，记录告警
+                    // 以便人工处理（实际几乎不可能发生）。
+                    tracing::warn!(email = %user.email, dropped_user = %prev, "email collision after normalization");
+                }
+            }
+        }
+        if changed || rebuilt.len() != snap.email_to_user.len() {
+            snap.email_to_user = rebuilt;
+            self.persist(&snap);
+        }
     }
 
     fn persist(&self, snap: &Snapshot) {
@@ -151,6 +180,18 @@ impl Db {
 
     pub fn get_user(&self, id: &str) -> Option<User> {
         self.inner.lock().unwrap().users.get(id).cloned()
+    }
+
+    /// Replace a user's password hash (transparent argon2id re-hash of legacy
+    /// rows on successful login).
+    pub fn set_user_password_hash(&self, id: &str, password_hash: &str) -> anyhow::Result<()> {
+        let mut snap = self.inner.lock().unwrap();
+        let Some(user) = snap.users.get_mut(id) else {
+            anyhow::bail!("user not found");
+        };
+        user.password_hash = password_hash.to_string();
+        self.persist(&snap);
+        Ok(())
     }
 
     /// Lazily assign a sync key to a user (legacy accounts registered before

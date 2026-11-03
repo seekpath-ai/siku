@@ -151,22 +151,37 @@ pub async fn access_token_is_fresh(db: &sqlx::SqlitePool) -> bool {
     exp > now + 300
 }
 
-/// Register a new account.
+/// Register a new account. `code` is the email verification code — required
+/// once the relay has SMTP configured, optional for legacy relays.
 #[tauri::command]
 pub async fn auth_register(
     state: State<'_, AppState>,
     relay_url: String,
     email: String,
     password: String,
+    code: Option<String>,
 ) -> Result<(), String> {
     http_post_json::<_, serde_json::Value>(
         &relay_url,
         "api/register",
-        &serde_json::json!({ "email": email, "password": password }),
+        &serde_json::json!({ "email": email, "password": password, "code": code }),
         None,
     )
     .await?;
     info!("account registered");
+    Ok(())
+}
+
+/// Send a registration verification code to the given email.
+#[tauri::command]
+pub async fn auth_send_register_code(relay_url: String, email: String) -> Result<(), String> {
+    http_post_json::<_, serde_json::Value>(
+        &relay_url,
+        "api/register/code",
+        &serde_json::json!({ "email": email }),
+        None,
+    )
+    .await?;
     Ok(())
 }
 

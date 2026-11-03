@@ -1447,6 +1447,7 @@ pub async fn flush_outbox_with(
                     ttl_seconds: Some(ttl_seconds.max(0) as u64),
                     message_id: Some(message_id),
                     dedup_key: None,
+                    slot: None,
                 },
                 MAILBOX_ACK_TIMEOUT,
             )
@@ -1580,9 +1581,14 @@ pub async fn deliver_changes_mailbox(
             to_device_id: to_device_id.to_string(),
             ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
             nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
-            ttl_seconds: Some(7 * 24 * 3600),
+            // Account-archive WAL rows omit the TTL: on a v3 relay they never
+            // expire (reclaimed by the next checkpoint commit); older relays
+            // apply their 7-day default. Per-device deposits keep the
+            // explicit 7-day TTL.
+            ttl_seconds: if to_device_id.is_empty() { None } else { Some(7 * 24 * 3600) },
             message_id: Some(message_id.clone()),
             dedup_key: None,
+            slot: None,
         };
         // Advance the cursor ONLY after the relay acknowledges the deposit is
         // durably stored. A rejected deposit (e.g. per-device target not in room)
@@ -1617,13 +1623,37 @@ pub async fn deliver_changes_mailbox(
     Ok(cursor)
 }
 
-/// device_settings keys tracking the last full-snapshot deposit: the exported
-/// db_version watermark and the wall-clock time. Together they gate the
-/// expensive full-history scan — unchanged data is re-deposited only to
-/// refresh the archive's 7-day TTL, at roughly half that interval for margin.
+/// device_settings keys tracking the last checkpoint/snapshot. On v3 relays
+/// the WAL is durable, so `sync.checkpoint.db_version` alone drives a
+/// compaction decision (checkpoint when the WAL grew enough); it is separate
+/// from the legacy keys so the FIRST v3 connection always establishes a
+/// generation even when a legacy snapshot watermark exists. On legacy relays
+/// the snapshot doubles as the TTL'd durability net: re-deposit on change, or
+/// unchanged every ~3 days to refresh the TTL.
 const SNAPSHOT_DB_VERSION_KEY: &str = "sync.snapshot.db_version";
 const SNAPSHOT_AT_KEY: &str = "sync.snapshot.at";
+const CHECKPOINT_DB_VERSION_KEY: &str = "sync.checkpoint.db_version";
 const SNAPSHOT_TTL_REFRESH_SECS: i64 = 3 * 24 * 3600;
+
+/// Checkpoint thresholds (v3 relays): deposit a new checkpoint once the WAL
+/// grew past the last one by this many rows. Below the row floor, fall back
+/// to a byte estimate so few-but-huge edits (e.g. a multi-MB inline payload)
+/// still trigger a checkpoint; the O(1) row check keeps idle ticks cheap.
+const CHECKPOINT_MIN_ROWS: i64 = 1500;
+const CHECKPOINT_MIN_WAL_BYTES: i64 = 8 * 1024 * 1024;
+
+/// Estimated WAL bytes since `since` (row payloads dominate). Runs only when
+/// the cheap row-delta gate was inconclusive.
+async fn wal_bytes_since(db: &SqlitePool, since: i64) -> Result<i64> {
+    let bytes: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(LENGTH(pk) + LENGTH(cid) + LENGTH(COALESCE(val, ''))), 0)
+         FROM crsql_changes WHERE db_version > ?",
+    )
+    .bind(since)
+    .fetch_one(db)
+    .await?;
+    Ok(bytes)
+}
 
 /// Serialize a changeset, zlib-deflate it and wrap it in the compressed
 /// envelope. Returns the final wire JSON (base64 payload included).
@@ -1659,23 +1689,31 @@ fn inflate_envelope(env: SyncMessage) -> Result<SyncMessage> {
     Ok(SyncMessage::Changeset(cs))
 }
 
-/// Export the full change history (everything in `crsql_changes` since
+/// Checkpoint the full change history (everything in `crsql_changes` since
 /// db_version 0 — including tombstones, which CR-SQLite backfills for
 /// pre-CRR rows at registration), encrypt it as a changeset, and deposit it
 /// into the ACCOUNT-LEVEL archive so any device of the account — including
-/// one that never had a P2P session — can pick up the complete library and
-/// rows the archive may have pruned. The receiver applies it through the
-/// same cr-sqlite merge as incremental sync (delete-wins preserved), so
-/// refreshing the archive can no longer resurrect rows a peer deleted.
-/// Deliberately does NOT touch `sync.cursor.sent.*`: the delta cursor is
-/// managed exclusively by `deliver_changes_mailbox`.
+/// one that never had a P2P session — can pick up the complete library. The
+/// receiver applies it through the same cr-sqlite merge as incremental sync
+/// (delete-wins preserved). Deliberately does NOT touch `sync.cursor.sent.*`:
+/// the delta cursor is managed exclusively by `deliver_changes_mailbox`.
 ///
-/// The payload is zlib-compressed (history JSON compresses ~8x); if even the
-/// compressed envelope exceeds the relay frame budget it is sliced at row
-/// boundaries like the incremental path. The whole export is skipped when
-/// nothing changed since the last acked deposit and that deposit is still
-/// well within the archive TTL — an idle account otherwise pays a full-table
-/// scan + serialization on every connect (production: 46k rows / 44MB / 20s).
+/// The payload is zlib-compressed; if even the compressed envelope exceeds
+/// the relay frame budget it is sliced at row boundaries like the incremental
+/// path. Gating depends on the relay protocol (ServerHello):
+/// - v3+: WAL rows are durable, so a checkpoint is pure compaction — deposit
+///   one when the WAL grew by `CHECKPOINT_MIN_ROWS` / `CHECKPOINT_MIN_WAL_BYTES`
+///   since the last checkpoint. Slices carry slot metadata; the relay
+///   atomically replaces the sender's older generation and purges the covered
+///   WAL once the final slice lands.
+/// - legacy: the archive TTLs everything at 7 days, so the snapshot doubles
+///   as the durability net — re-deposit when the data changed, or unchanged
+///   every ~3 days to refresh the TTL.
+///
+/// Caller contract: increment delivery and checkpoints are driven from the
+/// same task (the auto-sync proxy loop), so no WAL row can interleave between
+/// the checkpoint export and its slices — the relay purges WAL by deposit
+/// order.
 pub async fn deliver_full_snapshot_mailbox(
     db: &SqlitePool,
     relay: &crate::sync::relay_client::RelayClient,
@@ -1683,22 +1721,55 @@ pub async fn deliver_full_snapshot_mailbox(
 ) -> Result<()> {
     use base64::Engine as _;
 
-    let last_version = crate::core::settings_service::get_device_setting(db, SNAPSHOT_DB_VERSION_KEY)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.parse::<i64>().ok());
-    let last_fresh = crate::core::settings_service::get_device_setting(db, SNAPSHOT_AT_KEY)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| chrono::DateTime::parse_from_rfc3339(&v).ok())
-        .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds() < SNAPSHOT_TTL_REFRESH_SECS)
-        .unwrap_or(false);
-    // Cheap gate first: crsql_db_version is O(1), the full-history scan below
-    // is not — skip it entirely when nothing changed since the last deposit.
-    if last_fresh && last_version == Some(current_db_version(db).await?) {
-        return Ok(());
+    let state_slots = match relay.protocol_version() {
+        // ServerHello has not arrived yet (fresh connection): capability is
+        // unknown, and a slot-less deposit on a v3 relay would be stored as a
+        // PERMANENT WAL row — repeated TTL-refresh snapshots would accumulate
+        // instead of expiring. Defer to the next tick (2h) or reconnect, by
+        // which time the handshake has resolved.
+        None => return Ok(()),
+        Some(v) => v >= 3,
+    };
+    if state_slots {
+        let last_checkpoint = crate::core::settings_service::get_device_setting(db, CHECKPOINT_DB_VERSION_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<i64>().ok());
+        match last_checkpoint {
+            None => {} // first v3 checkpoint: establish the generation
+            Some(v) => {
+                let delta = current_db_version(db).await? - v;
+                if delta <= 0 {
+                    return Ok(());
+                }
+                // Few rows changed: cheap O(1) gate passed, estimate bytes to
+                // catch few-but-huge edits before paying for a full export.
+                if delta < CHECKPOINT_MIN_ROWS
+                    && wal_bytes_since(db, v).await? < CHECKPOINT_MIN_WAL_BYTES
+                {
+                    return Ok(());
+                }
+            }
+        }
+    } else {
+        let last_version = crate::core::settings_service::get_device_setting(db, SNAPSHOT_DB_VERSION_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<i64>().ok());
+        let last_fresh = crate::core::settings_service::get_device_setting(db, SNAPSHOT_AT_KEY)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| chrono::DateTime::parse_from_rfc3339(&v).ok())
+            .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds() < SNAPSHOT_TTL_REFRESH_SECS)
+            .unwrap_or(false);
+        // Cheap gate first: crsql_db_version is O(1), the full-history scan
+        // below is not — skip it entirely when nothing changed.
+        if last_fresh && last_version == Some(current_db_version(db).await?) {
+            return Ok(());
+        }
     }
 
     let changes = export_changes_since(db, 0).await?;
@@ -1733,6 +1804,7 @@ pub async fn deliver_full_snapshot_mailbox(
         out
     };
     let n_slices = envelopes.len();
+    let group = uuid::Uuid::new_v4().to_string();
     for (i, envelope) in envelopes.into_iter().enumerate() {
         let bytes = envelope.len();
         let (ciphertext, nonce) =
@@ -1741,9 +1813,21 @@ pub async fn deliver_full_snapshot_mailbox(
             to_device_id: String::new(), // account-level archive
             ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
             nonce: base64::engine::general_purpose::STANDARD.encode(&nonce),
-            ttl_seconds: Some(7 * 24 * 3600),
+            // No explicit TTL: v3 relays keep slot slices (30 days while the
+            // group is incomplete, permanent once committed); legacy relays
+            // apply their 7-day default, matching the old behavior.
+            ttl_seconds: None,
             message_id: Some(uuid::Uuid::new_v4().to_string()),
             dedup_key: None,
+            slot: if state_slots {
+                Some(crate::sync::types::SlotMeta {
+                    group: group.clone(),
+                    index: i as u32,
+                    total: n_slices as u32,
+                })
+            } else {
+                None
+            },
         };
         // Record the skip-watermark only when every slice is durably stored;
         // an unacknowledged deposit retries on the next tick instead of
@@ -1762,9 +1846,14 @@ pub async fn deliver_full_snapshot_mailbox(
             }
         }
     }
+    let version_key = if state_slots {
+        CHECKPOINT_DB_VERSION_KEY
+    } else {
+        SNAPSHOT_DB_VERSION_KEY
+    };
     let _ = crate::core::settings_service::set_device_setting(
         db,
-        SNAPSHOT_DB_VERSION_KEY,
+        version_key,
         &exported_to.to_string(),
     )
     .await;
@@ -1839,6 +1928,7 @@ async fn deposit_sync_message_to(
                 ttl_seconds: Some(7 * 24 * 3600),
                 message_id: Some(uuid::Uuid::new_v4().to_string()),
                 dedup_key,
+                slot: None,
             },
         })
         .context("deposit sync message to mailbox")
@@ -2354,6 +2444,7 @@ pub async fn flush_pending_blob_pushes(
                     ttl_seconds: Some(7 * 24 * 3600),
                     message_id: None,
                     dedup_key: Some(blob_dedup_key(key, &format!("{hash}:{index}"))),
+                    slot: None,
                 };
                 match relay.deposit_await_ack(payload, MAILBOX_ACK_TIMEOUT).await {
                     Ok(()) => {
@@ -2406,6 +2497,7 @@ pub async fn flush_pending_blob_pushes(
             ttl_seconds: Some(7 * 24 * 3600),
             message_id: None,
             dedup_key: Some(blob_dedup_key(key, &hash)),
+            slot: None,
         };
         match relay.deposit_await_ack(payload, MAILBOX_ACK_TIMEOUT).await {
             Ok(()) => {
@@ -3364,11 +3456,16 @@ mod tests {
 
         let key = crate::sync::crypto::generate_sync_key();
 
-        // A deposits a full snapshot into the account archive.
+        // A deposits a full snapshot into the account archive. The fake relay
+        // reports protocol v3, so the deposit must carry slot metadata.
         let (a_tx, mut a_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
         let relay_a = crate::sync::relay_client::RelayClient::new_for_test(a_tx);
-        deliver_full_snapshot_mailbox(&db_a, &relay_a, &key).await?;
+        relay_a.force_protocol(3);
+        let relay_a2 = relay_a.clone();
+        let db_a2 = db_a.clone();
+        let deliver =
+            tokio::spawn(async move { deliver_full_snapshot_mailbox(&db_a2, &relay_a2, &key).await });
         let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = a_rx
             .recv()
             .await
@@ -3376,6 +3473,26 @@ mod tests {
         else {
             anyhow::bail!("expected mailbox deposit");
         };
+        let slot = payload
+            .slot
+            .as_ref()
+            .expect("v3 checkpoint deposits carry slot metadata");
+        assert_eq!(slot.total, 1, "tiny history fits in one slice");
+        // Ack so the checkpoint watermark is recorded, then let it finish.
+        relay_a.route_ack(crate::sync::types::MailboxDepositAckPayload {
+            id: payload.message_id.clone().unwrap_or_default(),
+            ok: true,
+            error: None,
+        });
+        deliver.await??;
+        let watermark = crate::core::settings_service::get_device_setting(
+            &db_a,
+            "sync.checkpoint.db_version",
+        )
+        .await
+        .ok()
+        .flatten();
+        assert!(watermark.is_some(), "acked checkpoint records its watermark");
 
         // B (offline device) applies the snapshot.
         let (b_tx, _b_rx) =
@@ -3410,6 +3527,65 @@ mod tests {
         sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
         db_a.close().await;
         db_b.close().await;
+        Ok(())
+    }
+
+    /// A fresh relay connection whose ServerHello has not arrived yet must NOT
+    /// deposit anything: with the capability unknown, a slot-less deposit on a
+    /// v3 relay would be stored as a permanent WAL row and accumulate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_deferred_until_relay_hello() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-mailbox-defer-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db_a = crate::core::db::tests::connect_with_crsqlite(&dir.join("a.db")).await?;
+        sqlx::query(crate::core::db::SCHEMA_INIT_SQL).execute(&db_a).await?;
+        crate::core::db::register_crr_tables(&db_a, crate::core::db::CORE_SYNC_TABLES).await?;
+        sqlx::query(
+            "INSERT INTO notes (id, vault_id, title, content, content_plain, tags, aliases, created_at, updated_at) \
+             VALUES ('n1', 1, 't', 'b', 'b', '[]', '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&db_a)
+        .await?;
+
+        let key = crate::sync::crypto::generate_sync_key();
+        let (a_tx, mut a_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::sync::types::RelayClientMsg>();
+        let relay_a = crate::sync::relay_client::RelayClient::new_for_test(a_tx);
+        // Protocol Unknown (no ServerHello yet): nothing is deposited.
+        deliver_full_snapshot_mailbox(&db_a, &relay_a, &key).await?;
+        assert!(
+            a_rx.try_recv().is_err(),
+            "no snapshot deposit before the relay handshake resolves"
+        );
+        // Once the relay reports v2 (legacy), the deposit flows again.
+        relay_a.force_protocol(2);
+        let relay_a2 = relay_a.clone();
+        let db_a2 = db_a.clone();
+        let deliver =
+            tokio::spawn(async move { deliver_full_snapshot_mailbox(&db_a2, &relay_a2, &key).await });
+        let msg = a_rx.recv().await.context("legacy relay gets the snapshot")?;
+        let crate::sync::types::RelayClientMsg::MailboxDeposit { payload } = msg else {
+            anyhow::bail!("expected mailbox deposit");
+        };
+        assert!(payload.slot.is_none(), "legacy relay gets a slot-less deposit");
+        relay_a.route_ack(crate::sync::types::MailboxDepositAckPayload {
+            id: payload.message_id.clone().unwrap_or_default(),
+            ok: true,
+            error: None,
+        });
+        deliver.await??;
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        db_a.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 

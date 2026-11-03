@@ -18,6 +18,7 @@ import {
   authLogin,
   authLogout,
   authRegister,
+  authSendRegisterCode,
   authStatus,
   deviceList,
   deviceRename,
@@ -94,6 +95,10 @@ export function AccountSettings({ onLoggedIn }: Props) {
   const [suggestedName, setSuggestedName] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  // 注册验证码：仅注册时需要；发送后 60s 倒计时防重发
+  const [regCode, setRegCode] = useState('');
+  const [codeSending, setCodeSending] = useState(false);
+  const [codeCountdown, setCodeCountdown] = useState(0);
   const [devices, setDevices] = useState<AccountDeviceRow[]>([]);
   const [loadingDevices, setLoadingDevices] = useState(false);
 
@@ -316,11 +321,30 @@ export function AccountSettings({ onLoggedIn }: Props) {
     }
   };
 
+  const handleSendCode = async () => {
+    setCodeSending(true);
+    setError('');
+    try {
+      await authSendRegisterCode(httpBase, email.trim());
+      setCodeCountdown(60);
+      const timer = window.setInterval(() => {
+        setCodeCountdown((c) => {
+          if (c <= 1) window.clearInterval(timer);
+          return c - 1;
+        });
+      }, 1000);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCodeSending(false);
+    }
+  };
+
   const handleRegister = async () => {
     setBusy(true);
     setError('');
     try {
-      await authRegister(httpBase, email, password);
+      await authRegister(httpBase, email, password, regCode.trim() || undefined);
       const name = deviceName.trim() || suggestedName || '我的设备';
       const info = await authLogin(httpBase, email, password, name);
       setAuth(info);
@@ -454,6 +478,22 @@ export function AccountSettings({ onLoggedIn }: Props) {
             placeholder={`设备名称（默认 ${suggestedName || '…'}）`}
             className="w-full px-3 py-2 bg-surface border border-surface-hover rounded-lg text-sm text-text-primary outline-none focus:border-primary"
           />
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={regCode}
+              onChange={(e) => setRegCode(e.target.value)}
+              placeholder="邮箱验证码（注册时填写）"
+              className="flex-1 min-w-0 px-3 py-2 bg-surface border border-surface-hover rounded-lg text-sm text-text-primary outline-none focus:border-primary"
+            />
+            <button
+              onClick={handleSendCode}
+              disabled={codeSending || codeCountdown > 0 || !email.trim() || !serverUrl.trim()}
+              className="shrink-0 px-3 py-2 bg-surface border border-surface-hover text-text-primary text-sm rounded-lg hover:bg-surface-hover disabled:opacity-50 transition-colors"
+            >
+              {codeSending ? '发送中…' : codeCountdown > 0 ? `${codeCountdown}s 后重发` : '发送验证码'}
+            </button>
+          </div>
           <div className="flex gap-2">
             <button
               onClick={handleLogin}

@@ -257,6 +257,38 @@ impl Db {
         }
     }
 
+    /// The email of the account currently owning `device_id` (for the
+    /// conflict prompt at login).
+    pub fn device_owner_email(&self, device_id: &str) -> Option<String> {
+        let snap = self.inner.lock().unwrap();
+        let dev = snap.devices.get(device_id)?;
+        snap.users.get(&dev.user_id).map(|u| u.email.clone())
+    }
+
+    /// Move a device to another account (user-confirmed account switch on the
+    /// same machine). Clears revocation and refreshes the name/seen stamp.
+    pub fn transfer_device(
+        &self,
+        new_user_id: &str,
+        device_id: &str,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        let mut snap = self.inner.lock().unwrap();
+        let Some(dev) = snap.devices.get_mut(device_id) else {
+            anyhow::bail!("device not found");
+        };
+        let old = dev.user_id.clone();
+        dev.user_id = new_user_id.to_string();
+        dev.revoked_at = None;
+        dev.last_seen_at = Some(crate::now_iso());
+        if !name.is_empty() {
+            dev.name = name.to_string();
+        }
+        self.persist(&snap);
+        info!(device_id = %device_id, from = %old, to = %new_user_id, "device ownership transferred");
+        Ok(())
+    }
+
     pub fn get_device(&self, device_id: &str) -> Option<Device> {
         self.inner.lock().unwrap().devices.get(device_id).cloned()
     }

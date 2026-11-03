@@ -151,20 +151,20 @@ pub async fn access_token_is_fresh(db: &sqlx::SqlitePool) -> bool {
     exp > now + 300
 }
 
-/// Register a new account. `code` is the email verification code — required
-/// once the relay has SMTP configured, optional for legacy relays.
+/// Register a new account with a password — legacy path for self-hosted
+/// relays without SMTP (the official relay registers implicitly at
+/// code-login, see auth_login).
 #[tauri::command]
 pub async fn auth_register(
     state: State<'_, AppState>,
     relay_url: String,
     email: String,
     password: String,
-    code: Option<String>,
 ) -> Result<(), String> {
     http_post_json::<_, serde_json::Value>(
         &relay_url,
         "api/register",
-        &serde_json::json!({ "email": email, "password": password, "code": code }),
+        &serde_json::json!({ "email": email, "password": password }),
         None,
     )
     .await?;
@@ -172,12 +172,12 @@ pub async fn auth_register(
     Ok(())
 }
 
-/// Send a registration verification code to the given email.
+/// Send an email verification code (login and registration share it).
 #[tauri::command]
-pub async fn auth_send_register_code(relay_url: String, email: String) -> Result<(), String> {
+pub async fn auth_send_code(relay_url: String, email: String) -> Result<(), String> {
     http_post_json::<_, serde_json::Value>(
         &relay_url,
-        "api/register/code",
+        "api/auth/code",
         &serde_json::json!({ "email": email }),
         None,
     )
@@ -185,15 +185,22 @@ pub async fn auth_send_register_code(relay_url: String, email: String) -> Result
     Ok(())
 }
 
-/// Log in and store the device token locally.
+/// Log in and store the device token locally. `code` is the passwordless
+/// credential: a valid code for a never-registered mailbox creates the
+/// account implicitly (relay side). `password` is the legacy path for
+/// self-hosted relays without SMTP. `transfer_device` retries a login after
+/// the user confirmed the device-ownership conflict prompt.
 #[tauri::command]
 pub async fn auth_login(
     state: State<'_, AppState>,
     sync_state: State<'_, crate::commands::sync::SyncState>,
+    app: tauri::AppHandle,
     relay_url: String,
     email: String,
-    password: String,
+    password: Option<String>,
+    code: Option<String>,
     device_name: String,
+    transfer_device: bool,
 ) -> Result<AuthInfo, String> {
     let device_id = ensure_device_id(&state.db).await.map_err(|e| e.to_string())?;
     let resp: serde_json::Value = http_post_json(
@@ -202,8 +209,10 @@ pub async fn auth_login(
         &serde_json::json!({
             "email": email,
             "password": password,
+            "code": code,
             "device_id": device_id,
             "device_name": device_name,
+            "transfer_device": transfer_device,
         }),
         None,
     )
@@ -256,6 +265,11 @@ pub async fn auth_login(
     // (backend-side) so sync starts even if the frontend never triggers it.
     crate::commands::sync::spawn_auto_sync_proxy(&sync_state, &state, &relay_url, &access_token).await;
 
+    // Re-evaluate remote channels immediately — otherwise a fresh login /
+    // account switch waits for the arbiter's next 45s tick with channels
+    // stuck in "未启用".
+    state.remote.sync_config(&state.db, &app).await;
+
     Ok(AuthInfo {
         access_token,
         user_id,
@@ -265,7 +279,10 @@ pub async fn auth_login(
 }
 
 /// Log out: clear locally stored account state and stop all sync activity
-/// (auto-sync proxy, host loop, current sessions).
+/// (auto-sync proxy, host loop, current sessions). Also unregisters this
+/// device from the relay account (best-effort): a clean logout removes the
+/// ownership record so a later account switch on this machine does not hit
+/// the ownership-transfer prompt.
 #[tauri::command]
 pub async fn auth_logout(
     state: State<'_, AppState>,
@@ -280,6 +297,24 @@ pub async fn auth_logout(
     crate::commands::sync::stop_all_sync(&sync_state).await;
 
     let db = &state.db;
+    // Best-effort device unregistration while the token is still valid.
+    // Offline/failed is fine: the relay transfers ownership on the next
+    // login after a user-confirmed prompt.
+    if let Ok(Some(relay_url)) = settings_service::get_device_setting(db, ACCOUNT_RELAY_URL_KEY).await {
+        if !relay_url.is_empty() {
+            if let Ok(device_id) = ensure_device_id(db).await {
+                let _ = auth_request(
+                    db,
+                    &relay_url,
+                    reqwest::Method::DELETE,
+                    &format!("api/devices/{device_id}"),
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+
     let _ = settings_service::set_device_setting(db, ACCOUNT_TOKEN_KEY, "").await;
     let _ = settings_service::set_device_setting(db, ACCOUNT_REFRESH_TOKEN_KEY, "").await;
     let _ = settings_service::set_device_setting(db, ACCOUNT_USER_ID_KEY, "").await;

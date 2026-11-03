@@ -10,7 +10,6 @@ import {
   Smartphone,
   Trash2,
   User,
-  KeyRound,
   X,
   Zap,
 } from 'lucide-react';
@@ -18,7 +17,7 @@ import {
   authLogin,
   authLogout,
   authRegister,
-  authSendRegisterCode,
+  authSendCode,
   authStatus,
   deviceList,
   deviceRename,
@@ -90,15 +89,18 @@ export function AccountSettings({ onLoggedIn }: Props) {
   const [serverUrl, setServerUrl] = useState(() => loadServerUrl());
   const [auth, setAuth] = useState<AuthInfo | null>(null);
   const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [deviceName, setDeviceName] = useState('');
   const [suggestedName, setSuggestedName] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  // 注册验证码：仅注册时需要；发送后 60s 倒计时防重发
-  const [regCode, setRegCode] = useState('');
+  // 邮箱验证码（passwordless 唯一凭证）；发送后 60s 倒计时防重发
+  const [code, setCode] = useState('');
   const [codeSending, setCodeSending] = useState(false);
   const [codeCountdown, setCodeCountdown] = useState(0);
+  // 无 SMTP 的自建 relay：发码返回 503 时回退到密码登录（旧路径）
+  const [passwordMode, setPasswordMode] = useState(false);
+  const [password, setPassword] = useState('');
+  // 设备归属冲突：relay 返回 409 + 脱敏归属邮箱，用户确认后才转移
+  const [deviceConflict, setDeviceConflict] = useState('');
   const [devices, setDevices] = useState<AccountDeviceRow[]>([]);
   const [loadingDevices, setLoadingDevices] = useState(false);
 
@@ -303,29 +305,11 @@ export function AccountSettings({ onLoggedIn }: Props) {
     }
   };
 
-  const handleLogin = async () => {
-    setBusy(true);
-    setError('');
-    try {
-      // Default device name is suggested as hostname + id suffix so two
-      // devices don't both show up as "我的设备".
-      const name = deviceName.trim() || suggestedName || '我的设备';
-      const info = await authLogin(httpBase, email, password, name);
-      setAuth(info);
-      onLoggedIn(info);
-      refreshDevices();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const handleSendCode = async () => {
     setCodeSending(true);
     setError('');
     try {
-      await authSendRegisterCode(httpBase, email.trim());
+      await authSendCode(httpBase, email.trim());
       setCodeCountdown(60);
       const timer = window.setInterval(() => {
         setCodeCountdown((c) => {
@@ -334,24 +318,54 @@ export function AccountSettings({ onLoggedIn }: Props) {
         });
       }, 1000);
     } catch (e) {
-      setError(String(e));
+      const msg = String(e);
+      if (msg.includes('503') || msg.includes('邮件服务未配置') || msg.includes('404')) {
+        // 自建 relay 未配置 SMTP（503），或旧版 relay 没有验证码端点（404）：
+        // 验证码不可用，回退密码登录
+        setPasswordMode(true);
+        setError('该服务器不支持邮箱验证码，请使用密码登录');
+      } else {
+        setError(msg);
+      }
     } finally {
       setCodeSending(false);
     }
   };
 
-  const handleRegister = async () => {
+  const doLogin = async (transferDevice: boolean) => {
     setBusy(true);
     setError('');
+    setDeviceConflict('');
     try {
-      await authRegister(httpBase, email, password, regCode.trim() || undefined);
-      const name = deviceName.trim() || suggestedName || '我的设备';
-      const info = await authLogin(httpBase, email, password, name);
+      // 设备名自动为主机名 + id 前缀，不再让用户填写
+      const name = suggestedName || '我的设备';
+      let info: AuthInfo;
+      if (passwordMode) {
+        try {
+          info = await authLogin(httpBase, email.trim(), { password, deviceName: name, transferDevice });
+        } catch (e) {
+          // 旧路径下的"账号不存在"：密码注册后立刻登录
+          if (String(e).includes('404') || String(e).includes('账号不存在')) {
+            await authRegister(httpBase, email.trim(), password);
+            info = await authLogin(httpBase, email.trim(), { password, deviceName: name, transferDevice });
+          } else {
+            throw e;
+          }
+        }
+      } else {
+        info = await authLogin(httpBase, email.trim(), { code: code.trim(), deviceName: name, transferDevice });
+      }
       setAuth(info);
       onLoggedIn(info);
       refreshDevices();
     } catch (e) {
-      setError(String(e));
+      const msg = String(e);
+      const conflict = msg.match(/device_conflict:(\S+)/);
+      if (conflict) {
+        setDeviceConflict(conflict[1]);
+      } else {
+        setError(msg);
+      }
     } finally {
       setBusy(false);
     }
@@ -464,54 +478,69 @@ export function AccountSettings({ onLoggedIn }: Props) {
             placeholder="邮箱"
             className="w-full px-3 py-2 bg-surface border border-surface-hover rounded-lg text-sm text-text-primary outline-none focus:border-primary"
           />
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="密码"
-            className="w-full px-3 py-2 bg-surface border border-surface-hover rounded-lg text-sm text-text-primary outline-none focus:border-primary"
-          />
-          <input
-            type="text"
-            value={deviceName}
-            onChange={(e) => setDeviceName(e.target.value)}
-            placeholder={`设备名称（默认 ${suggestedName || '…'}）`}
-            className="w-full px-3 py-2 bg-surface border border-surface-hover rounded-lg text-sm text-text-primary outline-none focus:border-primary"
-          />
-          <div className="flex gap-2">
+          {passwordMode ? (
             <input
-              type="text"
-              value={regCode}
-              onChange={(e) => setRegCode(e.target.value)}
-              placeholder="邮箱验证码（注册时填写）"
-              className="flex-1 min-w-0 px-3 py-2 bg-surface border border-surface-hover rounded-lg text-sm text-text-primary outline-none focus:border-primary"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="密码"
+              className="w-full px-3 py-2 bg-surface border border-surface-hover rounded-lg text-sm text-text-primary outline-none focus:border-primary"
             />
-            <button
-              onClick={handleSendCode}
-              disabled={codeSending || codeCountdown > 0 || !email.trim() || !serverUrl.trim()}
-              className="shrink-0 px-3 py-2 bg-surface border border-surface-hover text-text-primary text-sm rounded-lg hover:bg-surface-hover disabled:opacity-50 transition-colors"
-            >
-              {codeSending ? '发送中…' : codeCountdown > 0 ? `${codeCountdown}s 后重发` : '发送验证码'}
-            </button>
+          ) : (
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={code}
+                onChange={(e) => setCode(e.target.value)}
+                placeholder="邮箱验证码"
+                maxLength={8}
+                className="flex-1 min-w-0 px-3 py-2 bg-surface border border-surface-hover rounded-lg text-sm text-text-primary outline-none focus:border-primary"
+              />
+              <button
+                onClick={handleSendCode}
+                disabled={codeSending || codeCountdown > 0 || !email.trim() || !serverUrl.trim()}
+                className="shrink-0 px-3 py-2 bg-surface border border-surface-hover text-text-primary text-sm rounded-lg hover:bg-surface-hover disabled:opacity-50 transition-colors"
+              >
+                {codeSending ? '发送中…' : codeCountdown > 0 ? `${codeCountdown}s 后重发` : '发送验证码'}
+              </button>
+            </div>
+          )}
+          <button
+            onClick={() => doLogin(false)}
+            disabled={busy || !email.trim() || !serverUrl.trim() || (passwordMode ? !password : !code.trim())}
+            className="flex items-center gap-2 px-4 py-2 bg-primary text-white text-sm rounded-lg hover:opacity-90 disabled:opacity-50 transition-opacity"
+          >
+            {busy ? <Loader2 size={14} className="animate-spin" /> : <User size={14} />}
+            登录 / 注册
+          </button>
+          <div className="text-[11px] text-text-secondary/60">
+            {passwordMode
+              ? '该服务器未启用邮箱验证码；未注册的邮箱将自动创建账号'
+              : '未注册的邮箱验证后将自动创建账号；验证码 10 分钟内有效'}
           </div>
-          <div className="flex gap-2">
-            <button
-              onClick={handleLogin}
-              disabled={busy || !email || !password || !serverUrl.trim()}
-              className="flex items-center gap-2 px-4 py-2 bg-primary text-white text-sm rounded-lg hover:opacity-90 disabled:opacity-50 transition-opacity"
-            >
-              {busy ? <Loader2 size={14} className="animate-spin" /> : <User size={14} />}
-              登录
-            </button>
-            <button
-              onClick={handleRegister}
-              disabled={busy || !email || !password || !serverUrl.trim()}
-              className="flex items-center gap-2 px-4 py-2 bg-surface border border-surface-hover text-text-primary text-sm rounded-lg hover:bg-surface-hover disabled:opacity-50 transition-colors"
-            >
-              <KeyRound size={14} />
-              注册并登录
-            </button>
-          </div>
+          {deviceConflict && (
+            <div className="px-3 py-2 bg-amber-500/10 border border-amber-500/30 rounded-lg space-y-2">
+              <div className="text-xs text-amber-300">
+                本机当前绑定在 {deviceConflict} 名下，转移后将从该账号的设备列表移除。是否转移到当前账号？
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => doLogin(true)}
+                  disabled={busy}
+                  className="px-3 py-1.5 bg-amber-500/80 text-white text-xs rounded-lg hover:bg-amber-500 disabled:opacity-50 transition-colors"
+                >
+                  {busy ? '转移中…' : '转移并登录'}
+                </button>
+                <button
+                  onClick={() => setDeviceConflict('')}
+                  disabled={busy}
+                  className="px-3 py-1.5 bg-surface border border-surface-hover text-text-secondary text-xs rounded-lg hover:bg-surface-hover disabled:opacity-50 transition-colors"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          )}
           {error && <div className="text-xs text-red-400">{error}</div>}
         </div>
       ) : (

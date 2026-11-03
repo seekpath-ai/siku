@@ -2028,17 +2028,34 @@ export interface AccountDeviceRow {
   online?: boolean;
 }
 
-export async function authRegister(relayUrl: string, email: string, password: string, code?: string): Promise<void> {
-  return invoke<void>('auth_register', { relayUrl, email, password, code: code || null });
+/** 密码注册 — 仅自建 relay 未配置 SMTP 时的旧路径（官方 relay 在验证码登录时隐式建号）。 */
+export async function authRegister(relayUrl: string, email: string, password: string): Promise<void> {
+  return invoke<void>('auth_register', { relayUrl, email, password });
 }
 
-/** 发送注册验证码到邮箱（relay 需配置 SMTP）。 */
-export async function authSendRegisterCode(relayUrl: string, email: string): Promise<void> {
-  return invoke<void>('auth_send_register_code', { relayUrl, email });
+/** 发送登录/注册验证码到邮箱（relay 需配置 SMTP）。 */
+export async function authSendCode(relayUrl: string, email: string): Promise<void> {
+  return invoke<void>('auth_send_code', { relayUrl, email });
 }
 
-export async function authLogin(relayUrl: string, email: string, password: string, deviceName: string): Promise<AuthInfo> {
-  return invoke<AuthInfo>('auth_login', { relayUrl, email, password, deviceName });
+/**
+ * 统一登录入口：优先验证码（passwordless，邮箱未注册时隐式建号）；
+ * password 为无 SMTP 自建 relay 的旧路径。transferDevice 用于用户确认
+ * 设备所有权转移后的重试。
+ */
+export async function authLogin(
+  relayUrl: string,
+  email: string,
+  opts: { code?: string; password?: string; deviceName: string; transferDevice?: boolean },
+): Promise<AuthInfo> {
+  return invoke<AuthInfo>('auth_login', {
+    relayUrl,
+    email,
+    password: opts.password ?? null,
+    code: opts.code ?? null,
+    deviceName: opts.deviceName,
+    transferDevice: opts.transferDevice ?? false,
+  });
 }
 
 export async function authLogout(): Promise<void> {

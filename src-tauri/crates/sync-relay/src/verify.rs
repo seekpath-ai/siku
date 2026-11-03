@@ -1,9 +1,10 @@
-//! Email verification codes for registration, plus the SMTP sender.
+//! Email verification codes for login/registration, plus the SMTP sender.
 //!
 //! Codes live in memory only: a relay restart invalidates outstanding codes
-//! and the user simply requests a new one. Limits: 10-minute TTL, 5 verify
-//! attempts per code, one code per email per minute (a resend replaces the
-//! previous code).
+//! and the user simply requests a new one. Codes are the sole credential
+//! (passwordless accounts), so they are hardened accordingly: 8 digits,
+//! 10-minute TTL, single-use, 5 verify attempts per code, one code per email
+//! per minute, and a per-email daily send cap against mail bombing.
 
 use rand::Rng;
 use std::collections::HashMap;
@@ -14,6 +15,9 @@ use tracing::info;
 const CODE_TTL_SECS: i64 = 10 * 60;
 const RESEND_INTERVAL_SECS: i64 = 60;
 const MAX_ATTEMPTS: u32 = 5;
+/// Per-email daily send cap (UTC day). Blunting mail-bombing abuse; way above
+/// any legitimate login cadence.
+const DAILY_SEND_CAP: u32 = 20;
 
 struct CodeEntry {
     code_hash: String,
@@ -25,6 +29,9 @@ struct CodeEntry {
 #[derive(Default)]
 pub struct VerificationCodes {
     inner: Mutex<HashMap<String, CodeEntry>>,
+    /// email -> (UTC day, sends so far that day). Separate from `inner` so a
+    /// re-issued code never resets the daily counter.
+    daily: Mutex<HashMap<String, (String, u32)>>,
 }
 
 fn now() -> i64 {
@@ -68,7 +75,7 @@ impl VerificationCodes {
     }
 
     /// Issue a fresh code for `email`, replacing any previous one. Fails when
-    /// the resend interval has not elapsed.
+    /// the resend interval has not elapsed or the daily send cap is reached.
     pub fn issue(&self, email: &str) -> Result<String, String> {
         let mut map = self.inner.lock().unwrap();
         let ts = now();
@@ -78,7 +85,22 @@ impl VerificationCodes {
                 return Err(format!("发送太频繁，请 {wait} 秒后重试"));
             }
         }
-        let code = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000u32));
+        {
+            let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let mut daily = self.daily.lock().unwrap();
+            let entry = daily.entry(email.to_string()).or_insert_with(|| (day.clone(), 0));
+            if entry.0 != day {
+                *entry = (day, 0);
+            }
+            if entry.1 >= DAILY_SEND_CAP {
+                return Err("今日验证码发送次数已达上限，请明天再试".to_string());
+            }
+            entry.1 += 1;
+        }
+        // 8 digits: the code is the sole credential for passwordless
+        // accounts, so it gets one more order of magnitude over the 6-digit
+        // convention (5 attempts / 10^8 space / 10-minute TTL).
+        let code = format!("{:08}", rand::thread_rng().gen_range(0..100_000_000u64));
         map.insert(
             email.to_string(),
             CodeEntry {
@@ -115,7 +137,18 @@ impl VerificationCodes {
     }
 }
 
-/// SMTP sender for transactional mail (registration codes). Configured via
+/// Mask an email for display in conflict prompts: `15***@qq.com`.
+pub fn mask_email(email: &str) -> String {
+    match email.split_once('@') {
+        Some((local, domain)) => {
+            let keep: String = local.chars().take(2).collect();
+            format!("{keep}***@{domain}")
+        }
+        None => "***".to_string(),
+    }
+}
+
+/// SMTP sender for transactional mail (verification codes). Configured via
 /// env: `SMTP_HOST` / `SMTP_PORT` (465) / `SMTP_USER` / `SMTP_PASS` /
 /// `SMTP_FROM` (defaults to SMTP_USER). When unconfigured the relay logs a
 /// warning and registration falls back to the legacy codeless flow — a
@@ -165,10 +198,10 @@ impl Mailer {
         let message = Message::builder()
             .from(self.from.parse()?)
             .to(to.parse()?)
-            .subject("思库注册验证码")
+            .subject("思库验证码")
             .header(ContentType::TEXT_PLAIN)
             .body(format!(
-                "你的思库注册验证码：{code}\n\n10 分钟内有效。若非本人操作，请忽略本邮件。"
+                "你的思库验证码：{code}\n\n10 分钟内有效，可用于登录或注册。若非本人操作，请忽略本邮件。"
             ))?;
         let transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&self.host)
             .port(self.port)
@@ -201,10 +234,32 @@ mod tests {
     fn code_issue_verify_consume() {
         let codes = VerificationCodes::new();
         let code = codes.issue("a@b.com").unwrap();
-        assert_eq!(code.len(), 6);
+        assert_eq!(code.len(), 8);
         codes.verify("a@b.com", &code).unwrap();
         // Consumed: a second verify fails.
         assert!(codes.verify("a@b.com", &code).is_err());
+    }
+
+    #[test]
+    fn daily_send_cap_blocks_bombing() {
+        let codes = VerificationCodes::new();
+        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        codes
+            .daily
+            .lock()
+            .unwrap()
+            .insert("a@b.com".to_string(), (day, DAILY_SEND_CAP));
+        let err = codes.issue("a@b.com").unwrap_err();
+        assert!(err.contains("已达上限"));
+        // A different email is unaffected.
+        assert!(codes.issue("c@d.com").is_ok());
+    }
+
+    #[test]
+    fn email_masking() {
+        assert_eq!(mask_email("1589335815@qq.com"), "15***@qq.com");
+        assert_eq!(mask_email("a@b.com"), "a***@b.com");
+        assert_eq!(mask_email("no-at"), "***");
     }
 
     #[test]

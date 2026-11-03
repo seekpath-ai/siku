@@ -998,7 +998,7 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/v1/signaling", get(signaling_handler))
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/register", post(api_register))
-        .route("/api/register/code", post(api_register_code))
+        .route("/api/auth/code", post(api_auth_code))
         .route("/api/login", post(api_login))
         .route("/api/refresh", post(api_refresh))
         .route("/api/devices", get(api_list_devices))
@@ -1032,27 +1032,26 @@ struct RegisterRequest {
 }
 
 #[derive(serde::Deserialize)]
-struct RegisterCodeRequest {
+struct AuthCodeRequest {
     email: String,
 }
 
-/// POST /api/register/code — 向邮箱发送注册验证码。幂等间隔 60s（同邮箱）。
-async fn api_register_code(
+/// POST /api/auth/code — 向邮箱发送验证码。登录与注册共用一个入口：登录时
+/// 持有效验证码而邮箱尚未注册，即隐式建号。响应不透露邮箱是否已注册。
+/// 幂等间隔 60s（同邮箱），每邮箱每日 20 条上限。
+async fn api_auth_code(
     State(state): State<Arc<AppState>>,
-    axum::Json(req): axum::Json<RegisterCodeRequest>,
+    axum::Json(req): axum::Json<AuthCodeRequest>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
     let Some(mailer) = &state.mailer else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "email service not configured".to_string(),
+            "邮件服务未配置，请使用密码登录".to_string(),
         ));
     };
     let email = verify::normalize_email(&req.email);
     if !verify::is_valid_email(&email) {
         return Err((StatusCode::BAD_REQUEST, "邮箱格式不正确".to_string()));
-    }
-    if state.db.get_user_by_email(&email).is_some() {
-        return Err((StatusCode::CONFLICT, "该邮箱已注册，请直接登录".to_string()));
     }
     let code = state
         .codes
@@ -1062,7 +1061,7 @@ async fn api_register_code(
         .send_code(&email, &code)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("验证码发送失败: {e}")))?;
-    info!(email = %email, "registration code sent");
+    info!(email = %email, "auth code sent");
     Ok(axum::Json(serde_json::json!({ "ok": true })))
 }
 
@@ -1102,9 +1101,19 @@ async fn api_register(
 #[derive(Deserialize)]
 struct LoginRequest {
     email: String,
-    password: String,
+    /// Legacy password path (old clients, self-hosted relays without SMTP).
+    #[serde(default)]
+    password: Option<String>,
+    /// Email verification code — the passwordless credential. A valid code
+    /// for a never-seen mailbox registers the account implicitly.
+    #[serde(default)]
+    code: Option<String>,
     device_id: String,
     device_name: String,
+    /// Set when the user confirmed the ownership-transfer prompt: the device
+    /// currently belongs to another account and moves to this one.
+    #[serde(default)]
+    transfer_device: bool,
 }
 
 #[derive(Serialize)]
@@ -1121,22 +1130,68 @@ async fn api_login(
     axum::Json(req): axum::Json<LoginRequest>,
 ) -> Result<axum::Json<LoginResponse>, (StatusCode, String)> {
     let email = verify::normalize_email(&req.email);
-    let user_id = state
-        .auth
-        .login(&state.db, &email, &req.password)
-        .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
-    // 旧格式（迭代 SHA-256）哈希在登录成功时透明迁移到 argon2id。
-    if let Some(user) = state.db.get_user(&user_id) {
+    if !verify::is_valid_email(&email) {
+        return Err((StatusCode::BAD_REQUEST, "邮箱格式不正确".to_string()));
+    }
+    let code = req.code.as_deref().map(str::trim).filter(|c| !c.is_empty());
+
+    let user_id = if let Some(code) = code {
+        // Verification-code path. The code proves mailbox ownership — for a
+        // never-seen mailbox it doubles as the registration proof.
+        state
+            .codes
+            .verify(&email, code)
+            .map_err(|e| (StatusCode::UNAUTHORIZED, e))?;
+        match state.db.get_user_by_email(&email) {
+            Some(u) => u.id,
+            None => state
+                .auth
+                .register(&state.db, &email, "")
+                .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?,
+        }
+    } else {
+        // Legacy password path. 404 (not 401) when the mailbox is unknown so
+        // clients can offer registration instead of "wrong password".
+        let password = req.password.as_deref().unwrap_or("");
+        let user = state.db.get_user_by_email(&email).ok_or((
+            StatusCode::NOT_FOUND,
+            "账号不存在，请使用验证码登录".to_string(),
+        ))?;
+        state
+            .auth
+            .login(&state.db, &email, password)
+            .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+        // 旧格式（迭代 SHA-256）哈希在登录成功时透明迁移到 argon2id。
         if auth::is_legacy_hash(&user.password_hash) {
-            if let Ok(fresh) = auth::hash_password(&req.password) {
-                let _ = state.db.set_user_password_hash(&user_id, &fresh);
+            if let Ok(fresh) = auth::hash_password(password) {
+                let _ = state.db.set_user_password_hash(&user.id, &fresh);
             }
         }
-    }
+        user.id
+    };
+
     let device_id = req.device_id.trim();
-    let _ = state
+    // Device ownership: a device registered under another account blocks
+    // login until the user confirms the transfer (the client prompts with
+    // the masked owner email and retries with transfer_device = true).
+    if let Some(owner) = state.db.device_owner_email(device_id) {
+        if !owner.eq_ignore_ascii_case(&email) {
+            if !req.transfer_device {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("device_conflict:{}", verify::mask_email(&owner)),
+                ));
+            }
+            state
+                .db
+                .transfer_device(&user_id, device_id, req.device_name.trim())
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+    }
+    state
         .db
-        .register_device(&user_id, device_id, &req.device_name.trim());
+        .register_device(&user_id, device_id, req.device_name.trim())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let token = state
         .auth
         .issue_device_token(&user_id, device_id)
@@ -3291,16 +3346,16 @@ mod tests {
         );
     }
 
-    /// 未配置 SMTP 时 /api/register/code 不可用，注册保持旧流程（无验证码）。
+    /// 未配置 SMTP 时 /api/auth/code 不可用，密码登录的旧流程不受影响。
     #[tokio::test]
-    async fn register_code_endpoint_requires_mailer() {
+    async fn auth_code_endpoint_requires_mailer() {
         std::env::set_var("JWT_SECRET", "test-secret");
         let state = Arc::new(AppState::new());
         assert!(state.mailer.is_none(), "tests must not pick up real SMTP env");
         let (status, _) = http_json(
             state.clone(),
             "POST",
-            "/api/register/code",
+            "/api/auth/code",
             None,
             Some(serde_json::json!({ "email": "a@b.com" })),
         )
@@ -3317,6 +3372,151 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// 验证码登录：已注册邮箱直接登录；未见过的邮箱持有效验证码隐式建号，
+    /// 建号后无密码（密码登录不再适用，验证码登录仍可用）。
+    #[tokio::test]
+    async fn code_login_registers_passwordless_account() {
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let state = Arc::new(AppState::new());
+        // 测试环境无 SMTP：直接向验证码存储注入一枚有效验证码。
+        let code = state.codes.issue("new@example.com").unwrap();
+        let (status, json) = http_json(
+            state.clone(),
+            "POST",
+            "/api/login",
+            None,
+            Some(serde_json::json!({
+                "email": "new@example.com",
+                "code": code,
+                "device_id": "dev-1",
+                "device_name": "D1"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["access_token"].as_str().unwrap().len() > 10);
+        let user = state.db.get_user_by_email("new@example.com").unwrap();
+        assert!(user.password_hash.is_empty(), "code-registered account is passwordless");
+        // 密码登录对无密码账号一律失败。
+        let (status, _) = http_json(
+            state.clone(),
+            "POST",
+            "/api/login",
+            None,
+            Some(serde_json::json!({
+                "email": "new@example.com",
+                "password": "whatever",
+                "device_id": "dev-1",
+                "device_name": "D1"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // 验证码已消费：同一验证码不能二次登录。
+        let (status, _) = http_json(
+            state.clone(),
+            "POST",
+            "/api/login",
+            None,
+            Some(serde_json::json!({
+                "email": "new@example.com",
+                "code": state.codes.issue("x@y.com").unwrap(), // valid format, wrong email's code
+                "device_id": "dev-1",
+                "device_name": "D1"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// 密码登录时未知邮箱返回 404（客户端据此引导验证码注册），错误密码 401。
+    #[tokio::test]
+    async fn password_login_distinguishes_unknown_account() {
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let state = Arc::new(AppState::new());
+        let (status, _) = http_json(
+            state.clone(),
+            "POST",
+            "/api/login",
+            None,
+            Some(serde_json::json!({
+                "email": "ghost@example.com",
+                "password": "pw",
+                "device_id": "dev-1",
+                "device_name": "D1"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// 设备归属冲突：其它账号名下的设备登录返回 409 + 脱敏归属邮箱；
+    /// 带 transfer_device 重试后设备转移到新账号。
+    #[tokio::test]
+    async fn device_conflict_prompts_then_transfers() {
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let state = Arc::new(AppState::new());
+        for (email, pw) in [("a@example.com", "pw-a"), ("b@example.com", "pw-b")] {
+            let (status, _) = http_json(
+                state.clone(),
+                "POST",
+                "/api/register",
+                None,
+                Some(serde_json::json!({ "email": email, "password": pw })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        // 设备 dev-x 先登录账号 A。
+        let (status, _) = http_json(
+            state.clone(),
+            "POST",
+            "/api/login",
+            None,
+            Some(serde_json::json!({
+                "email": "a@example.com", "password": "pw-a",
+                "device_id": "dev-x", "device_name": "X"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // 同一设备登录账号 B → 409 + 脱敏归属邮箱，未确认前不转移。
+        let (status, body) = http_json(
+            state.clone(),
+            "POST",
+            "/api/login",
+            None,
+            Some(serde_json::json!({
+                "email": "b@example.com", "password": "pw-b",
+                "device_id": "dev-x", "device_name": "X"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body, "device_conflict:a***@example.com");
+        let b_id = state.db.get_user_by_email("b@example.com").unwrap().id;
+        assert!(state.db.list_devices(&b_id).is_empty(), "no transfer before confirm");
+
+        // 用户确认后带 transfer_device 重试 → 设备归到 B，A 的列表变空。
+        let (status, _) = http_json(
+            state.clone(),
+            "POST",
+            "/api/login",
+            None,
+            Some(serde_json::json!({
+                "email": "b@example.com", "password": "pw-b",
+                "device_id": "dev-x", "device_name": "X",
+                "transfer_device": true
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(state.db.list_devices(&b_id).len(), 1);
+        let a_id = state.db.get_user_by_email("a@example.com").unwrap().id;
+        assert!(state.db.list_devices(&a_id).is_empty(), "device left the old account");
     }
 
     /// 注册与登录都规范化邮箱（trim+小写）：大小写差异不会分裂账号。

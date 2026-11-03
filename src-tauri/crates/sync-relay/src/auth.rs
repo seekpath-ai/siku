@@ -77,11 +77,17 @@ impl Auth {
     }
 
     /// Register a new account. Returns Err when the email is taken.
+    /// An empty password creates a passwordless account (verification-code
+    /// login only): the empty hash never matches any password attempt.
     pub fn register(&self, db: &Db, email: &str, password: &str) -> anyhow::Result<String> {
         if db.get_user_by_email(email).is_some() {
             anyhow::bail!("email already registered");
         }
-        let password_hash = hash_password(password)?;
+        let password_hash = if password.is_empty() {
+            String::new()
+        } else {
+            hash_password(password)?
+        };
         let user_id = Uuid::new_v4().to_string();
         // Account-level sync key: generated once, distributed to every device
         // at login so mailbox messages can be decrypted without pairing.
@@ -131,6 +137,10 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
 }
 
 pub fn verify_password(password: &str, stored: &str) -> anyhow::Result<()> {
+    // Passwordless account (registered via email code): no password can match.
+    if stored.is_empty() {
+        anyhow::bail!("该账号未设置密码，请使用验证码登录");
+    }
     if is_legacy_hash(stored) {
         return verify_password_legacy(password, stored);
     }

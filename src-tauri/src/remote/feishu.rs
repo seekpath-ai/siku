@@ -406,6 +406,7 @@ fn parse_inbound(
             user_id,
             user_name: String::new(),
             msg_id: msg_id.clone(),
+            sent_at_ms: message_sent_at_ms(message),
             text,
             images: Vec::new(),
             media: if first_key.is_empty() {
@@ -456,6 +457,7 @@ fn parse_inbound(
             user_id,
             user_name: String::new(),
             msg_id: msg_id.clone(),
+            sent_at_ms: message_sent_at_ms(message),
             text: String::new(),
             images: Vec::new(),
             media: Some(crate::remote::router::MediaRef {
@@ -491,12 +493,20 @@ fn parse_inbound(
         user_id,
         user_name: String::new(),
         msg_id,
+        sent_at_ms: message_sent_at_ms(message),
         text,
         images: Vec::new(),
         media: None,
     }))
 }
 
+
+/// Feishu event timestamps arrive as string epoch milliseconds.
+fn message_sent_at_ms(message: &serde_json::Value) -> Option<i64> {
+    message
+        .get("create_time")
+        .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_i64()))
+}
 
 /// Engagement policy shared by the reply path and the "text only" notice:
 /// p2p chats always engage; group chats only when the bot is @-mentioned
@@ -660,6 +670,7 @@ impl FeishuCardActionHandler {
                 user_id: operator.to_string(),
                 user_name: String::new(),
                 msg_id: String::new(), // synthetic click: no dedup entry
+                sent_at_ms: None,      // fresh user intent: no stale guard
                 text: state.prompt.clone(),
                 images: Vec::new(),
                 media: None,

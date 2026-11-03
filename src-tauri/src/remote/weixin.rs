@@ -131,7 +131,30 @@ async fn run_monitor(
     let mut checkpoint = BufCheckpoint::new(&db);
     let mut connected_once = false;
 
+    // Startup grace on takeover: the previous holder's fresher cursor may
+    // still be syncing in — polling immediately with our stale local cursor
+    // makes the server replay backlog the other device already answered.
+    // Give sync a short window to deliver the row. Skipped for a fresh
+    // binding (an empty cursor starts from "now", no backlog to replay).
+    if !buf.is_empty() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+            }
+            if adopt_synced_cursor(&db, &mut buf, None).await
+                || std::time::Instant::now() >= deadline
+            {
+                break;
+            }
+        }
+    }
+
     loop {
+        // A fresher cursor may also arrive mid-session (handoff while this
+        // device was already polling on a stale one): adopt before polling.
+        adopt_synced_cursor(&db, &mut buf, checkpoint.last_persisted()).await;
         let poll = get_updates(&http, &base_url, &cfg.bot_token, &buf);
         let resp = tokio::select! {
             _ = cancel.cancelled() => {
@@ -223,6 +246,10 @@ struct BufCheckpoint<'a> {
     db: &'a sqlx::SqlitePool,
     last: std::time::Instant,
     dirty: Option<String>,
+    /// Last cursor value this device persisted. Re-reading the synced row
+    /// must distinguish our own writes (ignore) from a previous holder's
+    /// (adopt) — cursors are opaque, so this is the only available signal.
+    last_persisted: Option<String>,
 }
 
 impl BufCheckpoint<'_> {
@@ -233,7 +260,12 @@ impl BufCheckpoint<'_> {
             db,
             last: std::time::Instant::now() - Self::INTERVAL,
             dirty: None,
+            last_persisted: None,
         }
+    }
+
+    fn last_persisted(&self) -> Option<&str> {
+        self.last_persisted.as_deref()
     }
 
     async fn mark(&mut self, buf: &str) {
@@ -246,9 +278,31 @@ impl BufCheckpoint<'_> {
     async fn flush(&mut self) {
         if let Some(buf) = self.dirty.take() {
             persist_updates_buf(self.db, &buf).await;
+            self.last_persisted = Some(buf);
             self.last = std::time::Instant::now();
         }
     }
+}
+
+/// Adopt a cursor that the synced `remote_weixin_state` row holds and that
+/// differs from both our in-memory cursor and the last value we persisted
+/// ourselves: under single-active arbitration such a value could only have
+/// been written by the previous connection holder, so it is fresher.
+async fn adopt_synced_cursor(
+    db: &sqlx::SqlitePool,
+    buf: &mut String,
+    last_persisted: Option<&str>,
+) -> bool {
+    let remote = crate::core::settings_service::load_weixin_state(db)
+        .await
+        .map(|s| s.get_updates_buf)
+        .unwrap_or_default();
+    if !remote.is_empty() && remote != *buf && Some(remote.as_str()) != last_persisted {
+        tracing::info!("weixin: adopted fresher cursor synced from the previous holder");
+        *buf = remote;
+        return true;
+    }
+    false
 }
 
 async fn get_updates(
@@ -417,6 +471,16 @@ async fn handle_inbound(
         })
         .unwrap_or_default();
 
+    // Sender-side timestamp for the router's stale-backlog guard. The iLink
+    // message shape is not a formal spec, so probe both known spellings and
+    // normalize seconds to milliseconds; absent field = guard off.
+    let as_i64 = |v: &serde_json::Value| v.as_i64().or_else(|| v.as_str()?.parse().ok());
+    let sent_at_ms = msg
+        .get("create_time_ms")
+        .and_then(as_i64)
+        .or_else(|| msg.get("create_time").and_then(as_i64))
+        .map(|t| if t < 1_000_000_000_000 { t * 1000 } else { t });
+
     router::enqueue(
         app.clone(),
         InboundMessage {
@@ -426,6 +490,7 @@ async fn handle_inbound(
             user_id: from.to_string(),
             user_name: String::new(),
             msg_id,
+            sent_at_ms,
             text,
             images,
             media,

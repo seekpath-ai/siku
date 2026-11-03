@@ -57,6 +57,7 @@ CREATE TABLE remote_chats (           -- 同步表（OPTIONAL_SYNC_TABLES）：�
 - **微信运行时态**（长轮询游标、context_tokens）单独存同步行 `remote_weixin_state`：游标每个轮询周期都可能前进，若埋在 app_settings 整 blob 里，LWW 会冲掉其它设备对无关设置的编辑。checkpoint 15s 节流 + 退出时终写。
 - **单活仲裁**（`remote/mod.rs`）：连接同一时刻只允许一台设备持有。holder 确定性选举——relay 房间 presence（`api/devices` 返回 online 标记）中 device_id 最小者，所有设备独立计算同一结果，无锁无心跳；同步行 `remote_holder` 提供手动接管覆盖（设置页「在本机接管」），override 设备在线时优先。仲裁器每 45s 重估，presence 查询失败保持原角色（宁停勿双）；未登录同步账号时按单设备旧行为直连。渠道任务按 (want, config指纹) 跳过不变重启，健康连接不被 45s 周期打断。
 - **限流**：每用户 10 条/分钟滑动窗口；消息 ID 24h 去重（内存 LRU + app_data json 持久化）。
+- **接管重投加固**（2026-11-03，修复"备用机接管后服务器重投积压消息被当新消息批量处理"）：三层纵深——① 跨设备去重表 `remote_msg_ids`（同步行，id=`channel:msg_id`，INSERT OR IGNORE 原子占坑，>5000 行才修剪）替代纯本地 seen 文件；② 微信游标采纳：轮询循环启动时给同步 10s 宽限窗口、之后每轮 poll 前重读同步行，凡与本机内存值及本机最后持久化值都不同的游标判定为前持有者写入并采纳；③ 消息年龄护栏：超过 2 小时的入站消息（飞书 `create_time`、微信 `create_time_ms/create_time` 存在时）直接丢弃不触发回合。
 
 ## 4. 渠道协议要点
 

@@ -69,7 +69,7 @@ pub(crate) const CORE_SYNC_TABLES: &[&str] = &[
     // overlay rebuilt from the papers.authors/editor JSON columns (which do
     // sync via the papers table). See paper_service::rebuild_creators_for_papers.
 ];
-pub(crate) const OPTIONAL_SYNC_TABLES: &[&str] = &["chat_sessions", "chat_messages", "settings", "remote_chats"];
+pub(crate) const OPTIONAL_SYNC_TABLES: &[&str] = &["chat_sessions", "chat_messages", "settings", "remote_chats", "remote_msg_ids"];
 
 /// Fixed uuid of the default vault: every device seeds the same id so the
 /// default vault converges to a single row when syncing.
@@ -1243,6 +1243,20 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     // without DEFAULTs — both CRR-incompatible) are rebuilt to the
     // canonical shape.
     migrate_remote_chats_schema(&db).await?;
+
+    // Cross-device inbound message dedup (feishu/weixin). Synced (OPTIONAL)
+    // so a standby device taking over the channel connection recognizes
+    // server-redelivered backlog its predecessor already answered instead of
+    // re-processing it. id = "<channel>:<msg_id>".
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS remote_msg_ids (
+            id TEXT NOT NULL DEFAULT '',
+            ts TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (id)
+        )"
+    )
+    .execute(&db)
+    .await?;
 
     // Per-turn system-prompt snapshots for the "查看本轮上下文" viewer.
     // Device-local on purpose: the assembled prompt is a function of this

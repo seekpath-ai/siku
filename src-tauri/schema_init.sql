@@ -873,3 +873,10 @@ CREATE TABLE IF NOT EXISTS remote_chats (
     updated_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (channel, chat_id, user_id)
 );
+
+-- 远程入站消息跨设备去重（OPTIONAL_SYNC_TABLES 成员，测试注册用）
+CREATE TABLE IF NOT EXISTS remote_msg_ids (
+    id TEXT NOT NULL DEFAULT '',
+    ts TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (id)
+);

@@ -37,6 +37,13 @@ const DEBOUNCE_MS: u64 = 600;
 const RATE_LIMIT_PER_MIN: usize = 10;
 const SEEN_CAP: usize = 2048;
 const SEEN_TTL_SECS: i64 = 24 * 3600;
+/// Cap on the synced remote_msg_ids dedup table; pruning runs only above it
+/// (deletes are sync traffic, so the table is allowed to just sit below).
+const REMOTE_MSG_IDS_CAP: i64 = 5000;
+/// Stale-backlog guard: server-redelivered messages older than this are
+/// dropped even when every dedup layer missed them — nobody expects an
+/// answer to a message sent hours ago.
+const STALE_MESSAGE_MS: i64 = 2 * 3600 * 1000;
 /// How often an unapproved chat is reminded to pair.
 const PAIRING_NOTICE_INTERVAL_SECS: i64 = 3600;
 /// Max wait for a remote turn to persist its reply before giving up.
@@ -78,6 +85,10 @@ pub struct InboundMessage {
     pub user_id: String,
     pub user_name: String,
     pub msg_id: String,
+    /// Sender-side timestamp (epoch ms) when the channel provides one.
+    /// Drives the stale-backlog guard in `enqueue`; None disables the guard
+    /// for that message (synthetic turns, channels without timestamps).
+    pub sent_at_ms: Option<i64>,
     pub text: String,
     /// Downloaded image attachments ready for the agent turn.
     pub images: Vec<crate::ai::llm::ImageAttachment>,
@@ -245,6 +256,54 @@ async fn seen_check_and_mark(app_data_dir: &std::path::Path, id: &str) -> bool {
     false
 }
 
+/// Cross-device dedup backed by the synced `remote_msg_ids` table. The
+/// per-device seen file above is empty on a standby device taking over the
+/// channel connection, so without this the server-redelivered backlog its
+/// predecessor already answered gets processed again. INSERT OR IGNORE +
+/// rows_affected makes check-and-mark atomic on this device.
+/// Returns true when the message id was already processed (duplicate).
+async fn db_seen_check_and_mark(db: &SqlitePool, channel: &str, msg_id: &str) -> bool {
+    let id = format!("{channel}:{msg_id}");
+    let res = sqlx::query("INSERT OR IGNORE INTO remote_msg_ids (id, ts) VALUES (?, ?)")
+        .bind(&id)
+        .bind(crate::core::time::now_iso())
+        .execute(db)
+        .await;
+    match res {
+        Ok(done) => {
+            if done.rows_affected() > 0 {
+                prune_remote_msg_ids(db).await;
+                false
+            } else {
+                true
+            }
+        }
+        // Fail open: a dedup-store hiccup must not silence live messages.
+        Err(e) => {
+            tracing::warn!(error = %e, "remote msg_id dedup failed, processing anyway");
+            false
+        }
+    }
+}
+
+/// Deletes are sync traffic, so pruning runs only when the table clearly
+/// exceeds the cap, then removes the oldest overflow in one statement.
+async fn prune_remote_msg_ids(db: &SqlitePool) {
+    let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM remote_msg_ids")
+        .fetch_one(db)
+        .await
+        .unwrap_or(0);
+    if count <= REMOTE_MSG_IDS_CAP {
+        return;
+    }
+    let _ = sqlx::query(
+        "DELETE FROM remote_msg_ids WHERE id IN (SELECT id FROM remote_msg_ids ORDER BY ts ASC LIMIT ?)",
+    )
+    .bind(count - REMOTE_MSG_IDS_CAP)
+    .execute(db)
+    .await;
+}
+
 // ---------------------------------------------------------------- rate limit
 
 static RATE: Lazy<Mutex<HashMap<String, VecDeque<Instant>>>> =
@@ -280,8 +339,27 @@ static PENDING: Lazy<Mutex<HashMap<String, PendingBatch>>> =
 /// Entry point called by channel adapters for every inbound message.
 pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySink>) {
     let app_data_dir = app.state::<AppState>().app_data_dir.clone();
-    if !msg.msg_id.is_empty() && seen_check_and_mark(&app_data_dir, &msg.msg_id).await {
-        return;
+    if !msg.msg_id.is_empty() {
+        if seen_check_and_mark(&app_data_dir, &msg.msg_id).await {
+            return;
+        }
+        let db = app.state::<AppState>().db.clone();
+        if db_seen_check_and_mark(&db, &msg.channel, &msg.msg_id).await {
+            return;
+        }
+    }
+    // Stale-backlog guard: when a standby device takes over with a stale
+    // long-poll cursor, the server redelivers hours-old messages. Dedup
+    // catches what the predecessor recorded; this catches the rest.
+    if let Some(sent_ms) = msg.sent_at_ms {
+        let age_ms = chrono::Utc::now().timestamp_millis() - sent_ms;
+        if age_ms > STALE_MESSAGE_MS {
+            tracing::info!(
+                channel = %msg.channel, msg_id = %msg.msg_id, age_ms,
+                "dropping stale remote message"
+            );
+            return;
+        }
     }
 
     let key = format!("{}:{}", msg.channel, msg.chat_id);
@@ -975,4 +1053,59 @@ async fn create_remote_session(
     .await
     .map_err(|e| format!("db error: {e}"))?;
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Single-connection in-memory pool: multiple connections would each get
+    /// their own private ":memory:" database.
+    async fn test_db() -> SqlitePool {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE remote_msg_ids (id TEXT NOT NULL DEFAULT '', ts TEXT NOT NULL DEFAULT '', PRIMARY KEY (id))",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn db_seen_marks_once_per_channel_msg_id() {
+        let db = test_db().await;
+        assert!(!db_seen_check_and_mark(&db, "weixin", "m1").await);
+        assert!(db_seen_check_and_mark(&db, "weixin", "m1").await);
+        // Same msg_id on another channel instance is a distinct message.
+        assert!(!db_seen_check_and_mark(&db, "feishu:app1", "m1").await);
+        assert!(db_seen_check_and_mark(&db, "feishu:app1", "m1").await);
+    }
+
+    #[tokio::test]
+    async fn prune_remote_msg_ids_keeps_newest() {
+        let db = test_db().await;
+        for i in 0..(REMOTE_MSG_IDS_CAP + 10) {
+            sqlx::query("INSERT INTO remote_msg_ids (id, ts) VALUES (?, ?)")
+                .bind(format!("weixin:m{i}"))
+                // Zero-padded so lexicographic order matches insertion order.
+                .bind(format!("2026-01-01T00:{:05}", i))
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        prune_remote_msg_ids(&db).await;
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM remote_msg_ids")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, REMOTE_MSG_IDS_CAP);
+        // The oldest rows were pruned (re-inserted here), the newest survive.
+        assert!(!db_seen_check_and_mark(&db, "weixin", "m0").await);
+        assert!(db_seen_check_and_mark(&db, "weixin", &format!("m{}", REMOTE_MSG_IDS_CAP + 9)).await);
+    }
 }

@@ -53,7 +53,7 @@
 | `browser_type` | 浏览器 | ❌ | 按 ref 输入文本（真实按键，支持清空/回车） |
 | `browser_scroll` | 浏览器 | ✅ | 滚动页面或把 ref 元素滚入视野 |
 | `browser_screenshot` | 浏览器 | ✅ | 截图存 PNG 到会话写入目录（可接 read_media_file 视觉解读） |
-| `browser_download_pdf` | 浏览器 | ❌ | 页面存 PDF（print）或点击触发下载并捕获（download），可接 paper_import |
+| `browser_download_pdf` | 浏览器 | ❌ | 三模式取 PDF：fetch（抓取当前标签已打开文档原始字节）/ download（点击触发下载并捕获）/ print（页面渲染为 PDF），可接 paper_import |
 | `browser_captcha_wait` | 浏览器 | ✅ | 人机验证人工接管：桌面通知 + 轮询等待用户完成 |
 | `translate` | 翻译 | ✅ | 多语言翻译，默认目标中文 |
 | `knowledge_query` | 知识库 | ✅ | 跨领域全文检索知识条目 |
@@ -291,14 +291,21 @@ DOM 快照：返回页面标题/URL 与全部可见可交互元素（链接/按�
 
 ### `browser_download_pdf`
 
-PDF 产出。`print`：当前页渲染为 PDF（带背景）；`download`：先把浏览器下载目录定向到会话 `downloads/`，点击指定 ref 触发下载，轮询等待完成（`.crdownload` 消失），可选改名。PDF 结果提示可接 `paper_import`。
+PDF 产出，三个 action：
+
+- `fetch`：抓取当前标签页已打开文档（典型场景：点击 PDF 链接被 Chrome 内置查看器打开、未触发下载）的原始字节。原理：在页面上下文内 `fetch(location.href)` 重取文档并 base64 回传——PDF 导航的顶层 document origin 即 PDF URL 自身，故同源；走浏览器自身网络栈，代理/Cookie/企业 CA 自动生效。以 `document.contentType === 'application/pdf'` 判定 PDF 页（arXiv 这类无 `.pdf` 后缀的 URL 也覆盖）。字节头非 `%PDF` 时输出警告。
+- `download`：先把浏览器下载目录定向到会话 `downloads/`，点击指定 ref 触发下载，轮询等待完成（`.crdownload` 消失），可选改名。快速失败：点击后标签页 `document.contentType` 变为 `application/pdf`（被内置查看器打开）时立即报错并提示改用 `fetch`。
+- `print`：当前页渲染为 PDF（带背景）。仅限 HTML 页面——对内置 PDF 查看器页只会截到查看器 UI。
+
+PDF 结果提示可接 `paper_import`。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `action` | string | ✅ | `print` / `download` |
+| `action` | string | ✅ | `fetch` / `download` / `print` |
 | `ref` | string | ❌ | download 必填：触发下载的元素 ref |
+| `url` | string | ❌ | fetch 可选：文档 URL，默认取当前标签页 URL |
 | `filename` | string | ❌ | 输出文件名 |
-| `timeout_ms` | integer | ❌ | 下载等待上限，默认 60000，最大 300000 |
+| `timeout_ms` | integer | ❌ | 下载/抓取等待上限，默认 60000，最大 300000 |
 
 ### `browser_captcha_wait`
 

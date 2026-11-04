@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::Engine as _;
 use chromiumoxide::cdp::browser_protocol::browser::{
     SetDownloadBehaviorBehavior, SetDownloadBehaviorParams,
 };
@@ -112,15 +113,20 @@ impl Tool for BrowserDownloadPdfTool {
     }
 
     fn description(&self) -> &str {
-        "Get a PDF out of the browser. action='print' renders the active tab to PDF (good for \
-         article/preprint pages). action='download' arms the download directory and clicks the \
-         given element ref (e.g. a 'Download PDF' link), waits for the file to finish, and returns \
-         its path. Files land in the session write directory (downloads/). A downloaded PDF can be \
-         added to the library with paper_import."
+        "Get a PDF out of the browser. action='fetch' saves the document currently open in the \
+         tab (typically a PDF shown in Chrome's built-in viewer) by capturing its original bytes \
+         through the browser's own network stack — use it when clicking a PDF link opened the \
+         viewer instead of downloading, or when direct downloads fail behind proxies/certificate \
+         inspection. action='download' arms the download directory and clicks the given element \
+         ref (e.g. a 'Download PDF' link), waits for the file to finish, and returns its path. \
+         action='print' renders the active tab to PDF — for HTML article pages only; never use it \
+         on Chrome's built-in PDF viewer page (it captures only the viewer UI). Files land in the \
+         session write directory (downloads/). A saved PDF can be added to the library with \
+         paper_import."
     }
 
     fn param_enums(&self) -> &'static [(&'static str, &'static [&'static str])] {
-        &[("action", &["print", "download"])]
+        &[("action", &["print", "download", "fetch"])]
     }
 
     fn parameters(&self) -> Vec<ToolParameter> {
@@ -128,13 +134,19 @@ impl Tool for BrowserDownloadPdfTool {
             ToolParameter {
                 name: "action".into(),
                 param_type: "string".into(),
-                description: "print (render page to PDF) | download (click ref and capture the file)".into(),
+                description: "fetch (save the document open in the tab via the browser's network stack) | download (click ref and capture the file) | print (render an HTML page to PDF)".into(),
                 required: true,
             },
             ToolParameter {
                 name: "ref".into(),
                 param_type: "string".into(),
                 description: "Element ref to click (required for action=download)".into(),
+                required: false,
+            },
+            ToolParameter {
+                name: "url".into(),
+                param_type: "string".into(),
+                description: "Document URL for action=fetch; default: the active tab's current URL. Pass it when the PDF is not open in the tab yet.".into(),
                 required: false,
             },
             ToolParameter {
@@ -156,7 +168,8 @@ impl Tool for BrowserDownloadPdfTool {
         match args["action"].as_str() {
             Some("print") => print_pdf(&args).await,
             Some("download") => capture_download(&args).await,
-            Some(other) => Err(format!("unknown action '{other}' — expected print | download")),
+            Some("fetch") => fetch_document(&args).await,
+            Some(other) => Err(format!("unknown action '{other}' — expected print | download | fetch")),
             None => Err("action required".to_string()),
         }
     }
@@ -198,6 +211,133 @@ async fn print_pdf(args: &serde_json::Value) -> Result<String, String> {
     ))
 }
 
+/// Does `url` point at a PDF document (by path extension)?
+fn url_looks_like_pdf(url: &str) -> bool {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase()
+        .ends_with(".pdf")
+}
+
+/// In-page re-request of the current document, returned as base64. Runs in
+/// the top-level document — for a PDF opened in Chrome's built-in viewer
+/// that document's origin is the PDF URL itself, so the fetch is same-origin
+/// and rides the browser's own network stack (proxy, cookies, corporate CA).
+/// Chunked fromCharCode avoids argument-count limits on larger files.
+const FETCH_DOCUMENT_JS: &str = r#"(async () => {
+  const r = await fetch(location.href, { credentials: 'include' });
+  if (!r.ok) return { error: 'HTTP ' + r.status, url: location.href };
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  if (bytes.length > 45 * 1024 * 1024) {
+    return { error: 'document too large for in-browser capture (>45 MB)', url: location.href };
+  }
+  let binary = '';
+  const CHUNK = 32768;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return { b64: btoa(binary), url: location.href };
+})()"#;
+
+/// action=fetch: capture the original bytes of the document open in the
+/// active tab (typically a PDF in Chrome's built-in viewer). The browser
+/// itself re-requests the document from within the page, so proxies, cookies
+/// and corporate CA setups behave exactly as they did when the page was
+/// first opened.
+async fn fetch_document(args: &serde_json::Value) -> Result<String, String> {
+    let page = super::browser::require_page().await?;
+    let timeout_ms = args["timeout_ms"].as_u64().unwrap_or(60_000).min(300_000);
+    let explicit_url = args["url"].as_str().map(str::trim).filter(|u| !u.is_empty());
+
+    if let Some(url) = explicit_url {
+        tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), page.goto(url))
+            .await
+            .map_err(|_| format!("navigate to {url} timed out after {timeout_ms}ms"))?
+            .map_err(|e| format!("navigate to {url} failed: {e}"))?;
+    }
+
+    // The top-level document of a PDF navigation reports contentType
+    // application/pdf — authoritative even for extension-less URLs like
+    // arxiv.org/pdf/<id>. The .pdf suffix is a fallback signal for setups
+    // where the built-in viewer is disabled.
+    let content_type = page
+        .evaluate("document.contentType")
+        .await
+        .ok()
+        .and_then(|r| r.into_value::<String>().ok())
+        .unwrap_or_default();
+    let current_url = page.url().await.ok().flatten().unwrap_or_default();
+    if !content_type.eq_ignore_ascii_case("application/pdf") && !url_looks_like_pdf(&current_url)
+    {
+        return Err(format!(
+            "the active tab is not a PDF document (content-type: '{}', url: {}). action=fetch \
+             is for documents already open in the browser — pass url=... to navigate first, or \
+             use action=print for HTML pages.",
+            if content_type.is_empty() { "unknown" } else { content_type.as_str() },
+            current_url
+        ));
+    }
+
+    let result = page
+        .evaluate(FETCH_DOCUMENT_JS)
+        .await
+        .map_err(|e| format!("in-page fetch failed: {e}"))?
+        .into_value::<serde_json::Value>()
+        .map_err(|e| format!("in-page fetch returned an unreadable result: {e}"))?;
+    if let Some(err) = result["error"].as_str() {
+        return Err(format!(
+            "the browser could not re-request {}: {err}",
+            result["url"].as_str().unwrap_or(&current_url)
+        ));
+    }
+    let b64 = result["b64"]
+        .as_str()
+        .ok_or("in-page fetch returned no data")?;
+    let final_url = result["url"].as_str().unwrap_or(&current_url).to_string();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("cannot decode the document bytes: {e}"))?;
+
+    let filename = match args["filename"].as_str() {
+        Some(f) => {
+            let f = sanitize_filename(f)?;
+            if f.ends_with(".pdf") { f } else { format!("{f}.pdf") }
+        }
+        None => {
+            let stem: String = final_url
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(&final_url)
+                .rsplit('/')
+                .next()
+                .unwrap_or("document")
+                .trim_end_matches(".pdf")
+                .chars()
+                .map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+                .take(60)
+                .collect();
+            let stem = stem.trim_matches('_');
+            format!("{}.pdf", if stem.is_empty() { "document" } else { stem })
+        }
+    };
+    let path = write_dir(args, "downloads")?.join(&filename);
+    std::fs::write(&path, &bytes).map_err(|e| format!("write failed: {e}"))?;
+    let mut out = format!(
+        "Document saved ({:.1} KB): {}\nSource: {final_url}",
+        bytes.len() as f64 / 1024.0,
+        path.display()
+    );
+    if bytes.starts_with(b"%PDF") {
+        out.push_str("\nTo add it to the library, call paper_import with this path.");
+    } else {
+        out.push_str(
+            "\n⚠ the captured document has no %PDF header — it may be an error page; verify before importing.",
+        );
+    }
+    Ok(out)
+}
+
 /// Completed files in `dir` (excluding in-progress `.crdownload`).
 fn completed_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     std::fs::read_dir(dir)
@@ -236,6 +376,7 @@ async fn capture_download(args: &serde_json::Value) -> Result<String, String> {
 
     let page = super::browser::require_page().await?;
     let el = super::browser_interact::find_by_ref(&page, &refv).await?;
+    let url_before = page.url().await.ok().flatten().unwrap_or_default();
     el.click().await.map_err(|e| format!("click on [{refv}] failed: {e}"))?;
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
@@ -269,10 +410,33 @@ async fn capture_download(args: &serde_json::Value) -> Result<String, String> {
                 return Ok(out);
             }
         }
+        // Fast-fail: the click navigated the tab to a PDF, i.e. Chrome opened
+        // its built-in viewer and no download will ever fire. Point at the
+        // action that handles exactly this case. document.contentType is the
+        // authoritative signal — arXiv-style URLs carry no .pdf suffix.
+        if !in_progress {
+            let ct = page
+                .evaluate("document.contentType")
+                .await
+                .ok()
+                .and_then(|r| r.into_value::<String>().ok())
+                .unwrap_or_default();
+            let url_now = page.url().await.ok().flatten().unwrap_or_default();
+            if ct.eq_ignore_ascii_case("application/pdf")
+                || (url_now != url_before && url_looks_like_pdf(&url_now))
+            {
+                return Err(format!(
+                    "clicking [{refv}] opened the PDF in Chrome's built-in viewer ({url_now}) — \
+                     no download was triggered. Use browser_download_pdf with action='fetch' to \
+                     save the opened document directly."
+                ));
+            }
+        }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
                 "no completed download within {}ms after clicking [{refv}] — the click may not \
-                 have triggered a download; check with browser_snapshot",
+                 have triggered a download. If it opened the PDF in a browser tab instead, use \
+                 browser_download_pdf with action='fetch' on that tab.",
                 timeout_ms
             ));
         }
@@ -291,5 +455,14 @@ mod tests {
         assert!(sanitize_filename("a\\b").is_err());
         assert!(sanitize_filename(".hidden").is_err());
         assert!(sanitize_filename("").is_err());
+    }
+
+    #[test]
+    fn pdf_url_detection() {
+        assert!(url_looks_like_pdf("https://arxiv.org/pdf/2412.20927v1.pdf"));
+        assert!(url_looks_like_pdf("https://x.test/A.PDF?dl=1#view"));
+        assert!(!url_looks_like_pdf("https://arxiv.org/abs/2412.20927"));
+        assert!(!url_looks_like_pdf("https://x.test/pdf-viewer"));
+        assert!(!url_looks_like_pdf(""));
     }
 }

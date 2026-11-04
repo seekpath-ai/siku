@@ -677,6 +677,8 @@ export interface AppSettings {
   browser_path?: string | null;
   /** Default browser_connect mode: persistent | temporary | attach. */
   browser_default_mode?: string | null;
+  /** Extra launch args for siku-launched browsers (persistent/temporary). */
+  browser_launch_args?: string | null;
 
   // Advanced truncation / limits
   log_max_size_mb: number;

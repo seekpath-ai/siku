@@ -114,6 +114,68 @@ pub fn persistent_profile_dir(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("browser-profile")
 }
 
+/// Shell-ish splitting for user-supplied launch args: whitespace separates,
+/// double quotes group (Windows paths with spaces), quotes are stripped.
+fn parse_launch_args(raw: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut has_content = false;
+    for c in raw.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                has_content = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if has_content {
+                    args.push(std::mem::take(&mut cur));
+                    has_content = false;
+                }
+            }
+            _ => {
+                cur.push(c);
+                has_content = true;
+            }
+        }
+    }
+    if has_content {
+        args.push(cur);
+    }
+    args
+}
+
+/// Args that would break the launch/attach contract or the headed-window
+/// requirement — dropped with a warning rather than honored.
+const BLOCKED_LAUNCH_ARGS: &[&str] = &[
+    "--user-data-dir",
+    "--remote-debugging-port",
+    "--remote-debugging-pipe",
+    "--headless",
+];
+
+/// Extra launch args from Settings, minus anything that conflicts with how
+/// the manager launches and drives the browser.
+fn custom_launch_args() -> Vec<String> {
+    let raw = crate::core::settings_service::cached_settings().browser_launch_args;
+    let Some(raw) = raw.filter(|s| !s.trim().is_empty()) else {
+        return Vec::new();
+    };
+    parse_launch_args(&raw)
+        .into_iter()
+        .filter(|a| {
+            let key = a.split('=').next().unwrap_or(a);
+            let blocked = BLOCKED_LAUNCH_ARGS
+                .iter()
+                .any(|b| key.eq_ignore_ascii_case(b));
+            if blocked {
+                tracing::warn!("ignoring blocked browser launch arg: {a}");
+            }
+            !blocked
+        })
+        .collect()
+}
+
 /// Liveness probes must never hang: a wedged browser process (alive but not
 /// answering CDP) would otherwise block the manager lock forever, taking
 /// every subsequent browser call down with it.
@@ -192,7 +254,7 @@ impl BrowserManager {
                     .clone()
                     .or_else(|| cleanup_dir.clone())
                     .expect("one of profile/cleanup dir is always set");
-                let config = BrowserConfig::builder()
+                let mut builder = BrowserConfig::builder()
                     .chrome_executable(&exe)
                     .user_data_dir(user_data_dir)
                     .with_head()
@@ -200,7 +262,11 @@ impl BrowserManager {
                     .arg("--no-first-run")
                     .arg("--no-default-browser-check")
                     .arg("--disable-session-crashed-bubble")
-                    .arg("--hide-crash-restore-bubble")
+                    .arg("--hide-crash-restore-bubble");
+                for arg in custom_launch_args() {
+                    builder = builder.arg(arg);
+                }
+                let config = builder
                     .build()
                     .map_err(|e| format!("invalid browser config: {e}"))?;
                 let (browser, handler) = Browser::launch(config)
@@ -444,6 +510,42 @@ mod tests {
         let err = mgr.connect(ConnectMode::Attach { port: 1 }).await.unwrap_err();
         assert!(err.contains("--remote-debugging-port"), "unexpected: {err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launch_args_splitting() {
+        assert_eq!(parse_launch_args(""), Vec::<String>::new());
+        assert_eq!(parse_launch_args("  "), Vec::<String>::new());
+        assert_eq!(
+            parse_launch_args("--proxy-server=http://127.0.0.1:7890"),
+            vec!["--proxy-server=http://127.0.0.1:7890"]
+        );
+        // Quoted Windows path with spaces stays one argument, quotes stripped.
+        assert_eq!(
+            parse_launch_args(r#"--load-extension="D:\my ext\helper" --foo"#),
+            vec!["--load-extension=D:\\my ext\\helper", "--foo"]
+        );
+        assert_eq!(parse_launch_args(r#"--flag="""#), vec!["--flag="]);
+    }
+
+    #[test]
+    fn blocked_args_filtered() {
+        for bad in [
+            "--user-data-dir=/tmp/x",
+            "--remote-debugging-port=1234",
+            "--headless",
+        ] {
+            let key = bad.split('=').next().unwrap_or(bad);
+            assert!(
+                BLOCKED_LAUNCH_ARGS.iter().any(|b| key.eq_ignore_ascii_case(b)),
+                "{bad} must be blocked"
+            );
+        }
+        assert!(
+            !BLOCKED_LAUNCH_ARGS
+                .iter()
+                .any(|b| "--proxy-server".eq_ignore_ascii_case(b))
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ export function BrowserSettings() {
   const [saved, setSaved] = useState(false);
   const [path, setPath] = useState('');
   const [mode, setMode] = useState<string>('persistent');
+  const [launchArgs, setLaunchArgs] = useState('');
   const [detected, setDetected] = useState<string | null>(null);
 
   const detect = useCallback(() => {
@@ -29,13 +30,14 @@ export function BrowserSettings() {
       .then((s) => {
         setPath(s.browser_path ?? '');
         setMode(s.browser_default_mode ?? 'persistent');
+        setLaunchArgs(s.browser_launch_args ?? '');
       })
       .catch((err) => console.error('Failed to load browser settings:', err))
       .finally(() => setLoading(false));
     detect();
   }, [detect]);
 
-  const persist = useCallback(async (nextPath: string, nextMode: string) => {
+  const persist = useCallback(async (nextPath: string, nextMode: string, nextArgs: string) => {
     setSaving(true);
     try {
       const current = await settingsAppGet();
@@ -43,6 +45,7 @@ export function BrowserSettings() {
         ...current,
         browser_path: nextPath || null,
         browser_default_mode: nextMode === 'persistent' ? null : nextMode,
+        browser_launch_args: nextArgs || null,
       });
       setSaved(true);
       window.setTimeout(() => setSaved(false), 2000);
@@ -84,7 +87,7 @@ export function BrowserSettings() {
           type="text"
           value={path}
           onChange={(e) => setPath(e.target.value)}
-          onBlur={() => persist(path.trim(), mode)}
+          onBlur={() => persist(path.trim(), mode, launchArgs.trim())}
           placeholder="留空自动检测"
           className="w-full px-3 py-1.5 bg-background border border-surface-hover rounded-lg text-xs text-text-primary focus:outline-none focus:border-primary/50"
         />
@@ -116,7 +119,7 @@ export function BrowserSettings() {
                 checked={mode === m.id}
                 onChange={() => {
                   setMode(m.id);
-                  persist(path.trim(), m.id);
+                  persist(path.trim(), m.id, launchArgs.trim());
                 }}
                 className="accent-primary mt-0.5"
               />
@@ -127,6 +130,24 @@ export function BrowserSettings() {
             </label>
           ))}
         </div>
+      </div>
+
+      <div className="px-4 py-3 bg-surface border border-surface-hover rounded-xl space-y-2">
+        <div className="text-sm font-medium text-text-primary">自定义启动参数</div>
+        <input
+          type="text"
+          value={launchArgs}
+          onChange={(e) => setLaunchArgs(e.target.value)}
+          onBlur={() => persist(path.trim(), mode, launchArgs.trim())}
+          placeholder='--proxy-server=http://127.0.0.1:7890 --load-extension="D:\ext\helper"'
+          className="w-full px-3 py-1.5 bg-background border border-surface-hover rounded-lg text-xs font-mono text-text-primary focus:outline-none focus:border-primary/50"
+        />
+        <p className="text-[11px] text-text-secondary/70 leading-relaxed">
+          追加给思库启动的浏览器（持久/临时模式），下次连接时生效；带空格的路径用双引号括起。
+          常用于 <span className="font-mono">--proxy-server</span> 指定代理、
+          <span className="font-mono">--load-extension</span> 加载本地扩展。
+          attach 模式无效（由你自己的启动命令决定）。
+        </p>
       </div>
     </div>
   );

@@ -649,6 +649,11 @@ pub struct AppSettings {
     /// None = persistent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser_default_mode: Option<String>,
+    /// Extra launch arguments for siku-launched browsers (persistent/temporary
+    /// mode), e.g. `--proxy-server=... --load-extension="D:\ext\helper"`.
+    /// None/empty = none. Ignored in attach mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_launch_args: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -990,6 +995,7 @@ impl Default for AppSettings {
             remote: RemoteSettings::default(),
             browser_path: None,
             browser_default_mode: None,
+            browser_launch_args: None,
         }
     }
 }

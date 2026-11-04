@@ -10,7 +10,6 @@ import { useProjectStore } from '@/stores/projectStore';
 import { usePetContextStore } from '@/stores/petContextStore';
 import { useStreamingChat } from '@/hooks/useStreamingChat';
 import { getChatMessages, getAgentSteps, agentRenameSession, agentSetSessionModel, agentIsRunning, agentCreateSession, agentSendMessage } from '@/lib/tauri';
-import { DEFAULT_TOOLS } from '@/lib/agent-tools';
 
 /** Empty-state hero input: typing here and hitting send creates a session
  * and immediately starts the first turn (Kimi-style "输入即开工"). The first
@@ -33,7 +32,7 @@ function HeroInput() {
       const session = await agentCreateSession({
         title,
         agentMode: 'chat',
-        toolsEnabled: DEFAULT_TOOLS,
+        toolsEnabled: null,
         projectId: activeProjectId ?? null,
       });
       setSessions([session, ...sessions]);

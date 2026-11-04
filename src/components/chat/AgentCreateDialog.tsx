@@ -4,7 +4,7 @@ import type { ApprovalConfig, LlmProvider } from '@/lib/types';
 import { LlmConfigFields } from './LlmConfigFields';
 import { ToolPicker } from './ToolPicker';
 import { defaultLlmBlock } from '@/lib/llm-presets';
-import { DEFAULT_TOOLS } from '@/lib/agent-tools';
+import { DEFAULT_TOOLS, isAllToolsSelected } from '@/lib/agent-tools';
 import { settingsAppGet, llmProviderList } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
 import { useDialog } from '@/hooks/useDialog';
@@ -16,7 +16,7 @@ interface Props {
   onCreate: (input: {
     title: string;
     systemPrompt?: string;
-    tools: string[];
+    tools: string[] | null;
     projectId?: string;
     workingDir: string | null;
     visionProviderId: string | null;
@@ -104,7 +104,7 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
       await onCreate({
         title: name.trim(),
         systemPrompt: persona.trim() || undefined,
-        tools,
+        tools: isAllToolsSelected(tools) ? null : tools,
         projectId: undefined,
         workingDir: workingDirMode === 'project' ? (projectPath ?? null) : null,
         visionProviderId: visionProviderId || null,

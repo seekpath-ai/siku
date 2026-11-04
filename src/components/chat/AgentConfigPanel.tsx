@@ -15,6 +15,7 @@ import {
   type SkillInfo,
 } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
+import { ALL_TOOL_KEYS, isAllToolsSelected } from '@/lib/agent-tools';
 import { useProjectStore } from '@/stores/projectStore';
 
 interface Props {
@@ -23,7 +24,8 @@ interface Props {
   onSave: (sessionId: string, input: {
     title: string;
     systemPrompt?: string;
-    tools: string[];
+    /** Explicit subset; null = all built-in tools (future-proof). */
+    tools: string[] | null;
     /** Project binding; null = unbind. */
     projectId: string | null;
     workingDir: string | null;
@@ -57,7 +59,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
   const [providers, setProviders] = useState<LlmProvider[]>([]);
   const [name, setName] = useState(agent.title);
   const [persona, setPersona] = useState(agent.system_prompt || '');
-  const [tools, setTools] = useState<string[]>(agent.tools_enabled || []);
+  const [tools, setTools] = useState<string[]>(agent.tools_enabled ?? ALL_TOOL_KEYS);
   const [selectedProviderId, setSelectedProviderId] = useState<string>('');
   const [useCustomLlm, setUseCustomLlm] = useState(false);
   const [customLlm, setCustomLlm] = useState<LlmConfigBlock>(defaultLlmBlock());
@@ -132,7 +134,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
   useEffect(() => {
     setName(agent.title);
     setPersona(agent.system_prompt || '');
-    setTools(agent.tools_enabled || []);
+    setTools(agent.tools_enabled ?? ALL_TOOL_KEYS);
     setProjectId(agent.project_id ?? '');
     setApprovalMode(agent.approval_config?.mode || 'auto');
     setExpireSec(agent.approval_config?.expire_sec ?? 60);
@@ -232,7 +234,9 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
       await onSave(agent.id, {
         title: name.trim(),
         systemPrompt: persona.trim() || undefined,
-        tools,
+        // 全选时存 null（= 全部工具），后续版本新增工具自动生效，
+        // 不再冻结为创建时的清单。
+        tools: isAllToolsSelected(tools) ? null : tools,
         projectId: projectId || null,
         // Write directory: the bound project's folder wins over whatever the
         // session had before; "不指定" stays null (backend then uses the

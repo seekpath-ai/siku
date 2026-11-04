@@ -157,7 +157,7 @@ export interface AgentSession {
   working_dir: string | null;
   vision_provider_id: string | null;
   web_proxy: string | null;
-  tools_enabled: string[];
+  tools_enabled: string[] | null;
   system_prompt: string | null;
   llm_models: LlmConfigBlock[] | null;
   llm_provider_ids: string[] | null;

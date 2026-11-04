@@ -22,6 +22,7 @@ export const TOOL_CATEGORIES: AgentToolCategory[] = [
       { key: 'paper_snapshot', label: 'paper_snapshot — 截取论文图/表' },
       { key: 'paper_import', label: 'paper_import — 导入论文' },
       { key: 'search_library', label: 'search_library — 全文检索图书馆' },
+      { key: 'research_topic_create', label: 'research_topic_create — 创建科研追踪课题' },
     ],
   },
   {
@@ -54,6 +55,23 @@ export const TOOL_CATEGORIES: AgentToolCategory[] = [
     ],
   },
   {
+    name: '浏览器',
+    tools: [
+      { key: 'browser_connect', label: 'browser_connect — 启动/附加浏览器' },
+      { key: 'browser_close', label: 'browser_close — 关闭浏览器连接' },
+      { key: 'browser_navigate', label: 'browser_navigate — 打开网页' },
+      { key: 'browser_tabs', label: 'browser_tabs — 标签页管理' },
+      { key: 'browser_wait', label: 'browser_wait — 等待页面元素' },
+      { key: 'browser_snapshot', label: 'browser_snapshot — 页面元素快照' },
+      { key: 'browser_click', label: 'browser_click — 点击元素' },
+      { key: 'browser_type', label: 'browser_type — 输入文本' },
+      { key: 'browser_scroll', label: 'browser_scroll — 滚动页面' },
+      { key: 'browser_screenshot', label: 'browser_screenshot — 页面截图' },
+      { key: 'browser_download_pdf', label: 'browser_download_pdf — 页面存PDF/捕获下载' },
+      { key: 'browser_captcha_wait', label: 'browser_captcha_wait — 等待人工完成验证' },
+    ],
+  },
+  {
     name: '翻译',
     tools: [{ key: 'translate', label: 'translate — 翻译' }],
   },
@@ -82,6 +100,7 @@ export const TOOL_CATEGORIES: AgentToolCategory[] = [
     tools: [
       { key: 'ask_user', label: 'ask_user — 向用户提问' },
       { key: 'read_media_file', label: 'read_media_file — 图片理解（需多模态模型）' },
+      { key: 'set_app_theme', label: 'set_app_theme — 切换应用主题' },
     ],
   },
 ];
@@ -92,6 +111,13 @@ export const ALL_TOOL_KEYS: string[] = TOOL_CATEGORIES.flatMap((c) =>
 );
 
 export const DEFAULT_TOOLS: string[] = [...ALL_TOOL_KEYS];
+
+/** Selection covers every built-in tool — save as `null` (all tools) so the
+ *  session automatically picks up tools added by future versions instead of
+ *  freezing today's list. */
+export function isAllToolsSelected(sel: string[]): boolean {
+  return sel.length === ALL_TOOL_KEYS.length && ALL_TOOL_KEYS.every((k) => sel.includes(k));
+}
 
 // ── Approval previews for the file-writing tools ───────────────────────────
 // `file_write` / `file_edit` carry raw file content in their arguments, so the

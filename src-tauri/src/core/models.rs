@@ -431,7 +431,7 @@ pub struct ToolExecution {
 pub struct AgentSessionInput {
     pub title: String,
     pub agent_mode: String,
-    pub tools_enabled: Vec<String>,
+    pub tools_enabled: Option<Vec<String>>,
     pub system_prompt: Option<String>,
     /// The project this session belongs to (Codex-style project folder).
     pub project_id: Option<String>,

@@ -255,7 +255,8 @@ export async function exportPdf(paperId: string, targetPath: string): Promise<vo
 export interface AgentSessionInput {
   title: string;
   agentMode?: string;
-  toolsEnabled?: string[];
+  /** Explicit subset; null/undefined = all built-in tools (future-proof). */
+  toolsEnabled?: string[] | null;
   systemPrompt?: string;
   /** The project this session belongs to; null on update = unbind. */
   projectId?: string | null;
@@ -777,7 +778,7 @@ export async function createChatSession(
   title: string,
   mode?: string,
   agentMode?: string,
-  toolsEnabled?: string[],
+  toolsEnabled?: string[] | null,
   systemPrompt?: string,
   projectId?: string,
 ): Promise<AgentSession> {

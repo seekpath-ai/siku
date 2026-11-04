@@ -895,6 +895,44 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     .await
     .map_err(|e| anyhow::anyhow!("migration failed for chat_sessions memory_recall tool: {}", e))?;
 
+    // Migration: sessions created with "select all tools" stored the full
+    // picker list explicitly — which froze them out of every tool added
+    // later (browser_*, research_topic_create, set_app_theme, …). Normalize
+    // those lists to 'null' (= all tools, future-proof). Custom subsets are
+    // untouched: they deliberately excluded something (added 2026-11-04).
+    {
+        const LEGACY_FULL_TOOL_SET: &[&str] = &[
+            "paper_search", "paper_read", "paper_snapshot", "paper_import", "search_library",
+            "note_read", "note_write", "knowledge_query", "knowledge_create",
+            "memory_read", "memory_write", "memory_recall",
+            "web_fetch", "web_search", "translate",
+            "file_read", "file_list", "file_grep", "file_glob", "file_write", "file_edit",
+            "bash", "task_list", "task_output", "task_stop",
+            "ask_user", "read_media_file",
+        ];
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, tools_enabled FROM chat_sessions \
+             WHERE json_valid(tools_enabled) AND tools_enabled != 'null'",
+        )
+        .fetch_all(&db)
+        .await
+        .map_err(|e| anyhow::anyhow!("migration scan failed for chat_sessions tools_enabled: {}", e))?;
+        for (id, raw) in rows {
+            let Ok(list) = serde_json::from_str::<Vec<String>>(&raw) else {
+                continue;
+            };
+            let is_legacy_select_all = !list.is_empty()
+                && LEGACY_FULL_TOOL_SET.iter().all(|t| list.iter().any(|x| x == t));
+            if is_legacy_select_all {
+                sqlx::query("UPDATE chat_sessions SET tools_enabled = 'null' WHERE id = ?")
+                    .bind(&id)
+                    .execute(&db)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("migration failed normalizing tools_enabled: {}", e))?;
+            }
+        }
+    }
+
     // Migration: agent_steps for ReAct iterations (added 2026-08-07)
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS agent_steps (

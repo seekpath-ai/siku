@@ -114,14 +114,29 @@ pub fn persistent_profile_dir(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("browser-profile")
 }
 
+/// Liveness probes must never hang: a wedged browser process (alive but not
+/// answering CDP) would otherwise block the manager lock forever, taking
+/// every subsequent browser call down with it.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Tab count with a hard timeout. `None` = browser unreachable or wedged;
+/// callers treat that as a dead connection and rebuild.
+async fn tab_count(browser: &Browser) -> Option<usize> {
+    tokio::time::timeout(PROBE_TIMEOUT, browser.pages())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|p| p.len())
+}
+
 impl BrowserManager {
     /// Connect (or reuse a healthy existing connection). Idempotent.
     pub async fn connect(&self, mode: ConnectMode) -> Result<ConnectOutcome, String> {
         let mut guard = self.conn.lock().await;
 
         if let Some(existing) = guard.as_mut() {
-            match existing.browser.pages().await {
-                Ok(pages) => {
+            match tab_count(&existing.browser).await {
+                Some(tabs) => {
                     let product = existing
                         .browser
                         .version()
@@ -134,10 +149,10 @@ impl BrowserManager {
                         mode: existing.mode.clone(),
                         executable: existing.executable.clone(),
                         profile_dir: existing.profile_dir.clone(),
-                        tabs: pages.len(),
+                        tabs,
                     });
                 }
-                Err(_) => {
+                None => {
                     // Stale connection (browser closed by the user, crashed…):
                     // tear it down, then fall through to a fresh connect.
                     tracing::info!("stale browser connection detected, reconnecting");
@@ -195,13 +210,10 @@ impl BrowserManager {
             }
         };
 
-        let product = browser
-            .version()
-            .await
-            .map(|v| v.product)
-            .unwrap_or_else(|_| "unknown".to_string());
-        let tabs = browser.pages().await.map(|p| p.len()).unwrap_or(0);
-
+        // The handler MUST be driven before any CDP command: version()/pages()
+        // only receive their responses while the handler loop is being polled.
+        // Spawning it after those calls deadlocks the connect (browser window
+        // opens, the tool hangs forever).
         let handler_task = tokio::spawn(async move {
             let mut handler = handler;
             loop {
@@ -211,6 +223,16 @@ impl BrowserManager {
                 }
             }
         });
+
+        let product = browser
+            .version()
+            .await
+            .map(|v| v.product)
+            .unwrap_or_else(|_| "unknown".to_string());
+        // A browser that cannot answer this right after launch is not usable;
+        // report 0 tabs rather than hang — the next connect retries cleanly.
+        let tabs = tab_count(&browser).await.unwrap_or(0);
+
         let browser = Arc::new(browser);
 
         let outcome = ConnectOutcome {
@@ -258,7 +280,7 @@ impl BrowserManager {
     pub async fn live_browser(&self) -> Option<Arc<Browser>> {
         let mut guard = self.conn.lock().await;
         let alive = match guard.as_ref() {
-            Some(c) => c.browser.pages().await.is_ok(),
+            Some(c) => tab_count(&c.browser).await.is_some(),
             None => false,
         };
         if alive {
@@ -377,11 +399,12 @@ async fn teardown(conn: Connection) {
     } = conn;
     // Graceful close needs &mut; possible only when no phase-2 tool still
     // holds an Arc clone — otherwise drop alone still kills a launched child
-    // (kill_on_drop), so this is best-effort by design.
+    // (kill_on_drop), so this is best-effort by design. Timeout-bounded: a
+    // wedged browser must not hang browser_close / app shutdown.
     let mut browser = browser;
     if !matches!(mode, ConnectMode::Attach { .. }) {
         if let Some(b) = Arc::get_mut(&mut browser) {
-            let _ = b.close().await;
+            let _ = tokio::time::timeout(PROBE_TIMEOUT, b.close()).await;
         }
     }
     drop(browser);

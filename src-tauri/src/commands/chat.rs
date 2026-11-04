@@ -51,8 +51,12 @@ pub async fn create_chat_session(
     let now = time::now_iso();
     let mode = mode.unwrap_or_else(|| "qa".to_string());
     let agent_mode = agent_mode.unwrap_or_else(|| "chat".to_string());
-    let tools_enabled_json = serde_json::to_string(&tools_enabled.unwrap_or_default())
-        .map_err(|e| format!("json error: {e}"))?;
+    // NULL/'null' = all built-in tools (future-proof default); a JSON array
+    // is an explicit subset ("[]" = explicitly none).
+    let tools_enabled_json = match &tools_enabled {
+        Some(list) => serde_json::to_string(list).map_err(|e| format!("json error: {e}"))?,
+        None => "null".to_string(),
+    };
 
     sqlx::query(
         // max_tokens / max_loops / context_budget bound explicitly: existing DBs

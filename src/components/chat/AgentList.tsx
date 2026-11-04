@@ -64,13 +64,13 @@ import { NewProjectDialog } from './NewProjectDialog';
 import { CreatePrDialog } from './CreatePrDialog';
 import { TaskCenterDialog } from './TaskCenterDialog';
 import { PluginsDialog } from './PluginsDialog';
-import { DEFAULT_TOOLS } from '@/lib/agent-tools';
 import type { AgentSession, LlmConfigBlock, ApprovalConfig } from '@/lib/types';
 
 interface AgentCreateInput {
   title: string;
   systemPrompt?: string;
-  tools: string[];
+  /** Explicit subset; null = all built-in tools (future-proof default). */
+  tools: string[] | null;
   /** Project binding; undefined = project-less (create), null = unbind (update). */
   projectId?: string | null;
   workingDir: string | null;
@@ -537,7 +537,7 @@ export function AgentList() {
       const session = await agentCreateSession({
         title: '新对话',
         agentMode: 'chat',
-        toolsEnabled: DEFAULT_TOOLS,
+        toolsEnabled: null,
         projectId,
       });
       setExpandedProjects((prev) => new Set(prev).add(projectId));

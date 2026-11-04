@@ -28,6 +28,7 @@ pub mod search;
 pub mod skills;
 pub mod sync;
 pub mod system;
+pub mod browser;
 pub mod tags;
 pub mod task_prompts;
 pub mod tasks;

@@ -671,6 +671,12 @@ export interface AppSettings {
   /** Semantic color overrides on top of the preset, e.g. { accent: "#e67e22" }. */
   theme_overrides?: Record<string, string> | null;
 
+  // Browser automation (L1)
+  /** Chrome/Edge executable override; absent/empty = auto-detect. */
+  browser_path?: string | null;
+  /** Default browser_connect mode: persistent | temporary | attach. */
+  browser_default_mode?: string | null;
+
   // Advanced truncation / limits
   log_max_size_mb: number;
   log_max_files: number;

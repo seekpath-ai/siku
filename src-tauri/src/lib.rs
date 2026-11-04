@@ -1108,6 +1108,7 @@ pub fn run() {
             commands::system::screenshot_hotkey_sync,
             commands::system::open_local_path,
             commands::system::reveal_in_file_manager,
+            commands::browser::browser_detect,
             commands::system::resolve_existing_path,
             // Annotations
             commands::annotation::annotation_list,

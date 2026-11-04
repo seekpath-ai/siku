@@ -1,8 +1,8 @@
 # Agent 工具清单
 
-思库（Siku）的 Agent 基于 ReAct 循环，通过 **Tool Registry** 动态注册可用工具。默认注册表包含 27 个内置工具，此外每个会话可挂载若干 `skill_<name>` 技能工具（见[技能工具](#技能工具)）。
+思库（Siku）的 Agent 基于 ReAct 循环，通过 **Tool Registry** 动态注册可用工具。默认注册表包含 39 个内置工具，此外每个会话可挂载若干 `skill_<name>` 技能工具（见[技能工具](#技能工具)）。
 
-> 本文档对应版本：`v1.1.4`
+> 本文档对应版本：`v2.0.1`
 
 ## 目录
 
@@ -11,6 +11,7 @@
 - [文献工具](#文献工具)
 - [笔记工具](#笔记工具)
 - [网络工具](#网络工具)
+- [浏览器工具](#浏览器工具)
 - [翻译工具](#翻译工具)
 - [知识库工具](#知识库工具)
 - [文件工具](#文件工具)
@@ -42,6 +43,18 @@
 | `note_write` | 笔记 | ❌ | 创建或更新笔记 |
 | `web_fetch` | 网络 | ✅ | 抓取 URL 并返回纯文本内容 |
 | `web_search` | 网络 | ✅ | 按用户配置的引擎链搜索网页（Bing/DuckDuckGo/Tavily/Brave/SearXNG 按序回退） |
+| `browser_connect` | 浏览器 | ❌ | 启动/附加真实 Chrome/Edge（persistent/temporary/attach 三模式），幂等复用 |
+| `browser_close` | 浏览器 | ❌ | 关闭浏览器连接（attach 模式只断开，不关闭用户的浏览器） |
+| `browser_navigate` | 浏览器 | ❌ | 活动标签页导航到 URL，等待加载完成 |
+| `browser_tabs` | 浏览器 | ❌ | 列出/切换/关闭标签页 |
+| `browser_wait` | 浏览器 | ✅ | 等待 CSS 选择器出现或定时休眠 |
+| `browser_snapshot` | 浏览器 | ✅ | DOM 快照：可见可交互元素映射为编号 ref（模型的"眼睛"） |
+| `browser_click` | 浏览器 | ❌ | 按 ref 点击元素（真实鼠标事件） |
+| `browser_type` | 浏览器 | ❌ | 按 ref 输入文本（真实按键，支持清空/回车） |
+| `browser_scroll` | 浏览器 | ✅ | 滚动页面或把 ref 元素滚入视野 |
+| `browser_screenshot` | 浏览器 | ✅ | 截图存 PNG 到会话写入目录（可接 read_media_file 视觉解读） |
+| `browser_download_pdf` | 浏览器 | ❌ | 页面存 PDF（print）或点击触发下载并捕获（download），可接 paper_import |
+| `browser_captcha_wait` | 浏览器 | ✅ | 人机验证人工接管：桌面通知 + 轮询等待用户完成 |
 | `translate` | 翻译 | ✅ | 多语言翻译，默认目标中文 |
 | `knowledge_query` | 知识库 | ✅ | 跨领域全文检索知识条目 |
 | `knowledge_create` | 知识库 | ❌ | 在指定领域创建知识条目 |
@@ -175,6 +188,125 @@
 |------|------|------|------|
 | `query` | string | ✅ | 搜索词 |
 | `max_results` | integer | ❌ | 最大返回条数，默认 6，最大 10 |
+
+---
+
+## 浏览器工具
+
+L1 浏览器自动化：经 CDP 驱动**本机真实的 Chrome/Edge**（不内嵌浏览器），让智能体完成需要登录态或 JS 渲染的网页任务——典型场景是"登录学校图书馆/知网检索并下载文献"。核心策略：复用真实浏览器指纹与登录态，遇到人机验证移交人类，不做反检测对抗。
+
+**使用约束（模型与用户都应知道）：**
+
+- 浏览器是 **headed 窗口**，要求桌面已登录且**未锁屏**；锁屏时操作会失败，远程（微信/飞书）发起浏览器任务前需确认电脑前有人或屏幕可用。
+- 三种供给模式（`browser_connect` 的 `mode`）：`persistent`（默认，思库管理的独立持久 profile，站点登录态长期保留——Chrome 136+ 拒绝在默认用户 profile 上开 CDP，故用独立 profile）、`temporary`（干净临时 profile，一次性任务）、`attach`（附加到用户以 `--remote-debugging-port` 启动的浏览器，**永不关闭**它）。
+- **快照即眼睛**：`browser_snapshot` 把可见可交互元素映射为编号 ref（`[3-12]`），click/type 都按 ref 操作；DOM 变化后 ref 失效，工具会明确报错要求重新快照。截图（`browser_screenshot`）只在视觉/布局相关时使用。
+- **人机验证**：navigate/click 后自动检测（reCAPTCHA/hCaptcha/Cloudflare/GeeTest/Arkose），命中即在结果中警告；`browser_captcha_wait` 发桌面通知并把标签页置前，轮询等待用户手动完成（默认 5 分钟，可续等）。绝不尝试绕过验证。
+- 产出落盘在会话写入目录的 `screenshots/`、`downloads/`；下载得到的 PDF 可直接 `paper_import` 入文献库。
+- 设置页「浏览器」可覆盖可执行文件路径与默认连接模式；应用退出时自动关闭思库启动的浏览器。
+
+### `browser_connect`
+
+启动或附加浏览器。幂等：已有健康连接直接复用；连接失活（用户关了窗口）自动重建。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `mode` | string | ❌ | `persistent`（默认，可用设置页改默认值）/ `temporary` / `attach` |
+| `port` | integer | ❌ | attach 模式的调试端口，默认 9222 |
+
+### `browser_close`
+
+关闭连接。思库启动的浏览器会被关闭（persistent profile 保留、temporary 删除）；attach 模式只断开连接。
+
+### `browser_navigate`
+
+活动标签页导航到 URL，等待 load 事件（30 秒超时）。无 scheme 时自动补 `https://`。返回最终 URL 与标题；若检测到人机验证会附加警告。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `url` | string | ✅ | 目标 URL |
+
+### `browser_tabs`
+
+列出（list）/切换（switch）/关闭（close）标签页。switch/close 用 list 输出的 1 起序号；switch 同时把窗口置前。新打开的 tab（target=_blank）在这里切换。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `action` | string | ✅ | `list` / `switch` / `close` |
+| `index` | integer | ❌ | tab 序号（switch/close 必填） |
+
+### `browser_wait`
+
+等待 CSS 选择器出现（250ms 轮询）或定时休眠。只读。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `selector` | string | ❌ | 等待的 CSS 选择器；省略则仅休眠 |
+| `timeout_ms` | integer | ❌ | 默认 10000，最大 60000 |
+
+### `browser_snapshot`
+
+DOM 快照：返回页面标题/URL 与全部可见可交互元素（链接/按钮/输入框/select/role=button 等），每个元素带 `[代-序号]` ref。上限 400 个元素，超出提示分步/滚动。只读。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `include_text` | boolean | ❌ | 同时返回页面可见正文（前 4000 字符），默认 false |
+
+### `browser_click`
+
+按 ref 点击（真实鼠标事件，JS 处理器正常触发）。点击后报告 URL 变化与新开 tab，并做人机验证检测。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `ref` | string | ✅ | 快照中的元素 ref，格式 `<代>-<序号>` |
+
+### `browser_type`
+
+按 ref 输入文本（真实按键，自动完成/校验处理器正常触发）。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `ref` | string | ✅ | 元素 ref |
+| `text` | string | ✅ | 输入内容 |
+| `clear` | boolean | ❌ | 先清空（触发 input/change 事件，兼容 React 等框架），默认 false |
+| `press_enter` | boolean | ❌ | 输入后按回车，默认 false |
+
+### `browser_scroll`
+
+滚动页面或把 ref 元素滚入视野，报告滚动位置与是否到底。只读。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `direction` | string | ❌ | `up` / `down`（默认）/ `top` / `bottom` |
+| `ref` | string | ❌ | 元素 ref（优先于 direction） |
+| `amount` | integer | ❌ | 滚动像素，默认 700 |
+
+### `browser_screenshot`
+
+截图存 PNG 到 `screenshots/`，返回路径（可接 `read_media_file` 视觉解读）。只读。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `full_page` | boolean | ❌ | 整页截图（默认 false，仅视口） |
+| `filename` | string | ❌ | 文件名，默认自动 `page-<时间戳>.png` |
+
+### `browser_download_pdf`
+
+PDF 产出。`print`：当前页渲染为 PDF（带背景）；`download`：先把浏览器下载目录定向到会话 `downloads/`，点击指定 ref 触发下载，轮询等待完成（`.crdownload` 消失），可选改名。PDF 结果提示可接 `paper_import`。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `action` | string | ✅ | `print` / `download` |
+| `ref` | string | ❌ | download 必填：触发下载的元素 ref |
+| `filename` | string | ❌ | 输出文件名 |
+| `timeout_ms` | integer | ❌ | 下载等待上限，默认 60000，最大 300000 |
+
+### `browser_captcha_wait`
+
+人机验证人工接管。检测到验证时调用：桌面通知 + 标签页置前，1 秒轮询直到验证消失；超时如实报错，可再调一次继续等。支持 reCAPTCHA / hCaptcha / Cloudflare Turnstile / GeeTest / Arkose。只读。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `timeout_ms` | integer | ❌ | 默认 300000（5 分钟），最大 600000 |
 
 ---
 

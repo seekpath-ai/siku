@@ -640,6 +640,15 @@ pub struct AppSettings {
     /// roam. Read once by `migrate_remote_settings`; dropped on save.
     #[serde(default, skip_serializing)]
     pub remote: RemoteSettings,
+
+    // ── Browser automation (L1) ──
+    /// Chrome/Edge executable override; None/empty = auto-detect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_path: Option<String>,
+    /// Default mode for browser_connect: "persistent" | "temporary" | "attach".
+    /// None = persistent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_default_mode: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -979,6 +988,8 @@ impl Default for AppSettings {
             research_auto_discover_interval_hours: default_research_auto_discover_interval_hours(),
             research_discover_max_results: default_research_discover_max_results(),
             remote: RemoteSettings::default(),
+            browser_path: None,
+            browser_default_mode: None,
         }
     }
 }

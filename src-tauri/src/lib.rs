@@ -303,6 +303,14 @@ async fn run_shutdown_cleanup_async(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
+    // Close the automation browser: launched instances get a graceful close
+    // (profile flushes cleanly); attached ones are only disconnected — the
+    // user's own browser is never closed. Independent of the pool, but do it
+    // before the runtime winds down.
+    if let Some(mgr) = crate::core::browser::global() {
+        mgr.shutdown().await;
+    }
+
     if let Err(e) = crate::core::db::finalize_db(&pool).await {
         tracing::error!("failed to finalize database on exit: {e}");
     }
@@ -551,6 +559,11 @@ pub fn run() {
                     .expect("failed to get app data dir");
 
                 let _ = handle2.emit("splash:phase", "即将就绪...");
+
+                // Browser automation manager (app-global; one CDP connection
+                // shared by all agent sessions). Initialized before any agent
+                // can run.
+                crate::core::browser::init(app_data_dir.clone());
 
                 // Create a shutdown channel so background loops can be stopped
                 // gracefully before the database is finalized on exit.

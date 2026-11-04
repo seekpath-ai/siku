@@ -8,6 +8,7 @@ pub mod annotation_service;
 pub mod batch_import;
 pub mod bibtex;
 pub mod bookmark_service;
+pub mod browser;
 pub mod citation_export;
 pub mod collection_service;
 pub mod cron_scheduler;

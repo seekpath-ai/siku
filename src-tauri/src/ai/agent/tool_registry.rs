@@ -290,6 +290,11 @@ impl ToolRegistry {
         registry.register(crate::ai::agent::tools::web_fetch::WebFetchTool::new(db.clone(), web_proxy.clone()));
         registry.register(crate::ai::agent::tools::web_search::WebSearchTool::new(db.clone(), web_proxy));
 
+        // Browser automation (L1): connection lifecycle. The manager is
+        // app-global, so these tools need no constructor state.
+        registry.register(crate::ai::agent::tools::browser::BrowserConnectTool);
+        registry.register(crate::ai::agent::tools::browser::BrowserCloseTool);
+
         // Translation
         registry.register(crate::ai::agent::tools::translation::TranslationTool::new(db.clone()));
 

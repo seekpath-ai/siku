@@ -43,7 +43,12 @@ impl Tool for BrowserNavigateTool {
 
         let final_url = page.url().await.ok().flatten().unwrap_or(url);
         let title = page.get_title().await.ok().flatten().unwrap_or_default();
-        Ok(format!("Navigated to {final_url}\nTitle: {title}"))
+        let mut out = format!("Navigated to {final_url}\nTitle: {title}");
+        let signals = crate::core::browser::captcha_signals(&page).await;
+        if !signals.is_empty() {
+            out.push_str(&crate::core::browser::captcha_warning(&signals));
+        }
+        Ok(out)
     }
 }
 

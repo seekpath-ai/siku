@@ -320,6 +320,51 @@ impl BrowserManager {
     }
 }
 
+/// Human-verification heuristics: matched challenge providers/widgets on the
+/// current page. Empty = no challenge detected. Deliberately conservative —
+/// a false positive costs one browser_captcha_wait round-trip, a false
+/// negative strands the agent clicking against an unsolvable wall.
+const CAPTCHA_PROBE_JS: &str = r#"(() => {
+  const signals = [];
+  for (const f of document.querySelectorAll('iframe[src]')) {
+    const src = (f.getAttribute('src') || '').toLowerCase();
+    if (/recaptcha|hcaptcha|challenges\.cloudflare\.com|arkoselabs|geetest|turnstile/.test(src)) {
+      signals.push('captcha iframe: ' + src.slice(0, 80));
+    }
+  }
+  if (document.querySelector('.cf-turnstile, #cf-chl-widget, .g-recaptcha, .h-captcha, .geetest_holder, #geetest-wrap')) {
+    signals.push('captcha widget element');
+  }
+  const title = (document.title || '');
+  if (/just a moment|attention required|verify you are human|安全验证|人机验证/i.test(title)) {
+    signals.push('challenge page title: ' + title);
+  }
+  if (/cdn-cgi\/challenge/.test(location.pathname)) {
+    signals.push('cloudflare challenge url');
+  }
+  return signals;
+})()"#;
+
+/// Probe the page for human-verification challenges. Any error (page
+/// mid-navigation, evaluate failed) is treated as "no signals" — the probe
+/// must never break a navigation or click that actually succeeded.
+pub async fn captcha_signals(page: &Page) -> Vec<String> {
+    page.evaluate(CAPTCHA_PROBE_JS)
+        .await
+        .ok()
+        .and_then(|r| r.into_value::<Vec<String>>().ok())
+        .unwrap_or_default()
+}
+
+/// Warning appended to tool results when a challenge is on screen.
+pub fn captcha_warning(signals: &[String]) -> String {
+    format!(
+        "\n⚠ HUMAN VERIFICATION detected ({}). A person must solve it in the browser window — \
+         call browser_captcha_wait to wait for completion instead of clicking blindly.",
+        signals.join("; ")
+    )
+}
+
 /// Close what we own, never what we merely attached to. Dropping `Browser`
 /// kills a launched child even if graceful close fails (kill_on_drop).
 async fn teardown(conn: Connection) {
@@ -376,5 +421,13 @@ mod tests {
         let err = mgr.connect(ConnectMode::Attach { port: 1 }).await.unwrap_err();
         assert!(err.contains("--remote-debugging-port"), "unexpected: {err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn captcha_warning_lists_signals() {
+        let w = captcha_warning(&["captcha iframe: x".to_string()]);
+        assert!(w.contains("HUMAN VERIFICATION"));
+        assert!(w.contains("captcha iframe: x"));
+        assert!(w.contains("browser_captcha_wait"));
     }
 }

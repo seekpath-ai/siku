@@ -69,6 +69,10 @@ impl Tool for BrowserClickTool {
                 }
             }
         }
+        let signals = crate::core::browser::captcha_signals(&page).await;
+        if !signals.is_empty() {
+            out.push_str(&crate::core::browser::captcha_warning(&signals));
+        }
         out.push_str("\nRe-run browser_snapshot before interacting further if the page changed.");
         Ok(out)
     }

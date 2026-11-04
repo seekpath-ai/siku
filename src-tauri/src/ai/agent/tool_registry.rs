@@ -284,7 +284,7 @@ impl ToolRegistry {
 
         // UI theme switching from chat (writes AppSettings, emits
         // app:settings_changed; the frontend re-applies CSS vars live).
-        registry.register(crate::ai::agent::tools::theme::SetAppThemeTool::new(db.clone(), app_handle));
+        registry.register(crate::ai::agent::tools::theme::SetAppThemeTool::new(db.clone(), app_handle.clone()));
 
         // Web tools
         registry.register(crate::ai::agent::tools::web_fetch::WebFetchTool::new(db.clone(), web_proxy.clone()));
@@ -306,6 +306,8 @@ impl ToolRegistry {
         // Output: screenshots, print-to-PDF, download capture.
         registry.register(crate::ai::agent::tools::browser_output::BrowserScreenshotTool);
         registry.register(crate::ai::agent::tools::browser_output::BrowserDownloadPdfTool);
+        // Human-verification handoff: detect (auto after navigate/click) + wait.
+        registry.register(crate::ai::agent::tools::browser_captcha::BrowserCaptchaWaitTool::new(app_handle));
 
         // Translation
         registry.register(crate::ai::agent::tools::translation::TranslationTool::new(db.clone()));

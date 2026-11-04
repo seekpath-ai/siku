@@ -125,8 +125,7 @@ export function DomainAgentSettings() {
       <div>
         <h2 className="text-base font-semibold text-text-primary">领域智能体</h2>
         <p className="text-[11px] text-amber-400/80 mt-2 leading-relaxed flex items-start gap-1.5">
-          <AlertTriangle size={12} className="mt-0.5 shrink-0" />
-          标有「影响解析」的提示词里包含 JSON 输出约定；删改它会让该功能解析失败（多数功能会降级而不是丢数据，但会消耗额度）。改坏了用「恢复默认」。
+          标有「影响解析」的提示词里包含 JSON 输出约定
         </p>
       </div>
 

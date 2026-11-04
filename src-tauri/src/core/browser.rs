@@ -22,6 +22,7 @@ use std::sync::OnceLock;
 use std::sync::Arc;
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::Page;
 use futures::StreamExt;
 use tokio::sync::Mutex;
 
@@ -65,6 +66,9 @@ struct Connection {
 pub struct BrowserManager {
     app_data_dir: PathBuf,
     conn: Mutex<Option<Connection>>,
+    /// Target id of the tab browser tools operate on. Resolved lazily: an
+    /// empty or stale value falls back to the most recent tab.
+    active_target: Mutex<Option<String>>,
 }
 
 static MANAGER: OnceLock<BrowserManager> = OnceLock::new();
@@ -74,6 +78,7 @@ pub fn init(app_data_dir: PathBuf) {
     let _ = MANAGER.set(BrowserManager {
         app_data_dir,
         conn: Mutex::new(None),
+        active_target: Mutex::new(None),
     });
 }
 
@@ -265,6 +270,54 @@ impl BrowserManager {
             None
         }
     }
+
+    /// The tab browser tools act on: the remembered target when it still
+    /// exists, otherwise the most recent tab (which becomes the new memory).
+    pub async fn active_page(&self) -> Result<Page, String> {
+        let browser = self
+            .live_browser()
+            .await
+            .ok_or("No browser connection — call browser_connect first")?;
+        let pages = browser
+            .pages()
+            .await
+            .map_err(|e| format!("cannot list tabs: {e}"))?;
+        let Some(last) = pages.last() else {
+            return Err("The browser has no open tab — call browser_navigate to open one".to_string());
+        };
+        let stored = self.active_target.lock().await.clone();
+        let page = stored
+            .and_then(|id| pages.iter().find(|p| p.target_id().as_ref().to_string() == id).cloned())
+            .unwrap_or_else(|| last.clone());
+        *self.active_target.lock().await = Some(page.target_id().as_ref().to_string());
+        Ok(page)
+    }
+
+    /// All open tabs in browser order, newest last.
+    pub async fn list_tabs(&self) -> Result<Vec<(String, Page)>, String> {
+        let browser = self
+            .live_browser()
+            .await
+            .ok_or("No browser connection — call browser_connect first")?;
+        let pages = browser
+            .pages()
+            .await
+            .map_err(|e| format!("cannot list tabs: {e}"))?;
+        Ok(pages
+            .into_iter()
+            .map(|p| (p.target_id().as_ref().to_string(), p))
+            .collect())
+    }
+
+    /// Remember which target subsequent tool calls act on.
+    pub async fn set_active(&self, target_id: &str) {
+        *self.active_target.lock().await = Some(target_id.to_string());
+    }
+
+    /// Forget the remembered target (e.g. after closing the active tab).
+    pub async fn clear_active(&self) {
+        *self.active_target.lock().await = None;
+    }
 }
 
 /// Close what we own, never what we merely attached to. Dropping `Browser`
@@ -317,6 +370,7 @@ mod tests {
         let mgr = BrowserManager {
             app_data_dir: dir.clone(),
             conn: Mutex::new(None),
+            active_target: Mutex::new(None),
         };
         // Port 1 is never a browser; the error must point the user at the fix.
         let err = mgr.connect(ConnectMode::Attach { port: 1 }).await.unwrap_err();

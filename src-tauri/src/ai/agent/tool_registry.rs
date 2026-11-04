@@ -294,6 +294,15 @@ impl ToolRegistry {
         // app-global, so these tools need no constructor state.
         registry.register(crate::ai::agent::tools::browser::BrowserConnectTool);
         registry.register(crate::ai::agent::tools::browser::BrowserCloseTool);
+        // Navigation / tabs / waiting.
+        registry.register(crate::ai::agent::tools::browser_nav::BrowserNavigateTool);
+        registry.register(crate::ai::agent::tools::browser_nav::BrowserTabsTool);
+        registry.register(crate::ai::agent::tools::browser_nav::BrowserWaitTool);
+        // DOM snapshot (the model's view of the page) and ref interactions.
+        registry.register(crate::ai::agent::tools::browser_snapshot::BrowserSnapshotTool);
+        registry.register(crate::ai::agent::tools::browser_interact::BrowserClickTool);
+        registry.register(crate::ai::agent::tools::browser_interact::BrowserTypeTool);
+        registry.register(crate::ai::agent::tools::browser_interact::BrowserScrollTool);
 
         // Translation
         registry.register(crate::ai::agent::tools::translation::TranslationTool::new(db.clone()));

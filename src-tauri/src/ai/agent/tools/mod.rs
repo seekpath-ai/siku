@@ -26,6 +26,9 @@ pub mod read_media_file;
 pub mod path;
 pub mod research;
 pub mod browser;
+pub mod browser_nav;
+pub mod browser_snapshot;
+pub mod browser_interact;
 
 /// Write `content` to `target` atomically: write a sibling temp file, then
 /// rename it over the target.

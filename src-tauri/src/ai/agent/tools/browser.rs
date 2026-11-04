@@ -123,3 +123,36 @@ impl Tool for BrowserCloseTool {
         }
     }
 }
+
+/// The page all browser tools act on (the remembered tab, else the newest).
+pub(crate) async fn require_page() -> Result<chromiumoxide::Page, String> {
+    browser::global()
+        .ok_or("browser manager unavailable (app not fully initialized)")?
+        .active_page()
+        .await
+}
+
+/// Snapshot refs look like `<gen>-<n>` (`3-12`). Anything else is either a
+/// model hallucination or selector injection — reject before it reaches a
+/// CSS selector.
+pub(crate) fn validate_ref(value: &str) -> Result<String, String> {
+    let valid = value.len() <= 12
+        && value.split_once('-').is_some_and(|(g, n)| {
+            !g.is_empty()
+                && !n.is_empty()
+                && g.bytes().all(|b| b.is_ascii_digit())
+                && n.bytes().all(|b| b.is_ascii_digit())
+        });
+    if valid {
+        Ok(value.to_string())
+    } else {
+        Err(format!(
+            "invalid element ref '{value}' — use a ref from the latest browser_snapshot output"
+        ))
+    }
+}
+
+/// Build the CSS selector for a validated ref.
+pub(crate) fn ref_selector(value: &str) -> String {
+    format!("[data-siku-ref='{value}']")
+}

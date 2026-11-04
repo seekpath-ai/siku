@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use crate::ai::agent::tool_registry::{Tool, ToolParameter};
 
 /// Find an element by its snapshot ref, or explain the refs went stale.
-async fn find_by_ref(page: &chromiumoxide::Page, refv: &str) -> Result<chromiumoxide::Element, String> {
+pub(crate) async fn find_by_ref(page: &chromiumoxide::Page, refv: &str) -> Result<chromiumoxide::Element, String> {
     page.find_element(super::browser::ref_selector(refv))
         .await
         .map_err(|_| {

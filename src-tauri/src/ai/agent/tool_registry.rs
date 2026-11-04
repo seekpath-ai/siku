@@ -303,6 +303,9 @@ impl ToolRegistry {
         registry.register(crate::ai::agent::tools::browser_interact::BrowserClickTool);
         registry.register(crate::ai::agent::tools::browser_interact::BrowserTypeTool);
         registry.register(crate::ai::agent::tools::browser_interact::BrowserScrollTool);
+        // Output: screenshots, print-to-PDF, download capture.
+        registry.register(crate::ai::agent::tools::browser_output::BrowserScreenshotTool);
+        registry.register(crate::ai::agent::tools::browser_output::BrowserDownloadPdfTool);
 
         // Translation
         registry.register(crate::ai::agent::tools::translation::TranslationTool::new(db.clone()));

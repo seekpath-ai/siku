@@ -654,6 +654,10 @@ pub struct AppSettings {
     /// None/empty = none. Ignored in attach mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser_launch_args: Option<String>,
+    /// Persistent browser profile directory override. None/empty = the
+    /// default under app data (`browser-profile`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_profile_dir: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -996,6 +1000,7 @@ impl Default for AppSettings {
             browser_path: None,
             browser_default_mode: None,
             browser_launch_args: None,
+            browser_profile_dir: None,
         }
     }
 }

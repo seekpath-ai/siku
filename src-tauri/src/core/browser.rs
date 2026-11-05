@@ -114,6 +114,16 @@ pub fn persistent_profile_dir(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("browser-profile")
 }
 
+/// Effective persistent profile dir: the settings override when set,
+/// otherwise the given default. Public for the settings/import commands.
+pub fn resolve_persistent_profile_dir(default_dir: &Path) -> PathBuf {
+    let custom = crate::core::settings_service::cached_settings().browser_profile_dir;
+    if let Some(dir) = custom.filter(|d| !d.trim().is_empty()) {
+        return PathBuf::from(dir.trim());
+    }
+    default_dir.to_path_buf()
+}
+
 /// Shell-ish splitting for user-supplied launch args: whitespace separates,
 /// double quotes group (Windows paths with spaces), quotes are stripped.
 fn parse_launch_args(raw: &str) -> Vec<String> {
@@ -239,7 +249,9 @@ impl BrowserManager {
                 let exe = detect_executable()?;
                 let (profile_dir, cleanup_dir) = match mode {
                     ConnectMode::Persistent => {
-                        let dir = persistent_profile_dir(&self.app_data_dir);
+                        let dir = resolve_persistent_profile_dir(&persistent_profile_dir(
+                            &self.app_data_dir,
+                        ));
                         std::fs::create_dir_all(&dir)
                             .map_err(|e| format!("cannot create browser profile dir: {e}"))?;
                         (Some(dir), None)

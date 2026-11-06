@@ -10,7 +10,7 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import type { ChatAttachment } from '@/lib/types';
-import { fileBrowserGetInfo, fileBrowserOpenInSystem } from '@/lib/tauri';
+import { fileBrowserGetInfo, fileBrowserOpenInSystem, remoteAttachmentRetry } from '@/lib/tauri';
 
 function humanSize(bytes?: number): string {
   if (!bytes || bytes <= 0) return '';
@@ -34,9 +34,22 @@ function iconFor(mime: string) {
  * siku conversation and the phone show the same thing. A file recorded on
  * another device resolves to a greyed-out card instead of a broken link.
  */
-export function FileAttachmentCard({ att }: { att: ChatAttachment }) {
+export function FileAttachmentCard({
+  att,
+  sessionId,
+  messageId,
+  index,
+}: {
+  att: ChatAttachment;
+  /** Ledger coordinates for the retry path (absent = retry not offered). */
+  sessionId?: string;
+  messageId?: string;
+  index?: number;
+}) {
   const [missing, setMissing] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
   const name = att.name || '文件';
   const size = humanSize(att.size);
   const status = att.status ?? 'ok';
@@ -65,6 +78,29 @@ export function FileAttachmentCard({ att }: { att: ChatAttachment }) {
     };
   }, [att.path, status]);
 
+  const canRetry =
+    status === 'failed' &&
+    !missing &&
+    !retrying &&
+    !!sessionId &&
+    !!messageId &&
+    typeof index === 'number';
+
+  const retry = async () => {
+    if (!canRetry) return;
+    setRetrying(true);
+    setRetryError(null);
+    try {
+      // Success lands back through the `chat:message_updated` event, which
+      // patches the row this card is rendered from.
+      await remoteAttachmentRetry(sessionId!, messageId!, index!);
+    } catch (e) {
+      setRetryError(String(e).replace(/^Error:\s*/, ''));
+    } finally {
+      setRetrying(false);
+    }
+  };
+
   const openFile = async () => {
     if (!att.path || missing || busy) return;
     setBusy(true);
@@ -78,8 +114,12 @@ export function FileAttachmentCard({ att }: { att: ChatAttachment }) {
     }
   };
 
-  const statusNode =
-    status === 'pending' ? (
+  const statusNode = retrying ? (
+      <span className="inline-flex items-center gap-1 text-codex-muted">
+        <Loader2 size={10} className="animate-spin" />
+        重试中
+      </span>
+    ) : status === 'pending' ? (
       <span className="inline-flex items-center gap-1 text-codex-muted">
         <Loader2 size={10} className="animate-spin" />
         发送中
@@ -97,6 +137,7 @@ export function FileAttachmentCard({ att }: { att: ChatAttachment }) {
     );
 
   return (
+    <div className="flex flex-col items-start gap-1">
     <button
       type="button"
       onClick={openFile}
@@ -129,5 +170,19 @@ export function FileAttachmentCard({ att }: { att: ChatAttachment }) {
         <ExternalLink size={11} className="shrink-0 text-codex-muted opacity-0 group-hover:opacity-100" />
       )}
     </button>
+      {canRetry && (
+        <div className="flex items-center gap-1.5 text-[10px]">
+          <button
+            type="button"
+            onClick={() => void retry()}
+            className="text-codex-accent hover:underline"
+            title={att.error || '重新发送这个文件'}
+          >
+            重新发送
+          </button>
+          {retryError && <span className="text-codex-danger truncate max-w-[220px]">{retryError}</span>}
+        </div>
+      )}
+    </div>
   );
 }

@@ -233,10 +233,13 @@ queued(工具登记，仅内存) → pending(assistant 行落库) → ok(上传+
 - **assistant 行写失败**（db error）：不发送，`send_text` 补一句"附件未能随回复发出"。
 - **回写后必须广播** `chat:message_updated {session_id, message_id, attachments}`：前端在 `done` 时就重载过历史（那时行里还是 `pending`），不推这条事件的话气泡会一直停在「发送中」，直到用户切标签再回来。前端在 `ChatPanel` 里按 message_id 就地补丁；行尚未加载时兜底重读一次会话。
 - 幂等：`path + size + sha256` 去重；工具被重复调用不重复发送。
+- **投递顺序与 typing**：`progress_finish` 不再停 typing；router 在"回复文本 + 文件全部投递完"之后才调 `progress_settle`（`ReplySink` 新方法）停心跳并发 CANCEL。否则 20MB 上传的数秒内手机侧完全静默——typing 正是那段等待的唯一反馈。心跳另设 900s 硬上限，防止 settle 丢失时残留在后台。
+- **失败可重试**：`remote_attachment_retry(session_id, message_id, index)` 按账本索引重发单个附件（不重跑回合），成功后 `patch_attachment_status` 改回 `ok`、清掉 `error` 并广播 `chat:message_updated`。守卫与原发送一致：仅私聊 + 总开关开启；群聊/只读/开关关闭直接报错。
 
 ### 7.5 权限与限额（安全边界）
 
-- 注册条件（已实现于 `run_agent_turn`）：`is_remote_context(context) && grant_full && context.kind == "private" && remote_config.allow_outbound_files`（渠道不限，微信/飞书都支持上传）。**群聊一律拒发**——远程会话按 chat 共享（同群已配对成员共用一个 `session_id`），发文件等于广播给全群；且成员授权可被单独升到 full（`RemoteSettings.tsx`），所以授权级别兜不住这一层。
+- **工具始终注册，能力在调用期判定**（`run_agent_turn`）：凡是远程回合（router 传入出站队列）就注册 `send_file_to_user`，把"不可用原因"带进工具；命中时 `execute` 返回**具体原因 + 替代方案**，而不是让工具消失。这条是 2026-11 的实测修正：工具不注册时模型看不到任何信号，会以为"能力一致"（旧提示词原话），于是用 `bash`/文件工具反复拼凑。
+- 四种拒绝情形：群聊 / 只读授权 / 管理员关闭总开关 / 非远程会话。**群聊一律拒发**——远程会话按 chat 共享（同群已配对成员共用一个 `session_id`），发文件等于广播给全群；且成员授权可被单独升到 full（`RemoteSettings.tsx`），所以授权级别兜不住这一层。
 - **总开关**「允许远程回传文件」存 `remote_config.allow_outbound_files`（随账号同步，`RemoteSettings` 手写 `Default` 保证缺省为开，历史 JSON 无该字段也按开处理）。关闭后工具**根本不注册**，模型看不到、也调不到。
 - `readonly` 授权不注册该工具（`READONLY_TOOLS_JSON` 不含它）。
 - 路径白名单：会话工作区、`remote_downloads/`、`remote_outbox/`、桌面/下载/文档目录；拒绝 `~/.ssh`、浏览器 profile、应用数据目录等敏感路径。
@@ -248,11 +251,13 @@ queued(工具登记，仅内存) → pending(assistant 行落库) → ok(上传+
 - assistant 气泡下方挂附件卡：文件显示图标 + 文件名 + 大小 + 状态；点击走 `file_browser_open_in_system` 用系统程序打开（命令已存在）。
 - 图片（`mime: image/*` 且本机存在）：内联缩略图 + 点击放大——`assetProtocol` 已开（`tauri.conf.json`，scope `**`）且 CSP 允许 `asset:`，走 `convertFileSrc`（参考 `MarkdownImage` 的本地路径解析）。**零成本**。
 - 需改的前端：`ChatAttachment` 扩判别联合；`MessageBubble` 增加 assistant 附件分支（现在只在 `isUser` 渲染）；新增文件卡片组件；`AttachmentImage` 写死 `data:${mime};base64,` 必须加分支，否则文件型附件渲染成裂图。
+- 失败态卡片带「重新发送」：卡片拿到 `sessionId/messageId/index`（`MessageBubble` 按**原始数组下标**映射，保证与账本索引一致），点击调 `remote_attachment_retry`；成功由 `chat:message_updated` 事件把卡片翻成「已发送到手机」，不依赖手动刷新。
 - 工具行仍留在 `agent_steps` 作审计线（`send_file_to_user · 已完成`），与飞书卡片的工具行天然对应；附件卡是"发了什么"的权威记录，二者互补不冗余。
 
 ### 7.7 形态差异（接受，不追求抹平）
 
 - **飞书**：文件只能是卡片之外的独立消息，且必然在 `progress_finish`（卡片定稿）之后到达，视觉上脱离"本轮"。可选：带文件的回合不发卡片，直接走文本 + 文件。
+- **微信**：上传期间 typing 一直亮着（CANCEL 挪到投递完成后），所以"发大文件时手机没反应"的窗口被消掉。
 - **微信**：正文 2000 字符分条 + 文件气泡交错，siku 侧仍是"一段正文 + 一张卡"。
 - IM 侧原生气泡可转发/收藏/"用其他应用打开"，siku 侧是本机文件卡——形态不同是必然，也是合理的：siku 的文件就在本机磁盘，直接打开比下载更顺。
 - 投递结果单向：CDN 失败只体现在附件卡状态与工具结果，IM 侧补一句说明；siku 不知道用户是否点开。

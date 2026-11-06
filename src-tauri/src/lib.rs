@@ -925,6 +925,7 @@ pub fn run() {
             commands::remote::remote_weixin_send_file,
             commands::remote::remote_outbound_files_enabled,
             commands::remote::remote_outbound_files_set,
+            commands::remote::remote_attachment_retry,
             // Agent
             commands::agent::agent_create_session,
             commands::agent::agent_update_session,

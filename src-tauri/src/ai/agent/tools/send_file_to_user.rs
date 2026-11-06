@@ -1,11 +1,16 @@
 //! Send a file from this computer to the remote user's chat app.
 //!
-//! Registered ONLY for remote IM turns in a private, fully-granted chat
-//! (docs/remote-channels.md §7.5), and it never sends anything itself: it
-//! registers the file on the turn's outbound queue and `run_agent_turn`
-//! serializes that queue into the assistant row, which is what the router
-//! later uploads. That keeps the conversation and the chat app in sync — the
-//! ledger row is the delivery source of truth (§7.1).
+//! Registered for EVERY remote IM turn, even when the capability is off: a
+//! silently missing tool tells the model nothing, so it would burn turns
+//! trying `bash`/file tools to "work around" it. When sending is not allowed
+//! (group chat / read-only grant / kill switch off) the tool is still present
+//! and answers with the reason plus alternatives.
+//!
+//! When it IS allowed it never sends anything itself: it registers the file on
+//! the turn's outbound queue and `run_agent_turn` serializes that queue into
+//! the assistant row, which is what the router later uploads. That keeps the
+//! conversation and the chat app in sync — the ledger row is the delivery
+//! source of truth (docs/remote-channels.md §7.1).
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -24,15 +29,20 @@ const MAX_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
 pub struct SendFileToUserTool {
     queue: OutboundQueue,
     allow_roots: Vec<PathBuf>,
+    /// Why this session cannot send files, when it cannot. `None` = allowed.
+    /// Carried into the tool instead of dropping the tool, so the model gets a
+    /// concrete refusal instead of an invisible capability gap.
+    unavailable: Option<String>,
     /// Monotonic counter so the ledger records a stable ordering.
     seq: AtomicU64,
 }
 
 impl SendFileToUserTool {
-    pub fn new(queue: OutboundQueue, allow_roots: Vec<PathBuf>) -> Self {
+    pub fn new(queue: OutboundQueue, allow_roots: Vec<PathBuf>, unavailable: Option<String>) -> Self {
         Self {
             queue,
             allow_roots,
+            unavailable,
             seq: AtomicU64::new(0),
         }
     }
@@ -96,7 +106,9 @@ impl Tool for SendFileToUserTool {
          Use it when the user asks you to send them a file (e.g. a PDF you just made, a report, \
          a screenshot). The file goes out with this reply — the text you write is sent first, then \
          the file. Allowed locations: this session's workspace, files the user sent you, and the \
-         user's Desktop/Downloads/Documents. Max 25 MB per file, 5 files per reply."
+         user's Desktop/Downloads/Documents. Max 25 MB per file, 5 files per reply. \
+         Unavailable in group chats, with a read-only grant, or when the owner disabled outbound \
+         files; calling it then returns the reason instead of sending."
     }
 
     fn parameters(&self) -> Vec<ToolParameter> {
@@ -117,6 +129,17 @@ impl Tool for SendFileToUserTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
+        // Refusal path: answer with the concrete reason and alternatives so the
+        // model can relay it in one step instead of improvising (§7.5).
+        if let Some(reason) = self.unavailable.as_deref() {
+            tracing::info!(reason, "send_file_to_user refused");
+            return Ok(format!(
+                "当前会话不能发送文件：{reason}\n\
+                 请直接向用户说明这一点，并给出替代方案：① 把内容以文字形式贴在对话里；\
+                 ② 请用户私聊我发送；③ 在思库桌面端查看。\
+                 不要尝试用 bash 或其他工具绕过。"
+            ));
+        }
         let raw_path = args["path"].as_str().ok_or("path required")?;
         let wd = super::path::working_dir_from_args(&args);
         let resolved = super::path::resolve_path(wd.as_deref(), raw_path)?;
@@ -217,10 +240,7 @@ mod tests {
         std::fs::write(&file, b"%PDF-1.4 test").unwrap();
 
         let q = queue();
-        let tool = SendFileToUserTool::new(
-            q.clone(),
-            vec![root.clone()],
-        );
+        let tool = SendFileToUserTool::new(q.clone(), vec![root.clone()], None);
         let args = serde_json::json!({
             "path": file.to_str().unwrap(),
             "caption": "这是报告",
@@ -246,13 +266,36 @@ mod tests {
         std::fs::write(&secret, b"private").unwrap();
 
         let q = queue();
-        let tool = SendFileToUserTool::new(q.clone(), vec![root]);
+        let tool = SendFileToUserTool::new(q.clone(), vec![root], None);
         let out = tool
             .execute(serde_json::json!({ "path": secret.to_str().unwrap() }))
             .await
             .unwrap();
         assert!(out.contains("不在允许发送的范围"), "{out}");
         assert!(q.lock().unwrap().is_empty());
+    }
+
+    /// A disabled capability must answer with a reason, not vanish: the model
+    /// otherwise has no signal and burns turns trying bash/file workarounds.
+    #[tokio::test]
+    async fn unavailable_tool_reports_the_reason_without_queueing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("report.pdf");
+        std::fs::write(&file, b"%PDF-1.4").unwrap();
+        let q = queue();
+        let tool = SendFileToUserTool::new(
+            q.clone(),
+            vec![dir.path().to_path_buf()],
+            Some("这是群聊会话：群内发文件会广播给所有成员，因此群聊不支持发送文件。".to_string()),
+        );
+        let out = tool
+            .execute(serde_json::json!({ "path": file.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert!(out.contains("当前会话不能发送文件"), "{out}");
+        assert!(out.contains("群聊"), "must carry the concrete reason: {out}");
+        assert!(out.contains("替代方案"), "must suggest alternatives: {out}");
+        assert!(q.lock().unwrap().is_empty(), "must not register anything");
     }
 
     #[test]

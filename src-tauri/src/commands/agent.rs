@@ -1202,11 +1202,15 @@ pub(crate) async fn run_agent_turn(
         .collect();
     registry.register_skills(&skills_dir, &selected_skills);
 
-    // Outbound file sending (docs/remote-channels.md §7): only for a remote IM
-    // turn in a PRIVATE chat with the "full" grant. Group chats are excluded
-    // because a group session is shared by every paired member — a file sent
-    // there is broadcast to the whole group, and per-member grant levels
-    // cannot prevent that.
+    // Outbound file sending (docs/remote-channels.md §7). The tool is
+    // registered for EVERY remote turn — even when sending is not allowed —
+    // because a missing tool tells the model nothing: it cannot see why the
+    // capability is gone, so it improvises (`bash`, file tools) and burns
+    // turns. Present-but-refusing gives it a concrete reason to relay.
+    //
+    // Group chats are refused at call time: the session is shared by every
+    // paired member, so a file sent there is broadcast to the whole group and
+    // per-member grant levels cannot prevent that.
     let remote_context = session.context.as_deref().unwrap_or("");
     let remote_ctx = serde_json::from_str::<serde_json::Value>(remote_context).ok();
     let private_chat = remote_ctx
@@ -1214,26 +1218,38 @@ pub(crate) async fn run_agent_turn(
         .and_then(|v| v.get("kind").and_then(|k| k.as_str()))
         .map(|k| k == "private")
         .unwrap_or(false);
-    let remote_eligible = grant_full
-        && private_chat
-        && crate::remote::is_remote_context(remote_context);
-    // Account-wide kill switch (synced with the channel config): with it off
-    // the tool is not advertised at all, so the model cannot even try.
-    let outbound_enabled = if remote_eligible {
-        crate::core::settings_service::load_remote_config(&state.db)
-            .await
-            .map(|c| c.allow_outbound_files)
-            .unwrap_or(true)
-    } else {
-        false
-    };
-    if let Some(queue) = outbound.clone().filter(|_| remote_eligible && outbound_enabled) {
+    let is_remote = crate::remote::is_remote_context(remote_context);
+    if let Some(queue) = outbound.clone() {
+        // Account-wide kill switch (synced with the channel config).
+        let outbound_enabled = if is_remote && private_chat && grant_full {
+            crate::core::settings_service::load_remote_config(&state.db)
+                .await
+                .map(|c| c.allow_outbound_files)
+                .unwrap_or(true)
+        } else {
+            false
+        };
+        let unavailable = if !is_remote {
+            Some("该能力只用于微信/飞书远程会话。".to_string())
+        } else if !private_chat {
+            Some("这是群聊会话：群内发文件会广播给所有成员，因此群聊不支持发送文件。".to_string())
+        } else if !grant_full {
+            Some("你在这个会话中的授权是「只读」，不能向外发送文件。".to_string())
+        } else if !outbound_enabled {
+            Some("管理员在思库设置中关闭了「允许远程回传文件」。".to_string())
+        } else {
+            None
+        };
         let roots = crate::ai::agent::tools::send_file_to_user::SendFileToUserTool::default_allow_roots(
             allow_working_dir.as_deref().map(std::path::Path::new),
             &state.app_data_dir,
         );
         registry.register(
-            crate::ai::agent::tools::send_file_to_user::SendFileToUserTool::new(queue, roots),
+            crate::ai::agent::tools::send_file_to_user::SendFileToUserTool::new(
+                queue,
+                roots,
+                unavailable,
+            ),
         );
     }
 

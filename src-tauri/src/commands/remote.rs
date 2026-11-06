@@ -453,3 +453,111 @@ pub async fn remote_weixin_send_file(
     )
     .await
 }
+
+/// Re-send one attachment that failed earlier, without re-running the whole
+/// turn (the card's job is "send this file again", not "rethink the answer").
+///
+/// Mirrors the delivery path: same channel sender, same row-bookkeeping, same
+/// `chat:message_updated` event so the open panel flips to 已发送.
+#[tauri::command]
+#[instrument(skip(state, app))]
+pub async fn remote_attachment_retry(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    session_id: String,
+    message_id: String,
+    attachment_index: usize,
+) -> Result<(), String> {
+    // 1. The session must still be a private remote chat: retrying inside a
+    //    group would broadcast the file exactly like the original send would.
+    let context: Option<String> =
+        sqlx::query_scalar("SELECT context FROM chat_sessions WHERE id = ?")
+            .bind(&session_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| format!("db error: {e}"))?;
+    let ctx: serde_json::Value = context
+        .as_deref()
+        .and_then(|c| serde_json::from_str(c).ok())
+        .ok_or_else(|| "不是远程会话，无法重发".to_string())?;
+    if ctx.get("remote").and_then(|r| r.as_bool()) != Some(true) {
+        return Err("不是远程会话，无法重发".to_string());
+    }
+    if ctx.get("kind").and_then(|k| k.as_str()) != Some("private") {
+        return Err("群聊不支持发送文件（会广播给所有成员）".to_string());
+    }
+    let channel = ctx
+        .get("channel")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| "会话缺少渠道信息".to_string())?
+        .to_string();
+    let chat_id = ctx
+        .get("chat_id")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| "会话缺少 chat_id".to_string())?
+        .to_string();
+
+    // 2. Rebuild the attachment from the stored ledger entry.
+    let attachments: Option<String> = sqlx::query_scalar(
+        "SELECT attachments FROM chat_messages WHERE id = ? AND session_id = ?",
+    )
+    .bind(&message_id)
+    .bind(&session_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| format!("db error: {e}"))?;
+    let current = attachments
+        .filter(|a| !a.trim().is_empty() && a.trim() != "null")
+        .ok_or_else(|| "该消息没有附件".to_string())?;
+    let file = crate::remote::router::outbound_file_at(&current, attachment_index)
+        .ok_or_else(|| "附件不存在（索引可能已过期）".to_string())?;
+    if !file.path.exists() {
+        return Err("文件已不在本机，无法重发".to_string());
+    }
+
+    let remote = crate::core::settings_service::load_remote_config(&state.db).await?;
+    if !remote.allow_outbound_files {
+        return Err("管理员已关闭「允许远程回传文件」".to_string());
+    }
+
+    // 3. Send through the same channel-level sender the turn used.
+    match crate::remote::router::channel_kind(&channel) {
+        "weixin" => {
+            crate::remote::weixin::send_file_now(
+                &state.db,
+                &remote.weixin,
+                &chat_id,
+                &file.path.to_string_lossy(),
+                None,
+            )
+            .await
+            .map(|_| ())
+        }
+        "feishu" => {
+            let cfg = feishu_cfg(&remote, &channel)?;
+            crate::remote::feishu::send_file(&cfg, &chat_id, &file).await
+        }
+        other => Err(format!("未知渠道: {other}")),
+    }?;
+
+    // 4. Freeze the success into the ledger and tell the open panel.
+    if let Some(patched) =
+        crate::remote::router::patch_attachment_status(&current, attachment_index, "ok", None)
+    {
+        sqlx::query("UPDATE chat_messages SET attachments = ? WHERE id = ?")
+            .bind(&patched)
+            .bind(&message_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| format!("db error: {e}"))?;
+        let _ = app.emit(
+            "chat:message_updated",
+            serde_json::json!({
+                "session_id": session_id,
+                "message_id": message_id,
+                "attachments": patched,
+            }),
+        );
+    }
+    Ok(())
+}

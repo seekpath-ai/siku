@@ -619,11 +619,15 @@ impl ReplySink for WeixinSink {
                 tracing::debug!("typing unavailable: empty ticket");
                 return;
             }
+            let started = std::time::Instant::now();
             loop {
                 if send_typing(&http, &base_url, &token, &chat, &ticket, 1)
                     .await
                     .is_err()
                 {
+                    return;
+                }
+                if started.elapsed().as_secs() >= TYPING_MAX_SECS {
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(TYPING_HEARTBEAT_SECS)).await;
@@ -637,11 +641,20 @@ impl ReplySink for WeixinSink {
 
     async fn progress_finish(
         &self,
-        chat_id: &str,
+        _chat_id: &str,
         _reply: &str,
         _ok: bool,
         _progress: &crate::remote::router::RemoteProgress,
     ) -> Result<bool, String> {
+        // Typing intentionally keeps running here: the reply text and any
+        // outbound file upload still have to happen, and that upload is
+        // exactly when the phone needs the "still working" signal. The router
+        // calls `progress_settle` when everything is out.
+        // WeChat can't edit messages: the reply always goes out as text.
+        Ok(false)
+    }
+
+    async fn progress_settle(&self, chat_id: &str) {
         if let Ok(mut tasks) = self.typing_tasks.lock() {
             if let Some(handle) = tasks.remove(chat_id) {
                 handle.abort();
@@ -652,13 +665,12 @@ impl ReplySink for WeixinSink {
         if let Some(t) = ticket.filter(|t| !t.is_empty()) {
             // Stop the indicator explicitly; if it already expired in the
             // client this is a no-op.
-            if let Err(e) = send_typing(&self.http, &self.base_url, &self.token, chat_id, &t, 2).await
+            if let Err(e) =
+                send_typing(&self.http, &self.base_url, &self.token, chat_id, &t, 2).await
             {
                 tracing::debug!(error = %e, "typing cancel failed");
             }
         }
-        // WeChat can't edit messages: the reply always goes out as text.
-        Ok(false)
     }
 }
 
@@ -1506,6 +1518,9 @@ const TYPING_HEARTBEAT_SECS: u64 = 5;
 const TYPING_TICKET_TTL_SECS: u64 = 12 * 3600;
 /// Cap on cached tickets (bounded like the context tokens).
 const TYPING_TICKET_CAP: usize = 200;
+/// Hard stop for a heartbeat whose settle never arrives (turn timeout is
+/// 600s; this is the same order of magnitude and just prevents an orphan).
+const TYPING_MAX_SECS: u64 = 900;
 
 /// Per-chat typing tickets. In-memory on purpose: a ticket is worthless to
 /// another device and re-fetching after a restart is one request, so it must

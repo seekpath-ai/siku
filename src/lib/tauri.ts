@@ -2985,6 +2985,13 @@ export async function remoteChatFileSave(
   return invoke<void>('remote_chat_file_save', { channel, messageId, fileKey, kind, savePath });
 }
 
+/** Re-send one failed outbound attachment without re-running the turn. */
+export async function remoteAttachmentRetry(
+  sessionId: string, messageId: string, attachmentIndex: number
+): Promise<void> {
+  return invoke<void>('remote_attachment_retry', { sessionId, messageId, attachmentIndex });
+}
+
 /** Account-wide switch for outbound files (computer → chat app). */
 export async function remoteOutboundFilesEnabled(): Promise<boolean> {
   return invoke<boolean>('remote_outbound_files_enabled');

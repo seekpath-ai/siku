@@ -16,12 +16,15 @@ use crate::AppState;
 /// System-prompt addendum appended to remote sessions at runtime (see
 /// `run_agent_turn`). Remote users read plain chat text: app-internal links
 /// and local paths are meaningless to them.
-pub const REMOTE_PROMPT_ADDENDUM: &str = "你正通过即时通讯软件（微信/飞书）远程服务用户，与思库应用内的对话能力一致。\
+pub const REMOTE_PROMPT_ADDENDUM: &str = "你正通过即时通讯软件（微信/飞书）远程服务用户，能力接近思库应用内的对话，但受会话类型与授权限制。\
 回复必须是纯文本：不要输出 siku-reader:// 等应用内链接，不要输出本地文件路径，\
 不要输出图片标记。引用文献或笔记时给出标题即可。回复控制在手机可阅读的长度，\
 内容较多时先给结论，并提示用户可以追问细节。\
 用户可能远程发来文件：消息中会附带文件的保存路径和已提取的内容，\
-用户要求入库时可用 paper_import 导入（仅限文献 PDF），但回复中不要暴露路径。";
+用户要求入库时可用 paper_import 导入（仅限文献 PDF），但回复中不要暴露路径。\
+把本机文件发到聊天应用（send_file_to_user）只在「私聊 + 全部授权 + 管理员开启回传」时可用；\
+群聊里不可用（会广播给所有成员）。工具返回不可用时，直接把原因告诉用户并给出替代方案，\
+不要尝试用 bash 或其他工具拼凑。";
 
 /// Read-only tool set applied per-turn for members paired with the
 /// "readonly" grant (the default for group members). Group sessions are
@@ -170,6 +173,21 @@ pub fn settled_attachments_json(items: &[(OutboundFile, Option<String>)]) -> Str
     .to_string()
 }
 
+/// Rebuild one outbound attachment from its stored JSON entry.
+fn parse_outbound_file(v: &serde_json::Value) -> Option<OutboundFile> {
+    if v.get("kind").and_then(|k| k.as_str()) != Some("file") {
+        return None;
+    }
+    Some(OutboundFile {
+        path: PathBuf::from(v.get("path")?.as_str()?),
+        name: v.get("name")?.as_str()?.to_string(),
+        size: v.get("size")?.as_u64()?,
+        mime: v.get("mime").and_then(|m| m.as_str()).unwrap_or_default().to_string(),
+        sha256: v.get("sha256").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
+        caption: None,
+    })
+}
+
 /// Files persisted as `pending` — i.e. registered by a turn that is about to
 /// deliver them. A cancelled/failed turn persists `failed` instead, so this
 /// returns nothing and the router sends nothing.
@@ -179,19 +197,38 @@ pub fn pending_files_from_attachments(json: &str) -> Vec<OutboundFile> {
     };
     items
         .iter()
-        .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some("file"))
         .filter(|v| v.get("status").and_then(|s| s.as_str()) == Some("pending"))
-        .filter_map(|v| {
-            Some(OutboundFile {
-                path: PathBuf::from(v.get("path")?.as_str()?),
-                name: v.get("name")?.as_str()?.to_string(),
-                size: v.get("size")?.as_u64()?,
-                mime: v.get("mime").and_then(|m| m.as_str()).unwrap_or_default().to_string(),
-                sha256: v.get("sha256").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
-                caption: None,
-            })
-        })
+        .filter_map(parse_outbound_file)
         .collect()
+}
+
+/// One attachment by its position in the stored array (the retry command
+/// needs the same index the UI shows).
+pub fn outbound_file_at(json: &str, index: usize) -> Option<OutboundFile> {
+    let items: serde_json::Value = serde_json::from_str(json).ok()?;
+    parse_outbound_file(items.as_array()?.get(index)?)
+}
+
+/// Rewrite one attachment's delivery state in the stored JSON. Used after a
+/// manual retry succeeds. Returns `None` when the JSON or index is invalid.
+pub fn patch_attachment_status(
+    json: &str,
+    index: usize,
+    status: &str,
+    error: Option<&str>,
+) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let item = value.as_array_mut()?.get_mut(index)?;
+    item["status"] = serde_json::json!(status);
+    match error {
+        Some(e) => item["error"] = serde_json::json!(e),
+        None => {
+            if let Some(obj) = item.as_object_mut() {
+                obj.remove("error");
+            }
+        }
+    }
+    Some(value.to_string())
 }
 
 #[async_trait::async_trait]
@@ -247,6 +284,12 @@ pub trait ReplySink: Send + Sync {
     ) -> Result<(), String> {
         Ok(())
     }
+    /// Stop any transient "working" indicator started by `progress_start`.
+    /// Called after the reply AND its outbound files went out: a slow upload
+    /// must keep the typing indicator alive, so this cannot live in
+    /// `progress_finish` (docs/remote-channels.md §7.7). Default: nothing to do.
+    async fn progress_settle(&self, _chat_id: &str) {}
+
     /// The turn settled with its final reply. Return true when the channel
     /// rendered the reply into its own progress surface — the router then
     /// skips the plain-text send. Default false: plain text as usual.
@@ -737,6 +780,10 @@ async fn process_batch(
             }
         }
     }
+
+    // Only now stop the "working" indicator: during a large upload it is the
+    // single piece of feedback the phone has (§7.7).
+    sink.progress_settle(&meta.chat_id).await;
 }
 
 /// The agent persists its assistant message only when the turn ends, so a
@@ -1276,6 +1323,29 @@ mod tests {
 
         let failed = failed_attachments_json(&[sample_file("a.pdf")], "已取消");
         assert!(pending_files_from_attachments(&failed).is_empty());
+    }
+
+    /// A manual retry reads one attachment by index and flips it back to ok,
+    /// dropping the stale error so the card stops offering "重试".
+    #[test]
+    fn attachment_retry_reads_by_index_and_clears_the_error() {
+        let items = vec![
+            (sample_file("ok.pdf"), None),
+            (sample_file("bad.pdf"), Some("CDN 上传失败: HTTP 400".to_string())),
+        ];
+        let json = settled_attachments_json(&items);
+
+        let f = outbound_file_at(&json, 1).expect("indexed file");
+        assert_eq!(f.name, "bad.pdf");
+        assert!(outbound_file_at(&json, 2).is_none());
+
+        let patched = patch_attachment_status(&json, 1, "ok", None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&patched).unwrap();
+        assert_eq!(v[1]["status"], "ok");
+        assert!(v[1].get("error").is_none(), "error must be cleared");
+        assert_eq!(v[0]["status"], "ok", "other entries untouched");
+        // Only files parse; a legacy inline image yields nothing.
+        assert!(outbound_file_at(r#"[{"mime":"image/png","base64":"AA"}]"#, 0).is_none());
     }
 
     /// The settled ledger keeps per-file outcomes, and legacy user-side

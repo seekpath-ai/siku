@@ -355,9 +355,19 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
             {/* Files this reply sent to the user's chat app (remote IM only). */}
             {message.attachments && outboundFiles.length > 0 && (
               <div className="flex flex-wrap gap-2 mt-2">
-                {outboundFiles.map((att, idx) => (
-                  <FileAttachmentCard key={idx} att={att} />
-                ))}
+                {/* Map the RAW array so `index` matches the ledger entry the
+                    retry command addresses. */}
+                {parseAttachments(message.attachments).map((att, idx) =>
+                  isOutboundFile(att) ? (
+                    <FileAttachmentCard
+                      key={idx}
+                      att={att}
+                      sessionId={message.session_id}
+                      messageId={message.id}
+                      index={idx}
+                    />
+                  ) : null,
+                )}
               </div>
             )}
           </>

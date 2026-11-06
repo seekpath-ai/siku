@@ -22,6 +22,7 @@ import {
   Search,
   X,
 } from 'lucide-react';
+import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
 import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
 import {
@@ -186,8 +187,6 @@ export function AgentList() {
   const [showArchivedProjects, setShowArchivedProjects] = useState(false);
   /** Projects expanded to show their sessions inline (Codex workspace style). */
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
-  const menuRef = useRef<HTMLDivElement>(null);
-  const projectMenuRef = useRef<HTMLDivElement>(null);
   const organizeRef = useRef<HTMLDivElement>(null);
 
   // Load projects once on mount.
@@ -268,34 +267,6 @@ export function AgentList() {
     return () => document.removeEventListener('mousedown', close, true);
   }, [organizeOpen]);
 
-  // Close the agent context menu on outside click.
-  useEffect(() => {
-    if (!contextMenu.visible) return;
-    const close = (e: MouseEvent) => {
-      if (menuRef.current?.contains(e.target as Node)) return;
-      setContextMenu({ visible: false, x: 0, y: 0, agentId: '' });
-    };
-    const timer = setTimeout(() => document.addEventListener('mousedown', close, true), 0);
-    return () => {
-      clearTimeout(timer);
-      document.removeEventListener('mousedown', close, true);
-    };
-  }, [contextMenu.visible]);
-
-  // Close the project context menu on outside click.
-  useEffect(() => {
-    if (!projectMenu.visible) return;
-    const close = (e: MouseEvent) => {
-      if (projectMenuRef.current?.contains(e.target as Node)) return;
-      setProjectMenu({ visible: false, x: 0, y: 0, projectId: '' });
-    };
-    const timer = setTimeout(() => document.addEventListener('mousedown', close, true), 0);
-    return () => {
-      clearTimeout(timer);
-      document.removeEventListener('mousedown', close, true);
-    };
-  }, [projectMenu.visible]);
-
   // Archived projects/sessions hide from the default lists; they live in the
   // collapsed "已归档" sections at the bottom.
   const visibleProjects = useMemo(() => projects.filter((p) => !p.archived), [projects]);
@@ -373,6 +344,127 @@ export function AgentList() {
     e.preventDefault();
     e.stopPropagation();
     setProjectMenu({ visible: true, x: e.clientX, y: e.clientY, projectId });
+  };
+
+  /** Items of the session right-click menu. The remote (feishu) entries and
+   *  the pin/archive toggles are conditional, so this is built per open. */
+  const agentMenuItems = (agent: AgentSession): ContextMenuItem[] => {
+    const remote = remoteContextOf(agent.context);
+    const items: ContextMenuItem[] = [];
+    if (remote && remote.channel.startsWith('feishu')) {
+      if (remote.kind !== 'private') {
+        items.push({
+          label: '查看群信息',
+          icon: <Users size={14} />,
+          onClick: () =>
+            setRemoteDialog({ kind: 'info', channel: remote.channel, chatId: remote.chatId }),
+        });
+      }
+      items.push({
+        label: '查看群文件',
+        icon: <FolderOpen size={14} />,
+        onClick: () =>
+          setRemoteDialog({ kind: 'files', channel: remote.channel, chatId: remote.chatId }),
+      });
+    }
+    items.push(
+      {
+        label: agent.is_pinned ? '取消置顶' : '置顶',
+        icon: <Pin size={14} />,
+        separatorBefore: items.length > 0,
+        onClick: () => {
+          void handlePin(agent.id, !agent.is_pinned);
+        },
+      },
+      {
+        label: '个性设置',
+        icon: <Settings size={14} />,
+        onClick: () => setConfigAgent(agent),
+      },
+      {
+        label: '打开工作区',
+        icon: <FolderOpen size={14} />,
+        onClick: () => {
+          void handleOpenWorkspace(agent);
+        },
+      },
+      {
+        label: '导出会话',
+        icon: <Download size={14} />,
+        onClick: () => {
+          void handleExportSession(agent);
+        },
+      },
+      {
+        label: agent.archived ? '取消归档' : '归档',
+        icon: agent.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />,
+        onClick: () => {
+          void handleArchiveSession(agent.id, !agent.archived);
+        },
+      },
+      {
+        label: '删除',
+        icon: <Trash2 size={14} />,
+        destructive: true,
+        separatorBefore: true,
+        onClick: () => {
+          void handleDelete(agent.id);
+        },
+      },
+    );
+    return items;
+  };
+
+  /** Items of the project right-click menu. */
+  const projectMenuItems = (project: (typeof projects)[number]): ContextMenuItem[] => {
+    const items: ContextMenuItem[] = [
+      {
+        label: '打开目录位置',
+        icon: <FolderOpen size={14} />,
+        onClick: () => {
+          fileBrowserRevealInSystem(project.path).catch((err) =>
+            console.error('reveal project dir:', err)
+          );
+        },
+      },
+    ];
+    if (!project.archived) {
+      items.push(
+        {
+          label: '重命名',
+          icon: <Pencil size={14} />,
+          onClick: () => {
+            void handleRenameProject(project.id);
+          },
+        },
+        {
+          label: '创建拉取请求',
+          icon: <GitPullRequest size={14} />,
+          onClick: () => setPrProject({ id: project.id, name: project.name }),
+        },
+      );
+    }
+    items.push(
+      {
+        label: project.archived ? '取消归档' : '归档',
+        icon: project.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />,
+        onClick: () => {
+          archiveProject(project.id, !project.archived).catch((err: unknown) =>
+            console.error('archive project:', err)
+          );
+        },
+      },
+      {
+        label: '删除',
+        icon: <Trash2 size={14} />,
+        destructive: true,
+        separatorBefore: true,
+        onClick: () => {
+          void handleDeleteProject(project.id);
+        },
+      },
+    );
+    return items;
   };
 
   // Open the session's effective write directory: the bound working_dir when
@@ -893,109 +985,22 @@ export function AgentList() {
       </>
       )}
 
-      {/* Agent context menu */}
-      {contextMenu.visible && (
-        <div
-          ref={menuRef}
-          className="fixed z-[3000] min-w-[150px] rounded-lg border border-codex-border bg-codex-surface shadow-xl py-1"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
-        >
-          {(() => {
-            const agent = sessions.find((s) => s.id === contextMenu.agentId);
-            if (!agent) return null;
-            const remote = remoteContextOf(agent.context);
-            const closeMenu = () => setContextMenu({ visible: false, x: 0, y: 0, agentId: '' });
-            return (
-              <>
-                {remote && remote.channel.startsWith('feishu') && remote.kind !== 'private' && (
-                  <button
-                    onClick={() => {
-                      setRemoteDialog({ kind: 'info', channel: remote.channel, chatId: remote.chatId });
-                      closeMenu();
-                    }}
-                    className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
-                  >
-                    <Users size={14} />
-                    查看群信息
-                  </button>
-                )}
-                {remote && remote.channel.startsWith('feishu') && (
-                  <button
-                    onClick={() => {
-                      setRemoteDialog({ kind: 'files', channel: remote.channel, chatId: remote.chatId });
-                      closeMenu();
-                    }}
-                    className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
-                  >
-                    <FolderOpen size={14} />
-                    查看群文件
-                  </button>
-                )}
-                <button
-                  onClick={() => {
-                    handlePin(agent.id, !agent.is_pinned);
-                    closeMenu();
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
-                >
-                  <Pin size={14} />
-                  {agent.is_pinned ? '取消置顶' : '置顶'}
-                </button>
-                <button
-                  onClick={() => {
-                    setConfigAgent(agent);
-                    closeMenu();
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
-                >
-                  <Settings size={14} />
-                  个性设置
-                </button>
-                <button
-                  onClick={() => {
-                    void handleOpenWorkspace(agent);
-                    closeMenu();
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
-                >
-                  <FolderOpen size={14} />
-                  打开工作区
-                </button>
-                <button
-                  onClick={() => {
-                    void handleExportSession(agent);
-                    closeMenu();
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
-                >
-                  <Download size={14} />
-                  导出会话
-                </button>
-                <button
-                  onClick={() => {
-                    handleArchiveSession(agent.id, !agent.archived);
-                    closeMenu();
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
-                >
-                  {agent.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
-                  {agent.archived ? '取消归档' : '归档'}
-                </button>
-                <button
-                  onClick={() => {
-                    handleDelete(agent.id);
-                    closeMenu();
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-danger hover:bg-codex-hover"
-                >
-                  <Trash2 size={14} />
-                  删除
-                </button>
-              </>
-            );
-          })()}
-        </div>
-      )}
+      {/* Session right-click menu. Uses the shared ContextMenu (portal +
+          viewport clamp): the previous hand-rolled `fixed` div sat at the raw
+          clientY, so with a long agent list its lower items were clipped by
+          the window bottom / the sidebar's bottom section. */}
+      {contextMenu.visible && (() => {
+        const agent = sessions.find((s) => s.id === contextMenu.agentId);
+        if (!agent) return null;
+        return (
+          <ContextMenu
+            x={contextMenu.x}
+            y={contextMenu.y}
+            onClose={() => setContextMenu({ visible: false, x: 0, y: 0, agentId: '' })}
+            items={agentMenuItems(agent)}
+          />
+        );
+      })()}
 
       {/* Remote chat dialogs (feishu group info / files) */}
       {remoteDialog?.kind === 'info' && (
@@ -1013,82 +1018,19 @@ export function AgentList() {
         />
       )}
 
-      {/* Project context menu */}
-      {projectMenu.visible && (
-        <div
-          ref={projectMenuRef}
-          className="fixed z-[3000] min-w-[170px] rounded-lg border border-codex-border bg-codex-surface shadow-xl py-1"
-          style={{ left: projectMenu.x, top: projectMenu.y }}
-        >
-          {(() => {
-            const project = projects.find((p) => p.id === projectMenu.projectId);
-            if (!project) return null;
-            const closeMenu = () => setProjectMenu({ visible: false, x: 0, y: 0, projectId: '' });
-            return (
-              <>
-                <button
-                  onClick={() => {
-                    fileBrowserRevealInSystem(project.path).catch((err) =>
-                      console.error('reveal project dir:', err)
-                    );
-                    closeMenu();
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
-                >
-                  <FolderOpen size={14} />
-                  打开目录位置
-                </button>
-                {!project.archived && (
-                  <>
-                    <button
-                      onClick={() => {
-                        void handleRenameProject(project.id);
-                        closeMenu();
-                      }}
-                      className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
-                    >
-                      <Pencil size={14} />
-                      重命名
-                    </button>
-                    <button
-                      onClick={() => {
-                        setPrProject({ id: project.id, name: project.name });
-                        closeMenu();
-                      }}
-                      className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
-                    >
-                      <GitPullRequest size={14} />
-                      创建拉取请求
-                    </button>
-                  </>
-                )}
-                <button
-                  onClick={() => {
-                    archiveProject(project.id, !project.archived).catch((err) =>
-                      console.error('archive project:', err)
-                    );
-                    closeMenu();
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-secondary hover:bg-codex-hover hover:text-codex-primary"
-                >
-                  {project.archived ? <ArchiveRestore size={14} /> : <Archive size={14} />}
-                  {project.archived ? '取消归档' : '归档'}
-                </button>
-                <button
-                  onClick={() => {
-                    void handleDeleteProject(project.id);
-                    closeMenu();
-                  }}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-[13px] text-codex-danger hover:bg-codex-hover"
-                >
-                  <Trash2 size={14} />
-                  删除
-                </button>
-              </>
-            );
-          })()}
-        </div>
-      )}
+      {/* Project right-click menu — same shared component, same fix. */}
+      {projectMenu.visible && (() => {
+        const project = projects.find((p) => p.id === projectMenu.projectId);
+        if (!project) return null;
+        return (
+          <ContextMenu
+            x={projectMenu.x}
+            y={projectMenu.y}
+            onClose={() => setProjectMenu({ visible: false, x: 0, y: 0, projectId: '' })}
+            items={projectMenuItems(project)}
+          />
+        );
+      })()}
 
       {showCreate && (
         <AgentCreateDialog

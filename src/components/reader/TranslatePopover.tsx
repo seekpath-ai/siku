@@ -159,7 +159,11 @@ export function TranslatePopover({ selection, targetLang, onSave, onClose }: Tra
         left: pos?.left ?? -9999,
         top: pos?.top ?? -9999,
         visibility: pos ? 'visible' : 'hidden',
-        maxHeight: '40vh',
+        // Budget = whatever is left below the anchor, capped at 40vh: the
+        // estimated height used for the flip can be off, and on a short
+        // window the card would otherwise run past the bottom edge and hide
+        // its actions. Scrolls instead.
+        maxHeight: pos ? `min(40vh, calc(100dvh - ${pos.top + 8}px))` : '40vh',
       }}
     >
       <div className="flex items-center gap-1.5 px-3 py-2 border-b border-surface-hover">

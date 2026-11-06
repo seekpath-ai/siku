@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Copy, StickyNote, Check, Languages } from 'lucide-react';
 import type { TextSelection } from './PdfViewer';
 
@@ -44,6 +44,24 @@ export function SelectionToolbar({
 
     setPos({ left, top, flip });
   }, [selection.rect]);
+
+  // The math above uses an estimated width (the multi-segment chip makes the
+  // real toolbar wider). Measure once mounted and nudge it back inside the
+  // viewport so a selection near the right/bottom edge cannot clip it.
+  useLayoutEffect(() => {
+    const el = toolbarRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const dx = Math.max(0, r.right - (window.innerWidth - 8));
+    const dy = Math.max(0, r.bottom - (window.innerHeight - 8));
+    if (dx > 0 || dy > 0) {
+      setPos((p) => ({
+        ...p,
+        left: Math.max(8, p.left - dx),
+        top: Math.max(8, p.top - dy),
+      }));
+    }
+  }, [pos.left, pos.top, selection.rect]);
 
   // ── Dismiss on click outside ──
   useEffect(() => {

@@ -9,6 +9,7 @@ import { useTabStore } from '@/stores/tabStore';
 import { notesCreate, bookmarksCreate } from '@/lib/tauri';
 import { openNoteTab } from '@/lib/openNote';
 import { GlobalAiTasks } from './GlobalAiTasks';
+import { ContextMenu } from '@/components/ui/ContextMenu';
 
 function isTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -49,7 +50,6 @@ export function TitleBar() {
   const [tabContextMenu, setTabContextMenu] = useState<{ x: number; y: number; tabId: string } | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
   const [appVersion, setAppVersion] = useState('0.1.0');
-  const tabContextMenuRef = useRef<HTMLDivElement>(null);
   const menuBarRef = useRef<HTMLDivElement>(null);
   const helpBtnRef = useRef<HTMLButtonElement>(null);
   const helpPanelRef = useRef<HTMLDivElement>(null);
@@ -192,25 +192,6 @@ export function TitleBar() {
       if (next) navigate({ to: next.route, params: next.params, search: next.search });
     }
   }, [navigate]);
-
-  // Close the tab context menu when clicking outside.
-  useEffect(() => {
-    if (!tabContextMenu) return;
-    const onMouseDown = (e: MouseEvent) => {
-      if (tabContextMenuRef.current && !tabContextMenuRef.current.contains(e.target as Node)) {
-        setTabContextMenu(null);
-      }
-    };
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setTabContextMenu(null);
-    };
-    document.addEventListener('mousedown', onMouseDown);
-    document.addEventListener('keydown', onKeyDown);
-    return () => {
-      document.removeEventListener('mousedown', onMouseDown);
-      document.removeEventListener('keydown', onKeyDown);
-    };
-  }, [tabContextMenu]);
 
   // Keep the active tab indicator in sync with the actual route. Some
   // navigations (browser back/forward, in-page links, keyboard shortcuts)
@@ -405,12 +386,16 @@ export function TitleBar() {
             (() => {
               const rect = helpBtnRef.current!.getBoundingClientRect();
               const left = Math.min(rect.left, window.innerWidth - 300 - 8);
+              const top = rect.bottom + 6;
               return (
                 <div
                   ref={helpPanelRef}
                   data-no-drag
-                  className="fixed z-[5000] w-[300px] max-h-[70vh] overflow-y-auto bg-surface border border-surface-hover rounded-lg shadow-2xl"
-                  style={{ left, top: rect.bottom + 6 }}
+                  className="fixed z-[5000] w-[300px] overflow-y-auto bg-surface border border-surface-hover rounded-lg shadow-2xl"
+                  // Height budget = whatever is left below the anchor, capped at
+                  // 70vh: on a short window the panel used to run past the
+                  // bottom edge (its lower actions were unreachable).
+                  style={{ left, top, maxHeight: `min(70vh, calc(100dvh - ${top + 8}px))` }}
                 >
                   {/* Version */}
                   <div className="px-4 py-3 border-b border-surface-hover">
@@ -532,31 +517,21 @@ export function TitleBar() {
         </div>
       </div>
 
-      {/* Tab context menu */}
+      {/* Tab context menu — shared ContextMenu (portal + viewport clamp) so a
+          tab near the right/bottom edge cannot clip the menu. */}
       {tabContextMenu && (
-        <div
-          ref={tabContextMenuRef}
-          style={{ left: tabContextMenu.x, top: tabContextMenu.y }}
-          className="fixed z-[5000] min-w-[140px] py-1 bg-surface border border-surface-hover rounded-lg shadow-xl"
-        >
-          {[
-            { label: '关闭', action: () => runContextAction(() => close(tabContextMenu.tabId), tabContextMenu.tabId) },
-            { label: '关闭其他', action: () => runContextAction(() => closeOthers(tabContextMenu.tabId), tabContextMenu.tabId) },
-            { label: '关闭右侧', action: () => runContextAction(() => closeToRight(tabContextMenu.tabId), tabContextMenu.tabId) },
-            { label: '关闭左侧', action: () => runContextAction(() => closeToLeft(tabContextMenu.tabId), tabContextMenu.tabId) },
-            { label: '全部关闭', action: () => runContextAction(() => closeAll(), tabContextMenu.tabId) },
-          ].map((item, idx) => (
-            <button
-              key={item.label}
-              onClick={(e) => { e.stopPropagation(); item.action(); }}
-              className={`w-full text-left px-3 py-1.5 text-xs text-text-primary hover:bg-primary/20 hover:text-primary transition-colors ${
-                idx === 0 ? '' : 'border-t border-surface-hover'
-              }`}
-            >
-              {item.label}
-            </button>
-          ))}
-        </div>
+        <ContextMenu
+          x={tabContextMenu.x}
+          y={tabContextMenu.y}
+          onClose={() => setTabContextMenu(null)}
+          items={[
+            { label: '关闭', onClick: () => runContextAction(() => close(tabContextMenu.tabId), tabContextMenu.tabId) },
+            { label: '关闭其他', separatorBefore: true, onClick: () => runContextAction(() => closeOthers(tabContextMenu.tabId), tabContextMenu.tabId) },
+            { label: '关闭右侧', separatorBefore: true, onClick: () => runContextAction(() => closeToRight(tabContextMenu.tabId), tabContextMenu.tabId) },
+            { label: '关闭左侧', separatorBefore: true, onClick: () => runContextAction(() => closeToLeft(tabContextMenu.tabId), tabContextMenu.tabId) },
+            { label: '全部关闭', separatorBefore: true, onClick: () => runContextAction(() => closeAll(), tabContextMenu.tabId) },
+          ]}
+        />
       )}
 
       {/* Global AI task chips (综述 / 表格列 / 分类) — before window controls */}

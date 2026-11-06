@@ -216,6 +216,7 @@ queued(工具登记，仅内存) → pending(assistant 行落库) → ok(上传+
 - **取消**（飞书「停止生成」）：不发送文件；行已存在则标 `failed: 已取消`。用户刚点停止，再发文件是噪音。
 - **回合错误**：不发送，标 `failed: <错误>`。
 - **assistant 行写失败**（db error）：不发送，`send_text` 补一句"附件未能随回复发出"。
+- **回写后必须广播** `chat:message_updated {session_id, message_id, attachments}`：前端在 `done` 时就重载过历史（那时行里还是 `pending`），不推这条事件的话气泡会一直停在「发送中」，直到用户切标签再回来。前端在 `ChatPanel` 里按 message_id 就地补丁；行尚未加载时兜底重读一次会话。
 - 幂等：`path + size + sha256` 去重；工具被重复调用不重复发送。
 
 ### 7.5 权限与限额（安全边界）

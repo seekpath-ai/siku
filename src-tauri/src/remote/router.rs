@@ -729,7 +729,10 @@ async fn process_batch(
             if let Some(atts) = row.attachments.as_deref() {
                 let pending = pending_files_from_attachments(atts);
                 if !pending.is_empty() {
-                    deliver_outbound_files(&sink, &db, &meta.chat_id, &row.id, pending).await;
+                    deliver_outbound_files(
+                        &app, &sink, &db, &session_id, &meta.chat_id, &row.id, pending,
+                    )
+                    .await;
                 }
             }
         }
@@ -778,8 +781,10 @@ async fn wait_for_new_reply(db: &SqlitePool, session_id: &str, baseline: i64) ->
 /// final status into the assistant row. Failures are recorded per file rather
 /// than dropped: the siku conversation is the ledger (§7.4).
 async fn deliver_outbound_files(
+    app: &AppHandle,
     sink: &Arc<dyn ReplySink>,
     db: &SqlitePool,
+    session_id: &str,
     chat_id: &str,
     row_id: &str,
     files: Vec<OutboundFile>,
@@ -803,7 +808,20 @@ async fn deliver_outbound_files(
         .await
     {
         tracing::warn!(error = %e, "failed to persist outbound attachment status");
+        return;
     }
+    // The open chat panel reloaded its history when the turn ended — i.e.
+    // BEFORE these uploads ran — so it still shows `pending`. Push the
+    // settled attachments so the bubble flips to 已发送 without a manual
+    // tab switch (or a full history reload).
+    let _ = app.emit(
+        "chat:message_updated",
+        serde_json::json!({
+            "session_id": session_id,
+            "message_id": row_id,
+            "attachments": json,
+        }),
+    );
 }
 
 // ---------------------------------------------------------------- progress

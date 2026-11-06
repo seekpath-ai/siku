@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { Bot, Loader2, ArrowUp } from 'lucide-react';
 import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';
@@ -217,6 +218,46 @@ export function ChatPanel() {
       cancelled = true;
     };
   }, [activeSessionId, setMessages, setAgentSteps]);
+
+  // Outbound files settle AFTER the turn's `done` event: the router uploads
+  // them once the reply row is persisted, then rewrites the attachments. The
+  // history reload above therefore still shows 「发送中」 — patch the row in
+  // place when the backend reports the final status instead of making the
+  // user switch tabs to re-read it.
+  useEffect(() => {
+    if (!activeSessionId) return;
+    let cancelled = false;
+    let unlisten: UnlistenFn | null = null;
+    void listen<{ session_id: string; message_id: string; attachments: string }>(
+      'chat:message_updated',
+      (ev) => {
+        const p = ev.payload;
+        if (p.session_id !== activeSessionId) return;
+        const st = useChatStore.getState();
+        const msg = st.messages.find((m) => m.id === p.message_id);
+        if (msg) {
+          st.patchMessage({ ...msg, attachments: p.attachments });
+          return;
+        }
+        // The history reload is still in flight; re-read the session once so
+        // the settled row lands instead of the stale `pending` copy.
+        void getChatMessages(p.session_id, { limit: MESSAGE_PAGE_SIZE })
+          .then((page) => {
+            if (cancelled) return;
+            const cur = useChatStore.getState();
+            if (cur.activeSessionId === p.session_id) cur.setMessages(page.messages);
+          })
+          .catch(() => {});
+      },
+    ).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [activeSessionId]);
 
   const handleRename = async (title: string) => {
     if (!activeSession) return;

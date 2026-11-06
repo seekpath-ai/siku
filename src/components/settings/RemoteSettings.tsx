@@ -18,6 +18,8 @@ import {
   remoteWeixinLoginVerify,
   remoteWeixinLogout,
   remoteWeixinSendFile,
+  remoteOutboundFilesEnabled,
+  remoteOutboundFilesSet,
 } from '@/lib/tauri';
 import type { FeishuBotConfig, RemoteChannelStatus, RemotePairing, WeixinConfigInfo, WeixinQrEvent } from '@/lib/tauri';
 
@@ -80,6 +82,9 @@ export function RemoteSettings() {
   // P0 outbound-file smoke test: send one picked file straight to WeChat,
   // bypassing the agent (docs/remote-channels.md §7.9).
   const [sendTestMsg, setSendTestMsg] = useState<string | null>(null);
+  // Account-wide kill switch for "send a file from this computer to the chat
+  // app" (docs/remote-channels.md §7.5). Synced with the channel config.
+  const [allowOutbound, setAllowOutbound] = useState(true);
   const [needVerify, setNeedVerify] = useState(false);
   const [verifyCode, setVerifyCode] = useState('');
   const [loginBusy, setLoginBusy] = useState(false);
@@ -239,6 +244,18 @@ export function RemoteSettings() {
     }
   };
 
+  useEffect(() => {
+    let cancelled = false;
+    remoteOutboundFilesEnabled()
+      .then((v) => {
+        if (!cancelled) setAllowOutbound(v);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   if (loading) {
     return (
       <div className="flex items-center gap-2 text-sm text-text-secondary/60 py-6">
@@ -254,6 +271,37 @@ export function RemoteSettings() {
         <p className="text-xs text-text-secondary/60 mt-1">
           思库运行期间，通过飞书/微信机器人远程对话：查询笔记、文献，或让智能体处理任务。配置与配对随账号同步漫游，同时只有一台在线设备持有连接，其它设备自动待机。远程会话显示在主对话列表中，能力与本机对话一致，按配对成员授予「全部 / 只读」权限。
         </p>
+      </div>
+
+      {/* Outbound file kill switch: off = the agent never sees the tool. */}
+      <div className="rounded-lg border border-surface-hover bg-surface px-4 py-3 flex items-center gap-3">
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-medium text-text-primary">允许远程回传文件</div>
+          <p className="text-xs text-text-secondary/60 mt-0.5">
+            开启后，微信/飞书私聊里可以让智能体把本机文件发到手机（仅「全部」权限成员，群聊始终禁止）。关闭后该能力对所有远程会话隐藏。
+          </p>
+        </div>
+        <button
+          role="switch"
+          aria-checked={allowOutbound}
+          onClick={() => {
+            const next = !allowOutbound;
+            setAllowOutbound(next);
+            remoteOutboundFilesSet(next).catch((e) => {
+              setAllowOutbound(!next);
+              console.error('outbound files switch:', e);
+            });
+          }}
+          className={`w-9 h-5 rounded-full transition-colors shrink-0 ${
+            allowOutbound ? 'bg-primary' : 'bg-surface-hover'
+          }`}
+        >
+          <span
+            className={`block w-4 h-4 rounded-full bg-white shadow transition-transform ${
+              allowOutbound ? 'translate-x-4' : 'translate-x-0.5'
+            } mt-0.5`}
+          />
+        </button>
       </div>
 
       {/* Standby banner: another device holds the connection */}

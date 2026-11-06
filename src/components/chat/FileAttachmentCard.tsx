@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import {
   FileArchive,
@@ -10,7 +10,7 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import type { ChatAttachment } from '@/lib/types';
-import { fileBrowserOpenInSystem } from '@/lib/tauri';
+import { fileBrowserGetInfo, fileBrowserOpenInSystem } from '@/lib/tauri';
 
 function humanSize(bytes?: number): string {
   if (!bytes || bytes <= 0) return '';
@@ -46,6 +46,24 @@ export function FileAttachmentCard({ att }: { att: ChatAttachment }) {
     () => (isImage && att.path && status !== 'pending' ? convertFileSrc(att.path) : ''),
     [att.path, isImage, status],
   );
+
+  // A conversation synced from another device carries the sender's absolute
+  // path, which does not exist here. Probe once so the card reads
+  // 「文件不在此设备」instead of a broken thumbnail / dead click.
+  useEffect(() => {
+    if (!att.path || status === 'pending') return;
+    let cancelled = false;
+    fileBrowserGetInfo(att.path)
+      .then(() => {
+        if (!cancelled) setMissing(false);
+      })
+      .catch(() => {
+        if (!cancelled) setMissing(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [att.path, status]);
 
   const openFile = async () => {
     if (!att.path || missing || busy) return;

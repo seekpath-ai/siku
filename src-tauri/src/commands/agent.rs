@@ -1214,19 +1214,20 @@ pub(crate) async fn run_agent_turn(
         .and_then(|v| v.get("kind").and_then(|k| k.as_str()))
         .map(|k| k == "private")
         .unwrap_or(false);
-    // Only WeChat has an upload path today; Feishu arrives with P2, so the
-    // tool must not be advertised there and then fail every call.
-    let weixin_chat = remote_ctx
-        .as_ref()
-        .and_then(|v| v.get("channel").and_then(|c| c.as_str()))
-        .map(|c| crate::remote::router::channel_kind(c) == "weixin")
-        .unwrap_or(false);
-    if let Some(queue) = outbound.clone().filter(|_| {
-        grant_full
-            && private_chat
-            && weixin_chat
-            && crate::remote::is_remote_context(remote_context)
-    }) {
+    let remote_eligible = grant_full
+        && private_chat
+        && crate::remote::is_remote_context(remote_context);
+    // Account-wide kill switch (synced with the channel config): with it off
+    // the tool is not advertised at all, so the model cannot even try.
+    let outbound_enabled = if remote_eligible {
+        crate::core::settings_service::load_remote_config(&state.db)
+            .await
+            .map(|c| c.allow_outbound_files)
+            .unwrap_or(true)
+    } else {
+        false
+    };
+    if let Some(queue) = outbound.clone().filter(|_| remote_eligible && outbound_enabled) {
         let roots = crate::ai::agent::tools::send_file_to_user::SendFileToUserTool::default_allow_roots(
             allow_working_dir.as_deref().map(std::path::Path::new),
             &state.app_data_dir,

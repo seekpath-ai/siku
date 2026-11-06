@@ -694,7 +694,7 @@ pub struct DeviceAppSettings {
     pub remote: RemoteSettings,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RemoteSettings {
     /// Feishu bot instances. Each entry is one self-built app (app_id +
     /// app_secret); several entries may span tenants or be multiple apps in
@@ -708,6 +708,26 @@ pub struct RemoteSettings {
     pub feishu: FeishuChannelConfig,
     #[serde(default)]
     pub weixin: WeixinChannelConfig,
+    /// Account-wide switch for outbound files (this computer → chat app).
+    /// Defaults to ON for configs written before the field existed; when off,
+    /// the agent never even sees `send_file_to_user`.
+    #[serde(default = "default_true")]
+    pub allow_outbound_files: bool,
+}
+
+/// Manual Default: the outbound-file switch must start ON. A derived Default
+/// would make it `false`, so the first save of any other channel setting (bot
+/// add, WeChat login) would silently persist the feature as disabled for
+/// accounts that had no remote config row yet.
+impl Default for RemoteSettings {
+    fn default() -> Self {
+        Self {
+            feishu_bots: Vec::new(),
+            feishu: Default::default(),
+            weixin: Default::default(),
+            allow_outbound_files: true,
+        }
+    }
 }
 
 impl RemoteSettings {
@@ -1211,4 +1231,24 @@ pub struct AnnotationInput {
     pub text: Option<String>,
     pub note: Option<String>,
     pub tags: Vec<String>,
+}
+
+#[cfg(test)]
+mod remote_settings_tests {
+    use super::RemoteSettings;
+
+    /// The outbound-file switch is on unless explicitly turned off: rows
+    /// written before the field existed must keep working, and a fresh
+    /// (missing) config must not disable the feature.
+    #[test]
+    fn outbound_files_default_to_enabled() {
+        assert!(RemoteSettings::default().allow_outbound_files);
+
+        let legacy: RemoteSettings = serde_json::from_str(r#"{"feishu_bots":[],"weixin":{}}"#).unwrap();
+        assert!(legacy.allow_outbound_files, "missing field must default to true");
+
+        let off: RemoteSettings =
+            serde_json::from_str(r#"{"allow_outbound_files":false}"#).unwrap();
+        assert!(!off.allow_outbound_files, "an explicit false must stick");
+    }
 }

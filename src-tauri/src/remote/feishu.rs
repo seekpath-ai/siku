@@ -988,6 +988,18 @@ impl ReplySink for FeishuSink {
         fetch_feishu_names(&self.cfg, chat_id, user_id, kind).await
     }
 
+    async fn send_media(
+        &self,
+        chat_id: &str,
+        file: &crate::remote::router::OutboundFile,
+    ) -> Result<(), String> {
+        // Caption first, then the attachment — same order as WeChat.
+        if let Some(caption) = file.caption.as_deref().filter(|c| !c.trim().is_empty()) {
+            self.send_text(chat_id, caption).await?;
+        }
+        send_file(&self.cfg, chat_id, file).await
+    }
+
     async fn send_text(&self, chat_id: &str, text: &str) -> Result<(), String> {
         for chunk in chunk_text(text, 4000) {
             let query = feishu_sdk::api::SendMessageQuery {
@@ -1369,4 +1381,263 @@ pub(crate) async fn download_resource(
         .await
         .map_err(|e| format!("飞书文件读取失败: {e}"))?;
     Ok((bytes.to_vec(), mime))
+}
+
+// ---------------------------------------------------------------- outbound media
+// Two upload endpoints, then one message:
+//   image → POST /open-apis/im/v1/images  (image_type=message) → image_key
+//   other → POST /open-apis/im/v1/files   (file_type + file_name) → file_key
+//   send  → POST /open-apis/im/v1/messages?receive_id_type=chat_id (msg_type=image|file)
+//
+// The multipart body is assembled by hand: reqwest's `multipart` feature would
+// pull extra crates for two endpoints, and the body here is fixed-shape.
+
+/// Feishu's own limits (they reject anything larger with a code we surface).
+const FEISHU_MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+const FEISHU_MAX_FILE_BYTES: u64 = 30 * 1024 * 1024;
+/// Transport/5xx attempts. 4xx never retries (bad payload stays bad).
+const UPLOAD_ATTEMPTS: usize = 2;
+
+/// `file_type` is a closed enum on the Feishu side; anything unknown is
+/// uploaded as a generic `stream` attachment.
+fn feishu_file_type(name: &str) -> &'static str {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "opus" => "opus",
+        "mp4" | "mov" | "webm" | "mkv" | "avi" => "mp4",
+        "pdf" => "pdf",
+        "doc" | "docx" => "doc",
+        "xls" | "xlsx" => "xls",
+        "ppt" | "pptx" => "ppt",
+        _ => "stream",
+    }
+}
+
+/// ASCII-only fallback for the part header. The real (possibly Chinese) name
+/// travels in the `file_name` form field, which is what Feishu uses.
+fn ascii_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    if cleaned.trim_matches('_').is_empty() {
+        "file".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn multipart_body(
+    boundary: &str,
+    fields: &[(&str, &str)],
+    file_field: &str,
+    filename: &str,
+    mime: &str,
+    bytes: &[u8],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(bytes.len() + 1024);
+    for (key, value) in fields {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
+}
+
+/// POST one multipart body; retries transport errors and 5xx.
+async fn upload_multipart(
+    token: &str,
+    url: &str,
+    content_type: &str,
+    body: Vec<u8>,
+) -> Result<serde_json::Value, String> {
+    let http = reqwest::Client::new();
+    let mut last_err = String::new();
+    for attempt in 1..=UPLOAD_ATTEMPTS {
+        let request = http
+            .post(url)
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body.clone())
+            .timeout(std::time::Duration::from_secs(120));
+        match request.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if status.is_success() {
+                    return serde_json::from_str(&text)
+                        .map_err(|e| format!("飞书上传响应解析失败: {e}"));
+                }
+                last_err = format!(
+                    "飞书上传失败: HTTP {status} {}",
+                    text.chars().take(200).collect::<String>()
+                );
+                if status.is_client_error() {
+                    return Err(last_err);
+                }
+            }
+            Err(e) => last_err = format!("飞书上传失败: {e}"),
+        }
+        if attempt < UPLOAD_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+    Err(last_err)
+}
+
+/// Send one local file (image / video / document) to a Feishu chat.
+pub(crate) async fn send_file(
+    cfg: &FeishuBotConfig,
+    chat_id: &str,
+    file: &crate::remote::router::OutboundFile,
+) -> Result<(), String> {
+    let bytes = tokio::fs::read(&file.path)
+        .await
+        .map_err(|e| format!("读取文件失败（{}）: {e}", file.name))?;
+    if bytes.is_empty() {
+        return Err("文件为空，未发送".to_string());
+    }
+    let is_image = file.mime.starts_with("image/");
+    let limit = if is_image { FEISHU_MAX_IMAGE_BYTES } else { FEISHU_MAX_FILE_BYTES };
+    if bytes.len() as u64 > limit {
+        return Err(format!(
+            "文件过大（{}MB，飞书上限 {}MB）",
+            bytes.len() / (1024 * 1024),
+            limit / (1024 * 1024)
+        ));
+    }
+
+    let token = tenant_token(cfg).await?;
+    let boundary = format!("siku-{}", uuid::Uuid::new_v4().simple());
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+
+    let (msg_type, key_field, key) = if is_image {
+        let body = multipart_body(
+            &boundary,
+            &[("image_type", "message")],
+            "image",
+            &ascii_filename(&file.name),
+            &file.mime,
+            &bytes,
+        );
+        let resp = upload_multipart(
+            &token,
+            "https://open.feishu.cn/open-apis/im/v1/images",
+            &content_type,
+            body,
+        )
+        .await?;
+        let data = feishu_data(&resp, "上传图片")?;
+        let key = data
+            .get("image_key")
+            .and_then(|k| k.as_str())
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| "飞书上传图片未返回 image_key".to_string())?
+            .to_string();
+        ("image", "image_key", key)
+    } else {
+        let body = multipart_body(
+            &boundary,
+            &[
+                ("file_type", feishu_file_type(&file.name)),
+                ("file_name", &file.name),
+            ],
+            "file",
+            &ascii_filename(&file.name),
+            &file.mime,
+            &bytes,
+        );
+        let resp = upload_multipart(
+            &token,
+            "https://open.feishu.cn/open-apis/im/v1/files",
+            &content_type,
+            body,
+        )
+        .await?;
+        let data = feishu_data(&resp, "上传文件")?;
+        let key = data
+            .get("file_key")
+            .and_then(|k| k.as_str())
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| "飞书上传文件未返回 file_key".to_string())?
+            .to_string();
+        ("file", "file_key", key)
+    };
+
+    let resp: serde_json::Value = reqwest::Client::new()
+        .post("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id")
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "receive_id": chat_id,
+            "msg_type": msg_type,
+            "content": serde_json::json!({ key_field: key }).to_string(),
+        }))
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| format!("飞书发送文件消息失败: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("飞书发送文件消息响应解析失败: {e}"))?;
+    feishu_data(&resp, "发送文件消息")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::{ascii_filename, feishu_file_type, multipart_body};
+
+    #[test]
+    fn file_type_maps_extensions_to_feishu_enum() {
+        assert_eq!(feishu_file_type("a.pdf"), "pdf");
+        assert_eq!(feishu_file_type("A.DOCX"), "doc");
+        assert_eq!(feishu_file_type("b.xlsx"), "xls");
+        assert_eq!(feishu_file_type("c.pptx"), "ppt");
+        assert_eq!(feishu_file_type("d.mov"), "mp4");
+        assert_eq!(feishu_file_type("e.zip"), "stream");
+        assert_eq!(feishu_file_type("noext"), "stream");
+    }
+
+    /// The part header must stay ASCII (some servers reject raw UTF-8 in
+    /// `filename`); the real name rides the `file_name` field.
+    #[test]
+    fn ascii_filename_keeps_extension_and_falls_back() {
+        assert_eq!(ascii_filename("论文.pdf"), "__.pdf");
+        assert_eq!(ascii_filename("报告 2026.docx"), "___2026.docx");
+        assert_eq!(ascii_filename("图.png"), "_.png");
+        assert_eq!(ascii_filename("中文名"), "file");
+    }
+
+    /// Byte-exact shape: two text fields, then the binary part, closed by the
+    /// boundary. Guards against a missing `\r\n` breaking the whole upload.
+    #[test]
+    fn multipart_body_has_well_formed_parts() {
+        let body = multipart_body(
+            "B",
+            &[("file_type", "pdf"), ("file_name", "论文.pdf")],
+            "file",
+            "_.pdf",
+            "application/pdf",
+            b"DATA",
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.starts_with("--B\r\nContent-Disposition: form-data; name=\"file_type\"\r\n\r\npdf\r\n"));
+        assert!(text.contains("name=\"file\"; filename=\"_.pdf\"\r\nContent-Type: application/pdf\r\n\r\nDATA\r\n"));
+        assert!(text.ends_with("--B--\r\n"));
+    }
 }

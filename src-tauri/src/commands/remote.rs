@@ -395,6 +395,28 @@ pub async fn remote_chat_file_import(
     result
 }
 
+/// Read the account-wide outbound-file switch.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn remote_outbound_files_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(crate::core::settings_service::load_remote_config(&state.db)
+        .await?
+        .allow_outbound_files)
+}
+
+/// Toggle the account-wide outbound-file switch (synced with the channel
+/// config, so every device of the account follows it).
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn remote_outbound_files_set(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut cfg = crate::core::settings_service::load_remote_config(&state.db).await?;
+    cfg.allow_outbound_files = enabled;
+    crate::core::settings_service::save_remote_config(&state.db, &cfg).await
+}
+
 /// P0 smoke test for outbound WeChat media (docs/remote-channels.md §7.9):
 /// send one local file over the stored binding, bypassing the agent. Used to
 /// verify `getuploadurl` + CDN upload against a real account before the

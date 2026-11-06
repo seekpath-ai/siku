@@ -2985,6 +2985,15 @@ export async function remoteChatFileSave(
   return invoke<void>('remote_chat_file_save', { channel, messageId, fileKey, kind, savePath });
 }
 
+/** Account-wide switch for outbound files (computer → chat app). */
+export async function remoteOutboundFilesEnabled(): Promise<boolean> {
+  return invoke<boolean>('remote_outbound_files_enabled');
+}
+
+export async function remoteOutboundFilesSet(enabled: boolean): Promise<void> {
+  return invoke<void>('remote_outbound_files_set', { enabled });
+}
+
 /**
  * P0 smoke test for WeChat outbound media: send one local file over the stored
  * binding (no agent turn). Omit `chatId` to target the most recent approved

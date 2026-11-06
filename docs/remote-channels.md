@@ -1,6 +1,6 @@
 # 思库远程接入（飞书 + 微信ClawBot）实施方案
 
-> 状态：阶段一（飞书）、阶段二（微信ClawBot）已实现并真机实测通过（d35dd95：rustls CryptoProvider、飞书事件字段全拼 `message_type`/`message_id`、回复抢跑、微信回发容错）。方案已与用户确认：远程会话出现在主对话列表；群聊默认"仅 @响应 + 白名单"；任务触发暂不做，只做查询类。**阶段四（出站文件回传）P0/P1 已实现并真机实测通过（微信私聊）；P2（飞书）/P3（边界场景）未完成，见 §7。微信工作状态改用原生 typing（已实现并真机验证，见 §9）。**
+> 状态：阶段一（飞书）、阶段二（微信ClawBot）已实现并真机实测通过（d35dd95：rustls CryptoProvider、飞书事件字段全拼 `message_type`/`message_id`、回复抢跑、微信回发容错）。方案已与用户确认：远程会话出现在主对话列表；群聊默认"仅 @响应 + 白名单"；任务触发暂不做，只做查询类。**阶段四（出站文件回传）P0/P1 已真机实测通过（微信私聊）；P2（飞书上传）/P3（边界场景）已实现、待真机，见 §7。微信工作状态改用原生 typing（已真机验证，见 §9）；微信工具进度行明确不做。**
 
 ## 1. 目标与边界
 
@@ -85,7 +85,7 @@ CREATE TABLE remote_chats (           -- 同步表（OPTIONAL_SYNC_TABLES）：�
 | 二 | 微信 iLink 客户端（登录/轮询/发送）+ 二维码登录 UI | ✅ 445f2ab | 中：协议漂移 |
 | 实测修复 | rustls CryptoProvider、飞书字段全拼、回复抢跑、微信回发容错 | ✅ d35dd95 | — |
 | 三 | 按人配对、消息排队、入站媒体、群信息/群文件、进度面（详见下方 backlog） | ✅ 见 backlog | — |
-| 四 | 出站文件回传（微信 CDN 上行 + 附件账本 + 思库侧渲染） | ✅ P0/P1 真机实测通过（微信私聊），飞书待 P2 | — |
+| 四 | 出站文件回传（微信 CDN + 飞书上传 + 附件账本 + 思库侧渲染） | ✅ P0/P1 真机通过；P2/P3 已实现待真机 | 低：飞书上传为固定形状 multipart |
 
 **阶段三 backlog（优先级从高到低）**：
 
@@ -100,17 +100,17 @@ CREATE TABLE remote_chats (           -- 同步表（OPTIONAL_SYNC_TABLES）：�
 5. **媒体消息**：✅ 已实现入站侧——
    - 飞书图片：`resources` 下载 → base64 → 视觉输入（`run_agent_turn` attachments，模型不支持视觉时回明确错误）；图文混排（post）：段落标签解析，text/a 段拼文本、at 段保留"@名字"上下文（机器人自身 mention 剔除）、img 段逐张下载进视觉输入（多图支持）；**文件**：`resolve_file_media` 落盘并统一归置 `remote_downloads/` → 走正常 agent 回合，回合文本携带保存路径 + `read_document_text` 提取的内容（与本地对话附件同一管线，超限自动缓存并分页）；**不自动导入**——用户要求入库时 agent 自行用 `paper_import`（仅文献 PDF）；落盘失败回执引导手动处理；其它类型（语音/视频/表情）回不支持提示（仍受群@策略约束）。
    - 微信图片/文件：CDN 下载（`full_url` 优先，否则 `encrypt_query_param` 拼 `novac2c.cdn.weixin.qq.com/c2c/download`）+ AES-128-ECB 解密（密钥两种编码：base64(raw16) / base64(hex32)，图片另有 aeskey hex 优先；RustCrypto `aes` 纯 Rust 实现）；图片进视觉输入，文件落盘 `remote_downloads/`（路径存 MediaRef.file_key）后同样只提文本注入回合（d05fd90 起**不再自动导入文献库**，`weixin.rs` 里"router auto-imports PDFs"的注释是旧描述）。**语音**：直接读 `voice_item.text`（微信服务端自动转写，官方插件同路径），无需 silk 解码；无转写结果时回执引导发文字。
-   - 出站媒体（电脑 → 手机）：方案见 §7，未实现。另未做：飞书卡片远程审批。
+   - 出站媒体（电脑 → 手机）：✅ 微信私聊真机通过，飞书上传已实现（待真机），方案见 §7。另未做：飞书卡片远程审批。
 6. **工作状态展示**：✅ 已实现——
    - **共用进度管线**（`router.rs`）：回合开始挂 `app.listen("agent:event")` 按 session_id 过滤，聚合 `RemoteProgress`（工具行动态含耗时、流式正文/推理摘要、计时），2s 节流推 `ReplySink::progress_update`；`progress_start`/`progress_finish` 负责建/收，finish 返回 true 时跳过纯文本补发。
    - **飞书活卡片**：interactive 卡片 + `PATCH /im/v1/messages/{id}` 原地更新。回合开始发卡（问题摘要+计时）→ 工具行实时追加（中文化标签：阅读文献/检索文献库/联网搜索…，完成打勾+耗时）→ 流式正文预览 → 完成 PATCH 为 ✅ 绿卡（正文+用时+工具数）/失败红卡；>2500 字降级"分条发送"。卡片创建失败自动回退纯文本。
    - **微信进度面 = 原生 typing**：✅ 已实现——4s「收到，正在思考…」/ 15s「还在处理中…」两条延迟文本回执已下线（iLink 无消息编辑端点，每条回执都是独立气泡，长回合刷屏）。改为 `POST /ilink/bot/sendtyping`（status 1/2），`typing_ticket` 由 `/ilink/bot/getconfig` 下发并按 chat 内存缓存 12h；回合开始立刻置位 + **5s 心跳**续期，`progress_finish` 发 CANCEL。取不到 ticket / 发送失败一律**静默**，不回退文本。细节见 §9。
    - 二期候选：思考过程折叠展示。✅ 已实现卡片按钮回调（`card.action.trigger` 回调，需在控制台「回调订阅」添加并长连接接收）：运行中卡片带「停止生成」（取消 agent 回合）、完成/失败卡片带「重新生成/重试」（原提示词经 enqueue 重跑一轮，旧卡标记"已重试 ↻"，`retried` 标志防连点/重投重复开回合）、有推理内容时带「思考过程」展开/收起（按钮 value 带目标态幂等设置，防 at-least-once 重投双翻转）；**三个按钮全部走"应答内返回卡片"**（`EventResp` body 携带 `{"card":{"type":"raw","data":...}}`，平台收到立即渲染，零额外 PATCH、无应答超时重发窗口、状态与界面不脱节）；旧卡点击按 message_id 防串。
-7. **出站文件回传（电脑 → 手机）**：✅ P0/P1 已真机实测通过——实施细节与剩余项见 §7。微信私聊可用；飞书（P2）与边界场景（P3）待做。
+7. **出站文件回传（电脑 → 手机）**：✅ 微信私聊真机通过；飞书上传与边界场景已实现（待真机）。实施细节见 §7。
 
 ## 7. 出站文件回传（电脑 → 手机）实施方案
 
-> 状态：**P0 + P1 已实现并真机实测通过（微信私聊）**：图片/PDF 发送正常，对话侧附件卡与手机端一致；代码另通过 `cargo check` / `tsc --noEmit` / eslint 与单元测试。飞书（P2）与边界场景（P3）未实现。
+> 状态：**P0/P1 已真机实测通过（微信私聊）**：图片/PDF 发送正常，对话侧附件卡与手机端一致。**P2（飞书上传）与 P3（边界场景）已实现**，代码通过 `cargo check` / `tsc --noEmit` / eslint 与单元测试，飞书侧待真机（需要一个自建应用 + 测试群）。
 >
 > 目标：把"思库所在电脑上的文件发到用户微信/飞书"做成第一类能力，并让思库对话与 IM 侧**语义一致**（不追求像素一致——同一个人在手机上是文件气泡、在思库是本机文件卡，这不叫不一致）。
 
@@ -190,6 +190,21 @@ body = AES-128-ECB + PKCS7(明文, aeskey)
 - `filesize` 算错（未按 PKCS7 填充）会被服务端拒或对方解密失败。
 - 单文件上限：插件默认 25MB（`maxSingleMediaBytes`），服务端真实上限待实测。
 
+### 7.2b 飞书上行（已实现）
+
+两个上传端点 + 一条消息，均为 `Authorization: Bearer <tenant_access_token>`：
+
+| 类型 | 上传 | 发送 |
+|---|---|---|
+| 图片 | `POST /open-apis/im/v1/images`，multipart：`image_type=message` + `image` | `msg_type=image`，`content={"image_key":…}` |
+| 文件 | `POST /open-apis/im/v1/files`，multipart：`file_type` + `file_name` + `file` | `msg_type=file`，`content={"file_key":…}` |
+
+- `file_type` 是飞书的封闭枚举：`opus/video→mp4/pdf/doc/xls/ppt/stream`（`feishu_file_type()`）。
+- multipart **手工拼装**：reqwest 的 `multipart` feature 会引入额外依赖，而这里只有固定两个字段 + 一个文件段，不值得。
+- part 头的 `filename` 用 ASCII 兜底（`ascii_filename()`），真实中文名走 `file_name` 表单字段——飞书以该字段为准。
+- 上限：文件 30MB、图片 10MB（飞书侧）；工具侧统一 25MB 先拦一道。
+- 传输错误/5xx 重试 2 次，4xx 直接失败；错误码经 `feishu_data()` 转成可读信息（"请确认权限已开通并已发布版本"）。
+
 ### 7.3 数据结构（attachments 判别联合）
 
 ```jsonc
@@ -202,7 +217,7 @@ body = AES-128-ECB + PKCS7(明文, aeskey)
 ```
 
 - 无 `kind` 字段的老行按"用户侧内联图片"处理，`parseAttachments` 保持向后兼容。
-- `path` 是设备本地路径（文件落 `app_data_dir/remote_outbox/<uuid>_<name>`，与入站 `remote_downloads/` 对称）；跨设备同步后文件不存在 → 卡片灰化 + "文件仅存在于发送设备"。
+- `path` 是设备本地路径，**发送的是原文件、不复制**（`remote_outbox/` 只是允许读取的根目录之一，供 agent 自己产出的文件放置）；跨设备同步后文件不存在 → 卡片灰化 + "文件不在此设备"。
 - 不存 base64 → 其它设备不承担文件体积；也意味着**siku 侧只能看到元数据**，这是刻意的取舍。
 
 ### 7.4 状态机与取消/失败策略
@@ -221,7 +236,8 @@ queued(工具登记，仅内存) → pending(assistant 行落库) → ok(上传+
 
 ### 7.5 权限与限额（安全边界）
 
-- 注册条件（已实现于 `run_agent_turn`）：`is_remote_context(context) && grant_full && context.kind == "private" && channel_kind == "weixin"`。**群聊一律拒发**——远程会话按 chat 共享（同群已配对成员共用一个 `session_id`），发文件等于广播给全群；且成员授权可被单独升到 full（`RemoteSettings.tsx`），所以授权级别兜不住这一层。`weixin` 这一条是过渡闸门：飞书上传（P2）落地前不注册该工具，否则每次调用都只会得到"渠道不支持"的失败卡。
+- 注册条件（已实现于 `run_agent_turn`）：`is_remote_context(context) && grant_full && context.kind == "private" && remote_config.allow_outbound_files`（渠道不限，微信/飞书都支持上传）。**群聊一律拒发**——远程会话按 chat 共享（同群已配对成员共用一个 `session_id`），发文件等于广播给全群；且成员授权可被单独升到 full（`RemoteSettings.tsx`），所以授权级别兜不住这一层。
+- **总开关**「允许远程回传文件」存 `remote_config.allow_outbound_files`（随账号同步，`RemoteSettings` 手写 `Default` 保证缺省为开，历史 JSON 无该字段也按开处理）。关闭后工具**根本不注册**，模型看不到、也调不到。
 - `readonly` 授权不注册该工具（`READONLY_TOOLS_JSON` 不含它）。
 - 路径白名单：会话工作区、`remote_downloads/`、`remote_outbox/`、桌面/下载/文档目录；拒绝 `~/.ssh`、浏览器 profile、应用数据目录等敏感路径。
 - 限额：单文件 ≤25MB；每回合 ≤5 个、合计 ≤50MB。
@@ -252,14 +268,14 @@ Rust：
 3. ✅ `commands/agent.rs`：`run_agent_turn` 增 `outbound` 参数（4 处调用点同步）；assistant 行按回合终态写 `pending` / `failed`；错误分支同样记录。
 4. ✅ `ai/agent/tools/send_file_to_user.rs`（新）：白名单（工作区/remote_downloads/remote_outbox/桌面/下载/文档）、25MB/5 个/50MB 限额、sha256 去重、只 push 队列；3 个单测。
 5. ✅ `Cargo.toml`：`md-5 = "0.10"`（lock 已有，无新下载）。
-6. ⬜ `remote/feishu.rs`：`send_media`（`im/v1/files` / `im/v1/images` 上传 → 发 `file`/`image` 消息）——P2。
+6. ✅ `remote/feishu.rs`：`send_media`（`im/v1/files` / `im/v1/images` 上传 → 发 `file`/`image` 消息），手工 multipart + 2 次重试；3 个单测（file_type 映射 / ASCII 文件名 / multipart 字节形状）。
 
 前端：
 
 7. ✅ `lib/types.ts`：attachments 判别联合（`kind`、`size`、`path`、`status`、`error`；`base64` 转可选）。
 8. ✅ `MessageBubble.tsx`：assistant 分支渲染附件卡（用户侧仍只渲染内联图片，`AttachmentImage` 兼容无 base64 的行）。
 9. ✅ `components/chat/FileAttachmentCard.tsx`：图标/大小/状态（发送中·已发送到手机·发送失败+原因）、图片缩略图（asset 协议）、点击用系统程序打开、跨设备缺文件时提示"文件不在此设备"。
-10. 🟡 `RemoteSettings.tsx`：P0 冒烟按钮「发送文件到微信」已加（选文件→直发最近配对的微信会话）；「允许远程回传文件」总开关待 P3（当前由授权级别 + 私聊 + weixin 三重条件隐式控制）。
+10. ✅ `RemoteSettings.tsx`：P0 冒烟按钮「发送文件到微信」+「允许远程回传文件」总开关（命令 `remote_outbound_files_enabled/set`，随账号同步）；`FileAttachmentCard` 挂载时用 `file_browser_get_info` 探测文件是否存在，跨设备直接显示「文件不在此设备」。
 
 ### 7.9 分阶段与验收
 
@@ -267,8 +283,8 @@ Rust：
 |---|---|---|---|
 | P0 | 微信协议冒烟：设置页扫描件直发（`remote_weixin_send_file`，不走 agent） | ✅ 真机通过 | `getuploadurl` 对现有 bot token 放行 |
 | P1 | `send_file_to_user` + 队列 + 附件账本 + 思库侧渲染 | ✅ 真机通过 | 手机收到文件，对话出现附件卡且状态 `ok` |
-| P2 | 飞书 `send_media` | ⬜ 未开始 | 飞书私聊能收到文件；群聊被明确拒绝 |
-| P3 | 失败/取消/限额/跨设备灰化 +「允许远程回传文件」总开关 | 🟡 校验与状态机已实现，UI 开关待做 | 断网、超限、点停止、切设备四种场景状态正确 |
+| P2 | 飞书 `send_media`（图片 `im/v1/images`、文件 `im/v1/files`） | ✅ 代码就绪，⬜ 待真机 | 飞书私聊能收到图片与 PDF；群聊被拒（工具不注册） |
+| P3 | 超限/上传中断/停止生成/群聊拒发/跨设备灰化/总开关 | ✅ 已实现，⬜ 待真机 | 断网、超限、点停止、切设备四种场景状态正确 |
 
 风险：
 
@@ -309,11 +325,12 @@ Rust：
 | 优先级 | 方案 | 形态 | 备注 |
 |---|---|---|---|
 | **P1 ✅ 已实现并真机验证** | typing 心跳：`fetch_typing_ticket()` + `send_typing()`；`progress_start` 起后台任务（首次立即置位，之后 5s 续期），`progress_finish` 中止任务 + 发 CANCEL | 零消息噪音（手机顶部"正在输入…"） | ticket 用**进程内** `TypingCache` 缓存（按 chat，12h TTL，空 ticket 也缓存=「该 bot 不支持」），不写同步表；失败全程静默 |
-| P2 | 工具进度行 11/12，**聚合式追加**：不发 start，只在每 3~5s 或每完成一步时发一条汇总（"已完成 3 步：检索文献库 / 阅读文献 / 联网搜索"），仅统计耗时 ≥800ms 的工具 | 追加消息，数量受控 | 复用 router 已聚合的 `RemoteProgress.actions`（与飞书卡片同源）；配设置开关 |
+| P2 | 工具进度行 11/12 | — | **明确不做**（2026-11 决策）：iLink 无消息编辑端点，进度项只能追加，一个多工具回合就是一片气泡；typing 已足够表达"在工作"，逐工具直播性价比低 |
 | P3 ✅ | 回执收敛 | — | 已随下线完成（不再有任何"正在思考"文本） |
 
 ### 9.4 验证方式
 
 - 真机发一条会跑 >10s 的请求，观察微信聊天顶部是否出现"对方正在输入…"，并在回复到达后消失
 - typing 失败（ticket 为空）时应当**完全静默**，不得回退成文本回执
-- 若 P2 落地：确认一次多工具回合的气泡数量 ≤3 条
+- 工具进度行不做，因此微信侧一次回合**只应产生：可选说明文字 + 附件 + 最终回复**，不应出现任何工具行气泡
+

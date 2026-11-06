@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Check, FolderOpen, Loader2, RefreshCw } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { settingsAppGet, settingsAppSave } from '@/lib/tauri';
 import { useDialog } from '@/hooks/useDialog';
 
@@ -29,6 +30,44 @@ interface ImportSummary {
   dest: string;
 }
 
+type ImportScope = 'slim' | 'site' | 'full';
+
+/** Mirrors the backend's `ImportProgress` (browser:import-progress). */
+interface ImportProgress {
+  scope: string;
+  phase: 'scanning' | 'copying' | 'done';
+  files: number;
+  bytes: number;
+  total_files: number;
+  total_bytes: number;
+  current: string;
+}
+
+const SCOPES: { id: ImportScope; name: string; desc: string }[] = [
+  {
+    id: 'slim',
+    name: '精简（登录态）',
+    desc: 'Cookies、密码、扩展及其配置。通常几 MB，绝大多数登录够用',
+  },
+  {
+    id: 'site',
+    name: '完整站点数据',
+    desc: '精简 + IndexedDB / Service Worker / WebStorage。部分 SaaS、云笔记的登录态存在这里',
+  },
+  {
+    id: 'full',
+    name: '全量（含缓存与历史）',
+    desc: '整个 profile 原样复制，可能数 GB、耗时数分钟；历史与缓存也会带过去',
+  },
+];
+
+function formatBytes(n: number): string {
+  if (n >= 1024 * 1024 * 1024) return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
+
 /** 浏览器自动化设置：browser_* 工具使用的浏览器路径与默认连接模式。 */
 export function BrowserSettings() {
   const { alert, confirm } = useDialog();
@@ -44,6 +83,8 @@ export function BrowserSettings() {
   const [sourceSel, setSourceSel] = useState('');
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<string | null>(null);
+  const [scope, setScope] = useState<ImportScope>('slim');
+  const [progress, setProgress] = useState<ImportProgress | null>(null);
 
   const detect = useCallback(() => {
     invoke<string>('browser_detect')
@@ -115,18 +156,32 @@ export function BrowserSettings() {
     const profile = sourceSel.slice(sep + 2);
     const dest = profileDir.trim() || sources?.default_profile_dir || '';
     if (!dest) return;
+    const scopeHint =
+      scope === 'full'
+        ? '全量复制会把缓存与历史一并带过去，可能数 GB、耗时数分钟。'
+        : scope === 'site'
+          ? '将额外复制 IndexedDB / Service Worker 等站点数据（不含缓存与历史）。'
+          : '仅复制登录态与扩展（不含站点数据库、缓存与历史）。';
     const ok = await confirm(
-      '将覆盖目的位置的现有登录数据，且来源浏览器需已完全退出（含后台进程）。继续导入？',
+      `${scopeHint}目的位置的同名文件会被覆盖，且来源浏览器需已完全退出（含后台进程）。继续导入？`,
       '导入登录态与扩展',
     );
     if (!ok) return;
     setImporting(true);
     setImportResult(null);
+    setProgress(null);
+    // Live counter while the copy runs: a full profile is a multi-GB, multi-
+    // minute operation that would otherwise look like a frozen dialog.
+    let unlisten: UnlistenFn | null = null;
     try {
+      unlisten = await listen<ImportProgress>('browser:import-progress', (e) => {
+        setProgress(e.payload);
+      });
       const s = await invoke<ImportSummary>('browser_profile_import', {
         sourceRoot: root,
         profile,
         dest,
+        scope,
       });
       const mb = (s.bytes / 1024 / 1024).toFixed(1);
       setImportResult(
@@ -136,9 +191,10 @@ export function BrowserSettings() {
       setImportResult(null);
       alert(String(err), '导入失败');
     } finally {
+      unlisten?.();
       setImporting(false);
     }
-  }, [sourceSel, profileDir, sources, confirm, alert]);
+  }, [sourceSel, profileDir, sources, confirm, alert, scope]);
 
   const effectiveDir = profileDir.trim() || sources?.default_profile_dir || '';
 
@@ -221,9 +277,36 @@ export function BrowserSettings() {
       <div className="px-4 py-3 bg-surface border border-surface-hover rounded-xl space-y-2">
         <div className="text-sm font-medium text-text-primary">导入登录态与扩展</div>
         <p className="text-[11px] text-text-secondary/70 leading-relaxed">
-          把日常浏览器的 Cookies、密码、扩展及其配置（含代理插件）搬进持久配置——跳过缓存与历史，
-          体积远小于完整复制。导入前请完全退出来源浏览器（含后台进程）。
+          把日常浏览器的登录态搬进持久配置。先选范围再导入；导入前请完全退出来源浏览器（含后台进程）。
+          选好的目的目录如果本身已是一份完整配置，<span className="text-text-primary">选定即生效，无需导入</span>。
         </p>
+        <div className="space-y-1.5">
+          {SCOPES.map((opt) => (
+            <label
+              key={opt.id}
+              className={`flex items-start gap-2 px-2.5 py-2 rounded-lg border cursor-pointer transition-colors ${
+                scope === opt.id
+                  ? 'border-primary/60 bg-primary/5'
+                  : 'border-surface-hover hover:bg-surface-hover/40'
+              }`}
+            >
+              <input
+                type="radio"
+                name="browser-import-scope"
+                className="mt-0.5 accent-primary"
+                checked={scope === opt.id}
+                onChange={() => setScope(opt.id)}
+                disabled={importing}
+              />
+              <span className="min-w-0">
+                <span className="block text-xs text-text-primary">{opt.name}</span>
+                <span className="block text-[10px] text-text-secondary/60 leading-relaxed">
+                  {opt.desc}
+                </span>
+              </span>
+            </label>
+          ))}
+        </div>
         {sources && sources.sources.length > 0 ? (
           <select
             value={sourceSel}
@@ -276,6 +359,37 @@ export function BrowserSettings() {
           </button>
           {importing && <Loader2 size={13} className="animate-spin text-text-secondary" />}
         </div>
+        {importing && progress && (() => {
+          const pct =
+            progress.total_bytes > 0
+              ? Math.min(100, Math.round((progress.bytes / progress.total_bytes) * 100))
+              : 0;
+          return (
+            <div className="space-y-1" data-testid="browser-import-progress">
+              <div className="h-1.5 rounded-full bg-surface-hover overflow-hidden">
+                <div
+                  className="h-full bg-primary transition-[width] duration-200"
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+              <div className="flex items-center justify-between text-[10px] text-text-secondary/70">
+                <span>
+                  {progress.phase === 'scanning'
+                    ? '正在扫描来源目录…'
+                    : `复制中 · ${progress.files}/${progress.total_files} 文件`}
+                  {' · '}
+                  {formatBytes(progress.bytes)} / {formatBytes(progress.total_bytes)}
+                </span>
+                <span>{pct}%</span>
+              </div>
+              {progress.current && (
+                <div className="text-[10px] text-text-secondary/50 truncate" title={progress.current}>
+                  {progress.current}
+                </div>
+              )}
+            </div>
+          );
+        })()}
         {importResult && <p className="text-[11px] text-accent leading-relaxed">{importResult}</p>}
       </div>
 
@@ -293,7 +407,7 @@ export function BrowserSettings() {
           追加给思库启动的浏览器（持久/临时模式），下次连接时生效；带空格的路径用双引号括起。
           常用于 <span className="font-mono">--proxy-server</span> 指定代理、
           <span className="font-mono">--load-extension</span> 加载本地扩展。
-          attach 模式无效（由你自己的启动命令决定）。
+          attach 模式无效。
         </p>
       </div>
     </div>

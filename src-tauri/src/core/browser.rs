@@ -12,16 +12,18 @@
 //! - **Attach**: connects to a browser the user started with
 //!   `--remote-debugging-port`; siku must never close that browser.
 //!
-//! Launched children are closed gracefully on shutdown; chromiumoxide also
-//! sets `kill_on_drop`, so even an abort-path process exit cannot leave an
-//! orphaned automation browser.
+//! Launched children are closed gracefully on shutdown. The browser is
+//! spawned by us (not by chromiumoxide) so the launch flags stay under our
+//! control — see `launch_args` — which means its process is owned here too:
+//! `BrowserChild` kills it on drop, so an abort-path exit cannot leave an
+//! orphaned automation browser behind.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use std::sync::Arc;
 
-use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::browser::Browser;
 use chromiumoxide::Page;
 use futures::StreamExt;
 use tokio::sync::Mutex;
@@ -61,6 +63,28 @@ struct Connection {
     profile_dir: Option<PathBuf>,
     /// Throwaway profile removed when the connection ends (temporary mode).
     cleanup_dir: Option<PathBuf>,
+    /// The browser process WE spawned (persistent/temporary). Attach mode
+    /// leaves this `None` — its browser belongs to the user and must never be
+    /// killed.
+    child: Option<BrowserChild>,
+}
+
+/// Owns the spawned browser process. `Drop` kills it, preserving the old
+/// `kill_on_drop` guarantee now that chromiumoxide is no longer the launcher
+/// (a dropped `Connection` must not leave a browser running).
+struct BrowserChild(std::process::Child);
+
+impl BrowserChild {
+    fn kill_and_reap(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for BrowserChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+    }
 }
 
 pub struct BrowserManager {
@@ -162,17 +186,15 @@ const BLOCKED_LAUNCH_ARGS: &[&str] = &[
     "--remote-debugging-port",
     "--remote-debugging-pipe",
     "--headless",
+    // Would silently undo the whole point of the profile import (session
+    // cookies and proxy/ad-block extensions are why users import at all).
+    "--disable-extensions",
+    "--disable-extensions-except",
 ];
 
-/// Extra launch args from Settings, minus anything that conflicts with how
-/// the manager launches and drives the browser.
-fn custom_launch_args() -> Vec<String> {
-    let raw = crate::core::settings_service::cached_settings().browser_launch_args;
-    let Some(raw) = raw.filter(|s| !s.trim().is_empty()) else {
-        return Vec::new();
-    };
-    parse_launch_args(&raw)
-        .into_iter()
+/// Drop user-supplied args that would break the launch/attach contract.
+fn filter_launch_args(args: Vec<String>) -> Vec<String> {
+    args.into_iter()
         .filter(|a| {
             let key = a.split('=').next().unwrap_or(a);
             let blocked = BLOCKED_LAUNCH_ARGS
@@ -184,6 +206,16 @@ fn custom_launch_args() -> Vec<String> {
             !blocked
         })
         .collect()
+}
+
+/// Extra launch args from Settings, minus anything that conflicts with how
+/// the manager launches and drives the browser.
+fn custom_launch_args() -> Vec<String> {
+    let raw = crate::core::settings_service::cached_settings().browser_launch_args;
+    let Some(raw) = raw.filter(|s| !s.trim().is_empty()) else {
+        return Vec::new();
+    };
+    filter_launch_args(parse_launch_args(&raw))
 }
 
 /// Liveness probes must never hang: a wedged browser process (alive but not
@@ -199,6 +231,74 @@ async fn tab_count(browser: &Browser) -> Option<usize> {
         .ok()
         .and_then(|r| r.ok())
         .map(|p| p.len())
+}
+
+/// Reserve a loopback port for `--remote-debugging-port` (bind-then-drop; the
+/// gap before Chrome binds it is tiny, and a collision surfaces as a clear
+/// startup failure rather than a silent misconnection).
+fn free_debug_port() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| format!("cannot allocate a debug port: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("cannot read the allocated port: {e}"))?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+/// Launch arguments for the browser we spawn ourselves.
+///
+/// Deliberately NOT chromiumoxide's `DEFAULT_ARGS`: that set force-adds
+/// `--disable-extensions` (silently disables every extension in the imported
+/// profile) and `--password-store=basic` (saved passwords stop autofilling).
+/// Only flags that keep the automation window usable are kept here.
+fn launch_args(port: u16, user_data_dir: &Path, extra: &[String]) -> Vec<String> {
+    let mut args = vec![
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={}", user_data_dir.display()),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-session-crashed-bubble".to_string(),
+        "--hide-crash-restore-bubble".to_string(),
+        // Chromium containers: the default /dev/shm is often too small.
+        "--disable-dev-shm-usage".to_string(),
+    ];
+    args.extend(extra.iter().cloned());
+    args
+}
+
+/// Poll the DevTools endpoint until it answers. Also watches the child so an
+/// immediate exit (profile locked by another Chrome, bad flags) becomes a
+/// useful error instead of a 30-second hang.
+async fn wait_for_debug_endpoint(
+    port: u16,
+    child: &mut BrowserChild,
+) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{port}/json/version");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(800))
+        .build()
+        .map_err(|e| format!("cannot build the readiness probe: {e}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Ok(Some(status)) = child.0.try_wait() {
+            return Err(format!(
+                "浏览器启动后立即退出（{status}）。常见原因：该配置目录正被另一个 Chrome/Edge 实例占用，或启动参数有误。"
+            ));
+        }
+        if let Ok(resp) = client.get(&url).send().await {
+            if resp.status().is_success() {
+                return Ok(());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "浏览器调试端口 {port} 在 30 秒内未就绪（启动被阻塞或窗口未创建）"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
 }
 
 impl BrowserManager {
@@ -234,7 +334,7 @@ impl BrowserManager {
             }
         }
 
-        let (browser, handler, executable, profile_dir, cleanup_dir) = match &mode {
+        let (browser, handler, executable, profile_dir, cleanup_dir, child) = match &mode {
             ConnectMode::Attach { port } => {
                 let (browser, handler) = Browser::connect(format!("http://127.0.0.1:{port}"))
                     .await
@@ -243,7 +343,7 @@ impl BrowserManager {
                             "No browser debug endpoint at 127.0.0.1:{port} ({e}). Start Chrome/Edge with --remote-debugging-port={port} first."
                         )
                     })?;
-                (browser, handler, None, None, None)
+                (browser, handler, None, None, None, None)
             }
             ConnectMode::Persistent | ConnectMode::Temporary => {
                 let exe = detect_executable()?;
@@ -266,25 +366,39 @@ impl BrowserManager {
                     .clone()
                     .or_else(|| cleanup_dir.clone())
                     .expect("one of profile/cleanup dir is always set");
-                let mut builder = BrowserConfig::builder()
-                    .chrome_executable(&exe)
-                    .user_data_dir(user_data_dir)
-                    .with_head()
-                    .launch_timeout(std::time::Duration::from_secs(30))
-                    .arg("--no-first-run")
-                    .arg("--no-default-browser-check")
-                    .arg("--disable-session-crashed-bubble")
-                    .arg("--hide-crash-restore-bubble");
-                for arg in custom_launch_args() {
-                    builder = builder.arg(arg);
-                }
-                let config = builder
-                    .build()
-                    .map_err(|e| format!("invalid browser config: {e}"))?;
-                let (browser, handler) = Browser::launch(config)
-                    .await
+
+                // Manual launch on purpose. chromiumoxide's `Browser::launch`
+                // appends `--disable-extensions` whenever it was not given an
+                // explicit extension list (config.rs: "if self.extensions
+                // .is_empty()"), which silently disabled every extension in
+                // the imported profile. It also forces `--password-store=basic`
+                // (saved passwords stop autofilling). We need neither, so we
+                // spawn the browser ourselves and only borrow its CDP endpoint.
+                let port = free_debug_port()?;
+                let args = launch_args(port, &user_data_dir, &custom_launch_args());
+                let child = std::process::Command::new(&exe)
+                    .args(&args)
+                    .spawn()
                     .map_err(|e| format!("failed to launch {}: {e}", exe.display()))?;
-                (browser, handler, Some(exe), profile_dir, cleanup_dir)
+                let mut child = BrowserChild(child);
+                if let Err(e) = wait_for_debug_endpoint(port, &mut child).await {
+                    child.kill_and_reap();
+                    return Err(e);
+                }
+                let (browser, handler) = match Browser::connect(format!(
+                    "http://127.0.0.1:{port}"
+                ))
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        child.kill_and_reap();
+                        return Err(format!(
+                            "浏览器已启动但 CDP 连接失败（{e}）。请检查启动参数与配置目录。"
+                        ));
+                    }
+                };
+                (browser, handler, Some(exe), profile_dir, cleanup_dir, Some(child))
             }
         };
 
@@ -328,6 +442,7 @@ impl BrowserManager {
             executable,
             profile_dir,
             cleanup_dir,
+            child,
         });
         Ok(outcome)
     }
@@ -473,6 +588,7 @@ async fn teardown(conn: Connection) {
         handler,
         mode,
         cleanup_dir,
+        child,
         ..
     } = conn;
     // Graceful close needs &mut; possible only when no phase-2 tool still
@@ -487,6 +603,11 @@ async fn teardown(conn: Connection) {
     }
     drop(browser);
     handler.abort();
+    // Reap the process we spawned ourselves (the `Browser` handle no longer
+    // owns it): a wedged browser must not survive browser_close/shutdown.
+    if let Some(mut child) = child {
+        child.kill_and_reap();
+    }
     if let Some(dir) = cleanup_dir {
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -501,6 +622,44 @@ mod tests {
         assert_eq!(ConnectMode::Persistent.label(), "persistent");
         assert_eq!(ConnectMode::Temporary.label(), "temporary");
         assert_eq!(ConnectMode::Attach { port: 9222 }.label(), "attach (port 9222)");
+    }
+
+    /// Regression: the launch flags must never disable extensions or switch
+    /// off the OS keychain. chromiumoxide's own defaults did both — the first
+    /// silently killed every imported extension, the second broke password
+    /// autofill. This is the whole reason we spawn the browser ourselves.
+    #[test]
+    fn manual_launch_args_keep_extensions_and_keychain() {
+        let dir = PathBuf::from("/tmp/siku-profile");
+        let args = launch_args(9333, &dir, &["--lang=zh-CN".to_string()]);
+        assert!(args.iter().any(|a| a == "--remote-debugging-port=9333"), "{args:?}");
+        assert!(
+            args.iter().any(|a| a == &format!("--user-data-dir={}", dir.display())),
+            "{args:?}"
+        );
+        assert!(args.iter().any(|a| a == "--lang=zh-CN"), "custom args pass through: {args:?}");
+        for forbidden in ["--disable-extensions", "--disable-extensions-except", "--password-store=basic"] {
+            assert!(!args.iter().any(|a| a == forbidden), "{forbidden} must not be passed: {args:?}");
+        }
+    }
+
+    /// User-supplied args may not re-introduce what we removed either.
+    #[test]
+    fn blocked_launch_args_are_filtered_out() {
+        let filtered = filter_launch_args(vec![
+            "--disable-extensions".to_string(),
+            "--disable-extensions-except=/tmp/x".to_string(),
+            "--headless=new".to_string(),
+            "--user-data-dir=/tmp/other".to_string(),
+            "--lang=zh-CN".to_string(),
+        ]);
+        assert_eq!(filtered, vec!["--lang=zh-CN".to_string()]);
+    }
+
+    #[test]
+    fn free_debug_port_is_usable() {
+        let port = free_debug_port().expect("a loopback port");
+        assert!(port > 1024, "{port}");
     }
 
     #[test]

@@ -71,6 +71,7 @@
 | `ask_user` | 交互 | ✅ | 向用户发起结构化选择/填空 |
 | `set_app_theme` | 系统 | ✅ | 切换应用 UI 主题（预设或单色调覆盖），即时生效 |
 | `read_media_file` | 视觉 | ✅ | 用视觉模型分析图片 |
+| `send_file_to_user` | 文件 | ❌ | 把本机文件发到用户的微信（仅远程私聊 + 全部授权，见 `remote-channels.md` §7） |
 | `memory_read` | 长期记忆 | ✅ | 读取本会话的长期记忆文档 |
 | `memory_write` | 长期记忆 | ❌ | 追加或覆盖写入长期记忆 |
 | `memory_recall` | 长期记忆 | ✅ | 检索历史对话原文（含工具调用详情） |
@@ -384,6 +385,19 @@ PDF 结果提示可接 `paper_import`。
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `path` | string | ❌ | 目录路径，默认写入目录 |
+
+### `send_file_to_user`（远程专用）
+
+只有在**远程 IM 会话 + 私聊 + 「全部」授权 + 微信渠道**四个条件同时成立时才会注册（`run_agent_turn` 内按 `session.context` 判断），本机对话与群聊都看不到这个工具。
+
+它**不自己发送**：把文件登记进本轮的出站队列（`OutboundFile`），回合结束时由 `run_agent_turn` 序列化进 assistant 行的 `attachments`，再由路由层上传投递——保证"对话里看到的"和"手机上收到的"是同一份记录（`docs/remote-channels.md` §7.1）。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path` | string | ✅ | 文件路径（绝对路径，或相对会话写入目录） |
+| `caption` | string | ❌ | 随文件前的一条说明文字 |
+
+限制：仅允许会话工作区、`remote_downloads/`、`remote_outbox/`、桌面/下载/文档目录；单文件 ≤25MB、每回合 ≤5 个且合计 ≤50MB；按 `path+size` 去重。
 
 ### `file_write`
 

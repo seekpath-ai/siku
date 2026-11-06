@@ -119,7 +119,8 @@ async fn run_monitor(
         base_url: base_url.clone(),
         token: cfg.bot_token.clone(),
         db: db.clone(),
-        pending_acks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        typing: Arc::new(std::sync::Mutex::new(TypingCache::default())),
+        typing_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
     // The long-poll cursor lives in the synced `remote_weixin_state` row so
     // a standby device taking over resumes where the previous holder left
@@ -535,25 +536,25 @@ struct WeixinSink {
     base_url: String,
     token: String,
     db: sqlx::SqlitePool,
-    /// Delayed "working" notices per chat (ack + heartbeat), aborted when
-    /// the turn settles. WeChat has no message edit/typing indicator, so
-    /// these are ordinary text messages — delayed so fast turns stay quiet.
-    pending_acks: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<String, Vec<tokio::task::JoinHandle<()>>>,
-        >,
-    >,
+    /// Per-chat typing tickets (in memory only — see `TypingCache`).
+    typing: Arc<std::sync::Mutex<TypingCache>>,
+    /// Running typing heartbeats, one per chat, aborted when the turn settles.
+    typing_tasks:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
 }
-
-/// How long a turn may run before the ack message is sent.
-const ACK_DELAY_SECS: u64 = 4;
-/// Second notice for long turns.
-const HEARTBEAT_SECS: u64 = 15;
 
 #[async_trait::async_trait]
 impl ReplySink for WeixinSink {
     async fn send_text(&self, chat_id: &str, text: &str) -> Result<(), String> {
         send_text_raw(&self.http, &self.base_url, &self.token, &self.db, chat_id, text).await
+    }
+
+    async fn send_media(
+        &self,
+        chat_id: &str,
+        file: &crate::remote::router::OutboundFile,
+    ) -> Result<(), String> {
+        send_file(&self.http, &self.base_url, &self.token, &self.db, chat_id, file).await
     }
 
     async fn resolve_file_media(
@@ -568,6 +569,14 @@ impl ReplySink for WeixinSink {
         Ok(std::path::PathBuf::from(&media.file_key))
     }
 
+    /// WeChat has no message-editing surface, so "the bot is working" is
+    /// carried by the native typing indicator instead of chat bubbles: fetch
+    /// the per-user ticket (cached), set typing immediately, then heartbeat it
+    /// every 5s until `progress_finish` cancels it.
+    ///
+    /// Every failure path is silent on purpose — a bot the server issues no
+    /// ticket for must behave exactly like a bot with no typing support, and
+    /// never fall back to the old text notices (docs/remote-channels.md §9.4).
     async fn progress_start(
         &self,
         chat_id: &str,
@@ -576,29 +585,52 @@ impl ReplySink for WeixinSink {
         _prompt: &str,
         _kind: crate::remote::router::ChatKind,
     ) -> Result<(), String> {
-        let mut handles = Vec::new();
-        for (delay_secs, notice) in [
-            (ACK_DELAY_SECS, "收到，正在思考…"),
-            (HEARTBEAT_SECS, "还在处理中，请稍候…"),
-        ] {
-            let http = self.http.clone();
-            let base_url = self.base_url.clone();
-            let token = self.token.clone();
-            let db = self.db.clone();
-            let chat = chat_id.to_string();
-            handles.push(tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                let _ = send_text_raw(&http, &base_url, &token, &db, &chat, notice).await;
-            }));
-        }
-        if let Ok(mut pending) = self.pending_acks.lock() {
-            // A previous turn's timers should be gone already (turns are
-            // serialized per chat); abort defensively.
-            if let Some(old) = pending.insert(chat_id.to_string(), handles) {
-                for h in old {
-                    h.abort();
-                }
+        // Turns are serialized per chat, so any handle here is stale.
+        if let Ok(mut tasks) = self.typing_tasks.lock() {
+            if let Some(old) = tasks.remove(chat_id) {
+                old.abort();
             }
+        }
+        let http = self.http.clone();
+        let base_url = self.base_url.clone();
+        let token = self.token.clone();
+        let db = self.db.clone();
+        let cache = self.typing.clone();
+        let chat = chat_id.to_string();
+        let handle = tokio::spawn(async move {
+            let now = std::time::Instant::now();
+            let cached = cache.lock().ok().and_then(|c| c.lookup(&chat, now));
+            let ticket = match cached {
+                Some(t) => t,
+                None => match fetch_typing_ticket(&http, &base_url, &token, &db, &chat).await {
+                    Ok(t) => {
+                        if let Ok(mut c) = cache.lock() {
+                            c.store(&chat, &t, now);
+                        }
+                        t
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "typing unavailable: no ticket");
+                        return;
+                    }
+                },
+            };
+            if ticket.is_empty() {
+                tracing::debug!("typing unavailable: empty ticket");
+                return;
+            }
+            loop {
+                if send_typing(&http, &base_url, &token, &chat, &ticket, 1)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(TYPING_HEARTBEAT_SECS)).await;
+            }
+        });
+        if let Ok(mut tasks) = self.typing_tasks.lock() {
+            tasks.insert(chat_id.to_string(), handle);
         }
         Ok(())
     }
@@ -610,11 +642,19 @@ impl ReplySink for WeixinSink {
         _ok: bool,
         _progress: &crate::remote::router::RemoteProgress,
     ) -> Result<bool, String> {
-        if let Ok(mut pending) = self.pending_acks.lock() {
-            if let Some(handles) = pending.remove(chat_id) {
-                for h in handles {
-                    h.abort();
-                }
+        if let Ok(mut tasks) = self.typing_tasks.lock() {
+            if let Some(handle) = tasks.remove(chat_id) {
+                handle.abort();
+            }
+        }
+        let now = std::time::Instant::now();
+        let ticket = self.typing.lock().ok().and_then(|c| c.lookup(chat_id, now));
+        if let Some(t) = ticket.filter(|t| !t.is_empty()) {
+            // Stop the indicator explicitly; if it already expired in the
+            // client this is a no-op.
+            if let Err(e) = send_typing(&self.http, &self.base_url, &self.token, chat_id, &t, 2).await
+            {
+                tracing::debug!(error = %e, "typing cancel failed");
             }
         }
         // WeChat can't edit messages: the reply always goes out as text.
@@ -1044,5 +1084,581 @@ async fn cdn_download(
     match key {
         Some(k) => aes_ecb_decrypt(&k, &bytes).ok_or_else(|| "CDN 媒体解密失败".to_string()),
         None => Ok(bytes),
+    }
+}
+
+// ---------------------------------------------------------- outbound media
+// Mirrors the official plugin's `src/cdn/upload.ts` + `src/messaging/send-media.ts`:
+//   getuploadurl → POST ciphertext to the CDN → sendmessage with a media item.
+// Only this file knows the wire details; the router/delivery contract lives in
+// router.rs (docs/remote-channels.md §7.2).
+
+/// CDN upload attempts for server-side (5xx/transport) errors. 4xx aborts
+/// immediately — retrying a rejected request never helps.
+const CDN_UPLOAD_RETRIES: usize = 3;
+/// Hard cap on one outbound file; the plugin's default `maxSingleMediaBytes`.
+pub const MAX_OUTBOUND_BYTES: u64 = 25 * 1024 * 1024;
+
+fn md5_hex(bytes: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    let mut hasher = Md5::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+/// PKCS7 ciphertext length for AES-128-ECB: always pads, so a block-aligned
+/// plaintext grows by a full block (mirrors the plugin's `aesEcbPaddedSize`).
+fn aes_ecb_padded_len(plaintext_len: usize) -> usize {
+    (plaintext_len / 16 + 1) * 16
+}
+
+fn aes_ecb_encrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    if key.len() != 16 {
+        return Err("AES key must be 16 bytes".to_string());
+    }
+    let cipher = aes::Aes128::new(key.into());
+    let pad = 16 - (data.len() % 16);
+    let mut buf = Vec::with_capacity(data.len() + pad);
+    buf.extend_from_slice(data);
+    buf.extend(std::iter::repeat(pad as u8).take(pad));
+    for chunk in buf.chunks_exact_mut(16) {
+        cipher.encrypt_block(aes::cipher::generic_array::GenericArray::from_mut_slice(chunk));
+    }
+    Ok(buf)
+}
+
+fn rand_hex(n: usize) -> String {
+    use rand::RngCore;
+    let mut buf = vec![0u8; n];
+    rand::thread_rng().fill_bytes(&mut buf);
+    hex::encode(buf)
+}
+
+/// Extension → MIME, limited to what WeChat renders sensibly. Unknown types
+/// fall back to octet-stream and go out as a plain file attachment.
+pub(crate) fn outbound_mime(name: &str) -> &'static str {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "txt" => "text/plain",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        _ => "application/octet-stream",
+    }
+}
+
+/// proto: UploadMediaType — 1 image, 2 video, 3 file, 4 voice.
+fn upload_media_type(mime: &str) -> i64 {
+    if mime.starts_with("image/") {
+        1
+    } else if mime.starts_with("video/") {
+        2
+    } else {
+        3
+    }
+}
+
+/// Ask the server for an upload slot, returning `(upload_full_url, upload_param)`
+/// — either may be present; the caller prefers the full URL.
+async fn get_upload_url(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    filekey: &str,
+    media_type: i64,
+    to_user_id: &str,
+    rawsize: u64,
+    rawfilemd5: &str,
+    filesize: u64,
+    aeskey_hex: &str,
+) -> Result<(Option<String>, Option<String>), String> {
+    let url = format!(
+        "{}/ilink/bot/getuploadurl",
+        base_url.trim_end_matches('/')
+    );
+    let body = serde_json::json!({
+        "filekey": filekey,
+        "media_type": media_type,
+        "to_user_id": to_user_id,
+        "rawsize": rawsize,
+        "rawfilemd5": rawfilemd5,
+        "filesize": filesize,
+        // No thumbnail: matches the official plugin (`no_need_thumb: true`).
+        "no_need_thumb": true,
+        "aeskey": aeskey_hex,
+        "base_info": base_info(),
+    });
+    let resp = http
+        .post(&url)
+        .headers(common_headers(Some(token)))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(API_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| format!("微信上传凭据请求失败: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("微信上传凭据响应读取失败: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "微信上传凭据请求失败: HTTP {status} {}",
+            text.chars().take(200).collect::<String>()
+        ));
+    }
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("微信上传凭据响应解析失败: {e}"))?;
+    let ret = v.get("ret").and_then(|r| r.as_i64()).unwrap_or(0);
+    if ret != 0 {
+        let errmsg = v.get("errmsg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(format!("微信上传凭据获取失败: ret={ret} {errmsg}"));
+    }
+    let full = v
+        .get("upload_full_url")
+        .and_then(|u| u.as_str())
+        .filter(|u| !u.is_empty())
+        .map(|u| u.to_string());
+    let param = v
+        .get("upload_param")
+        .and_then(|u| u.as_str())
+        .filter(|u| !u.is_empty())
+        .map(|u| u.to_string());
+    if full.is_none() && param.is_none() {
+        return Err("微信未返回上传地址（可能需要更新协议版本）".to_string());
+    }
+    Ok((full, param))
+}
+
+/// POST the ciphertext to the CDN; the `x-encrypted-param` response header is
+/// the download parameter that goes into the message item.
+async fn cdn_upload(
+    http: &reqwest::Client,
+    url: &str,
+    ciphertext: &[u8],
+) -> Result<String, String> {
+    let mut last_err = String::new();
+    for attempt in 1..=CDN_UPLOAD_RETRIES {
+        match http
+            .post(url)
+            .header("Content-Type", "application/octet-stream")
+            .body(ciphertext.to_vec())
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    let param = resp
+                        .headers()
+                        .get("x-encrypted-param")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !param.is_empty() {
+                        return Ok(param);
+                    }
+                    last_err = "CDN 上传响应缺少 x-encrypted-param".to_string();
+                } else {
+                    let header_msg = resp
+                        .headers()
+                        .get("x-error-message")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    last_err = format!("CDN 上传失败: HTTP {status} {header_msg}");
+                    // Client errors are terminal: the slot/key is wrong.
+                    if status.is_client_error() {
+                        return Err(last_err);
+                    }
+                }
+            }
+            Err(e) => last_err = format!("CDN 上传失败: {e}"),
+        }
+        if attempt < CDN_UPLOAD_RETRIES {
+            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+        }
+    }
+    Err(last_err)
+}
+
+/// Upload one local file and send it to a chat as an image / video / file
+/// message. Shared by `ReplySink::send_media` (agent-initiated) and the P0
+/// manual smoke-test command.
+pub(crate) async fn send_file(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    db: &sqlx::SqlitePool,
+    chat_id: &str,
+    file: &crate::remote::router::OutboundFile,
+) -> Result<(), String> {
+    let bytes = tokio::fs::read(&file.path)
+        .await
+        .map_err(|e| format!("读取文件失败（{}）: {e}", file.name))?;
+    if bytes.is_empty() {
+        return Err("文件为空，未发送".to_string());
+    }
+    if bytes.len() as u64 > MAX_OUTBOUND_BYTES {
+        return Err(format!(
+            "文件过大（{}MB，上限 {}MB）",
+            bytes.len() / (1024 * 1024),
+            MAX_OUTBOUND_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let rawsize = bytes.len() as u64;
+    let rawfilemd5 = md5_hex(&bytes);
+    let filesize = aes_ecb_padded_len(bytes.len()) as u64;
+    let filekey = rand_hex(16);
+    let aeskey = rand_hex(16);
+    let media_type = upload_media_type(&file.mime);
+
+    let (full, param) = get_upload_url(
+        http, base_url, token, &filekey, media_type, chat_id, rawsize, &rawfilemd5, filesize,
+        &aeskey,
+    )
+    .await?;
+    let upload_url = match full {
+        Some(u) => u,
+        None => {
+            let p = param.ok_or_else(|| "微信未返回上传地址".to_string())?;
+            format!(
+                "{CDN_BASE_URL}/upload?encrypted_query_param={}&filekey={}",
+                percent_encode(&p),
+                percent_encode(&filekey)
+            )
+        }
+    };
+
+    // The key travels as base64 of its hex spelling (that is what the client
+    // expects); our own inbound parser accepts the same encoding.
+    let aes_key_b64 = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(aeskey.as_bytes())
+    };
+    let ciphertext = aes_ecb_encrypt(&hex::decode(&aeskey).map_err(|e| e.to_string())?, &bytes)?;
+    let download_param = cdn_upload(http, &upload_url, &ciphertext).await?;
+
+    let media = serde_json::json!({
+        "encrypt_query_param": download_param,
+        "aes_key": aes_key_b64,
+        "encrypt_type": 1,
+    });
+    let item = match media_type {
+        1 => serde_json::json!({
+            "type": 2,
+            "image_item": { "media": media, "mid_size": filesize },
+        }),
+        2 => serde_json::json!({
+            "type": 5,
+            "video_item": { "media": media, "video_size": filesize },
+        }),
+        _ => serde_json::json!({
+            "type": 4,
+            // `len` is the PLAINTEXT size, as a string (protocol quirk).
+            "file_item": { "media": media, "file_name": file.name, "len": rawsize.to_string() },
+        }),
+    };
+
+    // Caption first, then the media item — one item per request, like the
+    // official plugin (WeChat has no combined text+attachment message).
+    if let Some(caption) = file.caption.as_deref().filter(|c| !c.trim().is_empty()) {
+        send_text_raw(http, base_url, token, db, chat_id, caption).await?;
+    }
+    send_message_item(http, base_url, token, db, chat_id, item).await
+}
+
+/// POST one `item_list` entry to `sendmessage`.
+async fn send_message_item(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    db: &sqlx::SqlitePool,
+    chat_id: &str,
+    item: serde_json::Value,
+) -> Result<(), String> {
+    let context_token = crate::core::settings_service::load_weixin_state(db)
+        .await
+        .ok()
+        .and_then(|s| s.context_tokens.get(chat_id).cloned());
+    let mut msg = serde_json::json!({
+        "from_user_id": "",
+        "to_user_id": chat_id,
+        "client_id": uuid::Uuid::new_v4().to_string(),
+        "message_type": 2,   // BOT
+        "message_state": 2,  // FINISH
+        "item_list": [item],
+    });
+    if let Some(t) = &context_token {
+        msg["context_token"] = serde_json::Value::String(t.clone());
+    }
+    let url = format!(
+        "{}/ilink/bot/sendmessage",
+        base_url.trim_end_matches('/')
+    );
+    let resp = http
+        .post(&url)
+        .headers(common_headers(Some(token)))
+        .json(&serde_json::json!({ "msg": msg, "base_info": base_info() }))
+        .timeout(std::time::Duration::from_secs(API_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| format!("微信发送失败: {e}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("微信发送响应读取失败: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "微信发送失败: HTTP {status} {}",
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        // A 2xx with an empty/non-JSON body has been observed on delivered
+        // messages; treat it as delivered (same tolerance as send_text_raw).
+        Err(_) => return Ok(()),
+    };
+    let ret = parsed.get("ret").and_then(|v| v.as_i64()).unwrap_or(0);
+    if ret != 0 {
+        let errmsg = parsed.get("errmsg").and_then(|v| v.as_str()).unwrap_or("");
+        return Err(format!("微信发送失败: ret={ret} {errmsg}"));
+    }
+    Ok(())
+}
+
+/// P0 smoke test: send one local file over the stored binding without going
+/// through an agent turn. Used by the `remote_weixin_send_file` command so the
+/// protocol can be verified on a real device before the tool exists.
+pub(crate) async fn send_file_now(
+    db: &sqlx::SqlitePool,
+    cfg: &crate::core::models::WeixinChannelConfig,
+    chat_id: &str,
+    file_path: &str,
+    caption: Option<String>,
+) -> Result<String, String> {
+    if cfg.bot_token.is_empty() {
+        return Err("微信渠道未登录，请先在设置中扫码".to_string());
+    }
+    let base_url = if cfg.baseurl.is_empty() {
+        FIXED_BASE_URL.to_string()
+    } else {
+        cfg.baseurl.clone()
+    };
+    let path = std::path::PathBuf::from(file_path);
+    let meta = std::fs::metadata(&path).map_err(|e| format!("文件不可读: {e}"))?;
+    if !meta.is_file() {
+        return Err("不是文件".to_string());
+    }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "文件".to_string());
+    let file = crate::remote::router::OutboundFile {
+        mime: outbound_mime(&name).to_string(),
+        sha256: String::new(),
+        size: meta.len(),
+        caption,
+        name: name.clone(),
+        path,
+    };
+    send_file(&reqwest::Client::new(), &base_url, &cfg.bot_token, db, chat_id, &file).await?;
+    Ok(format!("已发送 {name}（{} 字节）", meta.len()))
+}
+
+// ------------------------------------------------------------- typing state
+// WeChat's only zero-noise "the bot is working" signal: POST /ilink/bot/sendtyping
+// with a per-user `typing_ticket` from /ilink/bot/getconfig. The client clears
+// the indicator after a few seconds, so it must be re-sent while the turn runs
+// (the official plugin heartbeats it every 5s). Mirrors docs/remote-channels.md §9.
+
+/// Heartbeat cadence for the typing indicator.
+const TYPING_HEARTBEAT_SECS: u64 = 5;
+/// How long a fetched ticket is reused before asking again. The plugin
+/// refreshes randomly within 24h; 12h bounded is plenty and costs one cheap
+/// request per chat per half-day.
+const TYPING_TICKET_TTL_SECS: u64 = 12 * 3600;
+/// Cap on cached tickets (bounded like the context tokens).
+const TYPING_TICKET_CAP: usize = 200;
+
+/// Per-chat typing tickets. In-memory on purpose: a ticket is worthless to
+/// another device and re-fetching after a restart is one request, so it must
+/// not add writes to the synced state row.
+#[derive(Default)]
+struct TypingCache {
+    tickets: std::collections::HashMap<String, (String, std::time::Instant)>,
+}
+
+impl TypingCache {
+    /// A non-empty ticket younger than the TTL, if any. An empty cached ticket
+    /// means "this bot gets no typing support" — also a valid cache hit, so a
+    /// server that never issues tickets is not asked on every turn.
+    fn lookup(&self, chat_id: &str, now: std::time::Instant) -> Option<String> {
+        let (ticket, at) = self.tickets.get(chat_id)?;
+        if now.duration_since(*at).as_secs() >= TYPING_TICKET_TTL_SECS {
+            return None;
+        }
+        Some(ticket.clone())
+    }
+
+    fn store(&mut self, chat_id: &str, ticket: &str, now: std::time::Instant) {
+        if self.tickets.len() >= TYPING_TICKET_CAP && !self.tickets.contains_key(chat_id) {
+            if let Some(k) = self.tickets.keys().next().cloned() {
+                self.tickets.remove(&k);
+            }
+        }
+        self.tickets
+            .insert(chat_id.to_string(), (ticket.to_string(), now));
+    }
+}
+
+/// Fetch the typing ticket for one user (`ilink/bot/getconfig`).
+async fn fetch_typing_ticket(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    db: &sqlx::SqlitePool,
+    chat_id: &str,
+) -> Result<String, String> {
+    let context_token = crate::core::settings_service::load_weixin_state(db)
+        .await
+        .ok()
+        .and_then(|s| s.context_tokens.get(chat_id).cloned());
+    let mut body = serde_json::json!({
+        "ilink_user_id": chat_id,
+        "base_info": base_info(),
+    });
+    if let Some(t) = context_token.filter(|t| !t.is_empty()) {
+        body["context_token"] = serde_json::Value::String(t);
+    }
+    let url = format!("{}/ilink/bot/getconfig", base_url.trim_end_matches('/'));
+    let resp = http
+        .post(&url)
+        .headers(common_headers(Some(token)))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("getconfig 请求失败: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("getconfig 响应读取失败: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("getconfig 失败: HTTP {status}"));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("getconfig 响应解析失败: {e}"))?;
+    let ret = v.get("ret").and_then(|r| r.as_i64()).unwrap_or(0);
+    if ret != 0 {
+        let errmsg = v.get("errmsg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(format!("getconfig ret={ret} {errmsg}"));
+    }
+    Ok(v
+        .get("typing_ticket")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// Set or clear the typing indicator (`ilink/bot/sendtyping`).
+/// `status`: 1 = typing, 2 = cancel.
+async fn send_typing(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    chat_id: &str,
+    ticket: &str,
+    status: i64,
+) -> Result<(), String> {
+    let url = format!("{}/ilink/bot/sendtyping", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "ilink_user_id": chat_id,
+        "typing_ticket": ticket,
+        "status": status,
+        "base_info": base_info(),
+    });
+    let resp = http
+        .post(&url)
+        .headers(common_headers(Some(token)))
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("sendtyping 请求失败: {e}"))?;
+    let status_code = resp.status();
+    if !status_code.is_success() {
+        return Err(format!("sendtyping 失败: HTTP {status_code}"));
+    }
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("sendtyping 响应读取失败: {e}"))?;
+    // An empty body is a delivered typing state (same tolerance as sendmessage).
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|_| format!("sendtyping 响应解析失败: {}", text.chars().take(120).collect::<String>()))?;
+    let ret = v.get("ret").and_then(|r| r.as_i64()).unwrap_or(0);
+    if ret != 0 {
+        let errmsg = v.get("errmsg").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(format!("sendtyping ret={ret} {errmsg}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod typing_tests {
+    use super::{TypingCache, TYPING_TICKET_TTL_SECS};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn cache_hits_reuse_the_ticket_until_the_ttl_expires() {
+        let mut cache = TypingCache::default();
+        let now = Instant::now();
+        cache.store("u1", "ticket-a", now);
+        assert_eq!(cache.lookup("u1", now).as_deref(), Some("ticket-a"));
+
+        let almost = now + Duration::from_secs(TYPING_TICKET_TTL_SECS - 1);
+        assert_eq!(cache.lookup("u1", almost).as_deref(), Some("ticket-a"));
+
+        let expired = now + Duration::from_secs(TYPING_TICKET_TTL_SECS);
+        assert_eq!(cache.lookup("u1", expired), None);
+        assert_eq!(cache.lookup("other", now), None);
+    }
+
+    /// A bot the server issues no ticket for caches an empty value: the cache
+    /// still answers, so every turn does not re-ask (and typing stays off).
+    #[test]
+    fn empty_ticket_is_cached_as_unsupported() {
+        let mut cache = TypingCache::default();
+        let now = Instant::now();
+        cache.store("u1", "", now);
+        assert_eq!(cache.lookup("u1", now).as_deref(), Some(""));
     }
 }

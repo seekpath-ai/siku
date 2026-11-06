@@ -922,6 +922,7 @@ pub fn run() {
             commands::remote::remote_chat_file_save,
             commands::remote::remote_chat_file_import,
             commands::remote::remote_takeover,
+            commands::remote::remote_weixin_send_file,
             // Agent
             commands::agent::agent_create_session,
             commands::agent::agent_update_session,

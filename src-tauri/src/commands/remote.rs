@@ -394,3 +394,40 @@ pub async fn remote_chat_file_import(
     let _ = std::fs::remove_file(&tmp);
     result
 }
+
+/// P0 smoke test for outbound WeChat media (docs/remote-channels.md §7.9):
+/// send one local file over the stored binding, bypassing the agent. Used to
+/// verify `getuploadurl` + CDN upload against a real account before the
+/// agent-side tool is trusted with it.
+#[tauri::command]
+#[instrument(skip(state, caption))]
+pub async fn remote_weixin_send_file(
+    state: State<'_, AppState>,
+    file_path: String,
+    chat_id: Option<String>,
+    caption: Option<String>,
+) -> Result<String, String> {
+    let remote = crate::core::settings_service::load_remote_config(&state.db).await?;
+    // No explicit chat: use the most recently active approved WeChat chat, so
+    // the user does not have to paste an opaque iLink id.
+    let chat_id = match chat_id.filter(|c| !c.trim().is_empty()) {
+        Some(c) => c,
+        None => sqlx::query_scalar::<_, String>(
+            "SELECT chat_id FROM remote_chats
+             WHERE channel = 'weixin' AND approved = 1 AND chat_id != ''
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?
+        .ok_or_else(|| "没有已配对的微信会话，请先在微信里给机器人发一条消息并完成配对".to_string())?,
+    };
+    crate::remote::weixin::send_file_now(
+        &state.db,
+        &remote.weixin,
+        &chat_id,
+        &file_path,
+        caption,
+    )
+    .await
+}

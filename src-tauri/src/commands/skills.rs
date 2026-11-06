@@ -122,7 +122,7 @@ pub async fn skills_review_start(
         .to_string();
 
     let prompt = skill_review::build_review_prompt(&name, &dir, &report);
-    crate::commands::agent::run_agent_turn(&state, &app_handle, session_id.clone(), prompt, None, None)
+    crate::commands::agent::run_agent_turn(&state, &app_handle, session_id.clone(), prompt, None, None, None)
         .await?;
 
     Ok(SkillReviewStart { session_id, report })

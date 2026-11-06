@@ -296,10 +296,29 @@ export interface ApprovalConfig {
   whitelist?: string[];
 }
 
+/**
+ * One attachment on a chat message.
+ *
+ * Two shapes live in the same JSON column:
+ *  - inline image (user turn): base64 payload, no `kind` — the historical shape
+ *  - outbound file (assistant turn, remote IM only): metadata only, no payload
+ *    (files never enter the synced message rows; see docs/remote-channels.md §7.3)
+ */
 export interface ChatAttachment {
   mime: string;
-  base64: string;
+  /** Present for inline images only. */
+  base64?: string;
   name?: string | null;
+  /** Absent means the legacy inline-image shape. */
+  kind?: 'image' | 'file';
+  /** Outbound file: size in bytes. */
+  size?: number;
+  /** Outbound file: absolute path on the device that sent it. */
+  path?: string;
+  sha256?: string;
+  /** Outbound delivery state: pending → ok / failed. */
+  status?: 'pending' | 'ok' | 'failed';
+  error?: string | null;
 }
 
 export interface ChatMessage {

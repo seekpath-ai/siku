@@ -95,9 +95,119 @@ pub struct InboundMessage {
     pub media: Option<MediaRef>,
 }
 
+/// A file the agent asked to send back to the remote user's chat app.
+///
+/// The tool only *registers* it during the turn; `run_agent_turn` serializes
+/// the queue into the assistant row's `attachments`, and the router uploads
+/// the files after the reply is sent. One ledger row is therefore the single
+/// source of truth for both sides (docs/remote-channels.md §7).
+#[derive(Clone)]
+pub struct OutboundFile {
+    pub path: PathBuf,
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+    pub sha256: String,
+    /// Optional one-line text sent before the file itself.
+    pub caption: Option<String>,
+}
+
+/// Per-turn registration queue shared by the tool and `run_agent_turn`.
+/// Created by the router (never a global map: cancelled/error paths would
+/// leak entries and concurrent chats would collide).
+pub type OutboundQueue = Arc<std::sync::Mutex<Vec<OutboundFile>>>;
+
+pub fn new_outbound_queue() -> OutboundQueue {
+    Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+/// Serialize one outbound attachment in the shape the frontend parses
+/// (`ChatAttachment` with `kind: "file"` — no base64, see §7.3).
+fn attachment_entry(f: &OutboundFile, status: &str, error: Option<&str>) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "kind": "file",
+        "name": &f.name,
+        "size": f.size,
+        "mime": &f.mime,
+        "path": f.path.to_string_lossy(),
+        "sha256": &f.sha256,
+        "status": status,
+    });
+    if let Some(e) = error {
+        v["error"] = serde_json::json!(e);
+    }
+    v
+}
+
+/// Attachments JSON written when the turn succeeds; delivery happens later.
+pub fn pending_attachments_json(files: &[OutboundFile]) -> String {
+    serde_json::Value::Array(files.iter().map(|f| attachment_entry(f, "pending", None)).collect())
+        .to_string()
+}
+
+/// Attachments JSON for a turn that never delivered (cancelled / failed).
+pub fn failed_attachments_json(files: &[OutboundFile], reason: &str) -> String {
+    serde_json::Value::Array(
+        files
+            .iter()
+            .map(|f| attachment_entry(f, "failed", Some(reason)))
+            .collect(),
+    )
+    .to_string()
+}
+
+/// Attachments JSON after delivery: `None` error means it reached the user.
+pub fn settled_attachments_json(items: &[(OutboundFile, Option<String>)]) -> String {
+    serde_json::Value::Array(
+        items
+            .iter()
+            .map(|(f, err)| match err {
+                None => attachment_entry(f, "ok", None),
+                Some(e) => attachment_entry(f, "failed", Some(e)),
+            })
+            .collect(),
+    )
+    .to_string()
+}
+
+/// Files persisted as `pending` — i.e. registered by a turn that is about to
+/// deliver them. A cancelled/failed turn persists `failed` instead, so this
+/// returns nothing and the router sends nothing.
+pub fn pending_files_from_attachments(json: &str) -> Vec<OutboundFile> {
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some("file"))
+        .filter(|v| v.get("status").and_then(|s| s.as_str()) == Some("pending"))
+        .filter_map(|v| {
+            Some(OutboundFile {
+                path: PathBuf::from(v.get("path")?.as_str()?),
+                name: v.get("name")?.as_str()?.to_string(),
+                size: v.get("size")?.as_u64()?,
+                mime: v.get("mime").and_then(|m| m.as_str()).unwrap_or_default().to_string(),
+                sha256: v.get("sha256").and_then(|s| s.as_str()).unwrap_or_default().to_string(),
+                caption: None,
+            })
+        })
+        .collect()
+}
+
 #[async_trait::async_trait]
 pub trait ReplySink: Send + Sync {
     async fn send_text(&self, chat_id: &str, text: &str) -> Result<(), String>;
+    /// Send one local file to the chat. Channels that cannot upload files yet
+    /// (feishu, until P2) keep the default "unsupported" answer; the router
+    /// then records the failure in the assistant row instead of losing it.
+    async fn send_media(
+        &self,
+        _chat_id: &str,
+        _file: &OutboundFile,
+    ) -> Result<(), String> {
+        Err("当前渠道不支持发送文件".to_string())
+    }
+
     /// Best-effort display names for pairing rows and session titles:
     /// (chat/group name, sender name). Channels without a directory API
     /// (weixin iLink) return (None, None).
@@ -559,6 +669,9 @@ async fn process_batch(
     .await
     .unwrap_or(0);
 
+    // Files the agent registers during this turn land here; the engine writes
+    // them into the assistant row and we upload them after the reply goes out.
+    let outbound = new_outbound_queue();
     let result = crate::commands::agent::run_agent_turn(
         &state,
         &app,
@@ -566,12 +679,17 @@ async fn process_batch(
         text.clone(),
         if images.is_empty() { None } else { Some(images) },
         tools_override,
+        Some(outbound.clone()),
     )
     .await;
 
+    let mut reply_row: Option<ReplyRow> = None;
     let reply = match result {
         Ok(()) => match wait_for_new_reply(&db, &session_id, baseline).await {
-            Some(r) if !r.trim().is_empty() => r,
+            Some(row) if !row.content.trim().is_empty() => {
+                reply_row = Some(row);
+                reply_row.as_ref().map(|r| r.content.clone()).unwrap_or_default()
+            }
             _ => "（回复生成超时，请稍后在思库对话中查看，或追问一次）".to_string(),
         },
         Err(e) if e.contains("正在生成中") => {
@@ -602,17 +720,41 @@ async fn process_batch(
             tracing::error!(error = %e, "remote reply send failed");
         }
     }
+
+    // Registered files go out after the text so the answer is read first
+    // (§7.7). A cancelled/failed turn persisted them as `failed`, so nothing
+    // is pending there and this is a no-op.
+    if ok {
+        if let Some(row) = reply_row.as_ref() {
+            if let Some(atts) = row.attachments.as_deref() {
+                let pending = pending_files_from_attachments(atts);
+                if !pending.is_empty() {
+                    deliver_outbound_files(&sink, &db, &meta.chat_id, &row.id, pending).await;
+                }
+            }
+        }
+    }
 }
 
 /// The agent persists its assistant message only when the turn ends, so a
 /// new row past `baseline` is exactly "this turn finished" — including
 /// failures, which are persisted with an ❌ marker. Polls until the timeout.
-async fn wait_for_new_reply(db: &SqlitePool, session_id: &str, baseline: i64) -> Option<String> {
+/// The assistant row this turn wrote: id, content, attachments JSON. The id
+/// is needed to freeze attachment delivery status after the files are sent
+/// (docs/remote-channels.md §7.4), so it is selected alongside the content.
+struct ReplyRow {
+    id: String,
+    content: String,
+    attachments: Option<String>,
+}
+
+async fn wait_for_new_reply(db: &SqlitePool, session_id: &str, baseline: i64) -> Option<ReplyRow> {
     let deadline = Instant::now() + Duration::from_secs(REPLY_TIMEOUT_SECS);
     loop {
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        let row = sqlx::query_scalar::<_, String>(
-            "SELECT content FROM chat_messages WHERE session_id = ? AND role = 'assistant' AND rowid > ?
+        let row = sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT id, content, attachments FROM chat_messages
+             WHERE session_id = ? AND role = 'assistant' AND rowid > ?
              ORDER BY rowid DESC LIMIT 1",
         )
         .bind(session_id)
@@ -620,7 +762,8 @@ async fn wait_for_new_reply(db: &SqlitePool, session_id: &str, baseline: i64) ->
         .fetch_optional(db)
         .await
         .ok()
-        .flatten();
+        .flatten()
+        .map(|(id, content, attachments)| ReplyRow { id, content, attachments });
         if row.is_some() {
             return row;
         }
@@ -628,6 +771,38 @@ async fn wait_for_new_reply(db: &SqlitePool, session_id: &str, baseline: i64) ->
             tracing::warn!(session_id, "remote reply wait timed out");
             return None;
         }
+    }
+}
+
+/// Upload + send the files a successful turn registered, then freeze their
+/// final status into the assistant row. Failures are recorded per file rather
+/// than dropped: the siku conversation is the ledger (§7.4).
+async fn deliver_outbound_files(
+    sink: &Arc<dyn ReplySink>,
+    db: &SqlitePool,
+    chat_id: &str,
+    row_id: &str,
+    files: Vec<OutboundFile>,
+) {
+    let mut items: Vec<(OutboundFile, Option<String>)> = Vec::with_capacity(files.len());
+    for file in files {
+        let err = match sink.send_media(chat_id, &file).await {
+            Ok(()) => None,
+            Err(e) => {
+                tracing::warn!(chat_id, name = %file.name, error = %e, "remote outbound file failed");
+                Some(e)
+            }
+        };
+        items.push((file, err));
+    }
+    let json = settled_attachments_json(&items);
+    if let Err(e) = sqlx::query("UPDATE chat_messages SET attachments = ? WHERE id = ?")
+        .bind(&json)
+        .bind(row_id)
+        .execute(db)
+        .await
+    {
+        tracing::warn!(error = %e, "failed to persist outbound attachment status");
     }
 }
 
@@ -1058,6 +1233,52 @@ async fn create_remote_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_file(name: &str) -> OutboundFile {
+        OutboundFile {
+            path: PathBuf::from(format!("/tmp/{name}")),
+            name: name.to_string(),
+            size: 2048,
+            mime: "application/pdf".to_string(),
+            sha256: "abc".to_string(),
+            caption: None,
+        }
+    }
+
+    /// Only `pending` files are delivered; a cancelled turn's `failed` entries
+    /// must never reach the channel (docs/remote-channels.md §7.4).
+    #[test]
+    fn only_pending_attachments_are_delivered() {
+        let pending = pending_attachments_json(&[sample_file("a.pdf"), sample_file("b.pdf")]);
+        let files = pending_files_from_attachments(&pending);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, "a.pdf");
+        assert_eq!(files[0].size, 2048);
+        assert_eq!(files[0].mime, "application/pdf");
+
+        let failed = failed_attachments_json(&[sample_file("a.pdf")], "已取消");
+        assert!(pending_files_from_attachments(&failed).is_empty());
+    }
+
+    /// The settled ledger keeps per-file outcomes, and legacy user-side
+    /// inline images (no `kind`) are ignored by the delivery parser.
+    #[test]
+    fn settled_attachments_record_per_file_status() {
+        let items = vec![
+            (sample_file("ok.pdf"), None),
+            (sample_file("bad.pdf"), Some("CDN 上传失败: HTTP 400".to_string())),
+        ];
+        let json = settled_attachments_json(&items);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr[0]["status"], "ok");
+        assert_eq!(arr[1]["status"], "failed");
+        assert!(arr[1]["error"].as_str().unwrap().contains("CDN"));
+        assert!(pending_files_from_attachments(&json).is_empty());
+
+        let legacy = r#"[{"mime":"image/png","base64":"AAAA","name":"x.png"}]"#;
+        assert!(pending_files_from_attachments(legacy).is_empty());
+    }
 
     /// Single-connection in-memory pool: multiple connections would each get
     /// their own private ":memory:" database.

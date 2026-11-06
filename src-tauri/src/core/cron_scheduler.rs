@@ -153,7 +153,7 @@ pub async fn run(
                 let state = app2.state::<crate::AppState>();
                 let msg = format!("⏰ 定时任务：{prompt}");
                 let result =
-                    crate::commands::agent::run_agent_turn(&state, &app2, sid.clone(), msg, None, None)
+                    crate::commands::agent::run_agent_turn(&state, &app2, sid.clone(), msg, None, None, None)
                         .await;
 
                 // 触发完成后发系统通知：标题区分成功/失败，正文带会话标题 + prompt 摘要

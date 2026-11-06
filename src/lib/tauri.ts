@@ -1770,8 +1770,11 @@ export async function saveAttachmentBytes(input: SaveAttachmentBytesInput): Prom
 }
 
 /** Read a local image file and return it as a base64-encoded attachment. */
-export async function readImageFile(path: string): Promise<ChatAttachment> {
-  return invoke<ChatAttachment>('read_image_file', { path });
+/** An image read off disk for the attach flow — always carries its payload. */
+export type InlineImageAttachment = ChatAttachment & { base64: string };
+
+export async function readImageFile(path: string): Promise<InlineImageAttachment> {
+  return invoke<InlineImageAttachment>('read_image_file', { path });
 }
 
 // ============================================================
@@ -2980,6 +2983,17 @@ export async function remoteChatFileSave(
   channel: string, messageId: string, fileKey: string, kind: string, savePath: string
 ): Promise<void> {
   return invoke<void>('remote_chat_file_save', { channel, messageId, fileKey, kind, savePath });
+}
+
+/**
+ * P0 smoke test for WeChat outbound media: send one local file over the stored
+ * binding (no agent turn). Omit `chatId` to target the most recent approved
+ * WeChat chat.
+ */
+export async function remoteWeixinSendFile(
+  filePath: string, chatId?: string, caption?: string
+): Promise<string> {
+  return invoke<string>('remote_weixin_send_file', { filePath, chatId, caption });
 }
 
 export async function remoteChatFileImport(

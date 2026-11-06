@@ -3,7 +3,8 @@ import { User, Copy, Check, Paperclip, ChevronDown, ChevronUp, Tag, Download, La
 import { memo, useEffect, useMemo, useState } from 'react';
 import type { AgentStep, ChatMessage } from '@/lib/types';
 import { parseToolCalls, stepsToPhases } from '@/lib/agentPhases';
-import { parseAttachments } from '@/lib/attachments';
+import { parseAttachments, isInlineImage, isOutboundFile } from '@/lib/attachments';
+import { FileAttachmentCard } from './FileAttachmentCard';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
 import { chatMessageTag, saveTextFile, agentGetTurnContext } from '@/lib/tauri';
 import { buildTurnMarkdown, turnExportFileName, type TurnContextSnapshot } from '@/lib/exportTurn';
@@ -136,6 +137,12 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
   const isSystem = message.role === 'system';
   const isTool = message.role === 'tool';
   const toolCalls = parseToolCalls(message.tool_calls);
+  // Attachments have two shapes: inline images (user turns) and outbound file
+  // metadata (assistant turns of remote IM sessions).
+  const outboundFiles = useMemo(
+    () => parseAttachments(message.attachments).filter(isOutboundFile),
+    [message.attachments],
+  );
   const hasLegacyReasoning = !!message.reasoning_content;
   const hasLegacyToolCalls = toolCalls.length > 0;
   const hasSteps = agentSteps.length > 0;
@@ -320,28 +327,40 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
             <UserText content={message.content} />
             {message.attachments && (
               <div className="flex flex-wrap gap-2 mt-2">
-                {parseAttachments(message.attachments).map((att, idx) => (
-                  <AttachmentImage
-                    key={idx}
-                    att={att}
-                    alt={att.name || `图片 ${idx + 1}`}
-                    className="max-w-[120px] max-h-[120px] object-cover rounded-lg border border-codex-border/50"
-                  />
-                ))}
+                {parseAttachments(message.attachments)
+                  .filter(isInlineImage)
+                  .map((att, idx) => (
+                    <AttachmentImage
+                      key={idx}
+                      att={att}
+                      alt={att.name || `图片 ${idx + 1}`}
+                      className="max-w-[120px] max-h-[120px] object-cover rounded-lg border border-codex-border/50"
+                    />
+                  ))}
               </div>
             )}
           </>
         ) : (
-          <div className="prose prose-sm prose-invert max-w-none [&>*:first-child]:mt-0 [overflow-wrap:anywhere]">
-            <ReactMarkdown
-              remarkPlugins={assistantRemarkPlugins}
-              rehypePlugins={assistantRehypePlugins}
-              urlTransform={markdownUrlTransform}
-              components={assistantMarkdownComponents}
-            >
-              {normalizedContent}
-            </ReactMarkdown>
-          </div>
+          <>
+            <div className="prose prose-sm prose-invert max-w-none [&>*:first-child]:mt-0 [overflow-wrap:anywhere]">
+              <ReactMarkdown
+                remarkPlugins={assistantRemarkPlugins}
+                rehypePlugins={assistantRehypePlugins}
+                urlTransform={markdownUrlTransform}
+                components={assistantMarkdownComponents}
+              >
+                {normalizedContent}
+              </ReactMarkdown>
+            </div>
+            {/* Files this reply sent to the user's chat app (remote IM only). */}
+            {message.attachments && outboundFiles.length > 0 && (
+              <div className="flex flex-wrap gap-2 mt-2">
+                {outboundFiles.map((att, idx) => (
+                  <FileAttachmentCard key={idx} att={att} />
+                ))}
+              </div>
+            )}
+          </>
         )}
 
         {!isUser && (message.tokens_in != null || message.tokens_out != null || message.tokens_used != null) && (

@@ -47,6 +47,9 @@ base64 = "0.22"
 flate2 = "1"
 # WeChat iLink CDN media is AES-128-ECB encrypted (see remote/weixin.rs).
 aes = "0.8"
+# Outbound CDN uploads declare the plaintext MD5 (getuploadurl.rawfilemd5).
+# Already in the lockfile as a transitive dep, so this costs no new download.
+md-5 = "0.10"
 anyhow = "1.0"
 raw-window-handle = "0.6"
 tracing = "0.1"

@@ -14,7 +14,8 @@ export function AttachmentImage({
   className?: string;
 }) {
   const [open, setOpen] = useState(false);
-  const src = `data:${att.mime};base64,${att.base64}`;
+  // `base64` is absent on outbound-file rows (those render as a file card).
+  const src = att.base64 ? `data:${att.mime};base64,${att.base64}` : '';
 
   useEffect(() => {
     if (!open) return;
@@ -24,6 +25,8 @@ export function AttachmentImage({
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [open]);
+
+  if (!src) return null;
 
   return (
     <>

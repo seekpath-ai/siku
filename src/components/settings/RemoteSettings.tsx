@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import QRCode from 'qrcode';
 import { Check, HelpCircle, Loader2, Pencil, Plus, Power, Trash2 } from 'lucide-react';
 import {
@@ -16,6 +17,7 @@ import {
   remoteWeixinLoginStart,
   remoteWeixinLoginVerify,
   remoteWeixinLogout,
+  remoteWeixinSendFile,
 } from '@/lib/tauri';
 import type { FeishuBotConfig, RemoteChannelStatus, RemotePairing, WeixinConfigInfo, WeixinQrEvent } from '@/lib/tauri';
 
@@ -75,6 +77,9 @@ export function RemoteSettings() {
   const [weixinCfg, setWeixinCfg] = useState<WeixinConfigInfo | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [qrMessage, setQrMessage] = useState<string | null>(null);
+  // P0 outbound-file smoke test: send one picked file straight to WeChat,
+  // bypassing the agent (docs/remote-channels.md §7.9).
+  const [sendTestMsg, setSendTestMsg] = useState<string | null>(null);
   const [needVerify, setNeedVerify] = useState(false);
   const [verifyCode, setVerifyCode] = useState('');
   const [loginBusy, setLoginBusy] = useState(false);
@@ -399,21 +404,42 @@ export function RemoteSettings() {
         </div>
 
         {weixinCfg?.enabled ? (
-          <div className="flex items-center gap-3">
-            <div className="flex-1 min-w-0 text-xs text-text-secondary/60">
-              已连接微信账号 {weixinCfg.ilink_user_id || '—'}
+          <div className="space-y-2">
+            <div className="flex items-center gap-3">
+              <div className="flex-1 min-w-0 text-xs text-text-secondary/60">
+                已连接微信账号 {weixinCfg.ilink_user_id || '—'}
+              </div>
+              <button
+                onClick={async () => {
+                  const picked = await openFileDialog({ multiple: false, directory: false });
+                  if (typeof picked !== 'string') return;
+                  setSendTestMsg('发送中…');
+                  try {
+                    setSendTestMsg(await remoteWeixinSendFile(picked));
+                  } catch (e) {
+                    setSendTestMsg(`发送失败：${String(e)}`);
+                  }
+                }}
+                className="h-8 px-3 rounded-lg border border-surface-hover text-sm text-text-secondary hover:text-text-primary"
+                title="挑一个本地文件直接发到最近配对的微信会话，用于验证上行通道"
+              >
+                发送文件到微信
+              </button>
+              <button
+                onClick={() =>
+                  remoteWeixinLogout()
+                    .then(() => remoteWeixinConfig())
+                    .then(setWeixinCfg)
+                    .catch((e) => console.error('weixin logout:', e))
+                }
+                className="h-8 px-3 rounded-lg border border-surface-hover text-sm text-text-secondary hover:text-text-primary"
+              >
+                断开连接
+              </button>
             </div>
-            <button
-              onClick={() =>
-                remoteWeixinLogout()
-                  .then(() => remoteWeixinConfig())
-                  .then(setWeixinCfg)
-                  .catch((e) => console.error('weixin logout:', e))
-              }
-              className="h-8 px-3 rounded-lg border border-surface-hover text-sm text-text-secondary hover:text-text-primary"
-            >
-              断开连接
-            </button>
+            {sendTestMsg && (
+              <div className="text-xs text-text-secondary/70 break-all">{sendTestMsg}</div>
+            )}
           </div>
         ) : (
           <div className="space-y-3">

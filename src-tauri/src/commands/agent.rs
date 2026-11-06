@@ -971,6 +971,10 @@ pub(crate) async fn run_agent_turn(
     content: String,
     attachments: Option<Vec<crate::ai::llm::ImageAttachment>>,
     tools_override: Option<Vec<String>>,
+    // Per-turn outbound file queue (remote IM only). The tool registers files
+    // here and this function serializes them into the assistant row, so the
+    // ledger and the chat app share one source of truth.
+    outbound: Option<crate::remote::router::OutboundQueue>,
 ) -> Result<(), String> {
     // Reject a second concurrent turn for the same session (user double-send,
     // cron firing mid-turn, pet windows). The guard lives until the spawned
@@ -991,6 +995,9 @@ pub(crate) async fn run_agent_turn(
     .ok_or_else(|| "session not found".to_string())?;
 
     let mut config = build_agent_config(&state, &session).await?;
+    // "Full" = no per-turn narrowing applied. Needed below to decide whether
+    // the outbound-file tool may be exposed at all.
+    let grant_full = tools_override.is_none();
     // Per-turn tool override (remote IM per-member grants: a read-only
     // group member shares the group's session, so the restriction cannot
     // live on the session row — it is applied to this turn only).
@@ -1161,6 +1168,7 @@ pub(crate) async fn run_agent_turn(
     };
 
     // Build filtered tool registry (default write directory = working_dir)
+    let allow_working_dir = working_dir.clone();
     let mut registry = ToolRegistry::default_registry(
         &state.db,
         &state.app_data_dir,
@@ -1193,6 +1201,40 @@ pub(crate) async fn run_agent_turn(
         .into_iter()
         .collect();
     registry.register_skills(&skills_dir, &selected_skills);
+
+    // Outbound file sending (docs/remote-channels.md §7): only for a remote IM
+    // turn in a PRIVATE chat with the "full" grant. Group chats are excluded
+    // because a group session is shared by every paired member — a file sent
+    // there is broadcast to the whole group, and per-member grant levels
+    // cannot prevent that.
+    let remote_context = session.context.as_deref().unwrap_or("");
+    let remote_ctx = serde_json::from_str::<serde_json::Value>(remote_context).ok();
+    let private_chat = remote_ctx
+        .as_ref()
+        .and_then(|v| v.get("kind").and_then(|k| k.as_str()))
+        .map(|k| k == "private")
+        .unwrap_or(false);
+    // Only WeChat has an upload path today; Feishu arrives with P2, so the
+    // tool must not be advertised there and then fail every call.
+    let weixin_chat = remote_ctx
+        .as_ref()
+        .and_then(|v| v.get("channel").and_then(|c| c.as_str()))
+        .map(|c| crate::remote::router::channel_kind(c) == "weixin")
+        .unwrap_or(false);
+    if let Some(queue) = outbound.clone().filter(|_| {
+        grant_full
+            && private_chat
+            && weixin_chat
+            && crate::remote::is_remote_context(remote_context)
+    }) {
+        let roots = crate::ai::agent::tools::send_file_to_user::SendFileToUserTool::default_allow_roots(
+            allow_working_dir.as_deref().map(std::path::Path::new),
+            &state.app_data_dir,
+        );
+        registry.register(
+            crate::ai::agent::tools::send_file_to_user::SendFileToUserTool::new(queue, roots),
+        );
+    }
 
     let memory_path = agent_memory_path(
         &state.app_data_dir,
@@ -1451,6 +1493,9 @@ pub(crate) async fn run_agent_turn(
     let spawn_memory_path = memory_path.clone();
     let cancel_tokens = state.cancel_tokens.clone();
     let tracked = state.background_tasks.clone();
+    // Moved into the turn task: the assistant row must carry whatever the
+    // tool registered, and only this task knows the final turn state.
+    let turn_outbound = outbound.clone();
 
     crate::spawn_tracked(&tracked, async move {
         // Held until cleanup below is done: guarantees no other turn for this
@@ -1535,13 +1580,37 @@ pub(crate) async fn run_agent_turn(
                 } else {
                     display_content.clone()
                 };
+                // Outbound files registered by the agent this turn. A turn
+                // that never had a chance to deliver them (cancelled or
+                // failed) persists them as `failed`, so the router will not
+                // upload anything afterwards (docs/remote-channels.md §7.4).
+                let outbound_files: Vec<crate::remote::router::OutboundFile> = turn_outbound
+                    .as_ref()
+                    .and_then(|q| q.lock().ok().map(|g| g.clone()))
+                    .unwrap_or_default();
+                let outbound_attachments = if outbound_files.is_empty() {
+                    None
+                } else if let Some(err) = turn_error.as_ref() {
+                    Some(crate::remote::router::failed_attachments_json(
+                        &outbound_files,
+                        &format!("回合失败：{err}"),
+                    ))
+                } else if cancelled {
+                    Some(crate::remote::router::failed_attachments_json(
+                        &outbound_files,
+                        "已取消",
+                    ))
+                } else {
+                    Some(crate::remote::router::pending_attachments_json(&outbound_files))
+                };
+
                 // Save final assistant message without reasoning/tool_calls (steps hold those).
                 let tokens_used = if total_tokens.total() > 0 { Some(total_tokens.total() as i32) } else { None };
                 let tokens_in = if total_tokens.tokens_in > 0 { Some(total_tokens.tokens_in as i32) } else { None };
                 let tokens_in_hit = if total_tokens.tokens_in_hit > 0 { Some(total_tokens.tokens_in_hit as i32) } else { None };
                 let tokens_out = if total_tokens.tokens_out > 0 { Some(total_tokens.tokens_out as i32) } else { None };
                 let message_id = match chat::save_chat_message(
-                    &db, &sid, "assistant", &persist_content, None, tokens_used, tokens_in, tokens_in_hit, tokens_out, None, None, None, None, None,
+                    &db, &sid, "assistant", &persist_content, None, tokens_used, tokens_in, tokens_in_hit, tokens_out, None, None, None, None, outbound_attachments.as_deref(),
                 ).await {
                     Ok(id) => Some(id),
                     Err(e) => {
@@ -1619,8 +1688,20 @@ pub(crate) async fn run_agent_turn(
                 // trace, and append it to the JSONL memory so the file does
                 // not end on a dangling user message.
                 let error_content = format!("❌ {e}");
+                let failed_files: Vec<crate::remote::router::OutboundFile> = turn_outbound
+                    .as_ref()
+                    .and_then(|q| q.lock().ok().map(|g| g.clone()))
+                    .unwrap_or_default();
+                let failed_attachments = if failed_files.is_empty() {
+                    None
+                } else {
+                    Some(crate::remote::router::failed_attachments_json(
+                        &failed_files,
+                        &format!("回合失败：{e}"),
+                    ))
+                };
                 if let Err(db_err) = chat::save_chat_message(
-                    &db, &sid, "assistant", &error_content, None, None, None, None, None, None, None, None, None, None,
+                    &db, &sid, "assistant", &error_content, None, None, None, None, None, None, None, None, None, failed_attachments.as_deref(),
                 ).await {
                     error!(error = %db_err, "failed to persist agent error message");
                 }
@@ -1687,7 +1768,7 @@ pub async fn agent_send_message(
     content: String,
     attachments: Option<Vec<crate::ai::llm::ImageAttachment>>,
 ) -> Result<(), String> {
-    run_agent_turn(&state, &app_handle, session_id, content, attachments, None).await
+    run_agent_turn(&state, &app_handle, session_id, content, attachments, None, None).await
 }
 
 /// Answer a pending AskUserQuestion dialog for a session.

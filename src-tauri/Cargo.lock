@@ -6630,6 +6630,7 @@ dependencies = [
  "image",
  "libsqlite3-sys",
  "lopdf",
+ "md-5 0.10.6",
  "notify",
  "once_cell",
  "pdf_oxide",

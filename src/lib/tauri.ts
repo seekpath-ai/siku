@@ -675,8 +675,6 @@ export interface AppSettings {
   // Browser automation (L1)
   /** Chrome/Edge executable override; absent/empty = auto-detect. */
   browser_path?: string | null;
-  /** Default browser_connect mode: persistent | temporary | attach. */
-  browser_default_mode?: string | null;
   /** Extra launch args for siku-launched browsers (persistent/temporary). */
   browser_launch_args?: string | null;
   /** Persistent browser profile directory override; empty = default. */
@@ -2990,6 +2988,16 @@ export async function remoteAttachmentRetry(
   sessionId: string, messageId: string, attachmentIndex: number
 ): Promise<void> {
   return invoke<void>('remote_attachment_retry', { sessionId, messageId, attachmentIndex });
+}
+
+/** Delete the automation browser profile (logins, extensions, cache). */
+export async function browserResetProfile(): Promise<void> {
+  return invoke<void>('browser_reset_profile');
+}
+
+/** Open the persistent automation browser for a one-time login/extension setup pass. */
+export async function browserOpenSetup(): Promise<string> {
+  return invoke<string>('browser_open_setup');
 }
 
 /** Account-wide switch for outbound files (computer → chat app). */

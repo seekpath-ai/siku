@@ -1113,8 +1113,9 @@ pub fn run() {
             commands::system::open_local_path,
             commands::system::reveal_in_file_manager,
             commands::browser::browser_detect,
-            commands::browser::browser_profile_sources,
-            commands::browser::browser_profile_import,
+            commands::browser::browser_profile_info,
+            commands::browser::browser_open_setup,
+            commands::browser::browser_reset_profile,
             commands::system::resolve_existing_path,
             // Annotations
             commands::annotation::annotation_list,

@@ -15,9 +15,9 @@ impl Tool for BrowserConnectTool {
 
     fn description(&self) -> &str {
         "Launch or attach to a real Chrome/Edge browser for web automation. \
-         Modes: 'persistent' (default) uses a dedicated long-lived profile so site logins survive restarts — \
-         use it for sites needing login; 'temporary' uses a clean throwaway profile — a stronger web_fetch \
-         for JS-rendered pages; 'attach' connects to a browser the user already started with \
+         Defaults to the 'persistent' profile the user signs into (site logins survive restarts) — \
+         use it for anything needing login; 'temporary' uses a clean throwaway profile — a stronger \
+         web_fetch for JS-rendered pages; 'attach' connects to a browser the user already started with \
          --remote-debugging-port. Idempotent: a healthy existing connection is reused. \
          Requires an unlocked, logged-in desktop (headed window)."
     }
@@ -47,16 +47,9 @@ impl Tool for BrowserConnectTool {
         let mgr = browser::global().ok_or("browser manager unavailable (app not fully initialized)")?;
 
         let mode = match args["mode"].as_str() {
-            None => {
-                let configured = crate::core::settings_service::cached_settings().browser_default_mode;
-                match configured.as_deref() {
-                    Some("temporary") => ConnectMode::Temporary,
-                    Some("attach") => ConnectMode::Attach {
-                        port: args["port"].as_u64().unwrap_or(9222) as u16,
-                    },
-                    _ => ConnectMode::Persistent,
-                }
-            }
+            // Persistent is the only mode the settings UI offers; the other two
+            // stay available to the model for one-off jobs.
+            None => ConnectMode::Persistent,
             Some("persistent") => ConnectMode::Persistent,
             Some("temporary") => ConnectMode::Temporary,
             Some("attach") => ConnectMode::Attach {

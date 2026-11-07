@@ -447,6 +447,44 @@ impl BrowserManager {
         Ok(outcome)
     }
 
+    /// Open the persistent automation browser for a one-time human setup pass:
+    /// sign in to the sites you use and install/enable extensions. The profile
+    /// is persistent, so this state is reused by later agent turns — which is
+    /// the reliable alternative to cloning a signed-in profile (Chrome's
+    /// app-bound encryption drops copied cookies).
+    ///
+    /// Returns the profile directory so the UI can point the user at it.
+    pub async fn open_setup(&self) -> Result<String, String> {
+        // Setup must land in the PERSISTENT profile: a live temporary/attach
+        // session would hand the user the wrong browser window.
+        let current_mode = {
+            let guard = self.conn.lock().await;
+            guard.as_ref().map(|c| c.mode.clone())
+        };
+        if matches!(current_mode, Some(mode) if mode != ConnectMode::Persistent) {
+            self.disconnect().await;
+        }
+        let outcome = self.connect(ConnectMode::Persistent).await?;
+        let browser = self
+            .live_browser()
+            .await
+            .ok_or_else(|| "浏览器已连接但无法获取句柄".to_string())?;
+        // Chrome rejects CDP navigation to some chrome:// URLs; the extension
+        // manager is the most useful landing page, the web store is the
+        // fallback (the user can still type chrome://extensions themselves).
+        if let Err(e) = browser.new_page("chrome://extensions/").await {
+            tracing::warn!(error = %e, "chrome://extensions unavailable, opening the web store instead");
+            browser
+                .new_page("https://chromewebstore.google.com/")
+                .await
+                .map_err(|e| format!("无法打开浏览器页面: {e}"))?;
+        }
+        Ok(outcome
+            .profile_dir
+            .map(|p| p.display().to_string())
+            .unwrap_or_default())
+    }
+
     /// Close the connection (and the browser, if we launched it). Returns
     /// whether there was anything to close.
     pub async fn disconnect(&self) -> bool {

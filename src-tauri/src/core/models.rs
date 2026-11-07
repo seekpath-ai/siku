@@ -645,10 +645,6 @@ pub struct AppSettings {
     /// Chrome/Edge executable override; None/empty = auto-detect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser_path: Option<String>,
-    /// Default mode for browser_connect: "persistent" | "temporary" | "attach".
-    /// None = persistent.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub browser_default_mode: Option<String>,
     /// Extra launch arguments for siku-launched browsers (persistent/temporary
     /// mode), e.g. `--proxy-server=... --load-extension="D:\ext\helper"`.
     /// None/empty = none. Ignored in attach mode.
@@ -1018,7 +1014,6 @@ impl Default for AppSettings {
             research_discover_max_results: default_research_discover_max_results(),
             remote: RemoteSettings::default(),
             browser_path: None,
-            browser_default_mode: None,
             browser_launch_args: None,
             browser_profile_dir: None,
         }

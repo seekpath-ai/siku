@@ -1,8 +1,9 @@
-import { useMemo, useEffect, useRef } from 'react';
+import { useMemo } from 'react';
 import { X, Folder, ArrowUpToLine, Lock } from 'lucide-react';
 import type { Note } from '@/lib/types';
 import { useAllUnlockedSet } from '@/stores/noteLockStore';
 import { computeHiddenSet } from '@/lib/noteLock';
+import { Modal } from '@/components/ui/Modal';
 
 interface Props {
   notes: Note[];
@@ -16,16 +17,6 @@ interface Props {
 
 /** Modal listing all folders to move note(s) into (Obsidian-style). */
 export function MoveNoteDialog({ notes, noteIds, currentParentId, onMove, onClose }: Props) {
-  const panelRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const onDown = (e: MouseEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node)) onClose();
-    };
-    window.addEventListener('mousedown', onDown);
-    return () => window.removeEventListener('mousedown', onDown);
-  }, [onClose]);
-
   const folders = useMemo(() => notes.filter((n) => n.is_folder === 1), [notes]);
   const noteMap = useMemo(() => new Map(notes.map((n) => [n.id, n])), [notes]);
   // Gated folders (subtrees of not-yet-unlocked lock roots) can't be move
@@ -94,13 +85,12 @@ export function MoveNoteDialog({ notes, noteIds, currentParentId, onMove, onClos
   const rootFolders = childrenMap.get('') || [];
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
-      <div
-        ref={panelRef}
-        className="relative w-[340px] max-h-[70vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
-      >
-        <div className="flex items-center justify-between px-4 py-3 border-b border-surface-hover">
+    <Modal
+      onClose={onClose}
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+      className="w-[340px] max-h-[70vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
+    >
+      <div className="flex items-center justify-between px-4 py-3 border-b border-surface-hover">
           <span className="text-sm font-medium text-text-primary">
             {noteIds.length > 1 ? `将 ${noteIds.length} 个对象移动到` : '将文件移动到'}
           </span>
@@ -131,7 +121,6 @@ export function MoveNoteDialog({ notes, noteIds, currentParentId, onMove, onClos
           )}
           {rootFolders.map((folder) => renderFolder(folder, 0))}
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

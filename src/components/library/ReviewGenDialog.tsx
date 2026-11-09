@@ -21,6 +21,7 @@ import { openNoteTab } from '@/lib/openNote';
 import { ModelOverrideSelect } from './ModelOverrideSelect';
 import { ReviewReadingPanel, type ReviewCardDraft } from './ReviewReadingPanel';
 import { ReviewOutlineEditor } from './ReviewOutlineEditor';
+import { Modal } from '@/components/ui/Modal';
 import {
   reviewCardUpdate,
   reviewCreate,
@@ -734,8 +735,11 @@ export function ReviewGenDialog() {
   };
 
   return (
-    <div className="fixed inset-0 z-[6000] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={close} />
+    <Modal
+      onClose={close}
+      zTier="workspaceModal"
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+    >
       <div className="relative w-[94vw] max-w-[1080px] h-[88vh] max-h-[88vh] min-h-0 mx-4 flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         <div className="flex items-center gap-2 px-4 py-3 border-b border-surface-hover shrink-0">
           <Sparkles size={15} className="text-primary" />
@@ -1163,7 +1167,7 @@ export function ReviewGenDialog() {
           )}
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }
 

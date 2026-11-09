@@ -9,6 +9,7 @@ import { VaultSwitcher } from '@/components/notes/VaultSwitcher';
 import { HelpDialog } from '@/components/notes/HelpDialog';
 import { NotesSettingsModal } from '@/components/notes/NotesSettingsModal';
 import { ListPanel } from '@/components/layout/ListPanel';
+import { Modal } from '@/components/ui/Modal';
 import { Folder } from 'lucide-react';
 import { useShellStore } from '@/stores/shellStore';
 import { useDialog } from '@/hooks/useDialog';
@@ -762,26 +763,26 @@ function NotesPage() {
 
       {/* Vault import progress */}
       {importProgress && (
-        <div className="fixed inset-0 z-[200] flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-          <div className="relative w-[380px] bg-surface border border-surface-hover rounded-xl shadow-2xl p-5">
-            <div className="text-sm font-medium text-text-primary mb-3">正在导入库…</div>
-            <div className="h-1.5 rounded-full bg-surface-hover overflow-hidden">
-              <div
-                className="h-full bg-primary transition-all duration-150"
-                style={{
-                  width: `${importProgress.total > 0 ? Math.round((importProgress.current / importProgress.total) * 100) : 0}%`,
-                }}
-              />
-            </div>
-            <div className="flex items-center justify-between gap-2 mt-2 text-xs text-text-secondary">
-              <span className="truncate flex-1">{importProgress.name || '扫描目录…'}</span>
-              <span className="shrink-0 tabular-nums">
-                {importProgress.current} / {importProgress.total || '…'}
-              </span>
-            </div>
+        <Modal
+          backdropClassName="bg-black/50 backdrop-blur-sm"
+          className="w-[380px] bg-surface border border-surface-hover rounded-xl shadow-2xl p-5"
+        >
+          <div className="text-sm font-medium text-text-primary mb-3">正在导入库…</div>
+          <div className="h-1.5 rounded-full bg-surface-hover overflow-hidden">
+            <div
+              className="h-full bg-primary transition-all duration-150"
+              style={{
+                width: `${importProgress.total > 0 ? Math.round((importProgress.current / importProgress.total) * 100) : 0}%`,
+              }}
+            />
           </div>
-        </div>
+          <div className="flex items-center justify-between gap-2 mt-2 text-xs text-text-secondary">
+            <span className="truncate flex-1">{importProgress.name || '扫描目录…'}</span>
+            <span className="shrink-0 tabular-nums">
+              {importProgress.current} / {importProgress.total || '…'}
+            </span>
+          </div>
+        </Modal>
       )}
     </div>
   );

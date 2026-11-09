@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Lock, LockOpen, X, Eye, EyeOff, Loader2 } from 'lucide-react';
 import { vaultSetLockPassword, vaultVerifyLockPassword } from '@/lib/tauri';
 import { useNoteLockStore } from '@/stores/noteLockStore';
+import { Modal } from '@/components/ui/Modal';
 import type { Note } from '@/lib/types';
 
 interface DialogProps {
@@ -55,14 +56,6 @@ export function LockPasswordDialog({ mode, title, onSuccess, onClose }: DialogPr
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
-    const onDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onDown);
-    return () => window.removeEventListener('keydown', onDown);
-  }, [onClose]);
-
   const submit = async () => {
     if (busy) return;
     setError('');
@@ -100,10 +93,13 @@ export function LockPasswordDialog({ mode, title, onSuccess, onClose }: DialogPr
   };
 
   return (
-    <div className="fixed inset-0 z-[300] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-[320px] bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
-        <div className="flex items-center justify-between px-4 py-3 border-b border-surface-hover">
+    <Modal
+      onClose={onClose}
+      zTier="modalStacked"
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+      className="w-[320px] bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
+    >
+      <div className="flex items-center justify-between px-4 py-3 border-b border-surface-hover">
           <span className="flex items-center gap-1.5 text-sm font-medium text-text-primary">
             <Lock size={13} className="text-text-secondary" />
             {title ?? (mode === 'setup' ? '设置锁定密码' : '输入锁定密码')}
@@ -142,8 +138,7 @@ export function LockPasswordDialog({ mode, title, onSuccess, onClose }: DialogPr
             {mode === 'setup' ? '设置并继续' : '解锁'}
           </button>
         </form>
-      </div>
-    </div>
+    </Modal>
   );
 }
 

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Link2, Loader2, X, AlertCircle, FileText, CheckCircle2 } from 'lucide-react';
+import { Modal } from '@/components/ui/Modal';
 import { usePreviewPaperFromLink, useImportPaperFromLink } from '@/hooks/useLibrary';
 import { parseLinkImportError } from '@/lib/tauri';
 import type { PaperLinkMetadata, LinkImportError } from '@/lib/types';
@@ -67,9 +68,11 @@ export function ImportFromLinkDialog({ open, onClose }: ImportFromLinkDialogProp
   const isBusy = previewMutation.isPending || importMutation.isPending;
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={resetAndClose} />
-      <div className="relative w-full max-w-lg mx-4 bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
+    <Modal
+      onClose={resetAndClose}
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+      className="w-full max-w-lg bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
+    >
         <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-hover">
           <Link2 size={18} className="text-primary" />
           <span className="text-sm font-medium text-text-primary">从链接导入文献</span>
@@ -221,7 +224,6 @@ export function ImportFromLinkDialog({ open, onClose }: ImportFromLinkDialogProp
             </>
           )}
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

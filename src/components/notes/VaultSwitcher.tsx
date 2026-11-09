@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Check, Plus, Pencil, Trash2, X, Database, Download, Upload } from 'lucide-react';
 import { useDialog } from '@/hooks/useDialog';
+import { Modal } from '@/components/ui/Modal';
 import type { Vault } from '@/lib/types';
 
 interface Props {
@@ -25,15 +26,6 @@ export function VaultSwitcher({ vaults, currentVaultId, onSwitch, onCreate, onRe
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const onDown = (e: MouseEvent) => {
-      if (panelRef.current && !panelRef.current.contains(e.target as Node)) onClose();
-    };
-    window.addEventListener('mousedown', onDown);
-    return () => window.removeEventListener('mousedown', onDown);
-  }, [onClose]);
 
   useEffect(() => {
     if (creating || renamingId !== null) setTimeout(() => inputRef.current?.focus(), 30);
@@ -61,13 +53,12 @@ export function VaultSwitcher({ vaults, currentVaultId, onSwitch, onCreate, onRe
   };
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
-      <div
-        ref={panelRef}
-        className="relative w-[340px] max-h-[70vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
-      >
-        <div className="flex items-center justify-between px-4 py-3 border-b border-surface-hover">
+    <Modal
+      onClose={onClose}
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+      className="w-[340px] max-h-[70vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
+    >
+      <div className="flex items-center justify-between px-4 py-3 border-b border-surface-hover">
           <span className="text-sm font-medium text-text-primary">库切换器</span>
           <button
             onClick={onClose}
@@ -203,7 +194,6 @@ export function VaultSwitcher({ vaults, currentVaultId, onSwitch, onCreate, onRe
             </div>
           )}
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

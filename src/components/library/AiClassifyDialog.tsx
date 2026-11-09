@@ -25,6 +25,7 @@ import {
 import { useAiClassifyStore } from '@/stores/aiClassifyStore';
 import { useDialog } from '@/hooks/useDialog';
 import { ModelOverrideSelect } from './ModelOverrideSelect';
+import { Modal } from '@/components/ui/Modal';
 import {
   AI_CLASSIFY_PROGRESS_EVENT,
   aiClassifyApply,
@@ -836,10 +837,13 @@ export function AiClassifyDialog() {
   const visibleItems = tab === 'pending' ? pending : tab === 'accepted' ? accepted : items;
 
   return (
-    <div className="fixed inset-0 z-[6000] flex items-center justify-center">
+    <Modal
+      onClose={close}
+      zTier="workspaceModal"
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+    >
       {/* Closing is always allowed; the backend run reports its own state and
           停止 now interrupts an in-flight model call. */}
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={close} />
       <div className="relative w-[94vw] max-w-[1240px] h-[86vh] mx-4 flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         {/* Header */}
         <div className="flex items-center gap-2 px-4 py-2.5 border-b border-surface-hover shrink-0">
@@ -1903,7 +1907,7 @@ export function AiClassifyDialog() {
           </div>
         )}
       </div>
-    </div>
+    </Modal>
   );
 }
 

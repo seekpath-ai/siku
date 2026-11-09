@@ -24,6 +24,7 @@ import { useDialog } from '@/hooks/useDialog';
 import { listPapers } from '@/lib/tauri';
 import type { Collection, Tag as TagType } from '@/lib/types';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
+import { Modal } from '@/components/ui/Modal';
 import { ResizeHandle } from './ResizeHandle';
 
 const TAG_SECTION_MIN = 100;
@@ -744,36 +745,31 @@ export function CollectionTree() {
       )}
 
       {colorPickerTag && (
-        <div
-          className="fixed inset-0 z-[200] flex items-center justify-center"
-          onClick={() => setColorPickerTag(null)}
+        <Modal
+          onClose={() => setColorPickerTag(null)}
+          backdropClassName="bg-black/50 backdrop-blur-sm"
+          className="bg-surface border border-surface-hover rounded-xl shadow-2xl p-4"
         >
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-          <div
-            className="relative bg-surface border border-surface-hover rounded-xl shadow-2xl p-4"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="text-sm font-medium text-text-primary mb-3">标签颜色</div>
-            <div className="flex flex-wrap gap-2 max-w-[192px]">
-              {TAG_COLORS.map((c) => (
-                <button
-                  key={c}
-                  onClick={() => {
-                    updateTag.mutate({ id: colorPickerTag.id, color: c });
-                    setColorPickerTag(null);
-                  }}
-                  className={`w-7 h-7 rounded-full transition-transform hover:scale-110 ${
-                    colorPickerTag.color === c
-                      ? 'ring-2 ring-primary ring-offset-2 ring-offset-surface'
-                      : ''
-                  }`}
-                  style={{ backgroundColor: c }}
-                  title={c}
-                />
-              ))}
-            </div>
+          <div className="text-sm font-medium text-text-primary mb-3">标签颜色</div>
+          <div className="flex flex-wrap gap-2 max-w-[192px]">
+            {TAG_COLORS.map((c) => (
+              <button
+                key={c}
+                onClick={() => {
+                  updateTag.mutate({ id: colorPickerTag.id, color: c });
+                  setColorPickerTag(null);
+                }}
+                className={`w-7 h-7 rounded-full transition-transform hover:scale-110 ${
+                  colorPickerTag.color === c
+                    ? 'ring-2 ring-primary ring-offset-2 ring-offset-surface'
+                    : ''
+                }`}
+                style={{ backgroundColor: c }}
+                title={c}
+              />
+            ))}
           </div>
-        </div>
+        </Modal>
       )}
     </div>
   );

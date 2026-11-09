@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { FileDown, X } from 'lucide-react';
+import { Modal } from '@/components/ui/Modal';
 
 export interface PdfExportOptions {
   /** 章节自动编号：正文 h1–h4 前加 1 / 1.1 / 1.1.1 */
@@ -73,10 +74,12 @@ export function ExportPdfDialog({ noteTitle, canFixCitations, onConfirm, onCance
   ];
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onCancel} />
-      <div className="relative w-[380px] max-w-[92vw] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
-        <div className="flex items-center justify-between px-4 py-2.5 border-b border-surface-hover shrink-0">
+    <Modal
+      onClose={onCancel}
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+      className="w-[380px] max-w-[92vw] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
+    >
+      <div className="flex items-center justify-between px-4 py-2.5 border-b border-surface-hover shrink-0">
           <span className="text-sm font-medium text-text-primary flex items-center gap-1.5">
             <FileDown size={14} className="text-primary" />
             导出为 PDF
@@ -134,7 +137,6 @@ export function ExportPdfDialog({ noteTitle, canFixCitations, onConfirm, onCance
             导出
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

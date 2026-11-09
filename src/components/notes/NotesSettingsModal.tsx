@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import {
   X, Info, Palette, Layout, NotebookPen, KeyRound, Blocks,
   GitMerge, Link2, Zap, Command, Tag, CalendarDays, LayoutTemplate, History,
   Plug, Minus, Plus,
 } from 'lucide-react';
 import { useNotesSettingsStore, FONT_SIZE_MIN, FONT_SIZE_MAX, type NotesDefaultMode } from '@/stores/notesSettingsStore';
+import { Modal } from '@/components/ui/Modal';
 
 interface Props {
   onClose: () => void;
@@ -157,14 +158,6 @@ export function NotesSettingsModal({ onClose }: Props) {
   const [section, setSection] = useState<'options' | 'core' | 'community'>('options');
   const [selectedKey, setSelectedKey] = useState('about');
 
-  useEffect(() => {
-    const onDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onDown);
-    return () => window.removeEventListener('keydown', onDown);
-  }, [onClose]);
-
   const selected =
     section === 'options'
       ? OPTION_ITEMS.find((i) => i.key === selectedKey) ?? OPTION_ITEMS[0]
@@ -183,10 +176,12 @@ export function NotesSettingsModal({ onClose }: Props) {
     }`;
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-[720px] max-w-[92vw] h-[520px] max-h-[82vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
-        {/* Header */}
+    <Modal
+      onClose={onClose}
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+      className="w-[720px] max-w-[92vw] h-[520px] max-h-[82vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
+    >
+      {/* Header */}
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-surface-hover shrink-0">
           <span className="text-sm font-medium text-text-primary">设置</span>
           <button
@@ -267,7 +262,6 @@ export function NotesSettingsModal({ onClose }: Props) {
             ) : null}
           </div>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

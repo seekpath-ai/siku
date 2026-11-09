@@ -1,5 +1,6 @@
 import { CheckCircle2, FileStack, Loader2, MinusCircle, X, XCircle } from 'lucide-react';
 import { useBatchImportStore } from '@/stores/batchImportStore';
+import { Modal } from '@/components/ui/Modal';
 
 /** Progress dialog for batch imports (multi-select files / folder / Zotero).
  *  Driven entirely by useBatchImportStore; the backend streams per-item
@@ -14,13 +15,12 @@ export function BatchImportDialog() {
   const pct = s.total > 0 ? Math.round((s.current / s.total) * 100) : 0;
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div
-        className="absolute inset-0 bg-black/50 backdrop-blur-sm"
-        onClick={() => { if (!s.running) s.close(); }}
-      />
-      <div className="relative w-full max-w-md mx-4 bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
-        <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-hover">
+    <Modal
+      onClose={() => { if (!s.running) s.close(); }}
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+      className="w-full max-w-md bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
+    >
+      <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-hover">
           <FileStack size={18} className="text-primary" />
           <span className="text-sm font-medium text-text-primary">{s.label}</span>
           <button
@@ -100,7 +100,6 @@ export function BatchImportDialog() {
             </button>
           )}
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

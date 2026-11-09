@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { BookCopy, FolderOpen, Loader2, X } from 'lucide-react';
+import { Modal } from '@/components/ui/Modal';
 import { zoteroDetect, zoteroPreview, type ZoteroPreview } from '@/lib/tauri';
 import { runZoteroImport } from '@/stores/batchImportStore';
 
@@ -67,9 +68,11 @@ export function ZoteroImportDialog({ open, onClose }: ZoteroImportDialogProps) {
   };
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-lg mx-4 bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
+    <Modal
+      onClose={onClose}
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+      className="w-full max-w-lg bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
+    >
         <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-hover">
           <BookCopy size={18} className="text-primary" />
           <span className="text-sm font-medium text-text-primary">从 Zotero 导入</span>
@@ -143,7 +146,6 @@ export function ZoteroImportDialog({ open, onClose }: ZoteroImportDialogProps) {
             开始导入{preview ? `（${preview.items} 条）` : ''}
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

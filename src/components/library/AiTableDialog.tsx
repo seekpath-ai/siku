@@ -4,6 +4,7 @@ import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle, PanelR
 import { useAiTableStore } from '@/stores/aiTableStore';
 import { useDialog } from '@/hooks/useDialog';
 import { ModelOverrideSelect } from './ModelOverrideSelect';
+import { Modal } from '@/components/ui/Modal';
 import {
   aiTableExtractStart,
   aiTableExtractCancel,
@@ -407,11 +408,14 @@ export function AiTableDialog() {
   const pendingCells = Math.max(0, totalCells - doneCells - absentCells);
 
   return (
-    <div className="fixed inset-0 z-[6000] flex items-center justify-center">
+    <Modal
+      onClose={close}
+      zTier="workspaceModal"
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+    >
       {/* Closing is always allowed: the run keeps going in the background and
           the dialog re-attaches on reopen (ai_table_extract_status). Being
           trapped in a modal because a model call is slow is unacceptable. */}
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={close} />
       <div className="relative w-[94vw] max-w-[1200px] h-[calc(100dvh-3rem)] max-h-[1200px] min-h-0 mx-4 flex bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         {/* Left: switch between column definitions and extraction settings.
             Collapses to an icon rail so the grid owns the width once the
@@ -1195,6 +1199,6 @@ export function AiTableDialog() {
           </div>
         )}
       </div>
-    </div>
+    </Modal>
   );
 }

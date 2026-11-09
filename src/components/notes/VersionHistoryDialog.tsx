@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { X, History, RotateCcw, Bot } from 'lucide-react';
+import { Modal } from '@/components/ui/Modal';
 import { MergeView } from '@codemirror/merge';
 import { EditorState } from '@codemirror/state';
 import { EditorView, lineNumbers } from '@codemirror/view';
@@ -66,14 +67,6 @@ export function VersionHistoryDialog({ current, onRestore, onClose }: Props) {
       .catch(() => setVersions([]));
   }, [current.id]);
 
-  useEffect(() => {
-    const onDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onDown);
-    return () => window.removeEventListener('keydown', onDown);
-  }, [onClose]);
-
   const selected = versions?.find((v) => v.id === selectedId) ?? null;
 
   // Line-count summary (independent of the merge view's own diff).
@@ -117,10 +110,12 @@ export function VersionHistoryDialog({ current, onRestore, onClose }: Props) {
   };
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-[960px] max-w-[94vw] h-[560px] max-h-[82vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
-        {/* Header */}
+    <Modal
+      onClose={onClose}
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+      className="w-[960px] max-w-[94vw] h-[560px] max-h-[82vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
+    >
+      {/* Header */}
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-surface-hover shrink-0">
           <span className="text-sm font-medium text-text-primary flex items-center gap-1.5">
             <History size={14} className="text-primary" />
@@ -212,7 +207,6 @@ export function VersionHistoryDialog({ current, onRestore, onClose }: Props) {
             {restoring ? '恢复中...' : '恢复到该版本'}
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

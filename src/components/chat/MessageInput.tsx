@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Send, Paperclip, ImagePlus, BookOpen, Brain, Square, X, FileText, Scissors } from 'lucide-react';
+import { Send, Paperclip, BookOpen, Brain, Square, X, FileText, Scissors } from 'lucide-react';
 import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
 import { agentSendMessage, agentCancel, readDocumentFile, readImageFile, agentMemoryGet, agentGetSession, agentSetApprovalConfig } from '@/lib/tauri';
@@ -24,14 +24,13 @@ interface TextAttachment {
   content: string;
 }
 
-const DOCUMENT_FILTERS = [
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
+
+const ATTACH_FILTERS = [
   { name: '所有文件', extensions: ['*'] },
+  { name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] },
   { name: '文档', extensions: ['pdf', 'docx', 'xlsx', 'pptx'] },
   { name: '文本文件', extensions: ['txt', 'md', 'json', 'ts', 'tsx', 'js', 'rs', 'py', 'css', 'html', 'yml', 'yaml', 'toml', 'csv', 'xml'] },
-];
-
-const IMAGE_FILTERS = [
-  { name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] },
 ];
 
 export function MessageInput({ disabled }: Props) {
@@ -116,29 +115,44 @@ export function MessageInput({ disabled }: Props) {
     onError: (msg, title) => alert(msg, title ?? '图片附件'),
   });
 
-  const handleAttachText = async () => {
+  // Single attach entry: one picker for documents AND images; each path is
+  // dispatched by extension — images go inline as base64 (vision models),
+  // everything else is extracted to text with cache-based paging.
+  const handleAttach = async () => {
     try {
       const { open } = await import('@tauri-apps/plugin-dialog');
       const selected = await open({
         multiple: true,
         directory: false,
         defaultPath: activeProject?.path,
-        filters: DOCUMENT_FILTERS,
+        filters: ATTACH_FILTERS,
       });
       const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
       const failures: string[] = [];
       for (const path of paths) {
         if (typeof path !== 'string') continue;
         const name = path.split(/[\\/]/).pop() || path;
+        const ext = name.split('.').pop()?.toLowerCase() ?? '';
         try {
-          // cacheDir = session write dir when set, so the agent's file_read
-          // can page oversized extractions.
-          const content = await readDocumentFile(path, activeProject?.path);
-          setTextAttachments((prev) =>
-            prev.some((a) => a.path === path)
-              ? prev
-              : [...prev, { kind: 'text', id: `txt_${Date.now()}_${path.length}`, path, name, content }]
-          );
+          if (IMAGE_EXTS.has(ext)) {
+            if (images.some((a) => a.name === name)) continue;
+            const att = await readImageFile(path);
+            addImageData({
+              name: att.name || name,
+              mime: att.mime,
+              base64: att.base64,
+              previewUrl: `data:${att.mime};base64,${att.base64}`,
+            });
+          } else {
+            // cacheDir = session write dir when set, so the agent's file_read
+            // can page oversized extractions.
+            const content = await readDocumentFile(path, activeProject?.path);
+            setTextAttachments((prev) =>
+              prev.some((a) => a.path === path)
+                ? prev
+                : [...prev, { kind: 'text', id: `txt_${Date.now()}_${path.length}`, path, name, content }]
+            );
+          }
         } catch (err) {
           failures.push(`${name}: ${err}`);
         }
@@ -148,33 +162,6 @@ export function MessageInput({ disabled }: Props) {
       }
     } catch (err) {
       console.error('Attach failed:', err);
-    }
-  };
-
-  const handleAttachImage = async () => {
-    try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const selected = await open({
-        multiple: true,
-        directory: false,
-        defaultPath: activeProject?.path,
-        filters: IMAGE_FILTERS,
-      });
-      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
-      for (const path of paths) {
-        if (typeof path !== 'string') continue;
-        const name = path.split(/[\\/]/).pop() || path;
-        if (images.some((a) => a.name === name)) continue;
-        const att = await readImageFile(path);
-        addImageData({
-          name: att.name || name,
-          mime: att.mime,
-          base64: att.base64,
-          previewUrl: `data:${att.mime};base64,${att.base64}`,
-        });
-      }
-    } catch (err) {
-      console.error('Image attach failed:', err);
     }
   };
 
@@ -402,20 +389,11 @@ export function MessageInput({ disabled }: Props) {
               <button
                 type="button"
                 disabled={disabled}
-                onClick={handleAttachText}
+                onClick={handleAttach}
                 className="w-7 h-7 rounded-md border-0 bg-transparent text-text-secondary/70 flex items-center justify-center hover:bg-surface-hover hover:text-text-primary transition-colors disabled:opacity-50"
-                title="附加文本文件"
+                title="附加文件或图片"
               >
                 <Paperclip size={15} />
-              </button>
-              <button
-                type="button"
-                disabled={disabled}
-                onClick={handleAttachImage}
-                className="w-7 h-7 rounded-md border-0 bg-transparent text-text-secondary/70 flex items-center justify-center hover:bg-surface-hover hover:text-text-primary transition-colors disabled:opacity-50"
-                title="附加图片"
-              >
-                <ImagePlus size={15} />
               </button>
               <button
                 type="button"
@@ -426,7 +404,7 @@ export function MessageInput({ disabled }: Props) {
                     ? 'text-primary hover:text-primary'
                     : 'text-text-secondary/70 hover:text-text-primary'
                 }`}
-                title={shotArmed ? '等待截图…（截完自动附加）' : '截图（Ctrl+Shift+S，调用系统截图工具，截完自动附加）'}
+                title={shotArmed ? '等待截图…（截完自动附加；再点一次取消）' : '截图（Ctrl+Shift+S，调用系统截图工具，截完自动附加）'}
               >
                 <Scissors size={15} />
               </button>

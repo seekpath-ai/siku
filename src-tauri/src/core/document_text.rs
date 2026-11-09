@@ -29,6 +29,9 @@ pub const INJECT_BUDGET_CHARS: usize = 30_000;
 /// `cache_dir` is where oversized extractions land; it must be a directory
 /// the agent's file tools can read (the session's write directory when one is
 /// set). Absolute paths are accepted anywhere, so any readable directory works.
+///
+/// Files beyond the auto-extract size limit are NOT rejected — they degrade
+/// to a pointer note so the agent can page them with its own tools.
 pub fn read_document_text(path: &Path, cache_dir: &Path) -> Result<String, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("read failed: {e}"))?;
     let name = path
@@ -41,8 +44,12 @@ pub fn read_document_text(path: &Path, cache_dir: &Path) -> Result<String, Strin
 
     let limit = if is_pdf { MAX_PDF_BYTES } else { MAX_TEXT_OFFICE_BYTES };
     if meta.len() > limit {
-        return Err(format!(
-            "文件过大（{}MB，上限 {}MB）",
+        // Not a rejection: the attachment degrades to a pointer. The path is
+        // already in the <file> tag; bulk-extracting a huge document as an
+        // automatic side effect of attach would burn CPU/memory, so paging is
+        // left to the agent's tools.
+        return Ok(format!(
+            "[文件体积较大（{}MB，自动提取上限 {}MB），未注入文本。如需内容：文本类文件用 file_read 按 line_offset/n_lines 分页读取该路径；PDF/office 建议导入图书馆后用 paper_read 分块阅读，或请用户拆分文件。]",
             meta.len() / (1024 * 1024),
             limit / (1024 * 1024)
         ));
@@ -200,11 +207,12 @@ mod tests {
     }
 
     #[test]
-    fn oversized_file_is_rejected_by_size() {
-        // 文本/Office 上限 5MB — 用稀疏内容超过即可。
+    fn oversized_file_degrades_to_pointer() {
+        // 文本/Office 自动提取上限 5MB — 超限不再报错，降级为指针说明。
         let big = vec![b'a'; (MAX_TEXT_OFFICE_BYTES + 1) as usize];
         let (dir, path) = write_tmp(&big, "huge.txt");
-        let err = read_document_text(&path, dir.path()).unwrap_err();
-        assert!(err.contains("文件过大"), "{err}");
+        let text = read_document_text(&path, dir.path()).unwrap();
+        assert!(text.contains("未注入文本"), "{text}");
+        assert!(text.contains("file_read"), "{text}");
     }
 }

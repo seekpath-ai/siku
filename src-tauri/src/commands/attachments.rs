@@ -181,6 +181,24 @@ fn transcode_to_png(bytes: &[u8]) -> Option<Vec<u8>> {
     crate::ai::llm::transcode_image_to_png(bytes)
 }
 
+/// Longest-edge cap for attached images. Vision APIs reject oversized
+/// payloads; downscaling at attach time beats a provider error mid-turn.
+/// Re-encodes to PNG (alpha-safe), preserving aspect ratio.
+const MAX_IMAGE_EDGE: u32 = 2048;
+
+fn downscale_if_needed(bytes: &[u8]) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(bytes).ok()?;
+    if img.width().max(img.height()) <= MAX_IMAGE_EDGE {
+        return None;
+    }
+    let scaled = img.thumbnail(MAX_IMAGE_EDGE, MAX_IMAGE_EDGE);
+    let mut buf = std::io::Cursor::new(Vec::new());
+    scaled
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .ok()?;
+    Some(buf.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -197,12 +215,35 @@ mod tests {
         let img = image::load_from_memory(&png).expect("png should decode");
         assert_eq!((img.width(), img.height()), (8, 8));
     }
+
+    #[test]
+    fn downscales_beyond_max_edge() {
+        // 3000x1000 → long edge capped at MAX_IMAGE_EDGE, aspect preserved.
+        let img = image::RgbaImage::from_pixel(3000, 1000, image::Rgba([255, 0, 0, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let out = super::downscale_if_needed(&buf.into_inner()).expect("should downscale");
+        let scaled = image::load_from_memory(&out).unwrap();
+        assert_eq!(scaled.width(), super::MAX_IMAGE_EDGE);
+        // 1000 * 2048/3000 = 682.67 — floor or round depending on the filter.
+        assert!((682..=683).contains(&scaled.height()));
+    }
+
+    #[test]
+    fn keeps_small_image_untouched() {
+        let img = image::RgbaImage::from_pixel(64, 64, image::Rgba([0, 255, 0, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        assert!(super::downscale_if_needed(&buf.into_inner()).is_none());
+    }
 }
 
 /// Read a local image file and return it as a base64-encoded ImageAttachment.
 /// WebP and other exotic formats are transcoded to PNG: several OpenAI-
 /// compatible vision backends (vLLM without webp support) reject them with
-/// "Failed to load image or audio file".
+/// "Failed to load image or audio file". Images beyond MAX_IMAGE_EDGE on the
+/// long edge are downscaled (PNG re-encode) so the base64 payload stays
+/// within provider limits.
 #[tauri::command]
 #[instrument]
 pub async fn read_image_file(path: String) -> Result<ImageAttachment, String> {
@@ -228,6 +269,10 @@ pub async fn read_image_file(path: String) -> Result<ImageAttachment, String> {
             // the original and let the API judge it.
             None => (bytes, guess_image_mime(&resolved.to_string_lossy())),
         }
+    };
+    let (bytes, mime) = match downscale_if_needed(&bytes) {
+        Some(png) => (png, "image/png"),
+        None => (bytes, mime),
     };
     let base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(ImageAttachment { mime: mime.to_string(), base64, name })

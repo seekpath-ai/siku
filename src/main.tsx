@@ -103,6 +103,10 @@ function App() {
   // shown with an "initializing" placeholder instead of the splash, but the
   // router stays unmounted until the backend actually answers.
   const [initStalled, setInitStalled] = useState(false);
+  // Latest backend init phase, relayed from the splash's "splash:phase"
+  // events, shown on the stalled-init placeholder so the handover from
+  // splash to placeholder doesn't lose the progress text.
+  const [initPhase, setInitPhase] = useState('');
 
   React.useEffect(() => {
     trackPhase('react_mounted');
@@ -139,6 +143,11 @@ function App() {
     }, 10_000);
 
     let cancelled = false;
+    let unlistenPhase: (() => void) | undefined;
+    import('@/lib/events')
+      .then(({ listen }) => listen<string>('splash:phase', (e) => setInitPhase(e.payload)))
+      .then((fn) => { unlistenPhase = fn; })
+      .catch(() => { /* browser dev — no backend phases */ });
     (async () => {
       // Load persisted settings. The onboarding completion flag lives in the
       // database — a fresh DB (first install, or after deleting the data
@@ -204,6 +213,7 @@ function App() {
     return () => {
       cancelled = true;
       clearTimeout(safetyTimer);
+      unlistenPhase?.();
     };
   }, []);
 
@@ -238,10 +248,8 @@ function App() {
           justifyContent: 'center', height: '100vh', background: 'rgb(var(--background))',
           color: 'rgb(var(--text-primary))', fontFamily: 'sans-serif', gap: 8,
         }}>
-          <div>正在初始化数据库…</div>
-          <div style={{ fontSize: 12, color: 'rgb(var(--text-secondary))' }}>
-            首次启动或数据较多时可能需要更长时间
-          </div>
+          <div style={{ minHeight: '1.2em' }}>{initPhase || '正在初始化…'}</div>
+          <div className="siku-loading-bar" />
         </div>
       )}
       {showOnboarding && (

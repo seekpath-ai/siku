@@ -695,6 +695,33 @@ body.in-tauri {
   animation: flash-success 0.9s ease-in-out 1;
 }
 
+/* Indeterminate loading bar — main.tsx's init placeholder (backend init
+   outlasts the 10s fast-probe window). A bright segment slides along a dim
+   track, Obsidian-style: progress is not measurable, so no percentage. */
+.siku-loading-bar {
+  position: relative;
+  width: min(60vw, 300px);
+  height: 3px;
+  margin-top: 6px;
+  border-radius: 999px;
+  background: rgb(var(--primary) / 0.18);
+  overflow: hidden;
+}
+.siku-loading-bar::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 40%;
+  border-radius: 999px;
+  background: rgb(var(--primary));
+  animation: siku-loading-slide 1.3s ease-in-out infinite;
+}
+@keyframes siku-loading-slide {
+  0%   { left: -40%; }
+  100% { left: 100%; }
+}
+
 /* ── Print-to-PDF (notes) ─────────────────────────────────────────────
  * PrintNotePortal renders the note into #siku-print-root (a direct child of
  * body). On screen it stays hidden; when printing, the app shell is hidden

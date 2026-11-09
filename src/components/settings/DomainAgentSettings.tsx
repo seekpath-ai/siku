@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Loader2, Check, RotateCcw, AlertTriangle, Bot } from 'lucide-react';
+import { Loader2, RotateCcw, AlertTriangle, Bot } from 'lucide-react';
 import {
   settingsSet,
   taskPromptGroups,
@@ -7,6 +7,7 @@ import {
   type TaskPromptGroup,
   type TaskPromptInfo,
 } from '@/lib/tauri';
+import { SectionSaveButton } from '@/components/ui/SectionSaveButton';
 
 /** Settings page section: the system prompts behind the batch features
  *  (AI 综述 / AI 表格列 / AI 文献分类 / 科研追踪). These used to be hard-coded
@@ -17,6 +18,7 @@ export function DomainAgentSettings() {
   const [groupsMeta, setGroupsMeta] = useState<TaskPromptGroup[]>([]);
   const [budgets, setBudgets] = useState<Record<string, string>>({});
   const [savingBudget, setSavingBudget] = useState<string | null>(null);
+  const [savedBudget, setSavedBudget] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [savingKey, setSavingKey] = useState<string | null>(null);
@@ -72,6 +74,8 @@ export function DomainAgentSettings() {
       const next: Record<string, string> = {};
       for (const x of groups) next[x.id] = x.overrideValue != null ? String(x.overrideValue) : '';
       setBudgets(next);
+      setSavedBudget(g.id);
+      setTimeout(() => setSavedBudget((k) => (k === g.id ? null : k)), 2000);
     } catch (e) {
       console.error('save budget:', e);
     } finally {
@@ -160,17 +164,16 @@ export function DomainAgentSettings() {
                     placeholder={`自动（约 ${meta.builtinDefault}）`}
                     className="w-32 bg-background border border-surface-hover rounded px-2 py-1 text-[12px] text-text-primary outline-none focus:border-primary/50"
                   />
-                  <button
-                    onClick={() => void saveBudget(meta)}
-                    disabled={!dirty || savingBudget === meta.id}
-                    className="px-2.5 py-1 rounded-lg bg-primary text-black text-[11px] font-medium hover:bg-primary/90 disabled:opacity-40"
-                  >
-                    {savingBudget === meta.id ? <Loader2 size={11} className="animate-spin" /> : '保存'}
-                  </button>
                   <span className="text-[11px] text-text-secondary/50">
                     当前生效 {meta.effective}
                   </span>
                 </label>
+                <SectionSaveButton
+                  saving={savingBudget === meta.id}
+                  saved={savedBudget === meta.id}
+                  onClick={() => void saveBudget(meta)}
+                  disabled={!dirty}
+                />
               </div>
             );
           })()}
@@ -227,19 +230,16 @@ export function DomainAgentSettings() {
                   </p>
                 )}
 
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => void save(p)}
-                    disabled={savingKey === p.id}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-primary text-black text-[12px] font-medium hover:bg-primary/90 disabled:opacity-50"
-                  >
-                    {savingKey === p.id ? (
-                      <Loader2 size={12} className="animate-spin" />
-                    ) : savedKey === p.id ? (
-                      <Check size={12} />
-                    ) : null}
-                    保存
-                  </button>
+                <SectionSaveButton
+                  saving={savingKey === p.id}
+                  saved={savedKey === p.id}
+                  onClick={() => void save(p)}
+                >
+                  {p.overridden && (
+                    <span className="mr-auto text-[11px] text-text-secondary/50">
+                      当前使用自定义提示词（{p.effectivePrompt.length} 字）
+                    </span>
+                  )}
                   <button
                     onClick={() => void reset(p)}
                     disabled={savingKey === p.id || !draft}
@@ -248,12 +248,7 @@ export function DomainAgentSettings() {
                     <RotateCcw size={12} />
                     恢复默认
                   </button>
-                  {p.overridden && (
-                    <span className="text-[11px] text-text-secondary/50">
-                      当前使用自定义提示词（{p.effectivePrompt.length} 字）
-                    </span>
-                  )}
-                </div>
+                </SectionSaveButton>
               </div>
             );
           })}

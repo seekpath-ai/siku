@@ -8,7 +8,7 @@ import {
   exportDiagnostics,
   revealInFileManager,
 } from '@/lib/tauri';
-import { SaveButton } from '@/components/ui/SaveButton';
+import { SectionSaveButton } from '@/components/ui/SectionSaveButton';
 import type { AppSettings, EmbeddingStatus, EmbeddingProbe } from '@/lib/tauri';
 
 interface LimitField {
@@ -77,8 +77,10 @@ const DEFAULT_VALUES: AppSettings = {
 
 export function AdvancedSettings() {
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
+  // Per-section save state: each section saves only its own keys, so an
+  // unsaved edit in another section is never swept into the patch.
+  const [savingSection, setSavingSection] = useState<string | null>(null);
+  const [savedSection, setSavedSection] = useState<string | null>(null);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_VALUES);
   const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingStatus | null>(null);
   const [probe, setProbe] = useState<EmbeddingProbe | null>(null);
@@ -154,19 +156,30 @@ export function AdvancedSettings() {
     setSettings((prev) => ({ ...prev, [key]: value }));
   };
 
-  const handleSave = async () => {
-    setSaving(true);
+  const saveSection = async (sectionId: string, keys: (keyof AppSettings)[]) => {
+    setSavingSection(sectionId);
     try {
       const current = await settingsAppGet();
-      await settingsAppSave({ ...current, ...settings });
-      setSaved(true);
-      refreshEmbeddingStatus();
+      const patch: Record<string, unknown> = {};
+      for (const k of keys) patch[k] = settings[k];
+      await settingsAppSave({ ...current, ...patch });
+      setSavedSection(sectionId);
+      setTimeout(() => setSavedSection((s) => (s === sectionId ? null : s)), 2000);
+      if (sectionId === 'semantic') refreshEmbeddingStatus();
     } catch (err) {
       console.error('Failed to save advanced settings:', err);
     } finally {
-      setSaving(false);
+      setSavingSection(null);
     }
   };
+
+  const sectionSave = (id: string, keys: (keyof AppSettings)[]) => (
+    <SectionSaveButton
+      saving={savingSection === id}
+      saved={savedSection === id}
+      onClick={() => void saveSection(id, keys)}
+    />
+  );
 
   const renderFields = (fields: LimitField[]) => (
     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -241,16 +254,19 @@ export function AdvancedSettings() {
             </p>
           )}
         </div>
+        {sectionSave('log', LOG_FIELDS.map((f) => f.key))}
       </section>
 
       <section className="space-y-3">
         <h3 className="text-sm font-medium text-text-primary">界面显示</h3>
         {renderFields(DISPLAY_FIELDS)}
+        {sectionSave('display', DISPLAY_FIELDS.map((f) => f.key))}
       </section>
 
       <section className="space-y-3">
         <h3 className="text-sm font-medium text-text-primary">Prompt 与 RAG</h3>
         {renderFields(PROMPT_FIELDS)}
+        {sectionSave('prompt', PROMPT_FIELDS.map((f) => f.key))}
       </section>
 
       <section className="space-y-3">
@@ -387,6 +403,7 @@ export function AdvancedSettings() {
             )}
           </div>
         )}
+        {sectionSave('semantic', ['embedding_base_url', 'embedding_model', 'embedding_api_key'])}
       </section>
 
       <section className="space-y-3">
@@ -395,14 +412,14 @@ export function AdvancedSettings() {
           自动发现间隔设为 0 可关闭定时扫描。
         </p>
         {renderFields(RESEARCH_FIELDS)}
+        {sectionSave('research', RESEARCH_FIELDS.map((f) => f.key))}
       </section>
 
       <section className="space-y-3">
         <h3 className="text-sm font-medium text-text-primary">工具输出</h3>
         {renderFields(TOOL_FIELDS)}
+        {sectionSave('tool', TOOL_FIELDS.map((f) => f.key))}
       </section>
-
-      <SaveButton saving={saving} saved={saved} onClick={handleSave} />
     </div>
   );
 }

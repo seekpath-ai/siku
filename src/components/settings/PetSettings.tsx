@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
-import { Loader2, Check } from 'lucide-react';
+import { Loader2 } from 'lucide-react';
 import { settingsGet, settingsSet, petDomains, petListSkins, petGetSkinSelection, petSetSkinSelection, petGetSize, petSetSize, petGetChatLinked, petSetChatLinked } from '@/lib/tauri';
 import type { PetSkinSummary } from '@/lib/tauri';
+import { SectionSaveButton } from '@/components/ui/SectionSaveButton';
 
 interface DomainConfig {
   id: string;
@@ -261,21 +262,12 @@ export function PetSettings() {
                     </span>
                   )}
                 </div>
-                <div className="flex justify-end mt-2">
-                  <button
-                    onClick={() => savePrompt(d.id)}
-                    disabled={savingKey === d.id}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-primary/10 text-primary text-xs hover:bg-primary/20 transition-colors disabled:opacity-50"
-                  >
-                    {savingKey === d.id ? (
-                      <><Loader2 size={11} className="animate-spin" />保存中...</>
-                    ) : savedKey === d.id ? (
-                      <><Check size={11} />已保存</>
-                    ) : (
-                      '保存'
-                    )}
-                  </button>
-                </div>
+                <SectionSaveButton
+                  saving={savingKey === d.id}
+                  saved={savedKey === d.id}
+                  onClick={() => savePrompt(d.id)}
+                  className="mt-2"
+                />
               </div>
             )}
           </div>

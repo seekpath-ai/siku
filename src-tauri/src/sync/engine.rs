@@ -2620,6 +2620,9 @@ mod tests {
     }
 
     async fn connect_sessions() -> anyhow::Result<(SyncSession, SyncSession)> {
+        // Tests don't go through run(), so the process-level rustls
+        // CryptoProvider (aws-lc-rs vs ring ambiguity) is not installed yet.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let pc_a = create_peer_connection().await?;
         let pc_b = create_peer_connection().await?;
 

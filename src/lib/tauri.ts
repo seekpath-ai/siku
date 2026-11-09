@@ -332,6 +332,8 @@ export interface PetActivity {
   /** running | waiting | done | failed */
   state: string;
   detail: string | null;
+  /** Present for chat-sourced activities — the session to approve/decline in. */
+  sessionId?: string;
 }
 
 export interface PetStatusInfo {

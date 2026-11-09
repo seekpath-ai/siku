@@ -329,6 +329,10 @@ pub struct PetActivity {
     pub state: String,
     /// Progress line: "12/30 · 论文标题", "工具：paper_read", prompt head…
     pub detail: Option<String>,
+    /// Chat session behind a "chat:<id>" source — lets the status card
+    /// approve/decline a pending tool approval without opening the panel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -433,6 +437,7 @@ pub fn pet_report(
         label: label.to_string(),
         state: state.to_string(),
         detail,
+        session_id: source.strip_prefix("chat:").map(|s| s.to_string()),
     };
     match state {
         "done" | "failed" => {

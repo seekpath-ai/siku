@@ -444,11 +444,6 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
   const isNearBottomRef = useRef(true);
   const justOpenedRef = useRef(true);
 
-  // Show a speech bubble next to the floating pet ball (separate window).
-  const notify = useCallback(async (body: string) => {
-    emit('pet:bubble', body).catch(() => {});
-  }, []);
-
   // Stream agent events for the pet session via the shared listener hook.
   // flushIntervalMs: 0 keeps the panel's per-event rendering (the backend
   // already merges deltas into ~40ms windows); the pet-specific semantics
@@ -628,15 +623,13 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
             }
           })();
         }
-        if (e.type === 'done') {
-          notify('任务已完成，可在面板中查看结果');
-        }
         break;
       }
       default:
         break;
     }
-  }, [notify]);
+    // 完成态由球旁状态卡展示（含任务名），不再额外弹气泡。
+  }, []);
   useAgentEventStream({
     sessionId: petSessionId,
     flushIntervalMs: 0,

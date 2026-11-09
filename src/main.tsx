@@ -11,6 +11,7 @@ import { PetBallWindow } from './components/pet/PetBallWindow';
 import { PetBubbleWindow } from './components/pet/PetBubbleWindow';
 import { PetDetailWindow } from './components/pet/PetDetailWindow';
 import { PetMenuWindow } from './components/pet/PetMenuWindow';
+import { PetStatusWindow } from './components/pet/PetStatusWindow';
 import { PetChatWindow } from './components/pet/PetChatWindow';
 import { NoteWindow } from './components/notes/NoteWindow';
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -313,13 +314,14 @@ if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
 // ball, pet-bubble the ephemeral speech bubble, pet-chat windows the
 // popped-out conversation, note windows just the opened note, everything
 // else is the app.
-let windowKind: 'app' | 'pet' | 'pet-bubble' | 'pet-detail' | 'pet-menu' | 'pet-chat' | 'note' = 'app';
+let windowKind: 'app' | 'pet' | 'pet-bubble' | 'pet-detail' | 'pet-menu' | 'pet-status' | 'pet-chat' | 'note' = 'app';
 try {
   const label = getCurrentWindow().label;
   if (label === 'pet') windowKind = 'pet';
   else if (label === 'pet-bubble') windowKind = 'pet-bubble';
   else if (label === 'pet-detail') windowKind = 'pet-detail';
   else if (label === 'pet-menu') windowKind = 'pet-menu';
+  else if (label === 'pet-status') windowKind = 'pet-status';
   else if (label.startsWith('pet-chat-')) windowKind = 'pet-chat';
   else if (label.startsWith('note-')) windowKind = 'note';
 } catch {
@@ -335,6 +337,8 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     <PetDetailWindow />
   ) : windowKind === 'pet-menu' ? (
     <PetMenuWindow />
+  ) : windowKind === 'pet-status' ? (
+    <PetStatusWindow />
   ) : windowKind === 'pet-chat' ? (
     <PetChatWindow />
   ) : windowKind === 'note' ? (

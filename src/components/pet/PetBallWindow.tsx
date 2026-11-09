@@ -46,15 +46,26 @@ export function PetBallWindow() {
   // that closes on blur — an in-window menu forced the ball window to grow,
   // and its "click outside to dismiss" listener could never observe clicks
   // on the desktop, so the enlarged hit region regularly got stuck.
-  const showMenu = async () => {
+  const showMenu = async (clientX?: number, clientY?: number) => {
     try {
       const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const existing = await WebviewWindow.getByLabel('pet-menu');
       if (existing) await existing.close().catch(() => {});
-      // Created hidden; PetMenuWindow positions itself under the ball, then
-      // shows focused and closes on blur.
+      // Codex-style: the menu opens AT the cursor. clientX/Y are logical px
+      // inside the ball window; convert to physical screen coords and pass
+      // them via URL (PetMenuWindow falls back to ball-anchored without them).
+      let anchor = '';
+      if (clientX !== undefined && clientY !== undefined) {
+        const win = getCurrentWindow();
+        const scale = await win.scaleFactor();
+        const pos = await win.outerPosition();
+        anchor = `&x=${Math.round(pos.x + clientX * scale)}&y=${Math.round(pos.y + clientY * scale)}`;
+      }
+      // Created hidden; PetMenuWindow positions itself at the cursor (or
+      // under the ball without coordinates), then shows focused and closes
+      // on blur.
       new WebviewWindow('pet-menu', {
-        url: 'index.html?petMenu=1',
+        url: `index.html?petMenu=1${anchor}`,
         title: '',
         width: 160,
         height: 48,
@@ -109,17 +120,28 @@ export function PetBallWindow() {
     const win = getCurrentWindow();
     let lastX: number | null = null;
     let settleTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastMoveEmit = 0;
     const unlisten = win.onMoved(({ payload: pos }) => {
       if (lastX !== null) {
         const dx = pos.x - lastX;
         if (Math.abs(dx) > 2) setMoveDir(dx > 0 ? 'right' : 'left');
       }
       lastX = pos.x;
+      // Overlays anchored to the ball (status card) re-place on this event;
+      // throttled — onMoved fires per frame during a drag.
+      const now = Date.now();
+      if (now - lastMoveEmit > 100) {
+        lastMoveEmit = now;
+        emit('pet:ball-moved').catch(() => {});
+      }
       // Movement stopped (drag released): back to the state track.
       if (settleTimer) clearTimeout(settleTimer);
       settleTimer = setTimeout(() => {
         setMoveDir(null);
         lastX = null;
+        // Final settle event: the 100ms throttle may have swallowed the last
+        // move, and overlays should land exactly at the released position.
+        emit('pet:ball-moved').catch(() => {});
       }, 250);
     });
     return () => {
@@ -172,6 +194,40 @@ export function PetBallWindow() {
     if (!sizeReady || !skinReady) return;
     getCurrentWindow().show().catch(() => {});
   }, [sizeReady, skinReady]);
+
+  // Status card lifecycle (Codex-style): while the aggregate agent state is
+  // running/waiting, the interactive status card floats next to the ball;
+  // done/failed keep it up until the decay below flips back to idle, which
+  // closes it. The card window renders and positions itself.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+      const existing = await WebviewWindow.getByLabel('pet-status');
+      if (agentState === 'running' || agentState === 'waiting') {
+        if (existing || cancelled) return;
+        new WebviewWindow('pet-status', {
+          url: 'index.html?petStatus=1',
+          title: '',
+          width: 280,
+          height: 150,
+          decorations: false,
+          transparent: true,
+          shadow: false,
+          alwaysOnTop: true,
+          skipTaskbar: true,
+          resizable: false,
+          focus: false,
+          visible: false,
+        });
+      } else if (agentState === 'idle') {
+        if (existing) await existing.close().catch(() => {});
+      }
+    })().catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [agentState]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -238,6 +294,9 @@ export function PetBallWindow() {
   };
 
   const showDetail = async () => {
+    // Busy agents already have the interactive status card floating next to
+    // the ball — the hover card would duplicate it.
+    if (agentState !== 'idle') return;
     try {
       const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const existing = await WebviewWindow.getByLabel('pet-detail');
@@ -282,7 +341,7 @@ export function PetBallWindow() {
 
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
-    showMenu();
+    void showMenu(e.clientX, e.clientY);
   };
 
   return (

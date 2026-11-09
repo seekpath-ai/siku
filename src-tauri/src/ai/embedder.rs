@@ -396,11 +396,6 @@ pub struct EmbeddingProbe {
 
 const PROBE_TEXT: &str = "siku embedding probe 向量探针";
 
-/// Probe the active endpoint once.
-pub async fn test_embedding_endpoint() -> EmbeddingProbe {
-    probe_endpoint(&EmbeddingConfig::active()).await
-}
-
 /// Probe an endpoint described by the values the settings form currently holds,
 /// so a configuration can be tried before it is saved.
 pub async fn test_embedding_endpoint_with(

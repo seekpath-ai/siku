@@ -837,6 +837,8 @@ export function NoteList({
   // disabled in the webview; the payload carries absolute paths + position).
   useEffect(() => {
     if (!onFileImport) return;
+    // 纯浏览器（E2E/预览）没有窗口句柄，getCurrentWindow 会同步抛错。
+    if (!('__TAURI_INTERNALS__' in window)) return;
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     getCurrentWindow()

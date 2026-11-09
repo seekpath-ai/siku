@@ -39,7 +39,7 @@ test.describe('思库 E2E', () => {
 
     const navItems = ['图书馆', '对话', '知识库', '科研追踪', '笔记', '知识图谱', '文件列表'];
     for (const item of navItems) {
-      await expect(sidebar.locator(`a[title="${item}"]`)).toBeVisible();
+      await expect(sidebar.locator(`button[title="${item}"]`)).toBeVisible();
     }
   });
 
@@ -54,7 +54,7 @@ test.describe('思库 E2E', () => {
     };
 
     for (const [label, path] of Object.entries(routes)) {
-      await sidebar.locator(`a[title="${label}"]`).click();
+      await sidebar.locator(`button[title="${label}"]`).click();
       await page.waitForTimeout(800);
       expect(page.url()).toContain(path);
     }
@@ -63,13 +63,15 @@ test.describe('思库 E2E', () => {
   // ===== 空状态页面 =====
   test('图书馆空状态', async ({ page }) => {
     await page.goto(BASE_URL + '/library', { waitUntil: 'networkidle' });
-    await page.waitForTimeout(3000);
 
-    // Without Tauri backend: error state or empty state, or loading skeleton
-    const hasEmpty = await page.getByText('还没有导入任何文献').isVisible().catch(() => false);
-    const hasError = await page.getByText('加载文献失败').isVisible().catch(() => false);
-    const hasSkeleton = await page.locator('.animate-pulse').isVisible().catch(() => false);
-    expect(hasEmpty || hasError || hasSkeleton).toBeTruthy();
+    // Without Tauri backend: error state or empty state, or loading skeleton.
+    // 查询失败要经过 react-query 重试退避，轮询等待而不是定长 sleep。
+    const target = page
+      .getByText('还没有导入任何文献')
+      .or(page.getByText('加载文献失败'))
+      .or(page.locator('.animate-pulse').first())
+      .or(page.locator('.animate-spin').first());
+    await expect(target).toBeVisible({ timeout: 15000 });
   });
 
   test('知识库页面加载', async ({ page }) => {

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { X, Loader2, ScanSearch } from 'lucide-react';
+import { Modal } from '@/components/ui/Modal';
 
 interface RegionRangeDialogProps {
   isOpen: boolean;
@@ -50,9 +51,9 @@ export function RegionRangeDialog({
   };
 
   return (
-    <div
-      className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center"
-      onClick={(e) => { if (e.target === e.currentTarget && !detecting) onClose(); }}
+    <Modal
+      onClose={() => { if (!detecting) onClose(); }}
+      backdropClassName="bg-black/40"
     >
       <div className="bg-background border border-surface-hover rounded-lg shadow-2xl w-full max-w-sm mx-4">
         {/* Header */}
@@ -140,6 +141,6 @@ export function RegionRangeDialog({
           )}
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { listen, type UnlistenFn } from '@/lib/events';
 import { Bot, Loader2, ArrowUp } from 'lucide-react';
 import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';

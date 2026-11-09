@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Loader2, Cat, Check, Home, Camera, Compass } from 'lucide-react';
-import { listen } from '@tauri-apps/api/event';
+import { listen } from '@/lib/events';
 import { settingsAppGet, settingsAppSave, screenshotHotkeySync } from '@/lib/tauri';
 import { useTabStore } from '@/stores/tabStore';
 

@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { convertFileSrc } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { listen, type UnlistenFn } from '@/lib/events';
 import type {
   Paper, PaperInput, PaperLinkMetadata, PaperImportResult, PaperEnrichMetadataResult, LinkImportError, ListPapersParams,
   AgentSession, AgentStep, ChatMessage, ChatAttachment, LlmConfigBlock, ApprovalConfig, Project, CronJob, TaskInfo,

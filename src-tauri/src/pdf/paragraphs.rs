@@ -52,6 +52,7 @@ pub enum PageRotation {
 
 impl PageRotation {
     /// From a /Rotate value in degrees (pdf_oxide's `get_page_rotation`).
+    #[cfg(test)]
     pub fn from_degrees(deg: i32) -> Self {
         match deg.rem_euclid(360) {
             90 => Self::Degrees90,
@@ -131,8 +132,6 @@ pub struct GeoLine {
     pub x_end: f32,
     pub baseline_y: f32,
     pub font_size: f32,
-    /// Majority of the line's characters are bold (heading signal).
-    pub bold: bool,
 }
 
 
@@ -167,7 +166,6 @@ pub fn pdfium_lines(
     let mut x_end = f32::MIN;
     let mut baseline_y = 0.0f32;
     let mut fonts: Vec<f32> = Vec::new();
-    let mut bold_count = 0usize;
     let mut any = false;
 
     macro_rules! flush {
@@ -182,13 +180,17 @@ pub fn pdfium_lines(
                         x_end,
                         baseline_y,
                         font_size: median(real),
-                        bold: bold_count * 2 > fonts.len().max(1),
                     });
                 }
             }
+        };
+    }
+    // flush!() 后的状态复位只发生在循环中途的两个调用点；末尾那次 flush
+    // 之后函数即返回，复位是死赋值。
+    macro_rules! reset {
+        () => {
             text.clear();
             fonts.clear();
-            bold_count = 0;
             x_start = f32::MAX;
             x_end = f32::MIN;
             any = false;
@@ -202,6 +204,7 @@ pub fn pdfium_lines(
         // (newlines included) to nothing.
         if raw == '\n' || raw == '\r' {
             flush!();
+            reset!();
             continue;
         }
         let Some(c) = crate::pdf::paragraphs::normalize_glyph(raw) else { continue };
@@ -256,6 +259,7 @@ pub fn pdfium_lines(
             && x < x_end - em * 2.0;
         if wrap {
             flush!();
+            reset!();
         }
         if !any {
             baseline_y = y;
@@ -271,16 +275,6 @@ pub fn pdfium_lines(
             text.push(c);
         }
         fonts.push(font);
-        let bold = matches!(
-            ch.font_weight(),
-            Some(pdfium_render::prelude::PdfFontWeight::Weight600)
-                | Some(pdfium_render::prelude::PdfFontWeight::Weight700Bold)
-                | Some(pdfium_render::prelude::PdfFontWeight::Weight800)
-                | Some(pdfium_render::prelude::PdfFontWeight::Weight900)
-        );
-        if bold {
-            bold_count += 1;
-        }
     }
     flush!();
     lines
@@ -360,43 +354,6 @@ fn median(mut v: Vec<f32>) -> f32 {
 
 
 
-/// Order lines for reading: full-width lines (crossing the gutter — title,
-/// author block, …) first top-to-bottom, then column by column. PDF y grows
-/// upward.
-fn reading_order(lines: Vec<GeoLine>, gutter: Option<f32>) -> Vec<GeoLine> {
-    let by_y_desc = |a: &GeoLine, b: &GeoLine| {
-        b.baseline_y
-            .partial_cmp(&a.baseline_y)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    };
-    match gutter {
-        None => {
-            let mut v = lines;
-            v.sort_by(by_y_desc);
-            v
-        }
-        Some(x) => {
-            let (crossing, rest): (Vec<_>, Vec<_>) =
-                lines.into_iter().partition(|l| l.x_start < x && l.x_end > x);
-            let (mut left, mut right): (Vec<_>, Vec<_>) =
-                rest.into_iter().partition(|l| (l.x_start + l.x_end) / 2.0 < x);
-            let mut full = crossing;
-            full.sort_by(by_y_desc);
-            left.sort_by(by_y_desc);
-            right.sort_by(by_y_desc);
-            full.extend(left);
-            full.extend(right);
-            full
-        }
-    }
-}
-
-/// Join two consecutive lines of the same paragraph: hyphenation for Latin,
-/// no space across CJK boundaries, a single space otherwise.
-pub fn join_lines_pub(prev: &str, next: &str) -> String {
-    join_lines(prev, next)
-}
-
 /// Split a paragraph's lines into the text they contribute, plus the whole
 /// paragraph text.
 ///
@@ -443,6 +400,7 @@ pub fn line_segments(lines: &[GeoLine]) -> (String, Vec<usize>) {
     (text, segments)
 }
 
+#[cfg(test)]
 fn join_lines(prev: &str, next: &str) -> String {
     let prev_trim = prev.trim_end();
     let next_trim = next.trim_start();
@@ -479,7 +437,6 @@ mod tests {
             x_end: xe,
             baseline_y: y,
             font_size: font,
-            bold: false,
         }
     }
 

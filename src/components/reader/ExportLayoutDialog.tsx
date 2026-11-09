@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { X, Loader2, Download, Copy, Check } from 'lucide-react';
 import { generateExportText } from '@/lib/exportLayout';
 import type { PdfViewerHandle } from './PdfViewer';
+import { Modal } from '@/components/ui/Modal';
 
 interface ExportLayoutDialogProps {
   isOpen: boolean;
@@ -100,9 +101,9 @@ export function ExportLayoutDialog({
   };
 
   return (
-    <div
-      className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center"
-      onClick={(e) => { if (e.target === e.currentTarget) handleClose(); }}
+    <Modal
+      onClose={handleClose}
+      backdropClassName="bg-black/40"
     >
       <div className="bg-background border border-surface-hover rounded-lg shadow-2xl w-full max-w-lg mx-4 max-h-[90vh] flex flex-col">
         {/* Header */}
@@ -226,6 +227,6 @@ export function ExportLayoutDialog({
           </div>
         )}
       </div>
-    </div>
+    </Modal>
   );
 }

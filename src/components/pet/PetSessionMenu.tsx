@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { emit } from '@tauri-apps/api/event';
+import { emit } from '@/lib/events';
 import { Bot, Check, Eraser, MoreVertical } from 'lucide-react';
 import { usePetStore } from '@/stores/petStore';
 import { useDialog } from '@/hooks/useDialog';

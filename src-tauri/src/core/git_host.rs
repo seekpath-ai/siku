@@ -125,7 +125,7 @@ pub async fn create_pull_request(
         .ok_or_else(|| format!("未配置 {} 的访问令牌（PAT）", remote.platform.label()))?;
     let client = http_client(db).await?;
 
-    let (url, resp) = match remote.platform {
+    let (_url, resp) = match remote.platform {
         GitPlatform::GitHub => {
             let url = format!(
                 "https://api.github.com/repos/{}/{}/pulls",

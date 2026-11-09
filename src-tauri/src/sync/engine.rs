@@ -1886,6 +1886,7 @@ pub async fn decrypt_mailbox_message(
 
 /// Decrypt one mailbox message and apply its changeset locally. Returns the
 /// parsed envelope so callers can react to `Pull` requests.
+#[cfg(test)]
 pub async fn decrypt_and_apply_mailbox_message(
     db: &SqlitePool,
     key: &[u8; crate::sync::crypto::SYNC_KEY_LEN],

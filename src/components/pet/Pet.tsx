@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { listen, emit } from '@tauri-apps/api/event';
+import { listen, emit } from '@/lib/events';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useNavigate } from '@tanstack/react-router';
 import { X, Bot, Minus, Square, Copy, ExternalLink } from 'lucide-react';

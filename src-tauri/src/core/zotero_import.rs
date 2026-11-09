@@ -89,7 +89,6 @@ struct ZoteroCollection {
 }
 
 struct ZoteroItem {
-    id: i64,
     key: String,
     title: String,
     authors: Vec<String>,
@@ -275,7 +274,6 @@ async fn load_library(zdb: &SqlitePool, data_dir: &Path) -> Result<(Vec<ZoteroCo
 
         let title = field("title").unwrap_or_default();
         out.push(ZoteroItem {
-            id: item_id,
             key,
             title,
             authors,
@@ -425,7 +423,7 @@ pub async fn import(
         emit_progress(app, &base);
 
         match import_one(db, app_data_dir, item, &zcols, &mut collection_cache, &mut tag_cache).await {
-            ItemOutcome::Imported(_) => {
+            ItemOutcome::Imported => {
                 summary.imported += 1;
                 emit_progress(app, &BatchImportProgress { last_status: Some("imported".into()), imported: summary.imported, ..base });
             }
@@ -543,7 +541,7 @@ async fn import_one(
             let _ = tag_service::add_tags_to_paper(db, &paper.id, &[tag_id]).await;
         }
     }
-    ItemOutcome::Imported(paper.id)
+    ItemOutcome::Imported
 }
 
 #[cfg(test)]

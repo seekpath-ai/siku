@@ -108,18 +108,6 @@ pub async fn get_all_settings(db: &SqlitePool) -> Result<Vec<Setting>, String> {
     Ok(settings)
 }
 
-/// Delete a setting
-#[instrument(skip(db))]
-pub async fn delete_setting(db: &SqlitePool, key: &str) -> Result<(), String> {
-    sqlx::query("DELETE FROM settings WHERE key = ?")
-        .bind(key)
-        .execute(db)
-        .await
-        .map_err(|e| format!("db error: {e}"))?;
-
-    Ok(())
-}
-
 /// Load app settings from the database, falling back to defaults.
 pub async fn load_app_settings(db: &SqlitePool) -> Result<AppSettings, String> {
     match get_setting(db, APP_SETTINGS_KEY).await? {

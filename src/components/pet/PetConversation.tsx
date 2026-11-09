@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { emit } from '@tauri-apps/api/event';
+import { emit } from '@/lib/events';
 import { useNavigate } from '@tanstack/react-router';
 import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus, CheckCircle2, AlertCircle, Square } from 'lucide-react';
 import { usePetStore } from '@/stores/petStore';

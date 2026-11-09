@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { listen } from '@/lib/events';
 import { useQueryClient } from '@tanstack/react-query';
 import { useLibraryStore } from '@/stores/libraryStore';
 import { useShellStore } from '@/stores/shellStore';

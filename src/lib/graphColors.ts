@@ -5,7 +5,7 @@
  * consumer after a theme switch so these get re-resolved.
  */
 import { useEffect, useState } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { listen } from '@/lib/events';
 
 export function useThemeVersion(): number {
   const [version, setVersion] = useState(0);

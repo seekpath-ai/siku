@@ -37,6 +37,7 @@ import {
 } from '@/lib/tauri';
 import { openInBrowser } from '@/lib/externalLinks';
 import { useDialog } from '@/hooks/useDialog';
+import { Modal } from '@/components/ui/Modal';
 
 /** 用量字节数转人类可读单位（GB/MB/KB）。 */
 function formatBytes(bytes: number): string {
@@ -730,16 +731,13 @@ export function AccountSettings({ onLoggedIn }: Props) {
         </div>
       )}
 
-      {/* 扩容套餐选择弹窗（项目无通用卡片弹窗组件，按本文件风格条件渲染） */}
+      {/* 扩容套餐选择弹窗 */}
       {planModalOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-          onClick={() => !ordering && setPlanModalOpen(false)}
+        <Modal
+          onClose={() => { if (!ordering) setPlanModalOpen(false); }}
+          backdropClassName="bg-black/60"
+          className="w-full max-w-md max-h-[85vh] overflow-y-auto bg-surface border border-surface-hover rounded-xl p-4 space-y-3"
         >
-          <div
-            className="w-full max-w-md max-h-[85vh] overflow-y-auto bg-surface border border-surface-hover rounded-xl p-4 space-y-3"
-            onClick={(e) => e.stopPropagation()}
-          >
             <div className="flex items-center justify-between">
               <div className="text-sm font-medium text-text-primary">扩容云端存储</div>
               <button
@@ -885,20 +883,16 @@ export function AccountSettings({ onLoggedIn }: Props) {
                 </div>
               </>
             )}
-          </div>
-        </div>
+        </Modal>
       )}
 
-      {/* 待支付订单的付款方式弹窗（与扩容弹窗同风格条件渲染） */}
+      {/* 待支付订单的付款方式弹窗 */}
       {paymentOrder && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-          onClick={() => setPaymentOrder(null)}
+        <Modal
+          onClose={() => setPaymentOrder(null)}
+          backdropClassName="bg-black/60"
+          className="w-full max-w-md bg-surface border border-surface-hover rounded-xl p-4 space-y-3"
         >
-          <div
-            className="w-full max-w-md bg-surface border border-surface-hover rounded-xl p-4 space-y-3"
-            onClick={(e) => e.stopPropagation()}
-          >
             <div className="flex items-center justify-between">
               <div className="text-sm font-medium text-text-primary">付款方式</div>
               <button
@@ -938,8 +932,7 @@ export function AccountSettings({ onLoggedIn }: Props) {
             >
               完成
             </button>
-          </div>
-        </div>
+        </Modal>
       )}
     </div>
   );

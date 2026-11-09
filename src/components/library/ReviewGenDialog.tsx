@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { listen } from '@/lib/events';
 import { useNavigate } from '@tanstack/react-router';
 import {
   AlertTriangle,

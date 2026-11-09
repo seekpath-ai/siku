@@ -16,7 +16,7 @@ import { NoteWindow } from './components/notes/NoteWindow';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { initTheme } from './lib/theme';
 import 'katex/dist/katex.min.css';
-import 'pdfjs-dist/legacy/web/pdf_viewer.css';
+
 import './index.css';
 
 // Apply the cached theme before the first render so there is no flash of
@@ -151,8 +151,18 @@ function App() {
       // managed yet (init still running), not that the backend is dead. Fast
       // probes for ~10s, then 1s probes indefinitely — a slow machine or a
       // large migration must never push the UI past this gate.
+      //
+      // 纯浏览器环境（E2E / 前端预览）没有 IPC 后端：probe 永远失败会卡在
+      // 初始化占位页。直接放行，各页面走各自的空态/错误态。
+      const hasBackend = '__TAURI_INTERNALS__' in window;
       let onboardingCompletedInDb = false;
-      for (let attempt = 0; !cancelled; attempt++) {
+      if (!hasBackend) {
+        // 纯浏览器（E2E/预览）：没有 DB，onboarding 标志看 localStorage。
+        try {
+          onboardingCompletedInDb = localStorage.getItem(ONBOARDING_KEY) === '1';
+        } catch { /* ignore */ }
+      }
+      for (let attempt = 0; !cancelled && hasBackend; attempt++) {
         try {
           const entries = await settingsGetAll();
           onboardingCompletedInDb = entries.some((e) => e.key === ONBOARDING_KEY && e.value === '1');

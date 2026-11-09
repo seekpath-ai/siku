@@ -265,10 +265,6 @@ impl LlmUsage {
     pub fn total(&self) -> u32 {
         self.tokens_in.saturating_add(self.tokens_out)
     }
-
-    pub fn miss(&self) -> u32 {
-        self.tokens_in.saturating_sub(self.tokens_in_hit)
-    }
 }
 
 /// LLM response

@@ -3,7 +3,6 @@ use tracing::{error, info, info_span, warn};
 
 use crate::ai::agent::config::AgentConfig;
 use crate::ai::agent::memory::ConversationMemory;
-use crate::ai::agent::memory_store::{MemoryRecord, MemoryStore};
 use crate::ai::agent::tool_registry::ToolRegistry;
 use crate::ai::llm::{self, ChatMessage, LlmClient, StreamEvent, ToolCall};
 use crate::core::models::AgentStep;
@@ -206,7 +205,6 @@ pub struct AgentEngine {
     llm_config: crate::ai::llm::LlmConfig,
     tool_registry: ToolRegistry,
     memory: ConversationMemory,
-    memory_store: MemoryStore,
     config: AgentConfig,
     session_id: String,
     db: SqlitePool,
@@ -226,7 +224,6 @@ impl AgentEngine {
         session_id: String,
         db: SqlitePool,
         config: AgentConfig,
-        memory_store: MemoryStore,
         cancel_token: tokio_util::sync::CancellationToken,
         project_dir: Option<String>,
         context_prompt: Option<String>,
@@ -240,7 +237,6 @@ impl AgentEngine {
             llm_config,
             tool_registry,
             memory,
-            memory_store,
             config,
             session_id,
             db,
@@ -308,17 +304,6 @@ impl AgentEngine {
             Some(Ok(None)) => ("AskUserQuestion failed: channel closed".to_string(), None),
             Some(Err(_)) => ("AskUserQuestion timed out".to_string(), None),
             None => ("AskUserQuestion cancelled by user".to_string(), None),
-        }
-    }
-
-    /// Load conversation memory for this agent.
-    /// `max_memory_rounds == 0` loads the full conversation.
-    pub async fn load_memory(&self) -> Result<Vec<MemoryRecord>, String> {
-        let rounds = self.config.effective_max_memory_rounds();
-        if rounds == 0 {
-            Ok(self.memory_store.load_all())
-        } else {
-            Ok(self.memory_store.load_recent(rounds))
         }
     }
 

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 
 pub fn now_iso() -> String {
     // Millisecond precision: LWW conflict resolution compares these strings,
@@ -8,12 +8,6 @@ pub fn now_iso() -> String {
     // lexicographically), so comparisons must parse the timestamps (see
     // `sync::crdt::apply_changes`).
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
-
-pub fn iso_to_display(iso: &str) -> String {
-    DateTime::parse_from_rfc3339(iso)
-        .map(|dt| dt.with_timezone(&Utc).format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_else(|_| iso.to_string())
 }
 
 #[cfg(test)]
@@ -32,7 +26,7 @@ mod tests {
         // RFC3339 with millis: "2026-08-31T12:34:56.789Z".
         assert!(now.contains('.'), "now_iso must carry milliseconds: {now}");
         assert!(
-            DateTime::parse_from_rfc3339(&now).is_ok(),
+            chrono::DateTime::parse_from_rfc3339(&now).is_ok(),
             "now_iso must stay RFC3339-parseable: {now}"
         );
     }
@@ -51,20 +45,12 @@ mod tests {
         assert!(millis_next_second > millis_same_second);
 
         // Mixed precision must be compared parsed, not as strings.
-        let s = DateTime::parse_from_rfc3339(secs).unwrap();
-        let m = DateTime::parse_from_rfc3339(millis_same_second).unwrap();
+        let s = chrono::DateTime::parse_from_rfc3339(secs).unwrap();
+        let m = chrono::DateTime::parse_from_rfc3339(millis_same_second).unwrap();
         assert!(m > s, "millis timestamp is later within the same second");
         assert!(
             millis_same_second < secs,
             "lexicographic order is WRONG here ('.' < 'Z'); comparisons must parse"
-        );
-    }
-
-    #[test]
-    fn test_iso_to_display() {
-        assert_eq!(
-            iso_to_display("2026-06-16T10:30:00Z"),
-            "2026-06-16 10:30"
         );
     }
 }

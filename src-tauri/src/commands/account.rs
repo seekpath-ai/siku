@@ -156,7 +156,7 @@ pub async fn access_token_is_fresh(db: &sqlx::SqlitePool) -> bool {
 /// code-login, see auth_login).
 #[tauri::command]
 pub async fn auth_register(
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     relay_url: String,
     email: String,
     password: String,

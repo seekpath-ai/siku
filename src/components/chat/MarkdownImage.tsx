@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { ImageOff } from 'lucide-react';
+import { ImageLightbox } from '@/components/ui/Modal';
 
 /** Git Bash (the agent's preferred shell on Windows) prints MSYS-style
  * paths like `/c/Users/…` and the model quotes them back verbatim in
@@ -32,14 +33,6 @@ export function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
   const resolved = src ? resolveImageSrc(src) : '';
 
   useEffect(() => setFailed(false), [resolved]);
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false);
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [open]);
 
   if (!src) return null;
   if (failed) {
@@ -61,18 +54,7 @@ export function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
           className="max-w-[240px] max-h-[180px] object-cover rounded-lg border border-codex-border/50"
         />
       </button>
-      {open && (
-        <div
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 cursor-zoom-out"
-          onClick={() => setOpen(false)}
-        >
-          <img
-            src={resolved}
-            alt={alt ?? ''}
-            className="max-w-[92vw] max-h-[92vh] object-contain rounded shadow-2xl"
-          />
-        </div>
-      )}
+      {open && <ImageLightbox src={resolved} alt={alt} onClose={() => setOpen(false)} />}
     </>
   );
 }

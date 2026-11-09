@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { emit, listen } from '@tauri-apps/api/event';
+import { emit, listen } from '@/lib/events';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { PetSprite } from './PetSprite';
 import type { PetSkinDetail } from '@/lib/tauri';

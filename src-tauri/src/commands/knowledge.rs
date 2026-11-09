@@ -2,7 +2,7 @@ use tauri::State;
 use tracing::instrument;
 
 use crate::AppState;
-use crate::core::models::{KnowledgeDomain, KnowledgeItem, KnowledgeItemInput};
+use crate::core::models::{KnowledgeDomain, KnowledgeItem};
 use crate::core::time;
 
 /// List all knowledge domains (5 default domains)

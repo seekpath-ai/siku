@@ -147,7 +147,7 @@ pub async fn find_paper_by_doi(db: &SqlitePool, doi: &str) -> Result<Option<Stri
 }
 
 pub enum ItemOutcome {
-    Imported(String),
+    Imported,
     Skipped,
     Failed(String),
 }
@@ -166,12 +166,12 @@ pub async fn import_pdf_one(db: &SqlitePool, app_data_dir: &Path, path: &Path) -
         .unwrap_or("pdf")
         .to_string();
     match find_paper_by_blob_hash(db, &hash, &ext).await {
-        Ok(Some(id)) => return ItemOutcome::Skipped,
+        Ok(Some(_id)) => return ItemOutcome::Skipped,
         Ok(None) => {}
         Err(e) => return ItemOutcome::Failed(e),
     }
     match paper_service::import_paper(db, app_data_dir, path).await {
-        Ok(p) => ItemOutcome::Imported(p.id),
+        Ok(_p) => ItemOutcome::Imported,
         Err(e) => ItemOutcome::Failed(e.to_string()),
     }
 }
@@ -221,7 +221,7 @@ pub async fn run_pdf_batch(
         emit_progress(app, &base);
 
         match import_pdf_one(db, app_data_dir, path).await {
-            ItemOutcome::Imported(_) => {
+            ItemOutcome::Imported => {
                 summary.imported += 1;
                 emit_progress(app, &BatchImportProgress { last_status: Some("imported".into()), imported: summary.imported, ..base });
             }

@@ -21,7 +21,9 @@ import { useTabStore } from '@/stores/tabStore';
 import { useResearchStore } from '@/stores/researchStore';
 import { notesCreate, bookmarksCreate, settingsAppGet, settingsAppSave, screenshotHotkeySync, screenshotStart } from '@/lib/tauri';
 import { openNoteTab } from '@/lib/openNote';
-import { listen } from '@tauri-apps/api/event';
+import { listen } from '@/lib/events';
+import { notify } from '@/lib/notify';
+import { ToastHost } from '@/components/ui/ToastHost';
 
 interface AppShellProps { children: React.ReactNode; }
 
@@ -36,8 +38,6 @@ function useIsReaderRoute(): boolean {
 
 export function AppShell({ children }: AppShellProps) {
   const { mutate: importPaper } = useImportPaper();
-  const [toast, setToast] = useState<{ message: string; type: 'info' | 'warning' } | null>(null);
-  const toastTimerRef = useRef<number | null>(null);
   const [importLinkOpen, setImportLinkOpen] = useState(false);
   const [importZoteroOpen, setImportZoteroOpen] = useState(false);
   const [isShuttingDown, setIsShuttingDown] = useState(false);
@@ -50,12 +50,6 @@ export function AppShell({ children }: AppShellProps) {
   const zoomRef = useRef(1);
   const creatingNoteRef = useRef(false);
 
-  // Show a toast that auto-dismisses after a few seconds.
-  const showToast = useCallback((message: string, type: 'info' | 'warning' = 'info') => {
-    setToast({ message, type });
-    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = window.setTimeout(() => setToast(null), 2500);
-  }, []);
 
   // Skeleton screen — shows briefly on first mount to bridge the gap
   // between the splash fade-out and the real content rendering.
@@ -96,9 +90,9 @@ export function AppShell({ children }: AppShellProps) {
     };
     const handleToggleTranslation = () => {
       if (isReader) {
-        showToast('请在摘录面板中使用翻译功能');
+        notify('请在摘录面板中使用翻译功能');
       } else {
-        showToast('翻译面板仅在阅读器页面可用');
+        notify('翻译面板仅在阅读器页面可用');
       }
     };
     window.addEventListener('siku:import-pdf', handleImport);
@@ -147,14 +141,14 @@ export function AppShell({ children }: AppShellProps) {
     listen<{ topic_id: string; topic_name: string; added: number }>(
       'research:auto_discovered',
       (e) => {
-        showToast(`科研追踪：课题「${e.payload.topic_name}」新增 ${e.payload.added} 篇文献`);
+        notify(`科研追踪：课题「${e.payload.topic_name}」新增 ${e.payload.added} 篇文献`);
         useResearchStore.getState().bumpUnread(e.payload.topic_id, e.payload.added);
       }
     ).then((u) => {
       unlisten = u;
     });
     return () => unlisten?.();
-  }, [showToast]);
+  }, []);
 
   // Sync the pinned home tab with the user-configured homepage.
   useEffect(() => {
@@ -189,7 +183,6 @@ export function AppShell({ children }: AppShellProps) {
         .map((f) => (f as File & { path?: string }).path)
         .filter((p): p is string => !!p);
       if (paths.length === 0) return;
-      setToast(null);
       if (paths.length === 1) importPaper(paths[0]);
       else runFileBatch(paths).catch(() => {});
     };
@@ -200,29 +193,27 @@ export function AppShell({ children }: AppShellProps) {
   }, [importPaper]);
 
   const selectAndImport = useCallback(async () => {
-    if (!isTauri()) { showToast('仅桌面应用支持', 'warning'); return; }
-    setToast(null);
+    if (!isTauri()) { notify('仅桌面应用支持', 'warning'); return; }
     try {
       const { open } = await import('@tauri-apps/plugin-dialog');
       const selected = await open({ multiple: true, filters: [{ name: 'PDF', extensions: ['pdf'] }] });
       const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
       if (paths.length === 1) importPaper(paths[0]);
       else if (paths.length > 1) runFileBatch(paths).catch(() => {});
-    } catch (err) { showToast(`打开文件对话框失败: ${err}`, 'warning'); }
-  }, [importPaper, showToast]);
+    } catch (err) { notify(`打开文件对话框失败: ${err}`, 'warning'); }
+  }, [importPaper]);
 
   // Folder batch import: pick a directory, scan it for PDFs, import them all.
   const selectFolderAndImport = useCallback(async () => {
-    if (!isTauri()) { showToast('仅桌面应用支持', 'warning'); return; }
-    setToast(null);
+    if (!isTauri()) { notify('仅桌面应用支持', 'warning'); return; }
     try {
       const { open } = await import('@tauri-apps/plugin-dialog');
       const selected = await open({ directory: true, title: '选择要导入的文件夹（含子目录）' });
       if (typeof selected !== 'string') return;
       const found = await useBatchImportStore.getState().runFolder(selected);
-      if (found === 0) showToast('该文件夹（含子目录）中没有 PDF 文件', 'warning');
-    } catch (err) { showToast(`打开文件夹失败: ${err}`, 'warning'); }
-  }, [showToast]);
+      if (found === 0) notify('该文件夹（含子目录）中没有 PDF 文件', 'warning');
+    } catch (err) { notify(`打开文件夹失败: ${err}`, 'warning'); }
+  }, []);
 
   const applyWebviewZoom = useCallback(async (next: number) => {
     zoomRef.current = Math.max(0.5, Math.min(2, next));
@@ -240,12 +231,12 @@ export function AppShell({ children }: AppShellProps) {
       openNoteTab(navigate, note);
       window.dispatchEvent(new CustomEvent('siku:note-created', { detail: note.id }));
     } catch (err) {
-      showToast(`新建笔记失败: ${err}`, 'warning');
+      notify(`新建笔记失败: ${err}`, 'warning');
     } finally {
       // Keep the guard for a short moment to prevent double key events.
       setTimeout(() => { creatingNoteRef.current = false; }, 300);
     }
-  }, [navigate, showToast]);
+  }, [navigate]);
 
   // Open a route in a tab AND navigate to it. Keyboard shortcuts must do
   // both (like the menu bar), otherwise only the tab highlight changes
@@ -266,11 +257,11 @@ export function AppShell({ children }: AppShellProps) {
       const current = await settingsAppGet();
       const next = !(current.show_pet ?? true);
       await settingsAppSave({ ...current, show_pet: next });
-      showToast(next ? '宠物已显示' : '宠物已隐藏');
+      notify(next ? '宠物已显示' : '宠物已隐藏');
     } catch (err) {
       console.error('Failed to toggle pet:', err);
     }
-  }, [showToast]);
+  }, []);
 
   // Keyboard shortcuts for the menu bar items.
   useEffect(() => {
@@ -342,13 +333,13 @@ export function AppShell({ children }: AppShellProps) {
             const tab = useTabStore.getState().tabs.find((t) => t.id === useTabStore.getState().activeTabId);
             const title = tab?.title || document.title || location.pathname;
             bookmarksCreate({ title, route: location.pathname, params_json: JSON.stringify(location.search) })
-              .then(() => showToast('已收藏当前页'))
-              .catch((err) => showToast(`收藏失败: ${err}`, 'warning'));
+              .then(() => notify('已收藏当前页'))
+              .catch((err) => notify(`收藏失败: ${err}`, 'warning'));
           }
           return;
         case 't':
           e.preventDefault();
-          showToast(isReader ? '请在摘录面板中使用翻译功能' : '翻译面板仅在阅读器页面可用');
+          notify(isReader ? '请在摘录面板中使用翻译功能' : '翻译面板仅在阅读器页面可用');
           return;
         case '=':
         case '+':
@@ -376,7 +367,7 @@ export function AppShell({ children }: AppShellProps) {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [toggleSidePanel, isReader, selectAndImport, createNote, navigate, openRoute, openRouteTab, togglePet, showToast, applyWebviewZoom]);
+  }, [toggleSidePanel, isReader, selectAndImport, createNote, navigate, openRoute, openRouteTab, togglePet, notify, applyWebviewZoom]);
 
   return (
     <div
@@ -386,18 +377,7 @@ export function AppShell({ children }: AppShellProps) {
       <TitleBar />
       <TabSwitcher />
 
-      {/* Toast feedback */}
-      {toast && (
-        <div
-          className={`mx-4 mt-1 px-3 py-1.5 border rounded-lg text-xs shrink-0 ${
-            toast.type === 'warning'
-              ? 'bg-yellow-500/10 border-yellow-500/30 text-yellow-400'
-              : 'bg-blue-500/10 border-blue-500/30 text-blue-400'
-          }`}
-        >
-          {toast.message}
-        </div>
-      )}
+      <ToastHost />
 
       {/* Reader mode: full screen, no sidebar */}
       {isReader ? (

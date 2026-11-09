@@ -1423,7 +1423,6 @@ pub(crate) async fn run_agent_turn(
         session_id.clone(),
         state.db.clone(),
         config.clone(),
-        memory,
         cancel_token.clone(),
         project_dir,
         context_prompt,

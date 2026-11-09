@@ -5,7 +5,7 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import { Check, Copy, Eye, EyeOff } from 'lucide-react';
 import { useNavigate } from '@tanstack/react-router';
-import { emit } from '@tauri-apps/api/event';
+import { emit } from '@/lib/events';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { MarkdownCode, MarkdownPre } from '@/components/chat/CodeBlock';
 import { openInBrowser } from '@/lib/externalLinks';

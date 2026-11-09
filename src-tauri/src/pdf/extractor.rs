@@ -173,12 +173,3 @@ fn extract_text_oxide(path: &Path) -> Result<Vec<PageText>> {
     Ok(result)
 }
 
-/// Extract full text concatenated from all pages.
-pub fn extract_full_text(path: &Path) -> Result<String> {
-    let pages = extract_text(path)?;
-    Ok(pages
-        .into_iter()
-        .map(|p| p.text)
-        .collect::<Vec<_>>()
-        .join("\n\n"))
-}

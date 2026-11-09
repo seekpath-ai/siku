@@ -3,6 +3,8 @@ use std::collections::HashMap;
 /// A parsed BibTeX entry.
 pub struct BibtexEntry {
     pub entry_type: String,
+    /// 引用键（如 smith2024deep）。当前仅测试与导出调试读取。
+    #[allow(dead_code)]
     pub cite_key: String,
     pub fields: HashMap<String, String>,
 }

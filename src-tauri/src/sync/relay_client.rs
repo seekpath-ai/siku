@@ -275,12 +275,6 @@ impl RelayClient {
         }
     }
 
-    /// Relay protocol v3+: account-archive state slots — checkpoints replace
-    /// older generations and purge covered WAL, and account-level deposits
-    /// without an explicit TTL never expire.
-    pub fn supports_state_slots(&self) -> bool {
-        self.protocol_version().map(|v| v >= 3).unwrap_or(false)
-    }
 
     /// Send a mailbox deposit and wait for the relay's `MailboxDepositAck`.
     /// On success the message is durably stored; on rejection or timeout the

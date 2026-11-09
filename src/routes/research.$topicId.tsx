@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { createRoute, Link } from '@tanstack/react-router';
 import { Route as RootRoute } from './__root';
-import { listen } from '@tauri-apps/api/event';
+import { listen } from '@/lib/events';
 import { useResearch } from '@/hooks/useResearch';
 import { useResearchStore } from '@/stores/researchStore';
 import { usePetContextStore } from '@/stores/petContextStore';

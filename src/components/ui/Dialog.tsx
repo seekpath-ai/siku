@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { AlertCircle, Check, ChevronDown, ChevronRight, HelpCircle, List, MessageSquareText, X } from 'lucide-react';
 import { useDialogStore } from '@/stores/dialogStore';
+import { Modal } from './Modal';
 
 export function Dialog() {
   const { open, type, title, message, promptOptions, selectOptions, close } = useDialogStore();
@@ -56,17 +57,16 @@ export function Dialog() {
     );
 
   return (
-    // z above the floating pet panel (z-[4000]), titlebar dropdowns
-    // (z-[5000]) and the global library AI dialogs (z-[6000], e.g. the AI
-    // table): a modal dialog must top everything else in the window,
-    // including confirms opened from inside another dialog.
-    <div className="fixed inset-0 z-[7000] flex items-center justify-center">
-      <div
-        className="absolute inset-0 bg-black/50 backdrop-blur-sm"
-        onClick={() => close(type === 'alert' ? true : null)}
-      />
-      <div className="relative w-full max-w-sm mx-4 bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
-        <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-hover">
+    // appDialog 层：压过工作区弹窗（6000）与一切常驻 UI，保证模态确认总在
+    // 最上面——包括从其他弹窗里再开的确认。
+    <Modal
+      onClose={() => close(type === 'alert' ? true : null)}
+      zTier="appDialog"
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+      closeOnEscape={false}
+      className="w-full max-w-sm bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
+    >
+      <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-hover">
           {icon}
           <span className="text-sm font-medium text-text-primary">{title}</span>
           <button
@@ -179,7 +179,6 @@ export function Dialog() {
             {type === 'alert' ? '确定' : '确定'}
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

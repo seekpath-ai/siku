@@ -33,6 +33,7 @@ import type { NoteSearchResult, ChatMessageHit } from '@/lib/tauri';
 import type { Paper, KnowledgeItem, AgentSession, Bookmark as BookmarkType } from '@/lib/types';
 import { useChatStore } from '@/stores/chatStore';
 import { getAllUnlockedIds } from '@/stores/noteLockStore';
+import { Modal } from '@/components/ui/Modal';
 
 interface SearchItem {
   id: string;
@@ -431,8 +432,14 @@ export function GlobalSearch({ onImportPdf }: GlobalSearchProps) {
   ];
 
   return (
-    <div className="fixed inset-0 z-[300] flex items-start justify-center pt-[15vh]">
-      <div className="absolute inset-0 z-0 bg-black/40 backdrop-blur-sm" onClick={close} />
+    <Modal
+      onClose={close}
+      zTier="modalStacked"
+      position="top"
+      topOffset="15vh"
+      backdropClassName="bg-black/40 backdrop-blur-sm"
+      closeOnEscape={false}
+    >
       <div
         className="relative z-10 w-full max-w-2xl mx-4 bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden flex flex-col max-h-[70vh]"
         onMouseDown={(e) => e.stopPropagation()}
@@ -521,6 +528,6 @@ export function GlobalSearch({ onImportPdf }: GlobalSearchProps) {
           <span>Esc 关闭</span>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

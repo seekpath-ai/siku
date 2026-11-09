@@ -396,35 +396,9 @@ pub struct Setting {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct ChunkData {
-    pub id: String,
-    pub paper_id: String,
-    pub content: String,
-    pub page_start: Option<i32>,
-    pub page_end: Option<i32>,
-    pub section: Option<String>,
-    pub chunk_index: i32,
-    pub token_count: Option<i32>,
-    pub created_at: String,
-}
-
 // ============================================================
 // Agent & Tool Execution
 // ============================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct ToolExecution {
-    pub id: String,
-    pub session_id: String,
-    pub message_id: Option<String>,
-    pub tool_name: String,
-    pub tool_input: String,
-    pub tool_output: Option<String>,
-    pub status: String,
-    pub duration_ms: Option<i32>,
-    pub created_at: String,
-}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -487,18 +461,6 @@ impl std::fmt::Debug for AgentSessionInput {
             .field("skills_dir", &self.skills_dir)
             .finish()
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentStreamEvent {
-    #[serde(rename = "type")]
-    pub event_type: String,
-    pub session_id: String,
-    pub content: Option<String>,
-    pub tool_call_id: Option<String>,
-    pub tool_name: Option<String>,
-    pub tool_args: Option<serde_json::Value>,
-    pub tool_result: Option<String>,
 }
 
 // ============================================================
@@ -1051,18 +1013,6 @@ pub struct KnowledgeItem {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KnowledgeItemInput {
-    pub domain_id: String,
-    pub title: String,
-    pub content: Option<String>,
-    pub content_type: Option<String>,
-    pub source_type: Option<String>,
-    pub source_id: Option<String>,
-    pub metadata: Option<serde_json::Value>,
-    pub tags: Vec<String>,
-}
-
 // ============================================================
 // Research
 // ============================================================
@@ -1076,13 +1026,6 @@ pub struct ResearchTopic {
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResearchTopicInput {
-    pub name: String,
-    pub description: Option<String>,
-    pub keywords: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -1129,14 +1072,6 @@ pub struct FileEntry {
     pub size: u64,
     pub modified_at: Option<String>,
     pub mime_type: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct FileBookmark {
-    pub id: String,
-    pub name: String,
-    pub path: String,
-    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

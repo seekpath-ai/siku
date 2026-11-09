@@ -8,7 +8,7 @@ import { RangeSetBuilder, StateField, Facet, Prec, Annotation, EditorState, type
 import { syntaxTree, ensureSyntaxTree } from '@codemirror/language';
 import { autocompletion, completionStatus, type CompletionContext } from '@codemirror/autocomplete';
 import { open as shellOpen } from '@tauri-apps/plugin-shell';
-import { emit } from '@tauri-apps/api/event';
+import { emit } from '@/lib/events';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import katex from 'katex';
 import { saveAttachmentBytes } from '@/lib/tauri';

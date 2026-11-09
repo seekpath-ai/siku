@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { listen } from '@/lib/events';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import QRCode from 'qrcode';
 import { Check, HelpCircle, Loader2, Pencil, Plus, Power, Trash2 } from 'lucide-react';

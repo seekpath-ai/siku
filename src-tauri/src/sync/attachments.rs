@@ -185,13 +185,6 @@ pub const CHUNK_RAW_BYTES: usize = 3 * 1024 * 1024;
 /// only sync over a live P2P DataChannel.
 pub const MAX_CHUNKED_BLOB_BYTES: u64 = 200 * 1024 * 1024;
 /// Blobs up to this size are proactively pushed to the account archive on
-/// local write (paper import, note attachment, vault file), so peers receive
-/// them without a request round-trip. Kept at `MAX_MAILBOX_BLOB_BYTES`: a
-/// whole-payload push travels as a single frame, so it must fit the relay
-/// cap. Larger blobs (up to `PROACTIVE_PUSH_CHUNK_MAX_BYTES`) are pushed as
-/// `AttachmentChunk` slices instead.
-pub const PROACTIVE_PUSH_MAX_BYTES: u64 = MAX_MAILBOX_BLOB_BYTES;
-
 /// Largest blob proactively pushed at all (as `AttachmentChunk` slices).
 /// Beyond this, blobs stay request-served: a bigger archive copy would
 /// balloon relay storage against the account quota (a push persists 7 days)

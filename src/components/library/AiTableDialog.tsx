@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { listen } from '@/lib/events';
 import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle, PanelRight, PanelLeftClose, PanelLeftOpen, Columns3, SlidersHorizontal, RefreshCw, Search } from 'lucide-react';
 import { useAiTableStore } from '@/stores/aiTableStore';
 import { useDialog } from '@/hooks/useDialog';

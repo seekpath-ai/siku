@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { listen } from '@tauri-apps/api/event';
+import { listen } from '@/lib/events';
 import { petCurrentStatus } from '@/lib/tauri';
 import type { PetStatusInfo } from '@/lib/tauri';
 import { placeNearBall } from './overlayPlacement';

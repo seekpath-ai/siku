@@ -182,29 +182,7 @@ impl MemoryStore {
         }
     }
 
-    /// Load a paginated range from the end of the file.
-    pub fn load_range(&self, offset: usize, limit: usize) -> (Vec<MemoryRecord>, usize, bool) {
-        let total = self.read_meta().unwrap_or_else(|| self.rebuild_meta());
-        let tail_count = (offset + limit).min(total).max(1);
-        let lines = self.tail_lines(tail_count);
-        let mut records: Vec<MemoryRecord> = Vec::with_capacity(limit);
-        for line in lines.into_iter().skip(offset).take(limit) {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(r) = serde_json::from_str::<MemoryRecord>(&line) {
-                records.push(r);
-            }
-        }
-        let has_more = total > offset + limit;
-        (records, total, has_more)
-    }
 
-    /// Delete the memory file and its meta sidecar.
-    pub fn delete(&self) {
-        let _ = std::fs::remove_file(&self.file_path);
-        let _ = std::fs::remove_file(self.meta_path());
-    }
 
     /// Read the last `max_lines` non-empty lines from the file efficiently.
     fn tail_lines(&self, max_lines: usize) -> Vec<String> {

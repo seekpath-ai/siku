@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { X, Upload, Check } from 'lucide-react';
 import type { DetectedRegion, RegionType } from './regions';
+import { Modal } from '@/components/ui/Modal';
 
 const VALID_REGION_TYPES: RegionType[] = [
   'title', 'authors', 'abstract', 'body', 'heading',
@@ -131,9 +132,9 @@ export function ImportRegionsDialog({
   };
 
   return (
-    <div
-      className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center"
-      onClick={(e) => { if (e.target === e.currentTarget) handleClose(); }}
+    <Modal
+      onClose={handleClose}
+      backdropClassName="bg-black/40"
     >
       <div className="bg-background border border-surface-hover rounded-lg shadow-2xl w-full max-w-md mx-4">
         {/* Header */}
@@ -200,6 +201,6 @@ export function ImportRegionsDialog({
           )}
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

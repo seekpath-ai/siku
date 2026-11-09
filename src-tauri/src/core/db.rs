@@ -379,6 +379,7 @@ fn is_fts_corruption(err: &anyhow::Error) -> bool {
 }
 
 /// Drop and rebuild both full-text indexes over `chunks` from scratch.
+#[cfg(test)]
 async fn rebuild_chunk_fts(db: &Db) -> anyhow::Result<()> {
     warn!("rebuilding the full-text indexes over chunks");
     for sql in [

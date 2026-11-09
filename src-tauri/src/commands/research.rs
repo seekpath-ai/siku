@@ -129,7 +129,7 @@ pub async fn research_list_sources(
     let offset = offset.unwrap_or(0).max(0);
 
     let mut q = String::from("SELECT * FROM research_sources WHERE topic_id = ?");
-    if let Some(ref s) = status {
+    if let Some(ref _s) = status {
         q.push_str(" AND status = ?");
     }
     q.push_str(" ORDER BY discovered_at DESC LIMIT ? OFFSET ?");

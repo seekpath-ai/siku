@@ -114,3 +114,17 @@ export function Modal({
     </div>
   );
 }
+
+/** 图片放大预览：点击任意位置（含图片本身）或 Esc 关闭。 */
+export function ImageLightbox({ src, alt, onClose }: { src: string; alt?: string; onClose: () => void }) {
+  return (
+    <Modal onClose={onClose} zTier="lightbox" backdropClassName="bg-black/80" className="cursor-zoom-out">
+      <img
+        src={src}
+        alt={alt ?? ''}
+        onClick={onClose}
+        className="max-w-[92vw] max-h-[92vh] object-contain rounded shadow-2xl"
+      />
+    </Modal>
+  );
+}

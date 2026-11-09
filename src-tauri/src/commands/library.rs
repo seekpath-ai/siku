@@ -792,7 +792,7 @@ pub async fn paper_import_bibtex(
             .or_else(|| current.rights.clone()),
     };
 
-    let paper = paper_service::update_paper(&state.db, &paper_id, input)
+    let _paper = paper_service::update_paper(&state.db, &paper_id, input)
         .await
         .map_err(|e| e.to_string())?;
 

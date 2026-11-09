@@ -12,7 +12,7 @@
  * `set_app_theme` tool. Both go through AppSettings; the frontend re-applies
  * on the `app:settings_changed` event the backend emits after every save.
  */
-import { listen } from '@tauri-apps/api/event';
+import { listen } from '@/lib/events';
 import { settingsAppGet, settingsAppSave } from '@/lib/tauri';
 
 function isTauri(): boolean {

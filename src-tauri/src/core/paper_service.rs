@@ -884,7 +884,7 @@ pub async fn list_papers(db: &SqlitePool, params: ListPapersParams) -> Result<Ve
     if params.is_favorite.unwrap_or(false) {
         sql.push_str(" AND is_favorite = 1");
     }
-    if let Some(status) = params.read_status.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(_status) = params.read_status.as_deref().filter(|s| !s.is_empty()) {
         sql.push_str(" AND read_status = ?");
     }
     // "Recently read" filter: only papers actually opened. Independent of
@@ -894,20 +894,20 @@ pub async fn list_papers(db: &SqlitePool, params: ListPapersParams) -> Result<Ve
     }
 
     // Year range filter (inclusive).
-    if let Some(y) = params.year_from {
+    if let Some(_y) = params.year_from {
         sql.push_str(" AND year >= ?");
     }
-    if let Some(y) = params.year_to {
+    if let Some(_y) = params.year_to {
         sql.push_str(" AND year <= ?");
     }
 
     // Journal filter (case-insensitive substring).
-    if let Some(j) = params.journal.as_deref().filter(|j| !j.is_empty()) {
+    if let Some(_j) = params.journal.as_deref().filter(|j| !j.is_empty()) {
         sql.push_str(" AND journal LIKE ?");
     }
 
     // Related-to filter: papers linked to the given paper id.
-    if let Some(id) = params.related_to.as_deref().filter(|i| !i.is_empty()) {
+    if let Some(_id) = params.related_to.as_deref().filter(|i| !i.is_empty()) {
         sql.push_str(
             " AND id IN (SELECT paper_id FROM related_papers WHERE related_id = ?              UNION SELECT related_id FROM related_papers WHERE paper_id = ?)",
         );

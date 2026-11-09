@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { useNavigate } from '@tanstack/react-router';
 import { FileText, FileType2, Search } from 'lucide-react';
 import { useTabStore, type Tab } from '@/stores/tabStore';
+import { Modal } from '@/components/ui/Modal';
 
 /**
  * Recently-used tab order, newest first.
@@ -98,13 +99,12 @@ export function TabSwitcher() {
   if (!open) return null;
 
   return createPortal(
-    <div
-      data-no-drag
-      data-tauri-drag-region="false"
-      className="fixed inset-0 z-[5000] flex items-start justify-center bg-black/50 pt-[12vh]"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) setOpen(false);
-      }}
+    <Modal
+      onClose={() => setOpen(false)}
+      zTier="elevated"
+      position="top"
+      topOffset="12vh"
+      closeOnEscape={false}
     >
       <div className="w-[520px] max-w-[92vw] max-h-[60vh] flex flex-col rounded-xl bg-surface border border-surface-hover shadow-2xl overflow-hidden">
         <div className="flex items-center gap-2 px-3 h-10 border-b border-surface-hover shrink-0">
@@ -159,7 +159,7 @@ export function TabSwitcher() {
           ))}
         </div>
       </div>
-    </div>,
+    </Modal>,
     document.body
   );
 }

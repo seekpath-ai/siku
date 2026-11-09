@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { X, Bot } from 'lucide-react';
-import { listen } from '@tauri-apps/api/event';
+import { listen } from '@/lib/events';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { usePetStore } from '@/stores/petStore';
 import type { PetContext } from '@/stores/petContextStore';

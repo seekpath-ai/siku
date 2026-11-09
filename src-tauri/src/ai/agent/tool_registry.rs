@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// A parameter definition for a tool
@@ -228,11 +227,6 @@ impl ToolRegistry {
                 self.register(crate::ai::agent::tools::skill::SkillTool::new(skill));
             }
         }
-    }
-
-    /// List available tool names.
-    pub fn tool_names(&self) -> Vec<String> {
-        self.tools.keys().cloned().collect()
     }
 
     pub fn has_tool(&self, name: &str) -> bool {

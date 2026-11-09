@@ -1,5 +1,5 @@
 use sqlx::SqlitePool;
-use crate::core::models::{KnowledgeDomain, KnowledgeItem};
+use crate::core::models::{KnowledgeItem};
 
 pub async fn get_item(db: &SqlitePool, id: &str) -> Result<KnowledgeItem, String> {
     sqlx::query_as::<_, KnowledgeItem>("SELECT * FROM knowledge_items WHERE id = ?")

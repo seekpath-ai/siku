@@ -61,12 +61,6 @@ pub struct QueryTerms {
     pub ascii: Vec<String>,
 }
 
-impl QueryTerms {
-    pub fn is_empty(&self) -> bool {
-        self.cjk.is_empty() && self.ascii.is_empty()
-    }
-}
-
 /// Split a query into index-usable terms.
 ///
 /// * CJK runs are cut into bigrams (a single leftover character is kept as is,
@@ -79,14 +73,14 @@ pub fn analyze_query(query: &str) -> QueryTerms {
     let mut cjk_run = String::new();
     let mut ascii_run = String::new();
 
-    let mut flush_cjk = |run: &mut String, out: &mut Vec<String>| {
+    let flush_cjk = |run: &mut String, out: &mut Vec<String>| {
         if run.is_empty() {
             return;
         }
         out.extend(cjk_terms(run));
         run.clear();
     };
-    let mut flush_ascii = |run: &mut String, out: &mut Vec<String>| {
+    let flush_ascii = |run: &mut String, out: &mut Vec<String>| {
         if run.chars().count() >= 3 && !is_stopword(run) {
             out.push(run.to_lowercase());
         }
@@ -170,7 +164,7 @@ pub fn bigram_index_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len() * 2);
     let mut cjk_run: Vec<char> = Vec::new();
 
-    let mut flush = |run: &mut Vec<char>, out: &mut String| {
+    let flush = |run: &mut Vec<char>, out: &mut String| {
         if run.is_empty() {
             return;
         }

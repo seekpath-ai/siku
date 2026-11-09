@@ -122,9 +122,6 @@ impl LocalSignaling {
         Ok(())
     }
 
-    pub async fn recv(&mut self) -> Option<(SocketAddr, LocalSignalMsg)> {
-        self.rx.recv().await
-    }
 
     /// Receive with timeout.
     pub async fn recv_timeout(
@@ -442,7 +439,7 @@ pub async fn connect_local_host(
 
     let (dc_open_tx, mut dc_open_rx) = mpsc::channel::<()>(1);
     let dc_open_tx2 = dc_open_tx.clone();
-    let opened = dc.clone();
+    let _opened = dc.clone();
     dc.on_open(Box::new(move || {
         let _ = dc_open_tx2.try_send(());
         Box::pin(async {})

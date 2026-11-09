@@ -97,6 +97,11 @@ export function PetBallWindow() {
   const handleSpriteError = useCallback(() => setSkin(null), []);
   // Ball edge length in px (device setting `pet.size`, default 48).
   const [ballSize, setBallSize] = useState(48);
+  // Readiness gates for revealing the (initially hidden) window: both the
+  // size and the skin load must have settled — success or fallback — before
+  // show(), so a configured sprite never flashes as the default ball first.
+  const [sizeReady, setSizeReady] = useState(false);
+  const [skinReady, setSkinReady] = useState(false);
   // Drag direction while the ball moves; drives the sprite's walking tracks.
   const [moveDir, setMoveDir] = useState<'left' | 'right' | null>(null);
 
@@ -131,6 +136,7 @@ export function PetBallWindow() {
       } catch {
         /* keep default */
       }
+      setSizeReady(true);
     };
     load();
     let unlisten: (() => void) | undefined;
@@ -149,6 +155,7 @@ export function PetBallWindow() {
       } catch {
         setSkin(null);
       }
+      setSkinReady(true);
     };
     load();
     let unlisten: (() => void) | undefined;
@@ -157,6 +164,15 @@ export function PetBallWindow() {
     });
     return () => unlisten?.();
   }, []);
+
+  // The window is created hidden (create_pet_window): reveal only after both
+  // loads settled. show() is called from JS rather than Rust so the reveal
+  // never races the webview's first paint.
+  useEffect(() => {
+    if (!sizeReady || !skinReady) return;
+    getCurrentWindow().show().catch(() => {});
+  }, [sizeReady, skinReady]);
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     listen<string>('pet:state', (event) => {

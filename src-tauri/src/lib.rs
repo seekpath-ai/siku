@@ -181,6 +181,10 @@ pub fn create_pet_window<R: tauri::Runtime>(
         .always_on_top(true)
         .skip_taskbar(true)
         .focused(false)
+        // Created hidden: PetBallWindow reveals it once size + skin have
+        // loaded, so a configured sprite skin never flashes as the default
+        // ball first.
+        .visible(false)
         .build()?;
     let _ = pet.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
     // Log the size the window manager actually gave us: the ball is a

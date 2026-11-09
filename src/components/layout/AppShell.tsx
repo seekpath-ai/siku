@@ -24,6 +24,8 @@ import { openNoteTab } from '@/lib/openNote';
 import { listen } from '@/lib/events';
 import { notify } from '@/lib/notify';
 import { ToastHost } from '@/components/ui/ToastHost';
+import { installShortcutListener, registerShortcut, listShortcuts } from '@/lib/shortcuts';
+import { Modal } from '@/components/ui/Modal';
 
 interface AppShellProps { children: React.ReactNode; }
 
@@ -263,111 +265,46 @@ export function AppShell({ children }: AppShellProps) {
     }
   }, []);
 
-  // Keyboard shortcuts for the menu bar items.
+  // 全局快捷键：集中注册到 shortcuts.ts 注册表（帮助面板据此生成）。
+  const [shortcutsHelpOpen, setShortcutsHelpOpen] = useState(false);
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey || e.metaKey)) return;
-
-      const target = e.target as HTMLElement;
-      const isTyping =
-        target.tagName === 'INPUT' ||
-        target.tagName === 'TEXTAREA' ||
-        target.isContentEditable;
-
-      const key = e.key.toLowerCase();
-
-      // Navigation and global actions should work even while typing.
-      switch (key) {
-        case 'i':
-          e.preventDefault();
-          selectAndImport();
-          return;
-        case 'n':
-          e.preventDefault();
-          if (e.shiftKey) {
-            // Ctrl+Shift+N: new agent conversation (chat page).
-            openRouteTab('/chat', '对话', 'chat');
-            window.dispatchEvent(new CustomEvent('siku:new-agent'));
-          } else {
-            createNote();
-          }
-          return;
-        case ',':
-          e.preventDefault();
-          openRouteTab('/settings', '设置', 'settings');
-          return;
-        case '1':
-          e.preventDefault();
-          openRouteTab('/library', '图书馆', 'home');
-          return;
-        case '2':
-          e.preventDefault();
-          openRouteTab('/chat', '对话', 'chat');
-          return;
-        case '3':
-          e.preventDefault();
-          openRouteTab('/notes', '笔记', 'note');
-          return;
-        case '4':
-          e.preventDefault();
-          openRouteTab('/knowledge', '知识库', 'knowledge');
-          return;
-        case '5':
-          e.preventDefault();
-          openRouteTab('/files', '文件', 'files');
-          return;
-        case 'r':
-          e.preventDefault();
-          openRouteTab('/research', '研究追踪', 'research');
-          return;
-        case 'p':
-          // Ctrl+Shift+P toggles the desktop pet.
-          if (e.shiftKey) {
-            e.preventDefault();
-            togglePet();
-          }
-          return;
-        case 'd':
-          e.preventDefault();
-          {
-            const tab = useTabStore.getState().tabs.find((t) => t.id === useTabStore.getState().activeTabId);
-            const title = tab?.title || document.title || location.pathname;
-            bookmarksCreate({ title, route: location.pathname, params_json: JSON.stringify(location.search) })
-              .then(() => notify('已收藏当前页'))
-              .catch((err) => notify(`收藏失败: ${err}`, 'warning'));
-          }
-          return;
-        case 't':
-          e.preventDefault();
-          notify(isReader ? '请在摘录面板中使用翻译功能' : '翻译面板仅在阅读器页面可用');
-          return;
-        case '=':
-        case '+':
-          e.preventDefault();
-          applyWebviewZoom(zoomRef.current + 0.1);
-          return;
-        case '-':
-        case '_':
-          e.preventDefault();
-          applyWebviewZoom(zoomRef.current - 0.1);
-          return;
-        case '0':
-          e.preventDefault();
-          applyWebviewZoom(1);
-          return;
-      }
-
-      // Side panel toggle and editing commands should not hijack inputs.
-      if (isTyping) return;
-
-      if (key === 'b' && !isReader) {
-        e.preventDefault();
-        toggleSidePanel();
-      }
+    installShortcutListener();
+    const bookmark = () => {
+      const tab = useTabStore.getState().tabs.find((t) => t.id === useTabStore.getState().activeTabId);
+      const title = tab?.title || document.title || location.pathname;
+      bookmarksCreate({ title, route: location.pathname, params_json: JSON.stringify(location.search) })
+        .then(() => notify('已收藏当前页'))
+        .catch((err) => notify(`收藏失败: ${err}`, 'warning'));
     };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [toggleSidePanel, isReader, selectAndImport, createNote, navigate, openRoute, openRouteTab, togglePet, notify, applyWebviewZoom]);
+    const defs: Parameters<typeof registerShortcut>[0][] = [
+      { id: 'app.import', keys: 'Ctrl+I', description: '导入 PDF 文件', allowInInput: true, handler: () => selectAndImport() },
+      { id: 'app.new-note', keys: 'Ctrl+N', description: '新建笔记', allowInInput: true, handler: () => createNote() },
+      { id: 'app.new-agent', keys: 'Ctrl+Shift+N', description: '新建智能体对话', allowInInput: true, handler: () => {
+        openRouteTab('/chat', '对话', 'chat');
+        window.dispatchEvent(new CustomEvent('siku:new-agent'));
+      } },
+      { id: 'nav.settings', keys: 'Ctrl+,', description: '打开设置', allowInInput: true, handler: () => openRouteTab('/settings', '设置', 'settings') },
+      { id: 'nav.library', keys: 'Ctrl+1', description: '图书馆', allowInInput: true, handler: () => openRouteTab('/library', '图书馆', 'home') },
+      { id: 'nav.chat', keys: 'Ctrl+2', description: '对话', allowInInput: true, handler: () => openRouteTab('/chat', '对话', 'chat') },
+      { id: 'nav.notes', keys: 'Ctrl+3', description: '笔记', allowInInput: true, handler: () => openRouteTab('/notes', '笔记', 'note') },
+      { id: 'nav.knowledge', keys: 'Ctrl+4', description: '知识库', allowInInput: true, handler: () => openRouteTab('/knowledge', '知识库', 'knowledge') },
+      { id: 'nav.files', keys: 'Ctrl+5', description: '文件', allowInInput: true, handler: () => openRouteTab('/files', '文件', 'files') },
+      { id: 'nav.research', keys: 'Ctrl+R', description: '研究追踪', allowInInput: true, handler: () => openRouteTab('/research', '研究追踪', 'research') },
+      { id: 'app.toggle-pet', keys: 'Ctrl+Shift+P', description: '显示/隐藏桌宠', allowInInput: true, handler: () => togglePet() },
+      { id: 'app.bookmark', keys: 'Ctrl+D', description: '收藏当前页', allowInInput: true, handler: bookmark },
+      { id: 'app.translate-hint', keys: 'Ctrl+T', description: '翻译（阅读器摘录面板）', allowInInput: true, handler: () =>
+        notify(isReader ? '请在摘录面板中使用翻译功能' : '翻译面板仅在阅读器页面可用') },
+      { id: 'app.zoom-in', keys: 'Ctrl+=', description: '放大界面', allowInInput: true, handler: () => applyWebviewZoom(zoomRef.current + 0.1) },
+      { id: 'app.zoom-in-shift', keys: 'Ctrl+Shift+=', description: '放大界面', allowInInput: true, handler: () => applyWebviewZoom(zoomRef.current + 0.1) },
+      { id: 'app.zoom-out', keys: 'Ctrl+-', description: '缩小界面', allowInInput: true, handler: () => applyWebviewZoom(zoomRef.current - 0.1) },
+      { id: 'app.zoom-out-shift', keys: 'Ctrl+Shift+-', description: '缩小界面', allowInInput: true, handler: () => applyWebviewZoom(zoomRef.current - 0.1) },
+      { id: 'app.zoom-reset', keys: 'Ctrl+0', description: '重置缩放', allowInInput: true, handler: () => applyWebviewZoom(1) },
+      { id: 'app.toggle-sidebar', keys: 'Ctrl+B', description: '折叠/展开侧边栏', handler: () => { if (!isReader) toggleSidePanel(); } },
+      { id: 'app.shortcuts-help', keys: 'Shift+?', description: '快捷键帮助（本面板）', handler: () => setShortcutsHelpOpen((v) => !v) },
+    ];
+    const unregisters = defs.map(registerShortcut);
+    return () => unregisters.forEach((u) => u());
+  }, [toggleSidePanel, isReader, selectAndImport, createNote, navigate, openRoute, openRouteTab, togglePet, applyWebviewZoom]);
 
   return (
     <div
@@ -378,6 +315,38 @@ export function AppShell({ children }: AppShellProps) {
       <TabSwitcher />
 
       <ToastHost />
+
+      {/* 快捷键帮助（Shift+? 唤起） */}
+      {shortcutsHelpOpen && (
+        <Modal
+          onClose={() => setShortcutsHelpOpen(false)}
+          backdropClassName="bg-black/50 backdrop-blur-sm"
+          className="w-[420px] max-w-[92vw] max-h-[70vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
+        >
+          <div className="flex items-center justify-between px-4 py-3 border-b border-surface-hover shrink-0">
+            <span className="text-sm font-medium text-text-primary">快捷键</span>
+            <button
+              onClick={() => setShortcutsHelpOpen(false)}
+              className="p-1 rounded text-text-secondary/60 hover:text-text-primary hover:bg-surface-hover transition-colors"
+              aria-label="关闭快捷键帮助"
+            >
+              ✕
+            </button>
+          </div>
+          <div className="flex-1 overflow-y-auto px-4 py-2">
+            {listShortcuts()
+              .filter((s) => s.id !== 'app.shortcuts-help')
+              .map((s) => (
+                <div key={s.id} className="flex items-center justify-between py-1.5 text-[12px]">
+                  <span className="text-text-secondary">{s.description}</span>
+                  <kbd className="shrink-0 px-1.5 py-0.5 rounded bg-background border border-surface-hover text-[11px] text-text-primary font-mono">
+                    {s.keys}
+                  </kbd>
+                </div>
+              ))}
+          </div>
+        </Modal>
+      )}
 
       {/* Reader mode: full screen, no sidebar */}
       {isReader ? (

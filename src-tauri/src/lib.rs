@@ -334,12 +334,11 @@ fn run_shutdown_cleanup(
     tauri::async_runtime::block_on(run_shutdown_cleanup_async(app, done));
 }
 
-/// 同步弹出原生错误对话框,在进程因 panic 终止前阻塞提示用户。
+/// 同步弹出原生错误对话框,在主线程 panic 导致进程终止前阻塞提示用户。
 ///
-/// 项目 release 构建使用 `panic = "abort"`(见 Cargo.toml),任何 panic 都会
-/// 直接终止进程、不运行析构——之前崩溃表现为"无提示地自动关闭"。panic
-/// hook 在 abort 前必定执行,因此在这里用不依赖事件循环的原生 API 弹窗,
-/// 让用户知道发生了什么(日志中另有完整记录)。
+/// 只有主线程 panic 才是致命的(无法 unwind 出 OS 回调,进程必然中止),
+/// 因此只在主线程弹窗;工作者线程/tokio 任务的 panic 由 hook 记录日志,
+/// 不打扰用户(见 run() 中的 set_hook)。
 fn show_panic_dialog(message: &str) {
     use std::process::Command;
 
@@ -419,13 +418,14 @@ pub fn run() {
     // touches TLS.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    // Install a custom panic hook so that unclean database shutdowns (e.g.
-    // CR-SQLite unfinalized statements) do not pop up multiple OS error
-    // dialogs and obscure the main window. We still log the panic (with a
-    // backtrace) and — because release builds use panic = "abort" and would
-    // otherwise vanish silently — show a native error dialog before the
-    // process terminates.
-    std::panic::set_hook(Box::new(|info| {
+    // Install a custom panic hook. Every panic is logged with a backtrace.
+    // A panic on the MAIN thread is fatal (unwinding out of an OS callback is
+    // impossible, the process aborts), so we also show a native error dialog
+    // that does not depend on the event loop before the process dies. Panics
+    // on worker threads / tokio tasks only fail that unit of work — they are
+    // logged here and surfaced through normal error paths, no dialog.
+    let main_thread_id = std::thread::current().id();
+    std::panic::set_hook(Box::new(move |info| {
         let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
             s.to_string()
         } else if let Some(s) = info.payload().downcast_ref::<String>() {
@@ -435,14 +435,18 @@ pub fn run() {
         };
         let location = info.location().map(|l| format!("{}:{}", l.file(), l.line()));
         let backtrace = std::backtrace::Backtrace::force_capture();
+        let on_main_thread = std::thread::current().id() == main_thread_id;
         tracing::error!(
             panic_message = %msg,
             panic_location = ?location,
             panic_backtrace = ?backtrace,
-            "application panicked during shutdown"
+            on_main_thread,
+            "application panicked"
         );
         #[cfg(not(test))]
-        show_panic_dialog(&format!("{msg} ({location:?})"));
+        if on_main_thread {
+            show_panic_dialog(&format!("{msg} ({location:?})"));
+        }
     }));
 
     // Idempotency guard so the cleanup runs exactly once no matter which of

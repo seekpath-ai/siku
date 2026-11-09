@@ -97,7 +97,8 @@ onnx = ["fastembed"]
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# 保持默认 unwind：tokio 任务/工作者线程里的 panic 只终止该任务而不是
+# 整应用；主线程 panic 仍会中止进程，由 lib.rs 的 panic hook 弹窗提示。
 strip = true
 
 [profile.dev]

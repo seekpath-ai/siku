@@ -4,7 +4,12 @@
 
 /* Theme colors as RGB triplets so tailwind can compose alpha values
    (`rgb(var(--x) / <alpha-value>)`) and the theme can be switched at runtime
-   (see src/lib/theme.ts). Use as `rgb(var(--background))` in plain CSS. */
+   (see src/lib/theme.ts). Use as `rgb(var(--background))` in plain CSS.
+
+   两套调色板，都由 theme.ts 的预设整组重写：
+   - 主系（--background 等）：应用外壳/面板/设置等全局表面；
+   - --codex-*：对话与工作区表面（chat/pet 对话/MarkdownEditor），刻意更深；
+   - --warning/--danger：全局语义色（浅色预设有自己的取值，仍由预设重写）。 */
 :root {
   --background: 26 26 30;
   --surface: 36 36 43;
@@ -13,6 +18,9 @@
   --accent: 39 174 96;
   --text-primary: 245 245 245;
   --text-secondary: 156 163 175;
+
+  --warning: 245 158 11;
+  --danger: 239 68 68;
 
   --codex-bg: 13 13 13;
   --codex-surface: 20 20 20;
@@ -24,8 +32,6 @@
   --codex-muted: 115 115 115;
   --codex-accent: 25 195 125;
   --codex-accent-hover: 21 167 106;
-  --codex-warning: 245 158 11;
-  --codex-danger: 239 68 68;
   --codex-code: 10 10 10;
 }
 

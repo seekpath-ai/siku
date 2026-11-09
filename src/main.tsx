@@ -275,7 +275,7 @@ class ErrorFallback extends React.Component<
         }}>
           <h1 style={{ color: 'rgb(var(--primary))', marginBottom: 16 }}>思库</h1>
           <p style={{ color: 'rgb(var(--text-secondary))', marginBottom: 24 }}>应用加载失败，请重启。</p>
-          <pre style={{ color: 'rgb(var(--codex-danger))', fontSize: 12, maxWidth: 480, overflow: 'auto' }}>
+          <pre style={{ color: 'rgb(var(--danger))', fontSize: 12, maxWidth: 480, overflow: 'auto' }}>
             {this.state.error?.message}
           </pre>
         </div>

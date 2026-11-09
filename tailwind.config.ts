@@ -19,6 +19,8 @@ export default {
         accent: v('--accent'),
         'text-primary': v('--text-primary'),
         'text-secondary': v('--text-secondary'),
+        warning: v('--warning'),
+        danger: v('--danger'),
         codex: {
           bg: v('--codex-bg'),
           surface: v('--codex-surface'),
@@ -30,8 +32,6 @@ export default {
           muted: v('--codex-muted'),
           accent: v('--codex-accent'),
           'accent-hover': v('--codex-accent-hover'),
-          warning: v('--codex-warning'),
-          danger: v('--codex-danger'),
           code: v('--codex-code'),
         },
       },

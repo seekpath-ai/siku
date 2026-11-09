@@ -41,7 +41,7 @@ const READONLY = [
     '.cm-content': { color: 'rgb(var(--text-primary))' },
     '.cm-gutters': {
       backgroundColor: 'transparent',
-      color: 'rgb(var(--codex-primary) / 0.25)',
+      color: 'rgb(var(--text-primary) / 0.25)',
       border: 'none',
     },
   }),

@@ -157,7 +157,7 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
         <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
           <div className="space-y-1.5">
             <label className="text-xs text-codex-muted">
-              智能体名称 <span className="text-codex-danger">*</span>
+              智能体名称 <span className="text-danger">*</span>
             </label>
             <input
               autoFocus

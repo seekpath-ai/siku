@@ -21,7 +21,7 @@ function ApprovalCountdown() {
     return () => clearInterval(t);
   }, []);
   if (remaining <= 0) {
-    return <span className="text-[11px] text-codex-danger">已超时</span>;
+    return <span className="text-[11px] text-danger">已超时</span>;
   }
   const mm = Math.floor(remaining / 60);
   const ss = String(remaining % 60).padStart(2, '0');
@@ -34,11 +34,11 @@ function ApprovalCountdown() {
 }
 
 const statusConfig: Record<string, { icon: React.ReactNode; label: string; color: string }> = {
-  pending: { icon: <Clock size={14} />, label: '等待确认', color: 'text-codex-warning' },
+  pending: { icon: <Clock size={14} />, label: '等待确认', color: 'text-warning' },
   running: { icon: <Loader2 size={14} className="animate-spin" />, label: '执行中', color: 'text-codex-accent' },
   completed: { icon: <CheckCircle2 size={14} />, label: '已完成', color: 'text-codex-accent' },
-  error: { icon: <XCircle size={14} />, label: '错误', color: 'text-codex-danger' },
-  timeout: { icon: <Clock size={14} />, label: '超时', color: 'text-codex-warning' },
+  error: { icon: <XCircle size={14} />, label: '错误', color: 'text-danger' },
+  timeout: { icon: <Clock size={14} />, label: '超时', color: 'text-warning' },
 };
 
 export function ToolCallCard({ toolCall }: Props) {

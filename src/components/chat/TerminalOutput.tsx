@@ -25,7 +25,7 @@ export function TerminalOutput({ output, status = 'completed', command, collapse
         ) : (
           <span
             className={`w-1.5 h-1.5 rounded-full ${
-              status === 'error' || status === 'timeout' ? 'bg-codex-danger' : 'bg-codex-accent'
+              status === 'error' || status === 'timeout' ? 'bg-danger' : 'bg-codex-accent'
             }`}
           />
         )}
@@ -38,7 +38,7 @@ export function TerminalOutput({ output, status = 'completed', command, collapse
         }`}
       >
         {status === 'error' || status === 'timeout' ? (
-          <span className="text-codex-danger">{collapsed ? shown.join('\n') : output}</span>
+          <span className="text-danger">{collapsed ? shown.join('\n') : output}</span>
         ) : (
           shown.map((line, i) => (
             <div key={i}>
@@ -47,7 +47,7 @@ export function TerminalOutput({ output, status = 'completed', command, collapse
               ) : line.startsWith('✓') || line.startsWith('✔') ? (
                 <span className="text-codex-accent">{line}</span>
               ) : line.startsWith('✗') || line.startsWith('✖') ? (
-                <span className="text-codex-danger">{line}</span>
+                <span className="text-danger">{line}</span>
               ) : (
                 line
               )}

@@ -131,7 +131,7 @@ export function ApprovalCard({ toolCallId, toolName, command, args, sessionId, c
         // left is the user SEEING that the target is outside the write
         // directory. The target path itself stays visible right below, in the
         // command block.
-        <div className="mb-2 flex items-start gap-1.5 rounded-md border border-codex-warning/50 bg-codex-warning/10 px-2 py-1.5 text-[12px] leading-snug text-codex-warning">
+        <div className="mb-2 flex items-start gap-1.5 rounded-md border border-warning/50 bg-warning/10 px-2 py-1.5 text-[12px] leading-snug text-warning">
           <AlertTriangle size={13} className="mt-[1px] shrink-0" />
           <span>
             {FILE_WRITE_TOOLS.has(toolName)
@@ -162,7 +162,7 @@ export function ApprovalCard({ toolCallId, toolName, command, args, sessionId, c
             spellCheck={false}
             className="w-full rounded-md bg-codex-code border border-codex-border p-2.5 font-mono text-[12px] text-codex-primary outline-none focus:border-codex-accent resize-y"
           />
-          {argsError && <p className="mt-1 text-[11px] text-codex-danger">{argsError}</p>}
+          {argsError && <p className="mt-1 text-[11px] text-danger">{argsError}</p>}
         </div>
       )}
       {panel === 'guide' && (
@@ -261,7 +261,7 @@ export function ApprovalCard({ toolCallId, toolName, command, args, sessionId, c
                   </button>
                   <button
                     onClick={() => pickDecline('decline_stop')}
-                    className="w-full text-left px-3 py-1.5 text-[12px] text-codex-danger hover:bg-codex-hover"
+                    className="w-full text-left px-3 py-1.5 text-[12px] text-danger hover:bg-codex-hover"
                   >
                     拒绝并结束
                   </button>

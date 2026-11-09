@@ -17,7 +17,7 @@ function TimeoutCountdown() {
     return () => clearInterval(t);
   }, []);
   if (remaining <= 0) {
-    return <span className="text-[11px] text-codex-danger">已超时</span>;
+    return <span className="text-[11px] text-danger">已超时</span>;
   }
   const mm = Math.floor(remaining / 60);
   const ss = String(remaining % 60).padStart(2, '0');

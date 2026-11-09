@@ -126,7 +126,7 @@ export function FileAttachmentCard({
       </span>
     ) : status === 'failed' ? (
       <span
-        className="inline-flex items-center gap-1 text-codex-danger"
+        className="inline-flex items-center gap-1 text-danger"
         title={att.error || '发送失败'}
       >
         <AlertTriangle size={10} />
@@ -180,7 +180,7 @@ export function FileAttachmentCard({
           >
             重新发送
           </button>
-          {retryError && <span className="text-codex-danger truncate max-w-[220px]">{retryError}</span>}
+          {retryError && <span className="text-danger truncate max-w-[220px]">{retryError}</span>}
         </div>
       )}
     </div>

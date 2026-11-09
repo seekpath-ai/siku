@@ -416,7 +416,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
                       onClick={handleClearWorkspace}
                       disabled={!workspacePath}
                       title="删除该会话工作区里的文件"
-                      className="flex items-center gap-1 px-2 py-1 rounded-md border border-codex-border text-[11px] text-codex-danger hover:bg-codex-hover transition-colors disabled:opacity-50 disabled:hover:bg-transparent"
+                      className="flex items-center gap-1 px-2 py-1 rounded-md border border-codex-border text-[11px] text-danger hover:bg-codex-hover transition-colors disabled:opacity-50 disabled:hover:bg-transparent"
                     >
                       <Trash2 size={11} />
                       清空
@@ -426,7 +426,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
                 <p className="font-mono text-[11px] text-codex-secondary break-all">
                   {workspacePath ?? '（正在获取…）'}
                 </p>
-                {workspaceError && <p className="text-[11px] text-codex-danger">{workspaceError}</p>}
+                {workspaceError && <p className="text-[11px] text-danger">{workspaceError}</p>}
               </div>
             )}
             <p className="text-[11px] text-codex-muted">

@@ -29,6 +29,7 @@ import {
 } from '@/lib/tauri';
 import { AccountSettings } from './AccountSettings';
 import { useDialog } from '@/hooks/useDialog';
+import { HintIcon } from '@/components/ui/HintIcon';
 
 type SyncTab = 'cloud' | 'lan' | 'offline';
 
@@ -197,27 +198,6 @@ export function SyncSettings() {
       setSyncConfig({
         ...syncConfig,
         sync_optional_data: !next.sync_optional_data,
-      });
-    } finally {
-      setConfigSaving(false);
-    }
-  }, [syncConfig]);
-
-  const handleTogglePlaintextRelay = useCallback(async () => {
-    const next = {
-      ...syncConfig,
-      allow_plaintext_relay: !syncConfig.allow_plaintext_relay,
-    };
-    setSyncConfig(next);
-    setConfigSaving(true);
-    try {
-      await setRemoteSyncConfig(next);
-    } catch (err) {
-      console.error('Failed to save sync config:', err);
-      alert(`保存同步设置失败: ${err}`);
-      setSyncConfig({
-        ...syncConfig,
-        allow_plaintext_relay: !next.allow_plaintext_relay,
       });
     } finally {
       setConfigSaving(false);
@@ -418,56 +398,29 @@ export function SyncSettings() {
         {tabBtn('offline', '离线同步', <Archive size={14} />, '物理搬运 · 无需网络')}
       </div>
 
-      {/* 同步范围：全局设置，对公网与局域网同步均生效 */}
-      <div className="space-y-3">
-        <div className="text-sm font-medium text-text-primary">同步范围</div>
-        <div className="flex items-center justify-between px-4 py-3 bg-surface border border-surface-hover rounded-xl">
-          <div>
-            <div className="text-sm text-text-primary">同步聊天记录</div>
-            <div className="text-xs text-text-secondary">
-              启用后同步 chat_sessions、chat_messages 等可选表；含密钥的全局设置不参与同步
-            </div>
-          </div>
-          <button
-            role="switch"
-            aria-checked={syncConfig.sync_optional_data}
-            disabled={configSaving}
-            onClick={handleToggleOptionalSync}
-            className={`w-9 h-5 rounded-full transition-colors shrink-0 disabled:opacity-50 ${
-              syncConfig.sync_optional_data ? 'bg-primary' : 'bg-surface-hover'
-            }`}
-          >
-            <span
-              className={`block w-4 h-4 rounded-full bg-white shadow transition-transform ${
-                syncConfig.sync_optional_data ? 'translate-x-[18px]' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
+      {/* 聊天记录同步：全局单行开关，对公网与局域网同步均生效 */}
+      <div className="flex items-center justify-between px-4 py-2.5 bg-surface border border-surface-hover rounded-xl">
+        <div className="flex items-center text-sm text-text-primary">
+          同步聊天记录
+          <HintIcon>
+            启用后同步 chat_sessions、chat_messages 等可选表；含密钥的全局设置不参与同步。
+          </HintIcon>
         </div>
-
-        <div className="flex items-center justify-between px-4 py-3 bg-surface border border-surface-hover rounded-xl">
-          <div>
-            <div className="text-sm text-text-primary">允许不加密的中继连接（ws://）</div>
-            <div className="text-xs text-text-secondary">
-              中继连接默认要求加密（wss://）；公网明文传输会暴露账号令牌，仅自建局域网中继调试时开启
-            </div>
-          </div>
-          <button
-            role="switch"
-            aria-checked={syncConfig.allow_plaintext_relay}
-            disabled={configSaving}
-            onClick={handleTogglePlaintextRelay}
-            className={`w-9 h-5 rounded-full transition-colors shrink-0 disabled:opacity-50 ${
-              syncConfig.allow_plaintext_relay ? 'bg-red-500/80' : 'bg-surface-hover'
+        <button
+          role="switch"
+          aria-checked={syncConfig.sync_optional_data}
+          disabled={configSaving}
+          onClick={handleToggleOptionalSync}
+          className={`w-9 h-5 rounded-full transition-colors shrink-0 disabled:opacity-50 ${
+            syncConfig.sync_optional_data ? 'bg-primary' : 'bg-surface-hover'
+          }`}
+        >
+          <span
+            className={`block w-4 h-4 rounded-full bg-white shadow transition-transform ${
+              syncConfig.sync_optional_data ? 'translate-x-[18px]' : 'translate-x-0.5'
             }`}
-          >
-            <span
-              className={`block w-4 h-4 rounded-full bg-white shadow transition-transform ${
-                syncConfig.allow_plaintext_relay ? 'translate-x-[18px]' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
-        </div>
+          />
+        </button>
       </div>
 
       {/* ═══════════ 公网同步 ═══════════ */}

@@ -956,7 +956,7 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
       <div className="px-3 py-2.5 border-t border-surface-hover shrink-0 space-y-2">
         {shotArmed && (
           <div className="text-[11px] text-primary/80">
-            正在等待截图：请在屏幕上框选区域，完成后自动附加（也可直接 Ctrl+V 粘贴图片）
+            正在等待截图：请在屏幕上框选区域，完成后自动附加（也可直接 Ctrl+V 粘贴图片；再点截图按钮取消）
           </div>
         )}
         <div className="rounded-lg border border-surface-hover bg-background transition-colors focus-within:border-primary/40">
@@ -1022,7 +1022,7 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
                     ? 'text-primary hover:text-primary'
                     : 'text-text-secondary/70 hover:text-text-primary'
                 }`}
-                title={shotArmed ? '等待截图…（截完自动附加）' : '截图（调用系统截图工具，截完自动附加；也可直接粘贴图片）'}
+                title={shotArmed ? '等待截图…（截完自动附加；再点一次取消）' : '截图（调用系统截图工具，截完自动附加；也可直接粘贴图片）'}
               >
                 <Scissors size={15} />
               </button>

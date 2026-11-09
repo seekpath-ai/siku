@@ -30,6 +30,10 @@ export function fileToBase64(file: File): Promise<{ base64: string; mime: string
  * the user was asked to take (avoids attaching unrelated clipboard images). */
 const SCREENSHOT_TIMEOUT_MS = 120_000;
 
+/** Grace after focus returns with no fresh clipboard image before the armed
+ *  screenshot flow is treated as canceled. Covers slow clipboard writes. */
+const SHOT_CANCEL_GRACE_MS = 2500;
+
 interface UseImageAttachmentsOptions {
   /** Max staged images; additions beyond this are rejected via onError. */
   max?: number;
@@ -57,6 +61,12 @@ export function useImageAttachments({
   const [images, setImages] = useState<ImageAttachment[]>([]);
   const shotPending = useRef<{ since: number; prevSig: string | null } | null>(null);
   const [shotArmed, setShotArmed] = useState(false);
+  /** Set when the window regains focus while armed: a focus-stealing snipping
+   *  tool has closed. If no fresh clipboard image appears within a short
+   *  grace period, the user canceled the shot (Esc) — disarm the flow.
+   *  (Focus-less tools like `spectacle -rb` never set this; they keep
+   *  relying on polling + timeout.) */
+  const shotFocusReturn = useRef<number | null>(null);
 
   const addImageData = useCallback(
     (data: { name: string; mime: string; base64: string; previewUrl: string }) => {
@@ -109,14 +119,26 @@ export function useImageAttachments({
     // together would otherwise both pass the null check and attach twice.
     shotPending.current = null;
     if (Date.now() - pending.since > SCREENSHOT_TIMEOUT_MS) {
+      shotFocusReturn.current = null;
       setShotArmed(false);
       return;
     }
     const shot = await readClipboardShot();
     if (!shot || shot.sig === pending.prevSig) {
+      // Focus came back to us without a fresh clipboard image: the snipping
+      // tool closed without capturing (Esc / cancel). Allow a grace window
+      // for slow clipboard writes (the success path can lag focus), then
+      // disarm so the button doesn't stay stuck in the armed state.
+      const returnedAt = shotFocusReturn.current;
+      if (returnedAt !== null && Date.now() - returnedAt > SHOT_CANCEL_GRACE_MS) {
+        shotFocusReturn.current = null;
+        setShotArmed(false);
+        return;
+      }
       shotPending.current = pending; // no fresh shot — hand the claim back
       return;
     }
+    shotFocusReturn.current = null;
     setShotArmed(false);
     addImageData({
       name: `截图-${shotStamp()}.png`,
@@ -129,15 +151,27 @@ export function useImageAttachments({
 
   useEffect(() => {
     if (!shotArmed) return;
-    window.addEventListener('focus', checkClipboardShot);
+    const onFocus = () => {
+      shotFocusReturn.current ??= Date.now();
+      void checkClipboardShot();
+    };
+    window.addEventListener('focus', onFocus);
     const timer = setInterval(checkClipboardShot, 2000);
     return () => {
-      window.removeEventListener('focus', checkClipboardShot);
+      window.removeEventListener('focus', onFocus);
       clearInterval(timer);
     };
   }, [shotArmed, checkClipboardShot]);
 
   const startScreenshot = useCallback(async () => {
+    // A second click while armed = cancel the pending shot (the OS tool
+    // gives us no cancellation event otherwise).
+    if (shotArmed) {
+      shotPending.current = null;
+      shotFocusReturn.current = null;
+      setShotArmed(false);
+      return;
+    }
     // Remember the current clipboard content so only a NEW image attaches.
     // Window state is the user's deliberate choice: a visible window means
     // "may appear in the shot", a minimized one means they already cleared
@@ -150,7 +184,7 @@ export function useImageAttachments({
     } catch (err) {
       onError?.(String(err), '截图');
     }
-  }, [onError]);
+  }, [shotArmed, onError]);
 
   // Optional in-app shortcut: Ctrl+Shift+S triggers the screenshot flow.
   // Also responds to the OS-global hotkey (registered by the backend, fired

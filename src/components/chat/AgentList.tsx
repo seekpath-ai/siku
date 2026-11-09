@@ -57,7 +57,6 @@ function remoteContextOf(context: string | null): { channel: string; chatId: str
 }
 import { buildSessionMarkdown, sessionExportFileName } from '@/lib/exportTurn';
 import { useDialog } from '@/hooks/useDialog';
-import { ConfirmButton } from '@/components/ui/ConfirmButton';
 import { AgentAvatar } from './AgentAvatar';
 import { AgentCreateDialog } from './AgentCreateDialog';
 import { AgentConfigPanel } from './AgentConfigPanel';
@@ -595,6 +594,12 @@ export function AgentList() {
   };
 
   const handleDelete = async (id: string) => {
+    const session = sessions.find((s) => s.id === id);
+    const ok = await confirm(
+      `删除对话「${session?.title ?? ''}」？对话记录将被永久删除，无法恢复。`,
+      '删除对话'
+    );
+    if (!ok) return;
     try {
       await agentDeleteSession(id);
       removeSession(id);
@@ -675,15 +680,6 @@ export function AgentList() {
       {activeSessionId === session.id && (
         <span className="w-1.5 h-1.5 rounded-full bg-codex-accent shrink-0" />
       )}
-      <ConfirmButton
-        icon
-        onConfirm={() => handleDelete(session.id)}
-        confirmText="确认删除"
-        aria-label="删除对话"
-        className="opacity-0 group-hover:opacity-100"
-      >
-        <Trash2 size={12} />
-      </ConfirmButton>
     </div>
   );
 

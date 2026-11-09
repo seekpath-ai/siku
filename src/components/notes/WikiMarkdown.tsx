@@ -208,7 +208,11 @@ function MdImage({
   alt,
   ...rest
 }: React.ImgHTMLAttributes<HTMLImageElement> & { attachmentsDir?: string }) {
-  const [resolvedSrc, setResolvedSrc] = useState<string | undefined>(src);
+  // Initial undefined, NOT src: rendering the raw (relative/unresolved) src
+  // for the first frame starts a doomed load (404 under the app origin) whose
+  // onError latches `failed` before the resolved asset URL arrives — the chip
+  // then stuck until a remount. Render <img> only with the resolved URL.
+  const [resolvedSrc, setResolvedSrc] = useState<string | undefined>(undefined);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {

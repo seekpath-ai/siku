@@ -57,12 +57,23 @@ export function SessionModelBadge({ session, onModelChange, maxWidthClass = 'max
   // Sessions that never picked a model (remote IM sessions, legacy rows) run
   // on the global default at runtime — show it instead of hiding the badge.
   const fallbackDefault = !pool && !llm ? providers.find((p) => p.is_default) : undefined;
+  // Name first: the provider TYPE ("deepseek") can't distinguish two instances
+  // of the same provider (Aliyun-hosted vs official) — the user-given instance
+  // name can. Inline custom configs have no name, so they keep provider/model.
   const modelLabel = pool
-    ? `${pool.provider} / ${pool.model}`
+    ? `${pool.name || pool.provider} / ${pool.model}`
     : llm
       ? `${llm.provider} / ${llm.model}`
       : fallbackDefault
-        ? `${fallbackDefault.provider} / ${fallbackDefault.model}`
+        ? `${fallbackDefault.name || fallbackDefault.provider} / ${fallbackDefault.model}`
+        : '';
+  // Hover shows the full identity — base_url is the ultimate disambiguator.
+  const modelTooltip = pool
+    ? `${pool.name} (${pool.provider}/${pool.model})\n${pool.base_url}`
+    : llm
+      ? `${llm.provider} / ${llm.model}\n${llm.base_url}`
+      : fallbackDefault
+        ? `${fallbackDefault.name} (${fallbackDefault.provider}/${fallbackDefault.model})\n${fallbackDefault.base_url}`
         : '';
 
   // Current selection in the switcher. A custom (inline) LLM that exactly
@@ -84,7 +95,7 @@ export function SessionModelBadge({ session, onModelChange, maxWidthClass = 'max
       <button
         onClick={() => setModelMenuOpen((o) => !o)}
         className={`flex items-center gap-1 px-1.5 py-0.5 rounded bg-primary/10 text-primary hover:bg-primary/20 transition-colors ${maxWidthClass}`}
-        title="点击切换模型（下一轮对话生效）"
+        title={`${modelTooltip}\n点击切换模型（下一轮对话生效）`}
       >
         <Bot size={11} className="shrink-0" />
         <span className="truncate">{modelLabel}</span>

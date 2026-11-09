@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { emit } from '@/lib/events';
-import { Bot, Check, Eraser, MoreVertical } from 'lucide-react';
+import { Check, Eraser, MoreVertical } from 'lucide-react';
 import { usePetStore } from '@/stores/petStore';
 import { useDialog } from '@/hooks/useDialog';
 import { llmProviderList } from '@/lib/tauri';
@@ -12,9 +12,10 @@ interface Props {
   onCleared: () => void;
 }
 
-/** Pet panel session menu ("⋯" in the header): model switcher (provider/model
- *  only, no custom display names — the panel is too narrow for a header
- *  badge) plus destructive session actions like clearing the history. */
+/** Pet panel session menu ("⋯" in the header): model switcher (instance name
+ *  primary, provider/model as the secondary line — the type string alone
+ *  can't tell two same-provider instances apart) plus destructive session
+ *  actions like clearing the history. */
 export function PetSessionMenu({ onCleared }: Props) {
   const store = usePetStore();
   const { confirm, alert } = useDialog();
@@ -103,7 +104,7 @@ export function PetSessionMenu({ onCleared }: Props) {
         <MoreVertical size={13} strokeWidth={1.5} />
       </button>
       {open && (
-        <div className="absolute top-full right-0 mt-1 z-50 min-w-[190px] py-1 bg-surface border border-surface-hover rounded-lg shadow-xl">
+        <div className="absolute top-full right-0 mt-1 z-50 min-w-[220px] py-1 bg-surface border border-surface-hover rounded-lg shadow-xl">
           <div className="px-3 pt-1 pb-0.5 text-[10px] uppercase tracking-wider text-text-secondary/50">
             模型
           </div>
@@ -127,9 +128,11 @@ export function PetSessionMenu({ onCleared }: Props) {
                 <span className="w-3 shrink-0">
                   {p.id === currentProviderId && <Check size={12} className="text-primary" />}
                 </span>
-                <Bot size={11} className="shrink-0 text-text-secondary/60" />
-                <span className="truncate">
-                  {p.provider} / {p.model}
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate">{p.name || p.provider}</span>
+                  <span className="block truncate text-[10px] text-text-secondary/70">
+                    {p.provider} / {p.model}
+                  </span>
                 </span>
               </button>
             ))}

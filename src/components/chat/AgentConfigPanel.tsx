@@ -17,6 +17,7 @@ import {
 import { pickDirectory } from '@/lib/pickDirectory';
 import { ALL_TOOL_KEYS, isAllToolsSelected } from '@/lib/agent-tools';
 import { useProjectStore } from '@/stores/projectStore';
+import { Modal } from '@/components/ui/Modal';
 
 interface Props {
   agent: AgentSession;
@@ -265,19 +266,16 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
 
   if (loading) {
     return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <Modal backdropClassName="bg-black/60">
         <div className="p-6 rounded-2xl bg-codex-surface border border-codex-border text-codex-secondary text-sm">
           加载中...
         </div>
-      </div>
+      </Modal>
     );
   }
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
-      onClick={(e) => e.target === e.currentTarget && onClose()}
-    >
+    <Modal onClose={onClose} backdropClassName="bg-black/60">
       <div className="w-[520px] max-w-[95vw] max-h-[85vh] flex flex-col rounded-2xl bg-codex-surface border border-codex-border shadow-2xl">
         <div className="flex items-center justify-between px-6 py-4 border-b border-codex-border">
           <div className="flex items-center gap-2">
@@ -612,7 +610,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
           </button>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }
 

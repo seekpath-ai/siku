@@ -22,8 +22,8 @@ export const Z_TIERS = {
   modalStacked: 300,
   /** 桌宠浮动面板。 */
   petPanel: 4000,
-  /** 标题栏下拉菜单。 */
-  titlebarMenu: 5000,
+  /** 需压过工作区的弹层：标题栏下拉菜单、智能体确认（AskUserDialog）等。 */
+  elevated: 5000,
   /** 全局工作区弹窗（library AI 系列、导出等，需在桌宠/标题栏之上）。 */
   workspaceModal: 6000,
   /** 应用级 alert/confirm/prompt（ui/Dialog），必须压过一切。 */

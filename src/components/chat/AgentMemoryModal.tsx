@@ -3,6 +3,7 @@ import { Brain, X, Loader2, Check, BookOpen, Pen, MoreVertical, Code, Columns2, 
 import { MarkdownEditor } from '@/components/editor/MarkdownEditor';
 import { WikiMarkdown } from '@/components/notes/WikiMarkdown';
 import { VersionHistoryDialog } from '@/components/notes/VersionHistoryDialog';
+import { Modal } from '@/components/ui/Modal';
 import { agentMemoryGet, agentMemorySet, agentMemorySetActive, agentMemoryRestore, agentMemoryReview, type AgentMemoryReview, type MemoryScope } from '@/lib/tauri';
 import type { NoteVersion } from '@/lib/types';
 
@@ -79,14 +80,6 @@ export function AgentMemoryModal({ sessionId, onClose, onStateChange }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, scope]);
 
-  useEffect(() => {
-    const onDown = (e: KeyboardEvent) => {
-      // Let the version-history dialog consume Escape first.
-      if (e.key === 'Escape' && !versionOpen) onClose();
-    };
-    window.addEventListener('keydown', onDown);
-    return () => window.removeEventListener('keydown', onDown);
-  }, [onClose, versionOpen]);
 
   // Close the overflow menu on outside click.
   useEffect(() => {
@@ -219,8 +212,7 @@ export function AgentMemoryModal({ sessionId, onClose, onStateChange }: Props) {
   );
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={handleClose} />
+    <Modal onClose={handleClose} backdropClassName="bg-black/50 backdrop-blur-sm">
       <div className="relative w-[760px] max-w-[94vw] h-[620px] max-h-[88vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         <div className="flex items-center gap-2 px-4 py-2.5 border-b border-surface-hover shrink-0">
           <Brain size={15} className={active ? 'text-primary' : 'text-text-secondary/50'} />
@@ -427,6 +419,6 @@ export function AgentMemoryModal({ sessionId, onClose, onStateChange }: Props) {
           onClose={() => setVersionOpen(false)}
         />
       )}
-    </div>
+    </Modal>
   );
 }

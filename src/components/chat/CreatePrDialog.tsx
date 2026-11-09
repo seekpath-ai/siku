@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { GitPullRequest, Loader2, X, ExternalLink } from 'lucide-react';
+import { Modal } from '@/components/ui/Modal';
 import {
   gitHostSetToken,
   gitHostTokenStatus,
@@ -84,8 +85,10 @@ export function CreatePrDialog({ projectId, projectName, onClose }: CreatePrDial
   }, []);
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+    <Modal
+      onClose={onClose}
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+    >
       <div className="relative w-full max-w-md mx-4 bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-hover">
           <GitPullRequest size={18} className="text-primary" />
@@ -205,6 +208,6 @@ export function CreatePrDialog({ projectId, projectName, onClose }: CreatePrDial
           )}
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

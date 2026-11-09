@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { FolderOpen, X, Loader2, FileText, Image as ImageIcon, Download, LibraryBig } from 'lucide-react';
 import { save as saveDialog } from '@tauri-apps/plugin-dialog';
+import { Modal } from '@/components/ui/Modal';
 import {
   remoteChatFiles, remoteChatFileSave, remoteChatFileImport,
   type RemoteChatFile,
@@ -38,13 +39,6 @@ export function RemoteChatFilesDialog({ channel, chatId, onClose }: Props) {
     remoteChatFiles(channel, chatId).then(setFiles).catch((e) => setError(String(e)));
   }, [channel, chatId]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
 
   const rowKey = (f: RemoteChatFile) => `${f.message_id}:${f.file_key}`;
   const mark = (f: RemoteChatFile, ok: boolean, text: string) =>
@@ -77,8 +71,10 @@ export function RemoteChatFilesDialog({ channel, chatId, onClose }: Props) {
   };
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+    <Modal
+      onClose={onClose}
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+    >
       <div className="relative w-[640px] max-w-[94vw] h-[520px] max-h-[86vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         <div className="flex items-center gap-2 px-4 py-2.5 border-b border-surface-hover shrink-0">
           <FolderOpen size={15} className="text-text-secondary" />
@@ -152,6 +148,6 @@ export function RemoteChatFilesDialog({ channel, chatId, onClose }: Props) {
           })}
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

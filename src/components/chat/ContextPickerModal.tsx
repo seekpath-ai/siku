@@ -4,6 +4,7 @@ import { notesListAll, vaultList, filesList, filesReadText } from '@/lib/tauri';
 import { FilePreview } from '@/components/files/FilePreview';
 import { contextKey, type ContextItem } from './contextItem';
 import type { Note, FileItem } from '@/lib/types';
+import { Modal } from '@/components/ui/Modal';
 
 function isPdf(f: FileItem): boolean {
   return f.mime_type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf');
@@ -65,16 +66,6 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
       .catch(() => setFiles([]));
   }, []);
 
-  useEffect(() => {
-    const onDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      // Escape closes the stacked preview first, then the picker itself.
-      if (previewId) setPreviewId(null);
-      else onClose();
-    };
-    window.addEventListener('keydown', onDown);
-    return () => window.removeEventListener('keydown', onDown);
-  }, [onClose, previewId]);
 
   const q = query.trim().toLowerCase();
   const filteredNotes = useMemo(
@@ -151,8 +142,7 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
   const loading = notes === null || files === null;
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+    <Modal onClose={onClose} backdropClassName="bg-black/50 backdrop-blur-sm">
       <div className="relative w-[560px] max-w-[92vw] h-[520px] max-h-[84vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         <div className="flex items-center gap-2 px-4 py-2.5 border-b border-surface-hover shrink-0">
           <BookOpen size={15} className="text-text-secondary" />
@@ -312,16 +302,15 @@ export function ContextPickerModal({ initialSelected, onClose, onConfirm }: Prop
       {/* Stacked preview overlay for PDF/image files; sits above the picker so
           the selection state underneath is preserved. */}
       {previewId && (
-        <div className="fixed inset-0 z-[300] flex items-center justify-center">
-          <div
-            className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-            onClick={() => setPreviewId(null)}
-          />
-          <div className="relative w-[860px] max-w-[94vw] h-[82vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
-            <FilePreview fileId={previewId} onBack={() => setPreviewId(null)} />
-          </div>
-        </div>
+        <Modal
+          onClose={() => setPreviewId(null)}
+          zTier="modalStacked"
+          backdropClassName="bg-black/60 backdrop-blur-sm"
+          className="w-[860px] max-w-[94vw] h-[82vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden"
+        >
+          <FilePreview fileId={previewId} onBack={() => setPreviewId(null)} />
+        </Modal>
       )}
-    </div>
+    </Modal>
   );
 }

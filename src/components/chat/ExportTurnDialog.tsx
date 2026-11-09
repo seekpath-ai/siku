@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { X, Download } from 'lucide-react';
+import { Modal } from '@/components/ui/Modal';
 
 /** Pre-export options for one turn: the snapshot checkbox replaces a
  * confirm dialog whose 确认/取消 read as "export / don't export". Here
@@ -14,17 +15,13 @@ export function ExportTurnDialog({
 }) {
   const [includeContext, setIncludeContext] = useState(false);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
 
   return (
-    <div className="fixed inset-0 z-[6000] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+    <Modal
+      onClose={onClose}
+      zTier="workspaceModal"
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+    >
       <div className="relative w-full max-w-sm mx-4 bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         <div className="flex items-center gap-2 px-4 py-3 border-b border-surface-hover">
           <Download size={14} className="text-primary" />
@@ -72,6 +69,6 @@ export function ExportTurnDialog({
           </button>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

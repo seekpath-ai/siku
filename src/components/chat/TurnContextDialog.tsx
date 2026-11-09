@@ -3,6 +3,7 @@ import { X } from 'lucide-react';
 import { agentGetTurnContext, type TurnContext } from '@/lib/tauri';
 import { useChatStore } from '@/stores/chatStore';
 import type { ChatMessage } from '@/lib/types';
+import { Modal } from '@/components/ui/Modal';
 
 interface Props {
   /** The user message whose turn is being inspected. */
@@ -37,13 +38,6 @@ export function TurnContextDialog({ message, onClose }: Props) {
       .finally(() => setLoaded(true));
   }, [message.id]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
 
   // Prefer the snapshot's history (the exact records the turn was sent —
   // max_memory_rounds already applied). Snapshots predating the history
@@ -94,8 +88,11 @@ export function TurnContextDialog({ message, onClose }: Props) {
   const rounds = history.filter((m) => m.role === 'user').length;
 
   return (
-    <div className="fixed inset-0 z-[6000] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+    <Modal
+      onClose={onClose}
+      zTier="workspaceModal"
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+    >
       <div className="relative w-full max-w-2xl max-h-[80vh] mx-4 flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         <div className="flex items-center gap-2 px-4 py-3 border-b border-surface-hover shrink-0">
           <span className="text-sm font-medium text-text-primary">本轮上下文</span>
@@ -181,6 +178,6 @@ export function TurnContextDialog({ message, onClose }: Props) {
           </section>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

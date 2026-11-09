@@ -5,6 +5,7 @@ import { useChatStore } from '@/stores/chatStore';
 import { usePetStore } from '@/stores/petStore';
 import { agentAnswerUser } from '@/lib/tauri';
 import type { AskQuestion } from '@/lib/types';
+import { Modal } from '@/components/ui/Modal';
 
 /** Backend wait for AskUserQuestion answers (mirrors the approval timeout). */
 const ASK_USER_TIMEOUT_SEC = 300;
@@ -128,11 +129,13 @@ export function AskUserQuestionsDialog({ questions, onAnswer, onDismiss }: AskUs
   };
 
   return (
-    <div
-      className="fixed inset-0 z-[5000] flex items-center justify-center bg-black/60"
-      onClick={(e) => e.target === e.currentTarget && dismiss()}
+    <Modal
+      onClose={() => void dismiss()}
+      zTier="elevated"
+      backdropClassName="bg-black/60"
+      closeOnEscape={false}
+      className="w-[480px] max-w-[92vw] max-h-[80vh] overflow-y-auto rounded-2xl bg-codex-surface border border-codex-border shadow-2xl p-5"
     >
-      <div className="w-[480px] max-w-[92vw] max-h-[80vh] overflow-y-auto rounded-2xl bg-codex-surface border border-codex-border shadow-2xl p-5">
         <div className="flex items-center gap-2 mb-4">
           <Bot size={18} className="text-codex-accent" />
           <h3 className="text-base font-semibold text-codex-primary">智能体需要确认</h3>
@@ -223,8 +226,7 @@ export function AskUserQuestionsDialog({ questions, onAnswer, onDismiss }: AskUs
             提交
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 

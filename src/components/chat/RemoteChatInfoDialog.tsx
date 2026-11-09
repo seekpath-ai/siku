@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Users, X, Loader2, Crown } from 'lucide-react';
 import { remoteChatInfo, type RemoteChatInfo } from '@/lib/tauri';
+import { Modal } from '@/components/ui/Modal';
 
 interface Props {
   channel: string;
@@ -17,17 +18,12 @@ export function RemoteChatInfoDialog({ channel, chatId, onClose }: Props) {
     remoteChatInfo(channel, chatId).then(setInfo).catch((e) => setError(String(e)));
   }, [channel, chatId]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+    <Modal
+      onClose={onClose}
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+    >
       <div className="relative w-[420px] max-w-[94vw] max-h-[80vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         <div className="flex items-center gap-2 px-4 py-2.5 border-b border-surface-hover shrink-0">
           <Users size={15} className="text-text-secondary" />
@@ -76,6 +72,6 @@ export function RemoteChatInfoDialog({ channel, chatId, onClose }: Props) {
           )}
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

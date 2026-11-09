@@ -8,6 +8,7 @@ import {
   type TaskOutput,
 } from '@/lib/tauri';
 import type { CronJob, TaskInfo } from '@/lib/types';
+import { Modal } from '@/components/ui/Modal';
 
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];
 
@@ -103,13 +104,6 @@ export function TaskCenterDialog({ sessionId, onClose }: Props) {
   const [expanded, setExpanded] = useState<Record<string, { loading: boolean; output?: TaskOutput }>>({});
   const [stopping, setStopping] = useState<Set<string>>(new Set());
 
-  useEffect(() => {
-    const onDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onDown);
-    return () => window.removeEventListener('keydown', onDown);
-  }, [onClose]);
 
   const refreshJobs = useCallback(() => {
     cronList()
@@ -260,8 +254,10 @@ export function TaskCenterDialog({ sessionId, onClose }: Props) {
     'bg-background border border-surface-hover rounded-lg px-2 py-1.5 text-[12px] text-text-primary outline-none focus:border-primary/50';
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+    <Modal
+      onClose={onClose}
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+    >
       <div className="relative w-[640px] max-w-[94vw] h-[580px] max-h-[88vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         {/* Header */}
         <div className="flex items-center gap-2 px-4 py-2.5 border-b border-surface-hover shrink-0">
@@ -550,6 +546,6 @@ export function TaskCenterDialog({ sessionId, onClose }: Props) {
           </div>
         )}
       </div>
-    </div>
+    </Modal>
   );
 }

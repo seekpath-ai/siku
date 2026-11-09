@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { FolderPlus, FolderOpen, Loader2, X } from 'lucide-react';
 import { gitAvailable } from '@/lib/tauri';
+import { Modal } from '@/components/ui/Modal';
 
 interface NewProjectDialogProps {
   open: boolean;
@@ -66,8 +67,10 @@ export function NewProjectDialog({ open, onClose, onCreate }: NewProjectDialogPr
   };
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+    <Modal
+      onClose={onClose}
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+    >
       <div className="relative w-full max-w-md mx-4 bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-hover">
           <FolderPlus size={18} className="text-primary" />
@@ -147,6 +150,6 @@ export function NewProjectDialog({ open, onClose, onCreate }: NewProjectDialogPr
           </button>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

@@ -8,6 +8,7 @@ import { DEFAULT_TOOLS, isAllToolsSelected } from '@/lib/agent-tools';
 import { settingsAppGet, llmProviderList } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
 import { useDialog } from '@/hooks/useDialog';
+import { Modal } from '@/components/ui/Modal';
 
 interface Props {
   onClose: () => void;
@@ -130,19 +131,16 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
 
   if (loading) {
     return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <Modal backdropClassName="bg-black/60">
         <div className="p-6 rounded-2xl bg-codex-surface border border-codex-border text-codex-secondary text-sm">
           加载中...
         </div>
-      </div>
+      </Modal>
     );
   }
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
-      onClick={(e) => e.target === e.currentTarget && onClose()}
-    >
+    <Modal onClose={onClose} backdropClassName="bg-black/60">
       <div className="w-[520px] max-w-[95vw] max-h-[85vh] flex flex-col rounded-2xl bg-codex-surface border border-codex-border shadow-2xl">
         <div className="flex items-center justify-between px-6 py-4 border-b border-codex-border">
           <div className="flex items-center gap-2">
@@ -385,7 +383,7 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
           </button>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }
 

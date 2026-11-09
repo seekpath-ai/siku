@@ -11,6 +11,7 @@ import {
 import type { AgentStreamEvent } from '@/lib/types';
 import { useChatStore } from '@/stores/chatStore';
 import { useDialog } from '@/hooks/useDialog';
+import { Modal } from '@/components/ui/Modal';
 
 /** Plugins (skills) dialog — same modal shell as the task center.
  *
@@ -235,8 +236,10 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+    <Modal
+      onClose={onClose}
+      backdropClassName="bg-black/50 backdrop-blur-sm"
+    >
       <div className="relative w-[680px] max-w-[94vw] h-[580px] max-h-[88vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         {/* Header */}
         <div className="flex items-center gap-2 px-4 py-3 border-b border-surface-hover">
@@ -493,6 +496,6 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
           </div>
         </div>
       )}
-    </div>
+    </Modal>
   );
 }

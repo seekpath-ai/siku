@@ -7,7 +7,6 @@ import { usePetStore } from '@/stores/petStore';
 import { usePetContextStore } from '@/stores/petContextStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
 import { PetConversation, DOMAIN_ID_NAMES, DOMAIN_NAMES } from './PetConversation';
-import { PetSessionMenu } from './PetSessionMenu';
 
 /** Floating pet panel in the MAIN window: a draggable shell around
  *  PetConversation. The same conversation also runs inside the standalone
@@ -195,7 +194,6 @@ export function Pet() {
         </span>
         {/* Window-style controls (match the main TitleBar) */}
         <div className="flex items-center gap-0.5 shrink-0 ml-auto -mr-1">
-          <PetSessionMenu onCleared={() => {}} />
           <button
             onClick={handlePopOut}
             disabled={!store.session}

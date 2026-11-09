@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { emit } from '@/lib/events';
 import { useNavigate } from '@tanstack/react-router';
-import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus, CheckCircle2, AlertCircle, Square } from 'lucide-react';
+import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus, CheckCircle2, AlertCircle, Square, Eraser } from 'lucide-react';
 import { usePetStore } from '@/stores/petStore';
 import type { PetContext } from '@/stores/petContextStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
@@ -18,6 +18,8 @@ import { ApprovalPolicySwitch } from '@/components/chat/ApprovalPolicySwitch';
 import { parseAttachments } from '@/lib/attachments';
 import { ReasoningProcessCard } from '@/components/chat/ReasoningProcessCard';
 import { AttachmentImage } from '@/components/ui/AttachmentImage';
+import { SessionModelBadge } from '@/components/chat/SessionModelBadge';
+import { useDialog } from '@/hooks/useDialog';
 import { useImageAttachments } from '@/hooks/useImageAttachments';
 import { useAgentEventStream } from '@/hooks/useAgentEventStream';
 import { streamingToPhases, stepsToPhases } from '@/lib/agentPhases';
@@ -302,6 +304,30 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
   useEffect(() => () => {
     if (toastTimer.current) clearTimeout(toastTimer.current);
   }, []);
+
+  const { confirm } = useDialog();
+
+  // Clear the session from the input bar (surfaced from the retired ⋯ menu).
+  const handleClearSession = async () => {
+    if (!store.session || store.streaming) return;
+    const ok = await confirm(
+      '清空当前会话的全部对话记录？此操作不可恢复，下次打开将开始新会话。',
+      '清空会话记录'
+    );
+    if (!ok) return;
+    const sessionId = store.session.id;
+    try {
+      await store.clearSession();
+      // Other windows (main panel / detached chat) each hold their own store
+      // instance — tell them this session is gone so they don't keep showing
+      // a deleted conversation.
+      emit('pet:session-cleared', sessionId).catch(() => {});
+      showToast('success', '已清空会话记录');
+    } catch (err) {
+      console.error('clear pet session:', err);
+      showToast('error', `清空失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
 
   // Approval policy quick switch: bound to the pet-level `pet.approval`
   // setting (governs all domain/pet sessions), NOT the global
@@ -1006,6 +1032,29 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
                 compact
                 titleSuffix="（对所有宠物智能体生效）"
               />
+              {store.session && (
+                <span className="text-[11px] flex items-center">
+                  <SessionModelBadge
+                    session={store.session}
+                    onModelChange={(id) =>
+                      store.setSessionModel(id).catch((err) => console.error('switch model:', err))
+                    }
+                    maxWidthClass="max-w-[110px]"
+                    dropUp
+                  />
+                </span>
+              )}
+              {store.session && (
+                <button
+                  type="button"
+                  onClick={handleClearSession}
+                  disabled={store.streaming}
+                  className="w-7 h-7 rounded-md border-0 bg-transparent text-text-secondary/70 flex items-center justify-center hover:bg-red-500/15 hover:text-red-400 transition-colors disabled:opacity-40"
+                  title="清空本会话记录"
+                >
+                  <Eraser size={15} />
+                </button>
+              )}
             </div>
             {store.streaming ? (
               <button

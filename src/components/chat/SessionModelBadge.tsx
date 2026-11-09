@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Bot, Check, ChevronDown } from 'lucide-react';
+import { Bot, Check, ChevronDown, ChevronUp } from 'lucide-react';
 import type { AgentSession, LlmProvider } from '@/lib/types';
 import { llmProviderList } from '@/lib/tauri';
 
@@ -9,12 +9,14 @@ interface Props {
   onModelChange: (providerId: string) => void;
   /** Tailwind max-w-* cap for the badge label (space varies by container). */
   maxWidthClass?: string;
+  /** Open the menu upward — for badges sitting in a bottom input bar. */
+  dropUp?: boolean;
 }
 
 /** Model badge + switcher over the global provider pool. Shared by the chat
  *  header and the pet panel title bars so both switch a session's model the
  *  same way (pool reference from the next turn, replacing any inline custom). */
-export function SessionModelBadge({ session, onModelChange, maxWidthClass = 'max-w-[220px]' }: Props) {
+export function SessionModelBadge({ session, onModelChange, maxWidthClass = 'max-w-[220px]', dropUp = false }: Props) {
   const [providers, setProviders] = useState<LlmProvider[]>([]);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
@@ -99,10 +101,14 @@ export function SessionModelBadge({ session, onModelChange, maxWidthClass = 'max
       >
         <Bot size={11} className="shrink-0" />
         <span className="truncate">{modelLabel}</span>
-        <ChevronDown size={10} className="shrink-0 opacity-60" />
+        {dropUp ? (
+          <ChevronUp size={10} className="shrink-0 opacity-60" />
+        ) : (
+          <ChevronDown size={10} className="shrink-0 opacity-60" />
+        )}
       </button>
       {modelMenuOpen && (
-        <div className="absolute top-full left-0 mt-1 z-50 min-w-[240px] max-h-[300px] overflow-y-auto py-1 bg-surface border border-surface-hover rounded-lg shadow-xl">
+        <div className={`absolute left-0 z-50 min-w-[240px] max-h-[300px] overflow-y-auto py-1 bg-surface border border-surface-hover rounded-lg shadow-xl ${dropUp ? 'bottom-full mb-1' : 'top-full mt-1'}`}>
           {showCustomEntry && llm && (
             <div
               className="flex items-center gap-2 px-3 py-1.5 text-xs text-text-secondary"

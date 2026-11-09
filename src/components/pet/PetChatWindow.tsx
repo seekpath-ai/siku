@@ -5,7 +5,6 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { usePetStore } from '@/stores/petStore';
 import type { PetContext } from '@/stores/petContextStore';
 import { PetConversation, DOMAIN_ID_NAMES } from './PetConversation';
-import { PetSessionMenu } from './PetSessionMenu';
 import { Dialog } from '@/components/ui/Dialog';
 
 /** Standalone pet chat window ("pop the panel out of the main window").
@@ -63,7 +62,6 @@ export function PetChatWindow() {
             ? DOMAIN_ID_NAMES[store.session.domain ?? ''] || '智能助手'
             : '智能助手'}
         </span>
-        <PetSessionMenu onCleared={() => getCurrentWindow().close().catch(() => {})} />
         <button
           onClick={() => getCurrentWindow().close().catch(() => {})}
           className="w-8 h-8 flex items-center justify-center text-text-secondary hover:text-white hover:bg-red-500/80 transition-colors"
@@ -73,8 +71,8 @@ export function PetChatWindow() {
         </button>
       </div>
 
-      {/* Slim windows have no AppShell — mount the shared dialog host so the
-          session menu's confirm/alert dialogs render here too. */}
+      {/* Slim windows have no AppShell — mount the shared dialog host so
+          PetConversation's confirm/alert dialogs render here too. */}
       <Dialog />
 
       {paramError ? (

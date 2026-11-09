@@ -723,7 +723,7 @@ pub async fn spawn_auto_sync_proxy(
                                     // Forget the dedup entry so a later re-online can
                                     // re-establish the session; the previous one is
                                     // gone and must not block a fresh offer.
-                                    tried_peers.lock().unwrap().remove(&payload.device_id);
+                                    tried_peers.lock().unwrap_or_else(|e| e.into_inner()).remove(&payload.device_id);
                                 }
                             }
                             Some(crate::sync::types::RelayServerMsg::Ping) => continue,
@@ -910,7 +910,7 @@ fn maybe_offer_to_peer(
         return;
     }
     {
-        let mut tried = tried_peers.lock().unwrap();
+        let mut tried = tried_peers.lock().unwrap_or_else(|e| e.into_inner());
         if !tried.insert(peer.to_string()) {
             return;
         }

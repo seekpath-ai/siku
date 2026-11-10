@@ -8,6 +8,7 @@ import { useDialog } from '@/hooks/useDialog';
 import { useImageAttachments } from '@/hooks/useImageAttachments';
 import { AgentMemoryModal } from './AgentMemoryModal';
 import { ApprovalPolicySwitch } from './ApprovalPolicySwitch';
+import { useSkillMention } from './useSkillMention';
 import { ContextPickerModal } from './ContextPickerModal';
 import { contextKey, type ContextItem } from './contextItem';
 import type { ApprovalConfig, ChatAttachment } from '@/lib/types';
@@ -40,7 +41,8 @@ export function MessageInput({ disabled }: Props) {
   const [textAttachments, setTextAttachments] = useState<TextAttachment[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const { activeSessionId, addMessage, setLoading, isStreaming } = useChatStore();
+  const { activeSessionId, addMessage, setLoading, isStreaming, sessions, setSessions } = useChatStore();
+  const activeSession = sessions.find((s) => s.id === activeSessionId) ?? null;
   const activeProject = useProjectStore((s) =>
     s.projects.find((p) => p.id === s.activeProjectId)
   );
@@ -210,7 +212,8 @@ export function MessageInput({ disabled }: Props) {
     const attachBlock = textAttachments
       .map((a) => `<file name="${a.name}" path="${a.path}">\n${a.content}\n</file>`)
       .join('\n');
-    const content = [contextBlock, attachBlock, text].filter(Boolean).join('\n\n');
+    const skillHint = skillMention.takeFocusHint();
+    const content = [skillHint, contextBlock, attachBlock, text].filter(Boolean).join('\n\n');
 
     const chatAttachments: ChatAttachment[] | undefined =
       images.length > 0
@@ -266,7 +269,22 @@ export function MessageInput({ disabled }: Props) {
     }
   };
 
+  // 技能 @ 提及：键入 @（或 /）弹出技能面板，选中按需挂载并插入提示文本。
+  const skillMention = useSkillMention({
+    input,
+    setInput,
+    textareaRef,
+    sessionId: activeSessionId,
+    selectedSkills: activeSession?.selected_skills ?? [],
+    onSkillsChange: (next) =>
+      setSessions(
+        sessions.map((s) => (s.id === activeSessionId ? { ...s, selected_skills: next } : s)),
+      ),
+    disabled,
+  });
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (skillMention.handleKeyDown(e as React.KeyboardEvent<HTMLTextAreaElement>)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -299,13 +317,15 @@ export function MessageInput({ disabled }: Props) {
     <div className="px-5 pb-5 pt-2 bg-background">
       <div className="max-w-[800px] mx-auto">
         <div
-          className={`rounded-xl border p-1 transition-colors focus-within:bg-surface ${
+          className={`relative rounded-xl border p-1 transition-colors focus-within:bg-surface ${
             isDragging ? 'border-primary bg-primary/5' : 'border-surface-hover'
           }`}
           onDrop={handleDrop}
           onDragOver={handleDragOver}
           onDragLeave={handleDragLeave}
         >
+          {skillMention.popover}
+          {skillMention.chips}
           {(textAttachments.length > 0 || images.length > 0 || contexts.length > 0) && (
             <div className="flex flex-wrap gap-1.5 px-2 pt-2">
               {contexts.map((c) => (
@@ -375,7 +395,10 @@ export function MessageInput({ disabled }: Props) {
           <textarea
             ref={textareaRef}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              setInput(e.target.value);
+              skillMention.handleChange(e);
+            }}
             onKeyDown={handleKeyDown}
             onInput={handleInput}
             onPaste={handlePaste}
@@ -386,6 +409,7 @@ export function MessageInput({ disabled }: Props) {
           />
           <div className="flex items-center justify-between px-2 pb-1.5">
             <div className="flex items-center gap-1">
+              {skillMention.button}
               <button
                 type="button"
                 disabled={disabled}
@@ -466,7 +490,7 @@ export function MessageInput({ disabled }: Props) {
           </div>
         </div>
         <div className="text-center text-[12px] text-text-secondary/60 mt-2">
-          Enter 发送 · Shift + Enter 换行 · Ctrl+Shift+S 截图 · 拖拽/粘贴图片也可发送
+          Enter 发送 · Shift + Enter 换行 · @ 使用技能 · Ctrl+Shift+S 截图 · 拖拽/粘贴图片也可发送
         </div>
       </div>
       {memoryOpen && activeSessionId && (

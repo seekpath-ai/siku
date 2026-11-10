@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { emit } from '@/lib/events';
 import { CollapsibleText } from '@/components/ui/CollapsibleText';
+import { useSkillMention } from '@/components/chat/useSkillMention';
 import { useNavigate } from '@tanstack/react-router';
 import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus, CheckCircle2, AlertCircle, Square, Eraser } from 'lucide-react';
 import { usePetStore } from '@/stores/petStore';
@@ -314,6 +315,22 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
 
   const { confirm } = useDialog();
 
+  // 技能 @ 提及：键入 @（或 /）弹出技能面板，选中按需挂载到本会话并插入
+  // 提示文本。挂载失败走内联 toast——全局 Dialog 在独立宠物窗口不渲染。
+  const skillMention = useSkillMention({
+    input,
+    setInput,
+    textareaRef: inputRef,
+    sessionId: store.session?.id ?? null,
+    selectedSkills: store.session?.selected_skills ?? [],
+    onSkillsChange: (next) => {
+      const s = usePetStore.getState().session;
+      if (s) store.setSession({ ...s, selected_skills: next });
+    },
+    disabled: store.streaming,
+    onError: (msg) => showToast('error', msg),
+  });
+
   // Clear the session from the input bar (surfaced from the retired ⋯ menu).
   const handleClearSession = async () => {
     if (!store.session || store.streaming) return;
@@ -457,10 +474,10 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
   // (pending approval, post-done reload, bubble notify) stay in the
   // handlers below.
   const petSessionId = usePetStore((s) => s.session?.id ?? null);
-  const onPetDelta = useCallback((content: string) => {
+  const onPetDelta = useCallback((stepIndex: number, content: string) => {
     const st = usePetStore.getState();
     st.setStreaming(true);
-    st.appendDelta(content);
+    st.appendDelta(stepIndex, content);
   }, []);
   const onPetReasoning = useCallback((stepIndex: number, content: string) => {
     const st = usePetStore.getState();
@@ -959,7 +976,9 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
             正在等待截图：请在屏幕上框选区域，完成后自动附加（也可直接 Ctrl+V 粘贴图片；再点截图按钮取消）
           </div>
         )}
-        <div className="rounded-lg border border-surface-hover bg-background transition-colors focus-within:border-primary/40">
+        <div className="relative rounded-lg border border-surface-hover bg-background transition-colors focus-within:border-primary/40">
+          {skillMention.popover}
+          {skillMention.chips}
           {images.length > 0 && (
             <div className="flex flex-wrap gap-1.5 px-2 pt-2">
               {images.map((a) => (
@@ -985,8 +1004,12 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
           <textarea
             ref={inputRef}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              setInput(e.target.value);
+              skillMention.handleChange(e);
+            }}
             onKeyDown={(e) => {
+              if (skillMention.handleKeyDown(e)) return;
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 handleSend();
@@ -1004,6 +1027,7 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
           />
           <div className="flex items-center justify-between px-2 pb-1.5">
             <div className="flex items-center gap-1">
+              {skillMention.button}
               <button
                 type="button"
                 onClick={handleAttachImage}

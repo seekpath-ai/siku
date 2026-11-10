@@ -36,6 +36,10 @@ interface ChatState {
   /** Search-result jump: scroll this message into view and flash it. The
    * nonce lets repeat jumps to the same message retrigger. */
   jumpTarget: { messageId: string; nonce: number } | null;
+  /** 会话级持久的静默替换映射（DB 消息 id → 沿用的临时 id）。增量对齐的
+   * 游标会越过旧轮次，每轮现算的映射会丢旧映射、推理步骤因此挂回真实
+   * id 而找不到气泡 —— 所以跨 reload 累积。会话切换时随消息一起清空。 */
+  twinTempByDbId: Record<string, string>;
 
   setSessions: (sessions: AgentSession[]) => void;
   setActiveSession: (id: string | null) => void;
@@ -66,6 +70,8 @@ interface ChatState {
   finalizeStreamingStep: (stepIndex: number) => void;
   clearStreamingSteps: () => void;
   removeSession: (id: string) => void;
+  /** 累积静默替换映射（见 twinTempByDbId 字段说明）。 */
+  mergeTwinTempIds: (pairs: Record<string, string>) => void;
   setPendingQuestions: (q: AskQuestion[] | null, sessionId?: string | null) => void;
   setPendingFirst: (p: { sessionId: string; text: string } | null) => void;
   setJumpTarget: (messageId: string | null) => void;
@@ -89,6 +95,7 @@ export const useChatStore = create<ChatState>((set) => ({
   pendingQuestionsSessionId: null,
   pendingFirst: null,
   jumpTarget: null,
+  twinTempByDbId: {},
 
   setSessions: (sessions) => set({ sessions }),
   setActiveSession: (id) =>
@@ -104,6 +111,7 @@ export const useChatStore = create<ChatState>((set) => ({
         streamTextStep: null,
         streamingSteps: [],
         currentStreamingStep: null,
+        twinTempByDbId: {},
         // Restore the target session's streaming/loading flags so the input
         // is only disabled while THAT session is actually generating.
         isStreaming: id ? !!s.streamingById[id] : false,
@@ -272,6 +280,7 @@ export const useChatStore = create<ChatState>((set) => ({
         isLoading: wasActive ? false : s.isLoading,
         pendingQuestions: s.pendingQuestionsSessionId === id ? null : s.pendingQuestions,
         pendingQuestionsSessionId: s.pendingQuestionsSessionId === id ? null : s.pendingQuestionsSessionId,
+        twinTempByDbId: wasActive ? {} : s.twinTempByDbId,
       };
     }),
 
@@ -287,4 +296,6 @@ export const useChatStore = create<ChatState>((set) => ({
     set((s) => ({
       jumpTarget: messageId ? { messageId, nonce: (s.jumpTarget?.nonce ?? 0) + 1 } : null,
     })),
+  mergeTwinTempIds: (pairs) =>
+    set((s) => ({ twinTempByDbId: { ...s.twinTempByDbId, ...pairs } })),
 }));

@@ -7,6 +7,7 @@ import { ChatHeader } from './ChatHeader';
 import { ChatSearchBar } from './ChatSearchBar';
 import { AskUserDialog } from './AskUserDialog';
 import { useChatStore, MESSAGE_PAGE_SIZE } from '@/stores/chatStore';
+import { mergeMessages } from '@/lib/chatMerge';
 import { useProjectStore } from '@/stores/projectStore';
 import { usePetContextStore } from '@/stores/petContextStore';
 import { useStreamingChat } from '@/hooks/useStreamingChat';
@@ -244,12 +245,26 @@ export function ChatPanel() {
           return;
         }
         // The history reload is still in flight; re-read the session once so
-        // the settled row lands instead of the stale `pending` copy.
+        // the settled row lands instead of the stale `pending` copy. Merge —
+        // never wholesale-replace: the page is capped at MESSAGE_PAGE_SIZE,
+        // so replacing would drop older loaded messages and temp bubbles.
         void getChatMessages(p.session_id, { limit: MESSAGE_PAGE_SIZE })
           .then((page) => {
             if (cancelled) return;
             const cur = useChatStore.getState();
-            if (cur.activeSessionId === p.session_id) cur.setMessages(page.messages);
+            if (cur.activeSessionId !== p.session_id) return;
+            const { merged, twinTempByDbId } = mergeMessages(cur.messages, page.messages);
+            // 孪生替换会保留临时气泡（含旧的「发送中」附件状态）——把事件
+            // 携带的落定附件补到临时气泡上，否则卡片不翻转。
+            const tempId = twinTempByDbId.get(p.message_id);
+            if (tempId) {
+              const i = merged.findIndex((m) => m.id === tempId);
+              if (i >= 0) merged[i] = { ...merged[i], attachments: p.attachments };
+            }
+            cur.setMessages(merged);
+            if (twinTempByDbId.size > 0) {
+              cur.mergeTwinTempIds(Object.fromEntries(twinTempByDbId));
+            }
           })
           .catch(() => {});
       },

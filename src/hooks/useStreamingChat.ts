@@ -1,6 +1,7 @@
 import { useCallback } from 'react';
 import { useChatStore, MESSAGE_PAGE_SIZE } from '@/stores/chatStore';
 import { getChatMessages, getAgentSteps, type ChatMessagePage } from '@/lib/tauri';
+import { mergeMessages, isTempMessageId } from '@/lib/chatMerge';
 import { useAgentEventStream } from '@/hooks/useAgentEventStream';
 import type { AgentStep, AgentStreamEvent, ToolCallInfo } from '@/lib/types';
 
@@ -44,12 +45,10 @@ export function useStreamingChat() {
   // excluded, otherwise its just-now timestamp becomes the after-cursor and
   // hides the very rows we're fetching).
   const reloadSessionHistory = useCallback((sessionId: string) => {
-    const isTemp = (id: string) =>
-      id.startsWith('user_') || id.startsWith('error_') || id.startsWith('assistant_');
     const reload = async () => {
       const state = useChatStore.getState();
       const newestPersisted = state.activeSessionId === sessionId
-        ? [...state.messages].reverse().find((m) => !isTemp(m.id))
+        ? [...state.messages].reverse().find((m) => !isTempMessageId(m.id))
         : null;
       const [page, steps] = await Promise.all([
         newestPersisted
@@ -70,44 +69,24 @@ export function useStreamingChat() {
       // The user switched away meanwhile; that session's history is loaded
       // by ChatPanel when it becomes active again.
       if (state.activeSessionId !== sessionId) return;
-      const persisted = state.messages.filter((m) => !isTemp(m.id));
-      const known = new Set(persisted.map((m) => m.id));
-      // 静默替换：内容与 DB 一致的临时助手消息在其 DB 孪生的位置上沿用原
-      // id —— id 变化会让整个气泡卸载重挂（markdown/KaTeX 重渲染），是
-      // done 时闪跳的主因。必须按 DB 顺序原位替换：把临时气泡挪到队首会
-      // 颠倒「提问→回复」的顺序。未匹配的临时消息（持久化失败等）保留在
-      // 队尾，避免回复凭空消失。
-      const tempAssistants = state.messages.filter((m) => isTemp(m.id) && m.role === 'assistant');
-      const usedTempIds = new Set<string>();
-      // DB 消息 id → 沿用的临时 id：步骤的 message_id 也按它改挂，否则
-      // 推理卡按真实 id 索引、气泡按临时 id 渲染，两边对不上而消失。
-      const twinTempByDbId = new Map<string, string>();
-      const fresh = page.messages
-        .filter((m) => !known.has(m.id))
-        .map((m) => {
-          if (m.role !== 'assistant') return m;
-          const twin = tempAssistants.find((t) => !usedTempIds.has(t.id) && t.content === m.content);
-          if (twin) {
-            usedTempIds.add(twin.id);
-            twinTempByDbId.set(m.id, twin.id);
-            return twin;
-          }
-          return m;
-        });
-      const merged = [
-        ...persisted,
-        ...fresh,
-        ...tempAssistants.filter((t) => !usedTempIds.has(t.id)),
-      ];
+      const { merged, twinTempByDbId } = mergeMessages(state.messages, page.messages);
+      // 孪生映射跨 reload 累积：增量游标会越过旧轮次，只靠当前页现算会
+      // 丢旧映射，旧回复的推理步骤挂回真实 id 后找不到临时气泡而消失。
+      const twinAll = { ...state.twinTempByDbId, ...Object.fromEntries(twinTempByDbId) };
       const lastAssistant = [...merged].reverse().find((m) => m.role === 'assistant');
+      // 步骤的 message_id 随静默替换改挂临时 id，否则推理卡按真实 id
+      // 索引、气泡按临时 id 渲染，两边对不上而消失。
       const linked = steps.map((s) => {
-        const tempId = s.message_id ? twinTempByDbId.get(s.message_id) : undefined;
+        const tempId = s.message_id ? twinAll[s.message_id] : undefined;
         if (tempId) return { ...s, message_id: tempId };
         if (s.message_id === null && lastAssistant) return { ...s, message_id: lastAssistant.id };
         return s;
       });
       state.setMessages(merged);
       state.setAgentSteps(linked);
+      if (twinTempByDbId.size > 0) {
+        state.mergeTwinTempIds(Object.fromEntries(twinTempByDbId));
+      }
     };
     (async () => {
       try {
@@ -125,18 +104,31 @@ export function useStreamingChat() {
     })();
   }, []);
 
+  // 远程渠道（微信/飞书等）发起的回合没有本地乐观用户气泡：消息由后端落库，
+  // 前端要等 done 对齐才看到。回合开始的标志是 streaming 由 false 转 true ——
+  // 此刻立即增量对齐一次，让远程用户消息在流式回复出现前落位。本地发送的
+  // 回合同样会触发（临时气泡被 DB 行顶替），是一次无害的幂多拉取。
+  const markTurnStreaming = useCallback((sessionId: string) => {
+    const state = useChatStore.getState();
+    const turnStarting = !state.streamingById[sessionId];
+    state.setSessionStreaming(sessionId, true);
+    if (turnStarting && state.activeSessionId === sessionId) {
+      reloadSessionHistory(sessionId);
+    }
+  }, [reloadSessionHistory]);
+
   const onDelta = useCallback((stepIndex: number, content: string, sessionId: string) => {
     const state = useChatStore.getState();
-    state.setSessionStreaming(sessionId, true);
+    markTurnStreaming(sessionId);
     state.appendStreamContent(stepIndex, content);
-  }, []);
+  }, [markTurnStreaming]);
 
   const onReasoning = useCallback((stepIndex: number, content: string, sessionId: string) => {
     const state = useChatStore.getState();
-    state.setSessionStreaming(sessionId, true);
+    markTurnStreaming(sessionId);
     state.ensureStreamingStep(stepIndex);
     state.appendStreamingReasoning(stepIndex, content);
-  }, []);
+  }, [markTurnStreaming]);
 
   // Events for sessions other than the active one (pet/cron runs, or a chat
   // session the user switched away from). Content is dropped; only the
@@ -165,9 +157,9 @@ export function useStreamingChat() {
       state.setSessionLoading(e.session_id, false);
       clearStaleQuestions(e.session_id);
     } else if (STREAMING_START_TYPES.has(e.type)) {
-      state.setSessionStreaming(e.session_id, true);
+      markTurnStreaming(e.session_id);
     }
-  }, [clearStaleQuestions]);
+  }, [clearStaleQuestions, markTurnStreaming]);
 
   // Non-stream events for the active session. The hook has already flushed
   // any buffered delta/reasoning text, so the state read below observes the
@@ -177,11 +169,11 @@ export function useStreamingChat() {
 
     switch (e.type) {
       case 'thinking':
-        state.setSessionStreaming(e.session_id, true);
+        markTurnStreaming(e.session_id);
         break;
 
       case 'tool_approval_required':
-        state.setSessionStreaming(e.session_id, true);
+        markTurnStreaming(e.session_id);
         if (e.tool_call_id && e.tool_name && e.step_index !== undefined) {
           state.ensureStreamingStep(e.step_index);
           // 该轮产生工具调用：其已流出的文本是过程叙述，迁出回复气泡。
@@ -205,7 +197,7 @@ export function useStreamingChat() {
         break;
 
       case 'tool_call':
-        state.setSessionStreaming(e.session_id, true);
+        markTurnStreaming(e.session_id);
         if (e.tool_call_id && e.tool_name && e.step_index !== undefined) {
           state.ensureStreamingStep(e.step_index);
           // 该轮产生工具调用：其已流出的文本是过程叙述，迁出回复气泡。
@@ -365,7 +357,7 @@ export function useStreamingChat() {
         break;
       }
     }
-  }, [finalizeStep, reloadSessionHistory, clearStaleQuestions]);
+  }, [finalizeStep, reloadSessionHistory, clearStaleQuestions, markTurnStreaming]);
 
   useAgentEventStream({
     sessionId: activeSessionId,

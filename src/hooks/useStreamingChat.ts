@@ -72,21 +72,40 @@ export function useStreamingChat() {
       if (state.activeSessionId !== sessionId) return;
       const persisted = state.messages.filter((m) => !isTemp(m.id));
       const known = new Set(persisted.map((m) => m.id));
-      // 静默替换：内容与 DB 一致的临时消息沿用原 id —— id 变化会让整个
-      // 气泡卸载重挂（markdown/KaTeX 重渲染），是 done 时闪跳的主因。
-      const tempLast = [...state.messages].reverse().find((m) => isTemp(m.id) && m.role === 'assistant');
-      const dbTwin = tempLast
-        ? page.messages.find((m) => m.role === 'assistant' && m.content === tempLast.content)
-        : undefined;
+      // 静默替换：内容与 DB 一致的临时助手消息在其 DB 孪生的位置上沿用原
+      // id —— id 变化会让整个气泡卸载重挂（markdown/KaTeX 重渲染），是
+      // done 时闪跳的主因。必须按 DB 顺序原位替换：把临时气泡挪到队首会
+      // 颠倒「提问→回复」的顺序。未匹配的临时消息（持久化失败等）保留在
+      // 队尾，避免回复凭空消失。
+      const tempAssistants = state.messages.filter((m) => isTemp(m.id) && m.role === 'assistant');
+      const usedTempIds = new Set<string>();
+      // DB 消息 id → 沿用的临时 id：步骤的 message_id 也按它改挂，否则
+      // 推理卡按真实 id 索引、气泡按临时 id 渲染，两边对不上而消失。
+      const twinTempByDbId = new Map<string, string>();
+      const fresh = page.messages
+        .filter((m) => !known.has(m.id))
+        .map((m) => {
+          if (m.role !== 'assistant') return m;
+          const twin = tempAssistants.find((t) => !usedTempIds.has(t.id) && t.content === m.content);
+          if (twin) {
+            usedTempIds.add(twin.id);
+            twinTempByDbId.set(m.id, twin.id);
+            return twin;
+          }
+          return m;
+        });
       const merged = [
         ...persisted,
-        ...(tempLast && dbTwin ? [tempLast] : []),
-        ...page.messages.filter((m) => !known.has(m.id) && m.id !== dbTwin?.id),
+        ...fresh,
+        ...tempAssistants.filter((t) => !usedTempIds.has(t.id)),
       ];
       const lastAssistant = [...merged].reverse().find((m) => m.role === 'assistant');
-      const linked = lastAssistant
-        ? steps.map((s) => (s.message_id === null ? { ...s, message_id: lastAssistant.id } : s))
-        : steps;
+      const linked = steps.map((s) => {
+        const tempId = s.message_id ? twinTempByDbId.get(s.message_id) : undefined;
+        if (tempId) return { ...s, message_id: tempId };
+        if (s.message_id === null && lastAssistant) return { ...s, message_id: lastAssistant.id };
+        return s;
+      });
       state.setMessages(merged);
       state.setAgentSteps(linked);
     };

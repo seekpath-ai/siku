@@ -23,6 +23,7 @@ import {
 } from './markdownConfig';
 import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
 import { ContextMenu } from '@/components/ui/ContextMenu';
+import { CollapsibleText } from '@/components/ui/CollapsibleText';
 
 interface Props {
   message: ChatMessage;
@@ -324,7 +325,13 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
         )}
         {isUser ? (
           <>
-            <UserText content={message.content} />
+            <CollapsibleText
+              maxHeight={240}
+              gradientFrom="from-codex-surface"
+              buttonClassName="mt-1 inline-flex items-center gap-0.5 text-[11px] text-codex-muted hover:text-codex-primary transition-colors"
+            >
+              <UserText content={message.content} />
+            </CollapsibleText>
             {message.attachments && (
               <div className="flex flex-wrap gap-2 mt-2">
                 {parseAttachments(message.attachments)

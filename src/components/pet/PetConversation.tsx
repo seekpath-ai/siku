@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { emit } from '@/lib/events';
+import { CollapsibleText } from '@/components/ui/CollapsibleText';
 import { useNavigate } from '@tanstack/react-router';
 import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus, CheckCircle2, AlertCircle, Square, Eraser } from 'lucide-react';
 import { usePetStore } from '@/stores/petStore';
@@ -191,8 +192,14 @@ function PetMessage({ msg, onCitation, onSaveNote, saving }: {
     const images = parseAttachments(msg.attachments);
     return (
       <div className="flex justify-end">
-        <div className="max-w-[82%] bg-surface px-3 py-2 rounded-xl rounded-tr-sm text-[13px] text-text-primary whitespace-pre-wrap">
-          {msg.content}
+        <div className="max-w-[82%] bg-surface px-3 py-2 rounded-xl rounded-tr-sm text-[13px] text-text-primary">
+          <CollapsibleText
+            maxHeight={200}
+            gradientFrom="from-surface"
+            buttonClassName="mt-1 inline-flex items-center gap-0.5 text-[11px] text-text-secondary/60 hover:text-primary transition-colors"
+          >
+            <span className="whitespace-pre-wrap">{msg.content}</span>
+          </CollapsibleText>
           {images.length > 0 && (
             <div className="flex flex-wrap gap-1.5 mt-1.5">
               {images.map((att, idx) => (

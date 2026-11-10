@@ -384,15 +384,17 @@ CREATE INDEX IF NOT EXISTS idx_agent_steps_message ON agent_steps(message_id);
 
 -- translation_cache
 CREATE TABLE IF NOT EXISTS translation_cache (
-    id TEXT PRIMARY KEY,
-    source_hash TEXT NOT NULL,
+    id TEXT PRIMARY KEY NOT NULL,
+    source_hash TEXT NOT NULL DEFAULT '',
     source_embedding BLOB,
-    translation TEXT NOT NULL,
-    model TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    translation TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_translation_cache_hash_unique ON translation_cache(source_hash, model);
+-- 非唯一索引：CRR 表不允许主键以外的唯一索引（translation_cache 在
+-- OPTIONAL_SYNC_TABLES 中）；去重由确定性主键 id（source_hash:model）承担。
+CREATE INDEX IF NOT EXISTS idx_translation_cache_hash ON translation_cache(source_hash, model);
 
 -- saved_items
 CREATE TABLE IF NOT EXISTS saved_items (

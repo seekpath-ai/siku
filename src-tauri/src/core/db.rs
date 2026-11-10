@@ -69,7 +69,17 @@ pub(crate) const CORE_SYNC_TABLES: &[&str] = &[
     // overlay rebuilt from the papers.authors/editor JSON columns (which do
     // sync via the papers table). See paper_service::rebuild_creators_for_papers.
 ];
-pub(crate) const OPTIONAL_SYNC_TABLES: &[&str] = &["chat_sessions", "chat_messages", "settings", "remote_chats", "remote_msg_ids"];
+pub(crate) const OPTIONAL_SYNC_TABLES: &[&str] = &[
+    "chat_sessions",
+    "chat_messages",
+    "settings",
+    "remote_chats",
+    "remote_msg_ids",
+    // 译文缓存：可再生的派生数据，同步只为跨设备复用、省重复翻译的额度。
+    // id 是确定性内容寻址（source_hash:model，见下方迁移与 cache::store），
+    // 两台设备各自翻译同一段文字产生同一主键，CRDT 按行合并无唯一索引冲突。
+    "translation_cache",
+];
 
 /// Fixed uuid of the default vault: every device seeds the same id so the
 /// default vault converges to a single row when syncing.
@@ -962,6 +972,60 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     add_column_if_missing(&db, "agent_steps", "narration", "TEXT")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for agent_steps.narration: {}", e))?;
+
+    // Migration: rebuild translation_cache into the CRR-compatible shape
+    // (added 2026-11). The table joins OPTIONAL_SYNC_TABLES; CRRs require a
+    // non-nullable primary key (SQLite's `TEXT PRIMARY KEY` stays nullable)
+    // and forbid unique indices besides the PK. The rebuild normalizes ids
+    // to content-addressed form (source_hash:model — matching cache::store),
+    // so two devices translating the same text converge on one row instead
+    // of colliding on the old (source_hash, model) unique index. Runs before
+    // CRR registration — the table has never been a CRR, so rewriting ids
+    // leaves no sync tombstones.
+    let tc_info = sqlx::query("PRAGMA table_info(translation_cache)")
+        .fetch_all(&db)
+        .await?;
+    let tc_id_not_null = tc_info.iter().any(|r| {
+        r.try_get::<String, _>("name").map(|n| n == "id").unwrap_or(false)
+            && r.try_get::<i64, _>("notnull").unwrap_or(0) == 1
+    });
+    if !tc_info.is_empty() && !tc_id_not_null {
+        info!("running migration: rebuild translation_cache to the CRR-compatible shape");
+        sqlx::query("ALTER TABLE translation_cache RENAME TO translation_cache_old")
+            .execute(&db)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE translation_cache (
+                id TEXT PRIMARY KEY NOT NULL,
+                source_hash TEXT NOT NULL DEFAULT '',
+                source_embedding BLOB,
+                translation TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )"
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO translation_cache (id, source_hash, source_embedding, translation, model, created_at, updated_at)
+             SELECT source_hash || ':' || model, source_hash, source_embedding, translation, model, created_at, updated_at
+             FROM translation_cache_old"
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query("DROP TABLE translation_cache_old").execute(&db).await?;
+    }
+    // The legacy unique index rides the old table into DROP above; recreate
+    // the lookup index (plain, non-unique) on the current table.
+    sqlx::query("DROP INDEX IF EXISTS idx_translation_cache_hash_unique")
+        .execute(&db)
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed dropping translation_cache unique index: {}", e))?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_translation_cache_hash ON translation_cache(source_hash, model)")
+        .execute(&db)
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed creating translation_cache index: {}", e))?;
 
     // Migration: Codex-style projects (added 2026-08-09)
     add_column_if_missing(&db, "chat_sessions", "project_id", "TEXT")

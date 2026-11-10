@@ -1081,6 +1081,75 @@ mod tests {
         Ok(())
     }
 
+    /// translation_cache uses content-addressed primary keys
+    /// (`source_hash:model`, see cache::store): two devices translating the
+    /// same paragraph independently produce the SAME pk, so their rows merge
+    /// as one CRDT row instead of colliding on the (dropped) unique index.
+    /// Both directions must converge to a single row.
+    #[tokio::test]
+    async fn translation_cache_converges_on_content_addressed_id() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-crdt-tcache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a = connect_with_crsqlite(&dir.join("a.db")).await?;
+        let db_b = connect_with_crsqlite(&dir.join("b.db")).await?;
+        for db in [&db_a, &db_b] {
+            sqlx::query(SCHEMA_INIT_SQL).execute(db).await?;
+            register_crr_tables(db, CORE_SYNC_TABLES).await?;
+            register_crr_tables(db, OPTIONAL_SYNC_TABLES).await?;
+        }
+
+        let id = "hash-of-source:translator/model";
+        for (db, translation, ts) in [
+            (&db_a, "译文 A", "2026-01-01T00:00:01.000Z"),
+            (&db_b, "译文 B", "2026-01-01T00:00:02.000Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO translation_cache (id, source_hash, translation, model, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind("hash-of-source")
+            .bind(translation)
+            .bind("translator/model")
+            .bind(ts)
+            .bind(ts)
+            .execute(db)
+            .await?;
+        }
+
+        // A → B, then B → A: both must accept the peer's version of the same
+        // row without constraint errors, converging on one value.
+        let changes_a = export_changes_since(&db_a, 0).await?;
+        apply_changes(&db_b, &changes_a).await?;
+        let changes_b = export_changes_since(&db_b, 0).await?;
+        apply_changes(&db_a, &changes_b).await?;
+
+        for db in [&db_a, &db_b] {
+            let rows: Vec<(String,)> =
+                sqlx::query_as("SELECT translation FROM translation_cache WHERE id = ?")
+                    .bind(id)
+                    .fetch_all(db)
+                    .await?;
+            assert_eq!(rows.len(), 1, "same content must converge to one row");
+            assert_eq!(rows[0].0, "译文 B", "newer write wins");
+        }
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
     /// `notes.current_vault_id` is a device-local UI preference (which vault
     /// the user is looking at). Syncing it makes devices fight over the
     /// active vault via LWW — switching vaults on one device would yank every

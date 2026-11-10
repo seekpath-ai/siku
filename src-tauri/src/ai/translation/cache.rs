@@ -35,15 +35,19 @@ pub async fn store(
     translation: &str,
     model: &str,
 ) -> Result<(), String> {
-    let id = uuid::Uuid::new_v4().to_string();
+    // 内容寻址 id：两台设备翻译同一段文字得到同一主键，同步按行合并
+    // （OPTIONAL_SYNC_TABLES 含 translation_cache），不触发唯一索引冲突。
     let source_hash = hash_source(source_text, target_lang);
+    let id = format!("{}:{}", source_hash, model);
     let now = time::now_iso();
 
-    // Upsert — update if hash+model already exists
+    // Upsert — 确定性主键（source_hash:model）即去重键：同一原文+目标语+
+    // 模型重复写入时更新译文。不能用 (source_hash, model) 唯一索引做冲突
+    // 目标：CRR 表（可选同步）不允许主键以外的唯一索引。
     sqlx::query(
         "INSERT INTO translation_cache (id, source_hash, translation, model, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(source_hash, model) DO UPDATE SET translation = excluded.translation, updated_at = excluded.updated_at"
+         ON CONFLICT(id) DO UPDATE SET translation = excluded.translation, updated_at = excluded.updated_at"
     )
     .bind(&id)
     .bind(&source_hash)

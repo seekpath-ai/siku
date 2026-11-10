@@ -285,15 +285,16 @@ CREATE INDEX idx_chat_messages_session ON chat_messages(session_id);
 
 -- translation_cache
 CREATE TABLE translation_cache (
-    id TEXT PRIMARY KEY,
-    source_hash TEXT NOT NULL,
+    id TEXT PRIMARY KEY NOT NULL,
+    source_hash TEXT NOT NULL DEFAULT '',
     source_embedding BLOB,
-    translation TEXT NOT NULL,
-    model TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    translation TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
 );
-CREATE UNIQUE INDEX idx_translation_cache_hash_unique ON translation_cache(source_hash, model);
+-- 非唯一索引：CRR 表不允许主键以外的唯一索引；去重由确定性主键承担。
+CREATE INDEX idx_translation_cache_hash ON translation_cache(source_hash, model);
 
 -- saved_items
 CREATE TABLE saved_items (

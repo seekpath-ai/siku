@@ -78,7 +78,7 @@ export function Dialog() {
         </div>
 
         <div className="px-4 py-4">
-          <p className="text-sm text-text-primary leading-relaxed whitespace-pre-wrap">{message}</p>
+          <p className="text-sm text-text-primary leading-relaxed whitespace-pre-wrap break-words max-h-[50vh] overflow-y-auto">{message}</p>
           {type === 'prompt' && (
             promptOptions?.multiline ? (
               <textarea

@@ -1655,8 +1655,8 @@ pub(crate) async fn run_agent_turn(
                 if let Some(ref mid) = message_id {
                     for step in steps {
                         if let Err(e) = sqlx::query(
-                            "INSERT INTO agent_steps (id, session_id, message_id, step_index, reasoning_content, tool_calls, created_at)
-                             VALUES (?, ?, ?, ?, ?, ?, ?)"
+                            "INSERT INTO agent_steps (id, session_id, message_id, step_index, reasoning_content, tool_calls, narration, created_at)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                         )
                         .bind(&step.id)
                         .bind(&sid)
@@ -1664,6 +1664,7 @@ pub(crate) async fn run_agent_turn(
                         .bind(step.step_index)
                         .bind(&step.reasoning_content)
                         .bind(&step.tool_calls)
+                        .bind(&step.narration)
                         .bind(&step.created_at)
                         .execute(&db)
                         .await {
@@ -1947,7 +1948,7 @@ pub async fn get_agent_steps(
     session_id: String,
 ) -> Result<Vec<AgentStep>, String> {
     let steps = sqlx::query_as::<_, AgentStep>(
-        "SELECT id, session_id, message_id, step_index, reasoning_content, tool_calls, created_at
+        "SELECT id, session_id, message_id, step_index, reasoning_content, tool_calls, narration, created_at
          FROM agent_steps WHERE session_id = ? ORDER BY step_index ASC"
     )
     .bind(&session_id)

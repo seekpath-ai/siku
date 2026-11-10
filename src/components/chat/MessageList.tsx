@@ -39,6 +39,15 @@ const HistoryMessages = memo(function HistoryMessages({
     return map;
   }, [messages]);
 
+  // 刚完成的回复（最近一条 assistant 且完成于数秒内）：其推理卡挂载时
+  // 从展开态动画收起——流式卡是展开的，瞬时折叠读起来像跳变。
+  const lastAssistantId = useMemo(
+    () => [...messages].reverse().find((m) => m.role === 'assistant')?.id ?? null,
+    [messages],
+  );
+  const isJustCompleted = (m: ChatMessage) =>
+    m.id === lastAssistantId && Date.now() - new Date(m.created_at).getTime() < 8000;
+
   return (
     <>
       {messages.map((msg) => (
@@ -48,6 +57,7 @@ const HistoryMessages = memo(function HistoryMessages({
           agentSteps={msg.role === 'assistant' ? stepsByMessageId.get(msg.id) : undefined}
           prevUserMessage={msg.role === 'assistant' ? prevUserById.get(msg.id) : undefined}
           highlighted={msg.id === highlightId}
+          collapseCardOnMount={isJustCompleted(msg)}
         />
       ))}
     </>

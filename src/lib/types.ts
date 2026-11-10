@@ -359,12 +359,15 @@ export interface StreamingStep {
   step_index: number;
   reasoning_content: string;
   tool_calls: ToolCallInfo[];
+  /** 该轮产生工具调用时流过的可见文本（过程叙述）：从回复气泡迁移而来。 */
+  narration?: string;
   status: 'streaming' | 'completed';
 }
 
-/** A single flattened phase of a ReAct turn: either reasoning or one tool call. */
+/** A single flattened phase of a ReAct turn: reasoning, narration, or one tool call. */
 export type AgentPhase =
   | { kind: 'reasoning'; step_index: number; content: string }
+  | { kind: 'narration'; step_index: number; content: string }
   | { kind: 'tool_call'; step_index: number; toolCall: ToolCallInfo };
 
 export interface AgentStep {
@@ -374,6 +377,8 @@ export interface AgentStep {
   step_index: number;
   reasoning_content: string | null;
   tool_calls: string | null;
+  /** 过程叙述（tool 轮的可见文本）；旧数据为 null。 */
+  narration?: string | null;
   created_at: string;
 }
 

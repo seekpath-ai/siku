@@ -57,7 +57,11 @@ export function useStreamingChat() {
               after: { createdAt: newestPersisted.created_at, id: newestPersisted.id },
             })
           : getChatMessages(sessionId, { limit: MESSAGE_PAGE_SIZE }),
-        getAgentSteps(sessionId),
+        // 步骤失败降级为无推理卡，消息对齐仍要照常完成。
+        getAgentSteps(sessionId).catch((err) => {
+          console.error('reload agent steps:', err);
+          return [] as AgentStep[];
+        }),
       ]);
       return { page, steps };
     };
@@ -68,7 +72,17 @@ export function useStreamingChat() {
       if (state.activeSessionId !== sessionId) return;
       const persisted = state.messages.filter((m) => !isTemp(m.id));
       const known = new Set(persisted.map((m) => m.id));
-      const merged = [...persisted, ...page.messages.filter((m) => !known.has(m.id))];
+      // 静默替换：内容与 DB 一致的临时消息沿用原 id —— id 变化会让整个
+      // 气泡卸载重挂（markdown/KaTeX 重渲染），是 done 时闪跳的主因。
+      const tempLast = [...state.messages].reverse().find((m) => isTemp(m.id) && m.role === 'assistant');
+      const dbTwin = tempLast
+        ? page.messages.find((m) => m.role === 'assistant' && m.content === tempLast.content)
+        : undefined;
+      const merged = [
+        ...persisted,
+        ...(tempLast && dbTwin ? [tempLast] : []),
+        ...page.messages.filter((m) => !known.has(m.id) && m.id !== dbTwin?.id),
+      ];
       const lastAssistant = [...merged].reverse().find((m) => m.role === 'assistant');
       const linked = lastAssistant
         ? steps.map((s) => (s.message_id === null ? { ...s, message_id: lastAssistant.id } : s))
@@ -92,10 +106,10 @@ export function useStreamingChat() {
     })();
   }, []);
 
-  const onDelta = useCallback((content: string, sessionId: string) => {
+  const onDelta = useCallback((stepIndex: number, content: string, sessionId: string) => {
     const state = useChatStore.getState();
     state.setSessionStreaming(sessionId, true);
-    state.appendStreamContent(content);
+    state.appendStreamContent(stepIndex, content);
   }, []);
 
   const onReasoning = useCallback((stepIndex: number, content: string, sessionId: string) => {
@@ -151,6 +165,8 @@ export function useStreamingChat() {
         state.setSessionStreaming(e.session_id, true);
         if (e.tool_call_id && e.tool_name && e.step_index !== undefined) {
           state.ensureStreamingStep(e.step_index);
+          // 该轮产生工具调用：其已流出的文本是过程叙述，迁出回复气泡。
+          state.migrateStreamToNarration(e.step_index);
           // Update an existing tool call to pending; if it does not exist yet, add it.
           // `outside_write_base` travels with the approval event and must land
           // on BOTH paths: the tool_call that preceded this event (update) and
@@ -173,6 +189,8 @@ export function useStreamingChat() {
         state.setSessionStreaming(e.session_id, true);
         if (e.tool_call_id && e.tool_name && e.step_index !== undefined) {
           state.ensureStreamingStep(e.step_index);
+          // 该轮产生工具调用：其已流出的文本是过程叙述，迁出回复气泡。
+          state.migrateStreamToNarration(e.step_index);
           state.addStreamingToolCall(e.step_index, {
             id: e.tool_call_id,
             name: e.tool_name,

@@ -186,7 +186,11 @@ export function ChatPanel() {
 
     Promise.all([
       getChatMessages(activeSessionId, { limit: MESSAGE_PAGE_SIZE }),
-      getAgentSteps(activeSessionId),
+      // 步骤查询失败只丢推理过程卡，不能拖垮消息本体（曾因此整页历史空白）。
+      getAgentSteps(activeSessionId).catch((err) => {
+        console.error('Failed to load agent steps:', err);
+        return [];
+      }),
     ])
       .then(([page, steps]) => {
         if (!cancelled) {

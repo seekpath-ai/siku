@@ -466,12 +466,13 @@ impl AgentEngine {
 
         // — ReAct loop with streaming —
         let mut final_content = String::new();
-        // Every round's visible text, concatenated. The frontend streams ALL
-        // rounds into one reply, so the persisted message must match: the
-        // final round alone can be empty or just a trailer (e.g. the model
-        // putting the ```evidence block in a round of its own), which used to
-        // make the reply "vanish" after the history reload.
+        // 最终回复 = 无工具调用轮次的可见文本拼接（续写按原文衔接）。产生
+        // 工具调用的轮次文本是过程叙述（narration），归入该轮步骤持久化并
+        // 在推理卡展示——不再混进回复气泡。
         let mut full_text = String::new();
+        // Tool rounds' visible text, kept as a reply fallback when no
+        // no-tool round produced anything (e.g. cancelled mid tool-round).
+        let mut narrations: Vec<String> = Vec::new();
         // Set when a round ends on finish_reason=length with no visible text:
         // the completion budget was exhausted (thinking models count reasoning
         // tokens toward max_tokens) before any content was produced.
@@ -724,17 +725,26 @@ impl AgentEngine {
             // of the round correctly ordered.
             self.flush_batcher(&event_tx, step_index, &mut batcher);
 
-            // Fold this round's visible text into the full reply (see
-            // full_text above). A continuation picks up mid-sentence, so it is
-            // appended verbatim — no paragraph break, no trailing trim.
-            if !stream_text.trim().is_empty() {
+            // Classify this round's visible text: a round that emitted tool
+            // calls produced PROCESS NARRATION (goes to the step, not the
+            // reply); anything else is final-reply text. A continuation picks
+            // up mid-sentence, so it is appended verbatim — no paragraph
+            // break, no trailing trim.
+            let round_narration: Option<String> = if stream_text.trim().is_empty() {
+                None
+            } else if !tool_call_buf.is_empty() {
+                let n = stream_text.trim_end().to_string();
+                narrations.push(n.clone());
+                Some(n)
+            } else {
                 if continuing {
                     full_text.push_str(&stream_text);
                 } else {
                     if !full_text.is_empty() { full_text.push_str("\n\n"); }
                     full_text.push_str(stream_text.trim_end());
                 }
-            }
+                None
+            };
             continuing = false;
             // Mid-turn LLM failure: stop the ReAct loop here (never execute
             // tool calls or start another round against a failing backend).
@@ -749,6 +759,7 @@ impl AgentEngine {
                         step_index,
                         reasoning_content: Some(round_reasoning.clone()),
                         tool_calls: None,
+                        narration: None,
                         created_at: time::now_iso(),
                     });
                 }
@@ -796,6 +807,7 @@ impl AgentEngine {
                                         step_index,
                                         reasoning_content: Some(round_reasoning.clone()),
                                         tool_calls: None,
+                                        narration: None,
                                         created_at: time::now_iso(),
                                     });
                                 }
@@ -858,6 +870,7 @@ impl AgentEngine {
                                 step_index,
                                 reasoning_content: Some(round_reasoning.clone()),
                                 tool_calls: None,
+                                narration: None,
                                 created_at: time::now_iso(),
                             });
                         }
@@ -998,6 +1011,7 @@ impl AgentEngine {
                     step_index,
                     reasoning_content: if round_reasoning.trim().is_empty() { None } else { Some(round_reasoning.clone()) },
                     tool_calls: None,
+                    narration: None,
                     created_at: time::now_iso(),
                 };
                 steps.push(final_step);
@@ -1507,6 +1521,7 @@ impl AgentEngine {
                 step_index,
                 reasoning_content: reasoning_for_memory.map(|s| s.to_string()),
                 tool_calls: if step_tool_records.is_empty() { None } else { Some(tool_calls_json.clone()) },
+                narration: round_narration,
                 created_at: time::now_iso(),
             };
             steps.push(step.clone());
@@ -1523,13 +1538,15 @@ impl AgentEngine {
             info!(round, step_index, "tool round completed");
         }
 
-        // The reply shown/persisted is ALL rounds' visible text — matching
-        // what the user watched stream by. Falling back to the final round's
-        // content only when nothing was ever streamed. When the budget was
-        // exhausted by reasoning (finish_reason=length, no content anywhere),
-        // say so explicitly instead of persisting an empty bubble.
+        // The reply shown/persisted is the FINAL-REPLY text (no-tool rounds).
+        // Fallbacks, in order: process narrations when no no-tool round ever
+        // produced text (cancelled mid tool-round, or the whole answer rode a
+        // tool call); the final round's raw content; an explicit notice when
+        // reasoning exhausted the budget.
         let reply = if !full_text.trim().is_empty() {
             full_text
+        } else if !narrations.is_empty() {
+            narrations.join("\n\n")
         } else if !final_content.trim().is_empty() {
             final_content
         } else if truncated_empty {

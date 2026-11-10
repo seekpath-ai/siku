@@ -495,6 +495,8 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
         st.setStreaming(true);
         if (e.tool_call_id && e.tool_name && e.step_index !== undefined) {
           st.ensureStreamingStep(e.step_index);
+          // 该轮产生工具调用：其已流出的文本迁出回复气泡，归入推理卡。
+          st.migrateStreamToNarration(e.step_index);
           st.addStreamingToolCall(e.step_index, {
             id: e.tool_call_id,
             name: e.tool_name,
@@ -534,6 +536,7 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
         });
         if (e.tool_call_id && e.tool_name && stepIndex !== undefined) {
           st.ensureStreamingStep(stepIndex);
+          st.migrateStreamToNarration(stepIndex);
           st.updateStreamingToolCall(stepIndex, e.tool_call_id, {
             status: 'pending',
             outside_write_base: outsideWriteBase,
@@ -580,7 +583,14 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
         if (cur) st.finalizeStreamingStep(cur.step_index);
         if (st.session) {
           const sid = st.session.id;
-          const reload = () => Promise.all([getChatMessages(sid), getAgentSteps(sid)]);
+          const reload = () => Promise.all([
+            getChatMessages(sid),
+            // 步骤失败降级为无推理卡，消息对齐仍要照常完成。
+            getAgentSteps(sid).catch((err) => {
+              console.error('pet reload steps:', err);
+              return [] as AgentStep[];
+            }),
+          ]);
           const applyReloaded = ([page, steps]: [{ messages: ChatMessage[] }, AgentStep[]]) => {
             const msgs = page.messages;
             // Attribute steps the backend left unlinked to the latest
@@ -777,13 +787,14 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
   const handleSend = async () => {
     const text = input.trim();
     if ((!text && images.length === 0) || store.streaming) return;
+    const skillHint = skillMention.takeFocusHint();
     const attachments: ChatAttachment[] | undefined = images.length
       ? images.map((a) => ({ mime: a.mime, base64: a.base64, name: a.name }))
       : undefined;
     setInput('');
     clearImages();
     if (inputRef.current) inputRef.current.style.height = 'auto';
-    await store.send(text, attachments);
+    await store.send([skillHint, text].filter(Boolean).join('\n'), attachments);
   };
 
   const handleQuick = (cmd: string) => {

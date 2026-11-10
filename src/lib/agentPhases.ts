@@ -12,12 +12,16 @@ export function parseToolCalls(json: string | null): ToolCallInfo[] {
   }
 }
 
-/** Flatten streaming steps into reasoning / tool-call phases. */
+/** Flatten streaming steps into reasoning / narration / tool-call phases. */
 export function streamingToPhases(steps: StreamingStep[], current: StreamingStep | null): AgentPhase[] {
   const phases: AgentPhase[] = [];
   for (const step of [...steps, ...(current ? [current] : [])]) {
     if (step.reasoning_content.trim()) {
       phases.push({ kind: 'reasoning', step_index: step.step_index, content: step.reasoning_content });
+    }
+    // 过程叙述排在工具调用之前：模型先说「我要做什么」，再发起调用。
+    if (step.narration?.trim()) {
+      phases.push({ kind: 'narration', step_index: step.step_index, content: step.narration });
     }
     for (const tc of step.tool_calls) {
       phases.push({ kind: 'tool_call', step_index: step.step_index, toolCall: tc });
@@ -33,6 +37,9 @@ export function stepsToPhases(steps: AgentStep[]): AgentPhase[] {
   for (const step of steps) {
     if (step.reasoning_content?.trim()) {
       phases.push({ kind: 'reasoning', step_index: step.step_index, content: step.reasoning_content });
+    }
+    if (step.narration?.trim()) {
+      phases.push({ kind: 'narration', step_index: step.step_index, content: step.narration });
     }
     for (const tc of parseToolCalls(step.tool_calls)) {
       phases.push({ kind: 'tool_call', step_index: step.step_index, toolCall: tc });

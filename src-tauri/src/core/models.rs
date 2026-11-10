@@ -293,6 +293,9 @@ pub struct AgentStep {
     pub step_index: i32,
     pub reasoning_content: Option<String>,
     pub tool_calls: Option<String>,
+    /// 该轮产生工具调用时模型输出的可见文本（过程叙述）：不进最终回复，
+    /// 随步骤持久化，在推理过程卡中展示。旧数据为 NULL。
+    pub narration: Option<String>,
     pub created_at: String,
 }
 

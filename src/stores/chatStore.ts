@@ -19,6 +19,9 @@ interface ChatState {
   /** Loading (awaiting first token) flag per session, same mirroring rule. */
   loadingById: Record<string, boolean>;
   streamContent: string;
+  /** streamContent 所属的轮次（step_index）：工具调用事件到达时，该轮
+   * 文本作为过程叙述（narration）迁出回复气泡、归入推理卡。 */
+  streamTextStep: number | null;
   streamingSteps: StreamingStep[];
   currentStreamingStep: StreamingStep | null;
   /** Questions the agent is waiting on the user to answer (AskUserQuestion). */
@@ -51,8 +54,10 @@ interface ChatState {
   setStreaming: (v: boolean) => void;
   setSessionLoading: (sessionId: string, v: boolean) => void;
   setSessionStreaming: (sessionId: string, v: boolean) => void;
-  appendStreamContent: (text: string) => void;
+  appendStreamContent: (stepIndex: number, text: string) => void;
   clearStreamContent: () => void;
+  /** 工具调用到达：把该轮已流出的文本从回复气泡迁移为步骤的 narration。 */
+  migrateStreamToNarration: (stepIndex: number) => void;
   ensureStreamingStep: (stepIndex: number) => void;
   appendStreamingReasoning: (stepIndex: number, text: string) => void;
   addStreamingToolCall: (stepIndex: number, tc: ToolCallInfo) => void;
@@ -77,6 +82,7 @@ export const useChatStore = create<ChatState>((set) => ({
   streamingById: {},
   loadingById: {},
   streamContent: '',
+  streamTextStep: null,
   streamingSteps: [],
   currentStreamingStep: null,
   pendingQuestions: null,
@@ -95,6 +101,7 @@ export const useChatStore = create<ChatState>((set) => ({
         hasMoreMessages: false,
         agentSteps: [],
         streamContent: '',
+        streamTextStep: null,
         streamingSteps: [],
         currentStreamingStep: null,
         // Restore the target session's streaming/loading flags so the input
@@ -145,8 +152,35 @@ export const useChatStore = create<ChatState>((set) => ({
       streamingById: { ...s.streamingById, [sessionId]: v },
       ...(sessionId === s.activeSessionId ? { isStreaming: v } : {}),
     })),
-  appendStreamContent: (text) => set((s) => ({ streamContent: s.streamContent + text })),
-  clearStreamContent: () => set({ streamContent: '' }),
+  appendStreamContent: (stepIndex, text) =>
+    set((s) => {
+      // 换轮时若旧轮文本残留（理论上有 tool_call 先迁移，此处是兜底），
+      // 先归入旧轮的 narration，避免两轮文本混接。
+      if (s.streamTextStep !== null && s.streamTextStep !== stepIndex && s.streamContent) {
+        const withNarration = (st: StreamingStep): StreamingStep =>
+          st.step_index === s.streamTextStep ? { ...st, narration: st.narration ?? s.streamContent } : st;
+        return {
+          streamContent: text,
+          streamTextStep: stepIndex,
+          streamingSteps: s.streamingSteps.map(withNarration),
+          currentStreamingStep: s.currentStreamingStep ? withNarration(s.currentStreamingStep) : null,
+        };
+      }
+      return { streamContent: s.streamContent + text, streamTextStep: stepIndex };
+    }),
+  clearStreamContent: () => set({ streamContent: '', streamTextStep: null }),
+  migrateStreamToNarration: (stepIndex) =>
+    set((s) => {
+      if (!s.streamContent || s.streamTextStep !== stepIndex) return { streamContent: '', streamTextStep: null };
+      const withNarration = (st: StreamingStep): StreamingStep =>
+        st.step_index === stepIndex ? { ...st, narration: st.narration ?? s.streamContent } : st;
+      return {
+        streamContent: '',
+        streamTextStep: null,
+        streamingSteps: s.streamingSteps.map(withNarration),
+        currentStreamingStep: s.currentStreamingStep ? withNarration(s.currentStreamingStep) : null,
+      };
+    }),
 
   ensureStreamingStep: (stepIndex) =>
     set((s) => {

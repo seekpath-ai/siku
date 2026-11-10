@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Brain, ChevronDown, ChevronRight } from 'lucide-react';
 import type { AgentPhase } from '@/lib/types';
 import { AgentPhaseCard } from './AgentPhaseCard';
@@ -8,10 +8,22 @@ interface Props {
   streaming?: boolean;
   /** Start collapsed even while streaming (used by compact surfaces). */
   defaultCollapsed?: boolean;
+  /** Mount expanded then animate collapsing (the just-finished turn: the
+   *  streaming card was expanded, so an instant collapse reads as a jump). */
+  animateCollapseOnMount?: boolean;
 }
 
-export function ReasoningProcessCard({ phases, streaming, defaultCollapsed }: Props) {
-  const [expanded, setExpanded] = useState(defaultCollapsed ? false : Boolean(streaming));
+export function ReasoningProcessCard({ phases, streaming, defaultCollapsed, animateCollapseOnMount }: Props) {
+  const [expanded, setExpanded] = useState(
+    animateCollapseOnMount ? true : defaultCollapsed ? false : Boolean(streaming),
+  );
+
+  useEffect(() => {
+    if (!animateCollapseOnMount) return;
+    // 先按展开态绘制一帧，再触发折叠——配合 grid-rows 过渡形成收起动画。
+    const t = setTimeout(() => setExpanded(false), 60);
+    return () => clearTimeout(t);
+  }, [animateCollapseOnMount]);
 
   const roundCount = new Set(phases.map((p) => p.step_index)).size;
   const toolCount = phases.filter((p) => p.kind === 'tool_call').length;
@@ -42,13 +54,19 @@ export function ReasoningProcessCard({ phases, streaming, defaultCollapsed }: Pr
         </span>
       </button>
 
-      {expanded && (
-        <div className="px-3 py-2 border-t border-codex-border/50 space-y-2">
-          {phases.map((phase, idx) => (
-            <AgentPhaseCard key={`${phase.kind}-${phase.step_index}-${idx}`} phase={phase} streaming={streaming} />
-          ))}
+      {/* grid-rows 过渡：展开/收起（含流式结束后的挂载即折叠）都平滑。 */}
+      <div
+        className="grid transition-[grid-template-rows] duration-300 ease-in-out"
+        style={{ gridTemplateRows: expanded ? '1fr' : '0fr' }}
+      >
+        <div className="overflow-hidden min-h-0">
+          <div className="px-3 py-2 border-t border-codex-border/50 space-y-2">
+            {phases.map((phase, idx) => (
+              <AgentPhaseCard key={`${phase.kind}-${phase.step_index}-${idx}`} phase={phase} streaming={streaming} />
+            ))}
+          </div>
         </div>
-      )}
+      </div>
     </div>
   );
 }

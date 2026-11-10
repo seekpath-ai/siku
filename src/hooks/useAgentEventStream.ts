@@ -3,10 +3,11 @@ import { listen, type UnlistenFn } from '@/lib/events';
 import type { AgentStreamEvent } from '@/lib/types';
 
 export interface AgentEventStreamHandlers {
-  /** Visible-text fragment for `sessionId` (never empty). With
-   *  `flushIntervalMs > 0` this fires once per flush window with the
-   *  concatenated fragments instead of once per event. */
-  onDelta?: (content: string, sessionId: string) => void;
+  /** Visible-text fragment for `sessionId`, tagged with the round
+   *  (`stepIndex`) it belongs to (never empty). With `flushIntervalMs > 0`
+   *  this fires once per flush window per round — round boundaries are
+   *  preserved so a tool round's narration can migrate out of the reply. */
+  onDelta?: (stepIndex: number, content: string, sessionId: string) => void;
   /** Reasoning fragment for one step (never empty), batched like onDelta. */
   onReasoning?: (stepIndex: number, content: string, sessionId: string) => void;
   /** Any other event addressed to `sessionId`. Pending delta/reasoning
@@ -44,7 +45,7 @@ export function useAgentEventStream({
   useEffect(() => {
     let cancelled = false;
     let unlisten: UnlistenFn | null = null;
-    let deltaBuf = '';
+    const deltaBuf = new Map<number, string>();
     const reasoningBuf = new Map<number, string>();
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -58,10 +59,11 @@ export function useAgentEventStream({
     const flush = () => {
       stopTimer();
       const h = handlersRef.current;
-      if (deltaBuf) {
-        const text = deltaBuf;
-        deltaBuf = '';
-        h.onDelta?.(text, sessionId ?? '');
+      if (deltaBuf.size > 0) {
+        for (const [stepIndex, text] of deltaBuf) {
+          h.onDelta?.(stepIndex, text, sessionId ?? '');
+        }
+        deltaBuf.clear();
       }
       if (reasoningBuf.size > 0) {
         for (const [stepIndex, text] of reasoningBuf) {
@@ -87,12 +89,12 @@ export function useAgentEventStream({
       // StreamBatcher only emits non-empty merges); drop them like the old
       // per-consumer guards did.
       if (e.type === 'delta') {
-        if (e.content) {
+        if (e.content && e.step_index !== undefined) {
           if (flushIntervalMs > 0) {
-            deltaBuf += e.content;
+            deltaBuf.set(e.step_index, (deltaBuf.get(e.step_index) ?? '') + e.content);
             scheduleFlush();
           } else {
-            h.onDelta?.(e.content, sessionId);
+            h.onDelta?.(e.step_index, e.content, sessionId);
           }
         }
         return;

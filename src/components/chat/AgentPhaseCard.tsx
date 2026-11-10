@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Brain, ChevronDown, ChevronRight, Wrench } from 'lucide-react';
+import { Brain, ChevronDown, ChevronRight, MessageSquareText, Wrench } from 'lucide-react';
 import type { AgentPhase } from '@/lib/types';
 import { ToolCallCard } from './ToolCallCard';
 
@@ -10,6 +10,22 @@ interface Props {
 
 export function AgentPhaseCard({ phase, streaming }: Props) {
   const [expanded, setExpanded] = useState(streaming || false);
+
+  // 过程叙述（tool 轮的可见文本）：直接展示，无需折叠——它本就是模型
+  // 想让用户看到的话，只是不属于最终回复。
+  if (phase.kind === 'narration') {
+    return (
+      <div className="rounded-lg border border-codex-border/50 bg-codex-surface/20 px-3 py-2 mb-2">
+        <div className="flex items-center gap-2 mb-1">
+          <MessageSquareText size={12} className="text-codex-muted" />
+          <span className="text-[11px] text-codex-muted">第 {phase.step_index} 轮 · 过程叙述</span>
+        </div>
+        <p className="text-[12px] leading-relaxed text-codex-secondary whitespace-pre-wrap [overflow-wrap:anywhere]">
+          {phase.content}
+        </p>
+      </div>
+    );
+  }
 
   if (phase.kind === 'reasoning') {
     return (

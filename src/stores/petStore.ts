@@ -50,6 +50,8 @@ interface PetState {
   /** Persisted agent steps (tool calls / reasoning) for history cards. */
   agentSteps: AgentStep[];
   streamContent: string;
+  /** streamContent 所属轮次：工具调用到达时迁移为步骤 narration（同 chatStore）。 */
+  streamTextStep: number | null;
   loading: boolean;
   streaming: boolean;
   pendingApproval: PetApproval | null;
@@ -70,7 +72,9 @@ interface PetState {
   /** Attach to an EXISTING session (detached chat window) and load history. */
   attach: (sessionId: string) => Promise<void>;
   send: (text: string, attachments?: ChatAttachment[]) => Promise<void>;
-  appendDelta: (t: string) => void;
+  appendDelta: (stepIndex: number, t: string) => void;
+  /** 工具调用到达：把该轮已流出的文本迁移为步骤 narration（迁出回复气泡）。 */
+  migrateStreamToNarration: (stepIndex: number) => void;
   setStreaming: (s: boolean) => void;
   setPendingApproval: (a: PetApproval | null) => void;
   setPendingQuestions: (q: AskQuestion[] | null) => void;
@@ -100,6 +104,7 @@ const initial = {
   messages: [],
   agentSteps: [],
   streamContent: '',
+  streamTextStep: null,
   loading: false,
   streaming: false,
   pendingApproval: null,
@@ -125,6 +130,7 @@ export const usePetStore = create<PetState>((set, get) => ({
     }
     set({
       loading: true, open: true, session: null, messages: [], agentSteps: [], streamContent: '',
+      streamTextStep: null,
       streaming: false, pendingApproval: null, pendingQuestions: null, error: null,
       streamingSteps: [], currentStreamingStep: null,
     });
@@ -151,7 +157,11 @@ export const usePetStore = create<PetState>((set, get) => ({
       }
       const [msgPage, agentSteps] = await Promise.all([
         getChatMessages(session.id),
-        getAgentSteps(session.id),
+        // 步骤查询失败只丢推理过程卡，不能拖垮消息本体。
+        getAgentSteps(session.id).catch((err) => {
+          console.error('pet start steps:', err);
+          return [];
+        }),
       ]);
       const messages = msgPage.messages;
       set({ session, messages, agentSteps, loading: false });
@@ -164,6 +174,7 @@ export const usePetStore = create<PetState>((set, get) => ({
   attach: async (sessionId) => {
     set({
       loading: true, open: true, session: null, messages: [], agentSteps: [], streamContent: '',
+      streamTextStep: null,
       streaming: false, pendingApproval: null, pendingQuestions: null, error: null,
       streamingSteps: [], currentStreamingStep: null,
     });
@@ -171,7 +182,11 @@ export const usePetStore = create<PetState>((set, get) => ({
       const session = await agentGetSession(sessionId);
       const [msgPage, agentSteps] = await Promise.all([
         getChatMessages(sessionId),
-        getAgentSteps(sessionId),
+        // 步骤查询失败只丢推理过程卡，不能拖垮消息本体。
+        getAgentSteps(sessionId).catch((err) => {
+          console.error('pet attach steps:', err);
+          return [];
+        }),
       ]);
       const messages = msgPage.messages;
       set({ session, messages, agentSteps, loading: false });
@@ -202,7 +217,7 @@ export const usePetStore = create<PetState>((set, get) => ({
       created_at: new Date().toISOString(),
     };
     set((s) => ({
-      messages: [...s.messages, userMsg], streamContent: '', streaming: true,
+      messages: [...s.messages, userMsg], streamContent: '', streamTextStep: null, streaming: true,
       pendingApproval: null, pendingQuestions: null, streamingSteps: [], currentStreamingStep: null, error: null,
     }));
     try {
@@ -213,7 +228,33 @@ export const usePetStore = create<PetState>((set, get) => ({
     }
   },
 
-  appendDelta: (t) => set((s) => ({ streamContent: s.streamContent + t })),
+  appendDelta: (stepIndex, t) =>
+    set((s) => {
+      // 换轮时旧轮文本残留（兜底：正常会被 tool_call 先迁移）：归入旧轮 narration。
+      if (s.streamTextStep !== null && s.streamTextStep !== stepIndex && s.streamContent) {
+        const withNarration = (st: StreamingStep): StreamingStep =>
+          st.step_index === s.streamTextStep ? { ...st, narration: st.narration ?? s.streamContent } : st;
+        return {
+          streamContent: t,
+          streamTextStep: stepIndex,
+          streamingSteps: s.streamingSteps.map(withNarration),
+          currentStreamingStep: s.currentStreamingStep ? withNarration(s.currentStreamingStep) : null,
+        };
+      }
+      return { streamContent: s.streamContent + t, streamTextStep: stepIndex };
+    }),
+  migrateStreamToNarration: (stepIndex) =>
+    set((s) => {
+      if (!s.streamContent || s.streamTextStep !== stepIndex) return { streamContent: '', streamTextStep: null };
+      const withNarration = (st: StreamingStep): StreamingStep =>
+        st.step_index === stepIndex ? { ...st, narration: st.narration ?? s.streamContent } : st;
+      return {
+        streamContent: '',
+        streamTextStep: null,
+        streamingSteps: s.streamingSteps.map(withNarration),
+        currentStreamingStep: s.currentStreamingStep ? withNarration(s.currentStreamingStep) : null,
+      };
+    }),
   setStreaming: (streaming) => set({ streaming }),
   setPendingApproval: (pendingApproval) => set({ pendingApproval }),
   setPendingQuestions: (pendingQuestions) => set({ pendingQuestions }),

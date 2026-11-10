@@ -32,6 +32,8 @@ interface Props {
   prevUserMessage?: ChatMessage;
   /** Search-jump flash: transient ring around the bubble. */
   highlighted?: boolean;
+  /** 刚完成的回复：推理卡从展开态动画收起（流式态的平滑过渡）。 */
+  collapseCardOnMount?: boolean;
 }
 
 function formatTime(iso: string): string {
@@ -129,7 +131,7 @@ function UserText({ content }: { content: string }) {
 // and each history bubble re-parses ReactMarkdown/KaTeX on re-render. Props
 // (message object, steps array from the memoized map) are referentially
 // stable, so history bubbles skip those renders entirely.
-function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlighted = false }: Props) {
+function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlighted = false, collapseCardOnMount = false }: Props) {
   const agentName = useActiveAgentName();
   const [copied, setCopied] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -304,7 +306,7 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
 
       {!isUser && hasSteps && (
         <div className="mb-2">
-          <ReasoningProcessCard phases={stepsToPhases(agentSteps)} />
+          <ReasoningProcessCard phases={stepsToPhases(agentSteps)} animateCollapseOnMount={collapseCardOnMount} />
         </div>
       )}
 

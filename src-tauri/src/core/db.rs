@@ -957,6 +957,11 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     add_column_if_missing(&db, "agent_steps", "message_id", "TEXT REFERENCES chat_messages(id) ON DELETE CASCADE")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for agent_steps.message_id: {}", e))?;
+    // Migration: per-round narration (tool rounds' visible text lives on the
+    // step instead of inside the final reply), added 2026-11.
+    add_column_if_missing(&db, "agent_steps", "narration", "TEXT")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for agent_steps.narration: {}", e))?;
 
     // Migration: Codex-style projects (added 2026-08-09)
     add_column_if_missing(&db, "chat_sessions", "project_id", "TEXT")

@@ -1024,6 +1024,9 @@ pub fn run() {
             commands::translation::translate_text,
             commands::translation::translate_text_stream,
             commands::translation::translation_clear_cache,
+            commands::translation::translation_lookup_cached,
+            commands::translation::translation_translate_batch,
+            commands::translation::translation_cancel_batch,
             // Region detection
             commands::region::detect_regions_llm,
             // LLM Providers

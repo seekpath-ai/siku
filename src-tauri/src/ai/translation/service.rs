@@ -237,3 +237,153 @@ fn lang_name(code: &str) -> &str {
         _ => code,
     }
 }
+
+/// Look up cached translations for a batch of texts without calling the LLM.
+/// Used by the reader's compare pane to warm already-translated paragraphs.
+pub async fn lookup_cached_batch(
+    db: &SqlitePool,
+    texts: &[String],
+    target_lang: Option<&str>,
+) -> Result<Vec<Option<String>>, String> {
+    let target = target_lang.unwrap_or("zh");
+    let llm_config = crate::core::settings_service::load_llm_config(db).await?;
+    let mut out = Vec::with_capacity(texts.len());
+    for text in texts {
+        out.push(cache::lookup(db, text, target, &llm_config.model).await?);
+    }
+    Ok(out)
+}
+
+/// Batch-translate texts with bounded concurrency, emitting one event per
+/// item as `translation:batch-event` payloads tagged with `request_id`:
+///
+/// - `{ "type": "item",       "index": n, "content": "<translation>" }`
+/// - `{ "type": "item-error", "index": n, "content": "<message>" }`
+/// - `{ "type": "done", "translated": n, "failed": m, "cancelled": bool }`
+///
+/// Cache hits are resolved synchronously before any LLM call and emit an
+/// `item` event immediately. A failed item never aborts the batch.
+#[instrument(skip(db, app_handle, texts, cancel))]
+pub async fn translate_texts_batch(
+    app_handle: &tauri::AppHandle,
+    db: &SqlitePool,
+    texts: Vec<String>,
+    target_lang: Option<&str>,
+    request_id: &str,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<(), String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let target = target_lang.unwrap_or("zh").to_string();
+    let source = "auto";
+
+    let llm_config = crate::core::settings_service::load_llm_config(db).await?;
+    if llm_config.api_key.is_empty() && llm_config.provider != llm::LlmProvider::Ollama {
+        return Err("API key not configured. Please set it in Settings.".to_string());
+    }
+    let model = llm_config.model.clone();
+    let client: Arc<dyn llm::LlmClient> = Arc::from(
+        llm::client::create_llm_client(&llm_config)
+            .map_err(|e| format!("failed to create LLM client: {e}"))?,
+    );
+
+    let emit = |payload: serde_json::Value| {
+        let mut p = payload;
+        p["request_id"] = serde_json::Value::String(request_id.to_string());
+        let _ = app_handle.emit("translation:batch-event", p);
+    };
+
+    let translated = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicUsize::new(0));
+    let sem = Arc::new(tokio::sync::Semaphore::new(2));
+    let mut set = tokio::task::JoinSet::new();
+
+    for (index, text) in texts.into_iter().enumerate() {
+        if cancel.is_cancelled() {
+            break;
+        }
+        // Empty paragraphs need no call at all.
+        if text.trim().is_empty() {
+            emit(serde_json::json!({ "type": "item", "index": index, "content": "" }));
+            continue;
+        }
+        // Cache hits resolve inline — no task, no LLM call.
+        match cache::lookup(db, &text, &target, &model).await {
+            Ok(Some(cached)) => {
+                translated.fetch_add(1, Ordering::Relaxed);
+                emit(serde_json::json!({ "type": "item", "index": index, "content": cached }));
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                failed.fetch_add(1, Ordering::Relaxed);
+                emit(serde_json::json!({ "type": "item-error", "index": index, "content": e }));
+                continue;
+            }
+        }
+        // Backpressure: wait for a slot before spawning the next task.
+        let permit = match sem.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        let client = client.clone();
+        let db = db.clone();
+        let target = target.clone();
+        let model = model.clone();
+        let cancel = cancel.clone();
+        let translated = translated.clone();
+        let failed = failed.clone();
+        let app_handle = app_handle.clone();
+        let rid = request_id.to_string();
+        set.spawn(async move {
+            let _permit = permit;
+            let emit = |payload: serde_json::Value| {
+                let mut p = payload;
+                p["request_id"] = serde_json::Value::String(rid);
+                let _ = app_handle.emit("translation:batch-event", p);
+            };
+            if cancel.is_cancelled() {
+                return;
+            }
+            let messages = build_translation_messages(&text, source, &target);
+            let result = tokio::select! {
+                _ = cancel.cancelled() => return,
+                r = client.chat_completion(&messages, &[]) => r,
+            };
+            match result {
+                Ok(resp)
+                    if !resp.content.trim().is_empty()
+                        && resp.finish_reason.as_deref() != Some("length") =>
+                {
+                    let _ = cache::store(&db, &text, &target, &resp.content, &model).await;
+                    translated.fetch_add(1, Ordering::Relaxed);
+                    emit(serde_json::json!({ "type": "item", "index": index, "content": resp.content }));
+                }
+                Ok(resp) => {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    emit(serde_json::json!({
+                        "type": "item-error", "index": index,
+                        "content": format!("译文为空或被输出额度截断（finish_reason={}），请调高模型 max_tokens 后重试",
+                            resp.finish_reason.as_deref().unwrap_or("未知")),
+                    }));
+                }
+                Err(e) => {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    emit(serde_json::json!({ "type": "item-error", "index": index, "content": e }));
+                }
+            }
+        });
+    }
+
+    // Drain: on cancel, in-flight tasks observe the token via select! above.
+    while set.join_next().await.is_some() {}
+
+    emit(serde_json::json!({
+        "type": "done",
+        "translated": translated.load(Ordering::Relaxed),
+        "failed": failed.load(Ordering::Relaxed),
+        "cancelled": cancel.is_cancelled(),
+    }));
+    Ok(())
+}

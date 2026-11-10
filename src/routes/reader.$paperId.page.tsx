@@ -9,11 +9,12 @@ import {
   Loader2, FileQuestion, ArrowLeft, ZoomIn, ZoomOut, StickyNote, FileText,
   ScanSearch, Download, Upload, MoreVertical, Pencil, Highlighter, Eraser,
   BookOpen, LayoutGrid, RotateCw, RotateCcw, Printer, Check, Columns2, Link2,
+  Languages,
 } from 'lucide-react';
 import { PdfViewer } from '@/components/reader/PdfViewer';
 import type { PdfViewerHandle, TextSelection, PdfViewerProps, SnippetRect } from '@/components/reader/PdfViewer';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
-import { ComparePanel } from '@/components/reader/ComparePanel';
+import { ComparePanel, type CompareDisplayMode } from '@/components/reader/ComparePanel';
 import { PdfOutline } from '@/components/reader/PdfOutline';
 import { PdfThumbnails } from '@/components/reader/PdfThumbnails';
 import { ExportLayoutDialog } from '@/components/reader/ExportLayoutDialog';
@@ -36,7 +37,10 @@ import { useTranslationStore } from '@/stores/translationStore';
 import {
   readPdfBytes, annotationUpdateTranslation, paperRecordRead,
   exportPdf, openPaperInSystem, paperGetParagraphs,
+  translateText, translationLookupCached, translationTranslateBatch, translationCancelBatch,
+  type TranslationBatchEvent,
 } from '@/lib/tauri';
+import { listen } from '@/lib/events';
 import type { PaperParagraph } from '@/lib/tauri';
 import type { DetectedRegion } from '@/components/reader/regions';
 import { saveCachedRegions, loadCachedRegions, clearPaperCache } from '@/lib/regionCache';
@@ -113,6 +117,18 @@ function ReaderView({ paperId }: { paperId: string }) {
   // Anchored paragraphs for the 对照 pane (lazy-loaded on first open).
   const [compareParagraphs, setCompareParagraphs] = useState<PaperParagraph[] | null>(null);
   const [compareError, setCompareError] = useState<string | null>(null);
+  // ── 对照面板全文翻译 ──
+  // 显示模式持久化在 localStorage（译文本体在后端 SQLite 缓存里）。
+  const [transMode, setTransMode] = useState<CompareDisplayMode>(
+    () => (localStorage.getItem('siku.reader.compareMode') as CompareDisplayMode) || 'orig',
+  );
+  const [translations, setTranslations] = useState<Record<number, string>>({});
+  const [transErrors, setTransErrors] = useState<Record<number, string>>({});
+  const [transRunning, setTransRunning] = useState(false);
+  const [transProgress, setTransProgress] = useState<{ done: number; total: number } | null>(null);
+  const transUnlistenRef = useRef<(() => void) | null>(null);
+  const transWarmedRef = useRef(false);
+  const transRequestId = `compare-${paperId}`;
   const [toolbarSelection, setToolbarSelection] = useState<TextSelection | null>(null);
   /** Selection being translated in the anchored popover (nothing persisted). */
   const [translateSel, setTranslateSel] = useState<TextSelection | null>(null);
@@ -135,7 +151,7 @@ function ReaderView({ paperId }: { paperId: string }) {
   const sideMenuRef = useRef<HTMLDivElement>(null);
   const [drawingTool, setDrawingTool] = useState<DrawingTool | null>(null);
   const [drawingColor, setDrawingColor] = useState(DEFAULT_PEN_COLOR);
-  const { confirm } = useDialog();
+  const { confirm, alert } = useDialog();
 
   // Left sidebar state
   const [leftSidebar, setLeftSidebar] = useState<LeftSidebarMode>(null);
@@ -292,6 +308,115 @@ function ReaderView({ paperId }: { paperId: string }) {
       .then(setCompareParagraphs)
       .catch((e) => setCompareError(String(e)));
   }, [panel, paperId, compareParagraphs, compareError]);
+
+  // ── 对照面板全文翻译 ──
+  useEffect(() => {
+    localStorage.setItem('siku.reader.compareMode', transMode);
+  }, [transMode]);
+
+  // 目标语言变化：已加载的译文全部失效（缓存键含语言），下次按需重新预热。
+  useEffect(() => {
+    transWarmedRef.current = false;
+    setTranslations({});
+    setTransErrors({});
+  }, [translateTargetLang]);
+
+  // 译文/双语模式下先从本地缓存预热，不触发任何模型调用。
+  useEffect(() => {
+    if (panel !== 'compare' || !compareParagraphs || transMode === 'orig') return;
+    if (transWarmedRef.current) return;
+    transWarmedRef.current = true;
+    let stale = false;
+    translationLookupCached(compareParagraphs.map((p) => p.text), translateTargetLang)
+      .then((cached) => {
+        if (stale) return;
+        const map: Record<number, string> = {};
+        cached.forEach((t, i) => {
+          if (t != null) map[i] = t;
+        });
+        setTranslations(map);
+      })
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
+  }, [panel, compareParagraphs, transMode, translateTargetLang]);
+
+  // 离开页面（含切换论文）时摘掉批次事件监听；后台批次继续跑完落缓存。
+  useEffect(() => () => transUnlistenRef.current?.(), []);
+
+  const handleTranslateAll = async () => {
+    if (!compareParagraphs) return;
+    if (transRunning) {
+      void translationCancelBatch(transRequestId);
+      return;
+    }
+    const total = compareParagraphs.length;
+    const missing = compareParagraphs.filter((_, i) => translations[i] == null).length;
+    if (missing === 0) {
+      if (transMode === 'orig') setTransMode('bilingual');
+      return;
+    }
+    const ok = await confirm(
+      `将对 ${missing} 个未翻译段落调用模型（共 ${total} 段），首次翻译会消耗 API 额度；` +
+        '结果缓存在本地，之后打开无需再次翻译。是否继续？',
+      '全文翻译',
+    );
+    if (!ok) return;
+
+    setTransRunning(true);
+    setTransErrors({});
+    setTransProgress({ done: total - missing, total });
+    const unlisten = await listen<TranslationBatchEvent>('translation:batch-event', (event) => {
+      const e = event.payload;
+      if (e.request_id !== transRequestId) return;
+      if (e.type === 'item' && e.index != null) {
+        const idx = e.index;
+        setTranslations((prev) => ({ ...prev, [idx]: e.content ?? '' }));
+        setTransProgress((p) => (p ? { ...p, done: p.done + 1 } : p));
+      } else if (e.type === 'item-error' && e.index != null) {
+        const idx = e.index;
+        setTransErrors((prev) => ({ ...prev, [idx]: e.content ?? '翻译失败' }));
+        setTransProgress((p) => (p ? { ...p, done: p.done + 1 } : p));
+      } else if (e.type === 'done') {
+        setTransRunning(false);
+        setTransProgress(null);
+      }
+    });
+    transUnlistenRef.current = unlisten;
+    if (transMode === 'orig') setTransMode('bilingual');
+    try {
+      await translationTranslateBatch(
+        compareParagraphs.map((p) => p.text),
+        translateTargetLang,
+        transRequestId,
+      );
+    } catch (err) {
+      await alert(`全文翻译失败: ${err}`, '全文翻译');
+    } finally {
+      setTransRunning(false);
+      setTransProgress(null);
+      transUnlistenRef.current?.();
+      transUnlistenRef.current = null;
+    }
+  };
+
+  // 单段重试：走非流式 translate_text（同样命中/写入后端缓存）。
+  const handleRetryParagraph = async (index: number) => {
+    const p = compareParagraphs?.[index];
+    if (!p) return;
+    setTransErrors((prev) => {
+      const next = { ...prev };
+      delete next[index];
+      return next;
+    });
+    try {
+      const text = await translateText(p.text, null, translateTargetLang);
+      setTranslations((prev) => ({ ...prev, [index]: text }));
+    } catch (err) {
+      setTransErrors((prev) => ({ ...prev, [index]: String(err) }));
+    }
+  };
 
   // Markdown → PDF: land on the clicked paragraph (and line) and mark it as the
   // active block on both sides.
@@ -940,6 +1065,44 @@ function ReaderView({ paperId }: { paperId: string }) {
             同步
           </button>
         )}
+        {panel === 'compare' && (
+          <>
+            <button
+              onClick={handleTranslateAll}
+              disabled={!compareParagraphs}
+              title={
+                transRunning
+                  ? '取消全文翻译（已完成的段落会保留在缓存中）'
+                  : '翻译全部段落，结果缓存在本地'
+              }
+              className={`flex items-center gap-1 px-2 py-0.5 rounded text-xs transition-colors ${
+                transRunning
+                  ? 'bg-primary/10 text-primary'
+                  : 'text-text-secondary hover:bg-surface-hover disabled:opacity-40'
+              }`}
+            >
+              {transRunning ? <Loader2 size={13} className="animate-spin" /> : <Languages size={13} />}
+              {transRunning && transProgress
+                ? `${transProgress.done}/${transProgress.total}`
+                : '翻译'}
+            </button>
+            <div className="flex items-center rounded border border-surface-hover overflow-hidden text-xs">
+              {(['orig', 'bilingual', 'trans'] as const).map((m) => (
+                <button
+                  key={m}
+                  onClick={() => setTransMode(m)}
+                  className={`px-1.5 py-0.5 transition-colors ${
+                    transMode === m
+                      ? 'bg-primary/10 text-primary'
+                      : 'text-text-secondary hover:bg-surface-hover'
+                  }`}
+                >
+                  {m === 'orig' ? '原文' : m === 'bilingual' ? '双语' : '译文'}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
 
         {/* Drawing tools */}
         <div className="flex items-center gap-0.5">
@@ -1232,6 +1395,10 @@ function ReaderView({ paperId }: { paperId: string }) {
                     followingPdf={syncScroll && pdfDrivenSync}
                     followPage={!syncScroll}
                     onVisibleParagraph={handleVisibleParagraph}
+                    displayMode={transMode}
+                    translations={translations}
+                    translationErrors={transErrors}
+                    onRetryParagraph={handleRetryParagraph}
                   />
                 )
               ) : (

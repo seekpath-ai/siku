@@ -1216,6 +1216,42 @@ export async function translateTextStream(
   });
 }
 
+/** Batch translation progress event from `translation_translate_batch`. */
+export interface TranslationBatchEvent {
+  request_id: string;
+  type: 'item' | 'item-error' | 'done';
+  index?: number;
+  content?: string;
+  translated?: number;
+  failed?: number;
+  cancelled?: boolean;
+}
+
+/** Cached translations for a batch of texts (null = not cached). No LLM calls. */
+export async function translationLookupCached(
+  texts: string[],
+  targetLang?: string,
+): Promise<(string | null)[]> {
+  return invoke<(string | null)[]>('translation_lookup_cached', { texts, targetLang });
+}
+
+/**
+ * Batch-translate texts with bounded backend concurrency. Progress arrives as
+ * `translation:batch-event` payloads (see TranslationBatchEvent); the promise
+ * resolves when the batch finishes or is cancelled.
+ */
+export async function translationTranslateBatch(
+  texts: string[],
+  targetLang: string | undefined,
+  requestId: string,
+): Promise<void> {
+  return invoke<void>('translation_translate_batch', { texts, targetLang, requestId });
+}
+
+export async function translationCancelBatch(requestId: string): Promise<void> {
+  return invoke<void>('translation_cancel_batch', { requestId });
+}
+
 export async function translationClearCache(model?: string): Promise<number> {
   return invoke<number>('translation_clear_cache', { model });
 }

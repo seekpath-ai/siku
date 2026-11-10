@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef } from 'react';
-import { Loader2 } from 'lucide-react';
+import { Languages, Loader2 } from 'lucide-react';
 import type { PaperParagraph } from '@/lib/tauri';
+
+export type CompareDisplayMode = 'orig' | 'bilingual' | 'trans';
 
 interface Props {
   /** null = still loading. */
@@ -18,6 +20,14 @@ interface Props {
   /** Reports the paragraph at the top of this pane while the user scrolls it,
    *  so the PDF can be aligned to it (one call per animation frame). */
   onVisibleParagraph?: (index: number, p: PaperParagraph) => void;
+  /** 显示模式：原文 / 双语 / 译文。缺省 'orig' 时保持原行为。 */
+  displayMode?: CompareDisplayMode;
+  /** 段落译文（index → 文本）。 */
+  translations?: Record<number, string>;
+  /** 翻译失败的段落（index → 错误信息）。 */
+  translationErrors?: Record<number, string>;
+  /** 重试某一段的翻译。 */
+  onRetryParagraph?: (index: number) => void;
 }
 
 /** Dual-pane text side: paragraphs with page/bbox anchors. Comparison is
@@ -31,6 +41,10 @@ export function ComparePanel({
   followingPdf,
   followPage = true,
   onVisibleParagraph,
+  displayMode = 'orig',
+  translations = {},
+  translationErrors = {},
+  onRetryParagraph,
 }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const paraRefs = useRef<Map<number, HTMLDivElement>>(new Map());
@@ -155,7 +169,44 @@ export function ComparePanel({
                   : 'text-text-primary/85 hover:bg-surface-hover'
               }`}
             >
-              {p.text}
+              {displayMode !== 'trans' && <div>{p.text}</div>}
+              {displayMode !== 'orig' && (
+                translations[i] != null ? (
+                  <div
+                    className={
+                      displayMode === 'bilingual'
+                        ? 'mt-1.5 pt-1.5 border-t border-surface-hover/50 text-text-secondary'
+                        : ''
+                    }
+                  >
+                    {translations[i]}
+                  </div>
+                ) : translationErrors[i] != null ? (
+                  <div className={displayMode === 'bilingual' ? 'mt-1.5 pt-1.5 border-t border-surface-hover/50' : ''}>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onRetryParagraph?.(i);
+                      }}
+                      className="inline-flex items-center gap-1 text-[11px] text-red-400/90 hover:text-red-300"
+                      title={translationErrors[i]}
+                    >
+                      <Languages size={11} />
+                      翻译失败，点击重试
+                    </button>
+                    {displayMode === 'trans' && <div className="mt-1 text-text-primary/50">{p.text}</div>}
+                  </div>
+                ) : (
+                  // 尚未翻译：译文模式下保留原文（弱化显示），双语模式下显示占位。
+                  displayMode === 'bilingual' ? (
+                    <div className="mt-1.5 pt-1.5 border-t border-surface-hover/50 text-text-secondary/40 text-[11px]">
+                      未翻译
+                    </div>
+                  ) : (
+                    <div className="text-text-primary/50">{p.text}</div>
+                  )
+                )
+              )}
             </div>
           </div>
         );

@@ -4,7 +4,8 @@
     "resources": {
       "ext/crsqlite.so": "ext/crsqlite.so",
       "bin/libpdfium.so": "libpdfium.so",
-      "bin/PDFIUM-LICENSE.txt": "PDFIUM-LICENSE.txt"
+      "bin/PDFIUM-LICENSE.txt": "PDFIUM-LICENSE.txt",
+      "resources/skills": "skills"
     }
   }
 }

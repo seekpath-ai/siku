@@ -2,7 +2,7 @@ use tauri::State;
 use tracing::instrument;
 
 use crate::core::skill_review::{self, ReviewRecord, StaticReport};
-use crate::core::skills::{self, SkillInfo};
+use crate::core::skills::{self, DepStatus, SkillInfo, SkillSource};
 use crate::AppState;
 
 /// Default user skills directory: {app_data_dir}/skills.
@@ -10,26 +10,40 @@ fn user_skills_dir(state: &AppState) -> std::path::PathBuf {
     state.app_data_dir.join("skills")
 }
 
-/// List installed external skills for the plugins dialog (with review badges).
+fn builtin_skills_dir(state: &AppState) -> Option<&std::path::Path> {
+    state.builtin_skills_dir.as_deref()
+}
+
+/// List installed skills (built-in first-party + user-imported) for the
+/// plugins dialog.
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn skills_list(state: State<'_, AppState>) -> Result<Vec<SkillInfo>, String> {
-    Ok(skills::list_all(&state.db, &user_skills_dir(&state)).await)
+    Ok(skills::list_all(&state.db, builtin_skills_dir(&state), &user_skills_dir(&state)).await)
 }
 
-/// Full skill detail (incl. SKILL.md body + review record) for the detail dialog.
+/// Full skill detail (incl. SKILL.md body + review record + probed
+/// dependency status) for the detail dialog.
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn skills_get(state: State<'_, AppState>, name: String) -> Result<SkillDetail, String> {
-    let (skill, path) =
-        skills::get(&user_skills_dir(&state), &name).ok_or(format!("技能「{name}」不存在"))?;
-    let review = skill_review::get_review(&state.db, &name).await;
+    let (skill, path) = skills::get(builtin_skills_dir(&state), &user_skills_dir(&state), &name)
+        .ok_or(format!("技能「{name}」不存在"))?;
+    let review = match skill.source {
+        // 内置技能一方可信，免审查。
+        SkillSource::Builtin => None,
+        SkillSource::User => skill_review::get_review(&state.db, &name).await,
+    };
+    let dependencies = skills::probe_dependencies(&skill.requires);
     Ok(SkillDetail {
         name: skill.name,
         description: skill.description,
         content: skill.content,
         path,
         review,
+        source: skill.source,
+        dependencies,
+        tools: skill.tools,
     })
 }
 
@@ -42,8 +56,13 @@ pub struct SkillDetail {
     /// SKILL.md body (the instructions injected when the skill tool runs).
     pub content: String,
     pub path: String,
-    /// Latest review record; absent = never reviewed.
+    /// Latest review record; absent = never reviewed (or built-in).
     pub review: Option<ReviewRecord>,
+    pub source: SkillSource,
+    /// Declared dependencies with live availability (probed on open).
+    pub dependencies: Vec<DepStatus>,
+    /// 技能声明的工具权限（挂载后并入会话工具白名单）。
+    pub tools: Vec<String>,
 }
 
 /// Import a skill from a folder containing SKILL.md.
@@ -55,7 +74,7 @@ pub async fn skills_import_folder(
 ) -> Result<SkillInfo, String> {
     let dir = user_skills_dir(&state);
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建插件目录：{e}"))?;
-    skills::import_folder(&dir, std::path::Path::new(&path))
+    skills::import_folder(builtin_skills_dir(&state), &dir, std::path::Path::new(&path))
 }
 
 /// Import a skill from a zip archive.
@@ -67,18 +86,60 @@ pub async fn skills_import_zip(
 ) -> Result<SkillInfo, String> {
     let dir = user_skills_dir(&state);
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建插件目录：{e}"))?;
-    skills::import_zip(&dir, std::path::Path::new(&path))
+    skills::import_zip(builtin_skills_dir(&state), &dir, std::path::Path::new(&path))
 }
 
-/// Delete an installed skill (removes its directory). Sessions that mounted
-/// it simply stop seeing the tool on the next turn.
+/// Delete an installed user skill (removes its directory). Sessions that
+/// mounted it simply stop seeing the tool on the next turn. Built-in skills
+/// are read-only and cannot be deleted.
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn skills_delete(state: State<'_, AppState>, name: String) -> Result<(), String> {
-    skills::delete(&user_skills_dir(&state), &name)?;
+    skills::delete(builtin_skills_dir(&state), &user_skills_dir(&state), &name)?;
     // Drop any stored review alongside the skill.
     skill_review::drop_review(&state.db, &name).await?;
     Ok(())
+}
+
+/// Install the given pip packages with `python -m pip install --user`
+/// (no admin rights needed). Returns a short success line for display.
+#[tauri::command]
+pub async fn skills_install_pip(packages: Vec<String>) -> Result<String, String> {
+    if packages.is_empty() {
+        return Err("没有需要安装的依赖包".to_string());
+    }
+    // 包名合法性白名单：拒绝任何可能拼出参数注入的字符。
+    let legal = |p: &str| {
+        !p.is_empty()
+            && p.len() <= 64
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '[' | ']'))
+    };
+    if !packages.iter().all(|p| legal(p)) {
+        return Err("依赖包名包含非法字符".to_string());
+    }
+    tokio::task::spawn_blocking(move || {
+        // python3 first, then python（Windows 通常只有后者）。
+        let python = ["python3", "python"]
+            .into_iter()
+            .find(|cmd| crate::core::skill_review::binary_available(cmd))
+            .ok_or_else(|| "未检测到 python3/python，请先安装 Python 3".to_string())?;
+        let output = crate::core::process::no_window(&mut std::process::Command::new(python))
+            .args(["-m", "pip", "install", "--user"])
+            .args(&packages)
+            .output()
+            .map_err(|e| format!("启动 pip 失败：{e}"))?;
+        let mut log = String::from_utf8_lossy(&output.stdout).to_string();
+        log.push_str(&String::from_utf8_lossy(&output.stderr));
+        if !output.status.success() {
+            let tail: String =
+                log.chars().rev().take(800).collect::<String>().chars().rev().collect();
+            return Err(format!("pip 安装失败：\n{tail}"));
+        }
+        Ok(format!("已通过 {python} 安装：{}", packages.join("、")))
+    })
+    .await
+    .map_err(|e| format!("安装任务失败：{e}"))?
 }
 
 /// Result of `skills_review_start`: the reviewer session to display plus the

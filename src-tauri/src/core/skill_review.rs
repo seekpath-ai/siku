@@ -146,7 +146,7 @@ pub fn content_hash(dir: &Path) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn binary_available(name: &str) -> bool {
+pub fn binary_available(name: &str) -> bool {
     crate::core::process::no_window(&mut std::process::Command::new(name))
         .arg("--version")
         .stdin(std::process::Stdio::null())
@@ -163,7 +163,7 @@ const KNOWN_BINARIES: &[&str] = &[
 ];
 
 /// pip package name → importable module name (when they differ).
-fn pip_to_module(pkg: &str) -> String {
+pub fn pip_to_module(pkg: &str) -> String {
     match pkg.to_ascii_lowercase().as_str() {
         "python-pptx" => "pptx".to_string(),
         "pillow" => "PIL".to_string(),
@@ -176,7 +176,7 @@ fn pip_to_module(pkg: &str) -> String {
     }
 }
 
-fn python_module_available(module: &str) -> bool {
+pub fn python_module_available(module: &str) -> bool {
     crate::core::process::no_window(&mut std::process::Command::new("python3"))
         .args(["-c", &format!("import {module}")])
         .stdin(std::process::Stdio::null())
@@ -424,19 +424,6 @@ async fn load_reviews(db: &sqlx::SqlitePool) -> ReviewsMap {
 /// Stored review for one skill, or None.
 pub async fn get_review(db: &sqlx::SqlitePool, name: &str) -> Option<ReviewRecord> {
     load_reviews(db).await.get(name).cloned()
-}
-
-/// Badge shown on the skill card: verdict + whether the skill changed since.
-pub async fn review_badge(
-    db: &sqlx::SqlitePool,
-    name: &str,
-    current_hash: &str,
-) -> Option<ReviewBadge> {
-    let rec = get_review(db, name).await?;
-    Some(ReviewBadge {
-        verdict: rec.verdict,
-        stale: rec.content_hash != current_hash,
-    })
 }
 
 #[derive(Debug, Clone, Serialize)]

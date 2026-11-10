@@ -3,7 +3,8 @@
     "resources": {
       "ext/crsqlite.dylib": "ext/crsqlite.dylib",
       "bin/libpdfium-arm64.dylib": "libpdfium-arm64.dylib",
-      "bin/libpdfium-x64.dylib": "libpdfium-x64.dylib"
+      "bin/libpdfium-x64.dylib": "libpdfium-x64.dylib",
+      "resources/skills": "skills"
     }
   }
 }

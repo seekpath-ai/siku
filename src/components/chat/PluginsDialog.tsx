@@ -6,12 +6,14 @@ import {
 import {
   skillsList, skillsGet, skillsImportFolder, skillsImportZip, skillsDelete,
   skillsOpenDirectory, agentSetSessionSkills, skillsReviewStart, skillsReviewCollect,
+  skillsInstallPip,
   type SkillInfo, type SkillDetail,
 } from '@/lib/tauri';
 import type { AgentStreamEvent } from '@/lib/types';
 import { useChatStore } from '@/stores/chatStore';
 import { useDialog } from '@/hooks/useDialog';
 import { Modal } from '@/components/ui/Modal';
+import { SkillIcon } from './SkillIcon';
 
 /** Plugins (skills) dialog — same modal shell as the task center.
  *
@@ -27,6 +29,8 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   const [detail, setDetail] = useState<SkillDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [busy, setBusy] = useState(false);
+  /** pip 依赖一键安装进行中（详情弹窗内）。 */
+  const [installingDeps, setInstallingDeps] = useState(false);
   /** skill name → reviewer session id for in-flight AI reviews. */
   const [reviewing, setReviewing] = useState<Map<string, string>>(new Map());
   const { sessions, activeSessionId, setSessions } = useChatStore();
@@ -207,6 +211,26 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
       s.name.toLowerCase().includes(query.trim().toLowerCase()) ||
       s.description.toLowerCase().includes(query.trim().toLowerCase())
   );
+  const builtinSkills = filtered.filter((s) => s.source === 'builtin');
+  const userSkills = filtered.filter((s) => s.source !== 'builtin');
+
+  /** 安装详情里缺失的 pip 依赖，然后刷新探测结果。 */
+  const installMissingDeps = async (detail: SkillDetail) => {
+    const missing = detail.dependencies
+      .filter((d) => d.kind === 'pip' && !d.available)
+      .map((d) => d.name);
+    if (missing.length === 0 || installingDeps) return;
+    setInstallingDeps(true);
+    try {
+      const msg = await skillsInstallPip(missing);
+      await alert(msg, '安装依赖');
+      await openDetail(detail.name);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setInstallingDeps(false);
+    }
+  };
 
   /** Review state badge: 绿=通过 / 黄=注意 / 红=风险；stale（审查后内容变更）按待复审显示。 */
   const reviewBadge = (s: SkillInfo) => {
@@ -317,49 +341,71 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
                 : '没有匹配的插件。'}
             </div>
           ) : (
-            <div className="grid grid-cols-2 gap-2.5">
-              {filtered.map((s) => (
-                <div
-                  key={s.name}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => openDetail(s.name)}
-                  onKeyDown={(e) => e.key === 'Enter' && openDetail(s.name)}
-                  className="group relative text-left rounded-xl border border-surface-hover bg-background/40 p-3 hover:border-primary/40 transition-colors cursor-pointer"
-                >
-                  {/* AI 审查 (hover, top-right) */}
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void startReview(s.name);
-                    }}
-                    disabled={reviewing.has(s.name)}
-                    title="AI 审查（提示词/脚本安全 + 依赖检查）"
-                    className="absolute top-2 right-2 opacity-0 hover:opacity-100 group-hover:opacity-100 p-1 rounded-md text-text-secondary hover:text-primary hover:bg-surface-hover transition-opacity disabled:opacity-50"
-                  >
-                    {reviewing.has(s.name) ? (
-                      <Loader2 size={13} className="animate-spin" />
-                    ) : (
-                      <ShieldCheck size={13} />
-                    )}
-                  </button>
-                  <div className="flex items-center gap-2 mb-1 pr-6">
-                    <span className="text-[13px] font-medium text-text-primary font-mono truncate">
-                      {s.name}
-                    </span>
-                    {mounted.has(s.name) && (
-                      <span className="shrink-0 text-[10px] px-1.5 py-px rounded-full border border-primary/30 text-primary bg-primary/10">
-                        已挂载
-                      </span>
-                    )}
-                    {reviewBadge(s)}
-                    {detailLoading && <Loader2 size={11} className="animate-spin text-text-secondary/40" />}
-                  </div>
-                  <p className="text-[11px] text-text-secondary leading-relaxed line-clamp-2">
-                    {s.description || '（无描述）'}
-                  </p>
-                </div>
-              ))}
+            <div className="space-y-4">
+              {[
+                { label: '内置', items: builtinSkills },
+                { label: '我的插件', items: userSkills },
+              ].map(
+                (group) =>
+                  group.items.length > 0 && (
+                    <div key={group.label}>
+                      <div className="text-[11px] text-text-secondary/50 mb-1.5">{group.label}</div>
+                      <div className="grid grid-cols-2 gap-2.5">
+                        {group.items.map((s) => (
+                          <div
+                            key={s.name}
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => openDetail(s.name)}
+                            onKeyDown={(e) => e.key === 'Enter' && openDetail(s.name)}
+                            className="group relative text-left rounded-xl border border-surface-hover bg-background/40 p-3 hover:border-primary/40 transition-colors cursor-pointer"
+                          >
+                            {/* AI 审查 (hover, top-right)，内置技能免审不显示 */}
+                            {s.source !== 'builtin' && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void startReview(s.name);
+                                }}
+                                disabled={reviewing.has(s.name)}
+                                title="AI 审查（提示词/脚本安全 + 依赖检查）"
+                                className="absolute top-2 right-2 opacity-0 hover:opacity-100 group-hover:opacity-100 p-1 rounded-md text-text-secondary hover:text-primary hover:bg-surface-hover transition-opacity disabled:opacity-50"
+                              >
+                                {reviewing.has(s.name) ? (
+                                  <Loader2 size={13} className="animate-spin" />
+                                ) : (
+                                  <ShieldCheck size={13} />
+                                )}
+                              </button>
+                            )}
+                            <div className="flex items-center gap-2 mb-1 pr-6">
+                              <SkillIcon name={s.name} size={16} />
+                              <span className="text-[13px] font-medium text-text-primary font-mono truncate">
+                                {s.name}
+                              </span>
+                              {mounted.has(s.name) && (
+                                <span className="shrink-0 text-[10px] px-1.5 py-px rounded-full border border-primary/30 text-primary bg-primary/10">
+                                  已挂载
+                                </span>
+                              )}
+                              {s.source === 'builtin' ? (
+                                <span className="shrink-0 text-[10px] px-1.5 py-px rounded-full border border-sky-400/30 text-sky-400 bg-sky-400/10">
+                                  内置
+                                </span>
+                              ) : (
+                                reviewBadge(s)
+                              )}
+                              {detailLoading && <Loader2 size={11} className="animate-spin text-text-secondary/40" />}
+                            </div>
+                            <p className="text-[11px] text-text-secondary leading-relaxed line-clamp-2">
+                              {s.description || '（无描述）'}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+              )}
             </div>
           )}
         </div>
@@ -371,7 +417,13 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
           <div className="absolute inset-0 bg-black/40" onClick={() => setDetail(null)} />
           <div className="relative w-[560px] max-w-[90%] max-h-[86%] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
             <div className="flex items-center gap-2 px-4 py-3 border-b border-surface-hover">
+              <SkillIcon name={detail.name} size={16} />
               <span className="text-sm font-medium text-text-primary font-mono">{detail.name}</span>
+              {detail.source === 'builtin' && (
+                <span className="text-[10px] px-1.5 py-px rounded-full border border-sky-400/30 text-sky-400 bg-sky-400/10">
+                  内置
+                </span>
+              )}
               {mounted.has(detail.name) && (
                 <span className="text-[10px] px-1.5 py-px rounded-full border border-primary/30 text-primary bg-primary/10">
                   已挂载
@@ -395,6 +447,57 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
               <pre className="text-[11px] leading-relaxed text-text-secondary bg-background border border-surface-hover rounded-lg p-3 whitespace-pre-wrap break-words max-h-[300px] overflow-y-auto">
                 {detail.content || '（SKILL.md 无正文）'}
               </pre>
+              {detail.tools.length > 0 && (
+                <div className="rounded-lg border border-surface-hover bg-background p-3 space-y-1.5">
+                  <span className="text-[12px] font-medium text-text-primary">工具权限</span>
+                  <div className="text-[11px] text-text-secondary">
+                    {detail.tools.map((t) => (
+                      <span key={t} className="inline-block mr-1.5 px-1 rounded bg-surface-hover/60 font-mono">
+                        {t}
+                      </span>
+                    ))}
+                  </div>
+                  <p className="text-[10px] text-text-secondary/50 leading-relaxed">
+                    挂载后这些工具将对挂载的会话开放（即使会话本身限制了工具范围）；卸载即回收。
+                  </p>
+                </div>
+              )}
+              {detail.dependencies.length > 0 && (
+                <div className="rounded-lg border border-surface-hover bg-background p-3 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[12px] font-medium text-text-primary">运行依赖</span>
+                    {detail.dependencies.some((d) => d.kind === 'pip' && !d.available) && (
+                      <button
+                        onClick={() => void installMissingDeps(detail)}
+                        disabled={installingDeps}
+                        className="ml-auto flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] bg-primary/10 text-primary hover:bg-primary/20 transition-colors disabled:opacity-50"
+                      >
+                        {installingDeps && <Loader2 size={11} className="animate-spin" />}
+                        一键安装缺失依赖
+                      </button>
+                    )}
+                  </div>
+                  <div className="text-[11px] text-text-secondary">
+                    {detail.dependencies.map((d) => (
+                      <span
+                        key={`${d.kind}-${d.name}`}
+                        className={`inline-block mr-1.5 px-1 rounded ${
+                          d.available ? 'text-emerald-400/80' : 'text-red-400'
+                        }`}
+                        title={d.kind === 'binary' ? '系统程序' : 'Python 包'}
+                      >
+                        {d.name}
+                        {d.available ? '✓' : '✗'}
+                      </span>
+                    ))}
+                  </div>
+                  {detail.dependencies.some((d) => d.kind === 'binary' && !d.available) && (
+                    <p className="text-[10px] text-text-secondary/50 leading-relaxed">
+                      缺失的系统程序需手动安装（soffice 来自 LibreOffice）；pip 包可用上方按钮一键安装。
+                    </p>
+                  )}
+                </div>
+              )}
               {detail.review && (
                 <div className="rounded-lg border border-surface-hover bg-background p-3 space-y-2">
                   <div className="flex items-center gap-2">
@@ -459,18 +562,20 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
               )}
             </div>
             <div className="flex items-center gap-2 px-4 py-3 border-t border-surface-hover">
-              <button
-                onClick={() => void startReview(detail.name)}
-                disabled={reviewing.has(detail.name)}
-                className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-[12px] border border-surface-hover text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors disabled:opacity-50"
-              >
-                {reviewing.has(detail.name) ? (
-                  <Loader2 size={12} className="animate-spin" />
-                ) : (
-                  <ShieldCheck size={12} />
-                )}
-                {detail.review ? '重新审查' : 'AI 审查'}
-              </button>
+              {detail.source !== 'builtin' && (
+                <button
+                  onClick={() => void startReview(detail.name)}
+                  disabled={reviewing.has(detail.name)}
+                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-[12px] border border-surface-hover text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors disabled:opacity-50"
+                >
+                  {reviewing.has(detail.name) ? (
+                    <Loader2 size={12} className="animate-spin" />
+                  ) : (
+                    <ShieldCheck size={12} />
+                  )}
+                  {detail.review ? '重新审查' : 'AI 审查'}
+                </button>
+              )}
               <button
                 onClick={() => toggleMount(detail.name)}
                 className={`px-3 py-1.5 rounded-lg text-[12px] transition-colors ${
@@ -485,13 +590,15 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
                     ? '挂载到当前会话'
                     : '挂载（需先选择会话）'}
               </button>
-              <button
-                onClick={() => removeSkill(detail.name)}
-                className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-[12px] text-red-400 hover:bg-red-400/10 transition-colors"
-              >
-                <Trash2 size={12} />
-                删除
-              </button>
+              {detail.source !== 'builtin' && (
+                <button
+                  onClick={() => removeSkill(detail.name)}
+                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-[12px] text-red-400 hover:bg-red-400/10 transition-colors"
+                >
+                  <Trash2 size={12} />
+                  删除
+                </button>
+              )}
             </div>
           </div>
         </div>

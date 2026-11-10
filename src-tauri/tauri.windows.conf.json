@@ -3,7 +3,8 @@
     "resources": [
       "bin/pdfium.dll",
       "bin/PDFIUM-LICENSE.txt",
-      "ext/crsqlite.dll"
+      "ext/crsqlite.dll",
+      "resources/skills"
     ]
   }
 }

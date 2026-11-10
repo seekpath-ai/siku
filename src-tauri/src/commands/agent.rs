@@ -1179,8 +1179,6 @@ pub(crate) async fn run_agent_turn(
         vision_llm,
         session.web_proxy.clone(),
     );
-    registry.retain(config.tools.as_deref());
-
     let data_dir_path = device_settings.data_dir.as_deref().map(std::path::PathBuf::from);
 
     // Register the skills MOUNTED ON THIS SESSION (per-session plugins): a
@@ -1200,7 +1198,23 @@ pub(crate) async fn run_agent_turn(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    registry.register_skills(&skills_dir, &selected_skills);
+    let all_skills =
+        crate::core::skills::scan_all(state.builtin_skills_dir.as_deref(), &skills_dir);
+
+    // 挂载即授权：技能前言 `tools:` 声明的工具并入会话白名单（每轮重算，
+    // 卸载即回收）。领域智能体的窄白名单（如文献分析无 bash）因此可以
+    // 运行需要 bash/file 工具的技能；config.tools = None（全量）无需合并。
+    let merged_tools: Option<Vec<String>> = config.tools.as_ref().map(|base| {
+        let mut set: std::collections::HashSet<String> = base.iter().cloned().collect();
+        for s in &all_skills {
+            if selected_skills.contains(&s.name) {
+                set.extend(s.tools.iter().cloned());
+            }
+        }
+        set.into_iter().collect()
+    });
+    registry.retain(merged_tools.as_deref());
+    registry.register_skills(all_skills, &selected_skills);
 
     // Outbound file sending (docs/remote-channels.md §7). The tool is
     // registered for EVERY remote turn — even when sending is not allowed —

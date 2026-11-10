@@ -214,15 +214,20 @@ impl ToolRegistry {
         self.tools.retain(|name, _| allowed_set.contains(name.as_str()));
     }
 
-    /// Register the session's mounted skills as `skill_<name>` tools. Only
-    /// names in `selected` register — unmounted skills stay invisible to the
-    /// model, so their descriptions cost no context. Call AFTER `retain` so
-    /// mounted skills are always available to the agent.
-    pub fn register_skills(&mut self, dir: &std::path::Path, selected: &std::collections::HashSet<String>) {
+    /// Register the session's mounted skills as `skill_<name>` tools from a
+    /// pre-scanned list (the caller scans once and reuses the result for the
+    /// tool-permission union). Only names in `selected` register — unmounted
+    /// skills stay invisible to the model, so their descriptions cost no
+    /// context. Call AFTER `retain` so mounted skills are always available.
+    pub fn register_skills(
+        &mut self,
+        skills: Vec<crate::core::skills::Skill>,
+        selected: &std::collections::HashSet<String>,
+    ) {
         if selected.is_empty() {
             return;
         }
-        for skill in crate::core::skills::scan(dir) {
+        for skill in skills {
             if selected.contains(&skill.name) {
                 self.register(crate::ai::agent::tools::skill::SkillTool::new(skill));
             }

@@ -899,8 +899,19 @@ export interface SkillInfo {
   description: string;
   /** Directory holding SKILL.md. */
   path: string;
-  /** Latest review badge; absent = never reviewed. */
+  /** Latest review badge; absent = never reviewed (or built-in). */
   review?: SkillReviewBadge | null;
+  /** 来源：内置（随安装包分发，免审、只读）或用户导入。 */
+  source: 'builtin' | 'user';
+  /** 声明的依赖（未经探测；详情页返回探测结果）。 */
+  requires: { binaries: string[]; pip: string[] };
+}
+
+export interface SkillDepStatus {
+  /** `binary`（系统程序）或 `pip`（Python 包）。 */
+  kind: string;
+  name: string;
+  available: boolean;
 }
 
 export interface SkillDetail {
@@ -909,8 +920,13 @@ export interface SkillDetail {
   path: string;
   /** SKILL.md body (the instructions injected when the skill tool runs). */
   content: string;
-  /** Latest review record; absent = never reviewed. */
+  /** Latest review record; absent = never reviewed (or built-in). */
   review?: SkillReviewRecord | null;
+  source: 'builtin' | 'user';
+  /** 声明依赖的实时探测结果。 */
+  dependencies: SkillDepStatus[];
+  /** 技能声明的工具权限（挂载后并入会话工具白名单）。 */
+  tools: string[];
 }
 
 export async function skillsList(): Promise<SkillInfo[]> {
@@ -920,6 +936,11 @@ export async function skillsList(): Promise<SkillInfo[]> {
 /** Full skill detail for the plugins dialog's second-level view. */
 export async function skillsGet(name: string): Promise<SkillDetail> {
   return invoke<SkillDetail>('skills_get', { name });
+}
+
+/** pip install --user 一组依赖包，返回安装结果说明。 */
+export async function skillsInstallPip(packages: string[]): Promise<string> {
+  return invoke<string>('skills_install_pip', { packages });
 }
 
 /** Static scan report (deterministic, pre-LLM). */

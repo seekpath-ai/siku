@@ -78,7 +78,8 @@
     "resources": {
       "bin/pdfium.dll": "pdfium.dll",
       "bin/libpdfium.so": "libpdfium.so",
-      "bin/PDFIUM-LICENSE.txt": "PDFIUM-LICENSE.txt"
+      "bin/PDFIUM-LICENSE.txt": "PDFIUM-LICENSE.txt",
+      "resources/skills": "skills"
     }
   },
   "plugins": {

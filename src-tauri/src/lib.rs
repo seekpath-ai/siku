@@ -49,6 +49,9 @@ pub struct AppState {
     >,
     /// Remote IM channels (feishu/weixin bots) serving this device's agent.
     pub remote: crate::remote::RemoteManager,
+    /// Built-in skills directory bundled with the app (None in dev if the
+    /// source-tree resources are missing).
+    pub builtin_skills_dir: Option<std::path::PathBuf>,
 }
 
 /// Spawn a background task and register its handle so the exit path can abort
@@ -593,6 +596,9 @@ pub fn run() {
                     shutdown_tx: shutdown_tx.clone(),
                     background_tasks: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
                     remote: crate::remote::RemoteManager::default(),
+                    builtin_skills_dir: crate::core::skills::builtin_skills_dir(
+                        handle2.path().resource_dir().ok().as_deref(),
+                    ),
                 });
 
                 // Start remote IM channels (feishu/weixin) if configured,
@@ -991,6 +997,7 @@ pub fn run() {
             commands::skills::skills_import_folder,
             commands::skills::skills_import_zip,
             commands::skills::skills_delete,
+            commands::skills::skills_install_pip,
             commands::skills::skills_review_start,
             commands::skills::skills_review_collect,
             commands::skills::skills_open_directory,

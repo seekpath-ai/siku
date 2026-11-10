@@ -3,21 +3,58 @@ use std::path::Path;
 use serde::Serialize;
 use sqlx::SqlitePool;
 
+/// Where a skill comes from. Built-in skills ship inside the app bundle
+/// (read-only, trusted, review-exempt); user skills live in the user skills
+/// directory and go through import/review/delete as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillSource {
+    Builtin,
+    User,
+}
+
+/// Dependencies declared in SKILL.md frontmatter (inline bracket lists only):
+///
+/// ```yaml
+/// requires:
+///   binaries: [python3, soffice]
+///   pip: [python-pptx]
+/// ```
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRequires {
+    pub binaries: Vec<String>,
+    pub pip: Vec<String>,
+}
+
+impl SkillRequires {
+    pub fn is_empty(&self) -> bool {
+        self.binaries.is_empty() && self.pip.is_empty()
+    }
+}
+
 /// A loaded inline skill (Kimi Code style): a `<skills_dir>/<name>/SKILL.md`
-/// with YAML-ish frontmatter (`name`, `description`) and a markdown body.
-/// `dir` is the skill's own directory — auxiliary files (scripts, templates)
-/// live there and the SKILL.md body references them by relative path.
+/// with YAML-ish frontmatter (`name`, `description`, optional `requires`) and
+/// a markdown body. `dir` is the skill's own directory — auxiliary files
+/// (scripts, templates) live there and the SKILL.md body references them by
+/// relative path.
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
     pub description: String,
     pub content: String,
     pub dir: std::path::PathBuf,
+    pub source: SkillSource,
+    pub requires: SkillRequires,
+    /// 技能运行需要的 agent 工具白名单（前言 `tools: [bash, file_write]`）。
+    /// 挂载该技能的会话在原有工具白名单基础上并集放行这些工具——
+    /// 挂载即授权，卸载即回收。
+    pub tools: Vec<String>,
 }
 
 /// Parse `SKILL.md`: optional `---` frontmatter block with `name:` and
 /// `description:` fields, followed by the markdown body.
-fn parse_skill_md(text: &str) -> Option<(String, String, String)> {
+fn parse_skill_md(text: &str) -> Option<(String, String, String, SkillRequires, Vec<String>)> {
     let body = text.strip_prefix("---")?;
     let end = body.find("---")?;
     let front = &body[..end];
@@ -25,17 +62,50 @@ fn parse_skill_md(text: &str) -> Option<(String, String, String)> {
 
     let mut name = String::new();
     let mut description = String::new();
+    let mut requires = SkillRequires::default();
+    let mut tools: Vec<String> = Vec::new();
+    let mut in_requires = false;
     for line in front.lines() {
-        if let Some(v) = line.strip_prefix("name:") {
+        let trimmed = line.trim();
+        if let Some(v) = trimmed.strip_prefix("name:") {
+            if !line.starts_with([' ', '\t']) {
+                in_requires = false;
+            }
             name = v.trim().trim_matches('"').trim_matches('\'').to_string();
-        } else if let Some(v) = line.strip_prefix("description:") {
+        } else if let Some(v) = trimmed.strip_prefix("description:") {
             description = v.trim().trim_matches('"').trim_matches('\'').to_string();
+        } else if let Some(v) = trimmed.strip_prefix("tools:") {
+            if !line.starts_with([' ', '\t']) {
+                in_requires = false;
+                tools = parse_inline_list(v);
+            }
+        } else if trimmed == "requires:" {
+            in_requires = true;
+        } else if in_requires && line.starts_with([' ', '\t']) {
+            if let Some(v) = trimmed.strip_prefix("binaries:") {
+                requires.binaries = parse_inline_list(v);
+            } else if let Some(v) = trimmed.strip_prefix("pip:") {
+                requires.pip = parse_inline_list(v);
+            }
+        } else if !line.starts_with([' ', '\t']) {
+            in_requires = false;
         }
     }
     if name.is_empty() {
         return None;
     }
-    Some((name, description, content))
+    Some((name, description, content, requires, tools))
+}
+
+/// Parse an inline `[a, b, c]` list from a frontmatter value.
+fn parse_inline_list(value: &str) -> Vec<String> {
+    let v = value.trim();
+    let inner = v.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(v);
+    inner
+        .split(',')
+        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Normalize a frontmatter `name` into a form that keeps the generated
@@ -60,7 +130,8 @@ fn sanitize_name(name: &str) -> Option<String> {
 }
 
 /// Scan a skills directory for `<name>/SKILL.md` files.
-pub fn scan(dir: &Path) -> Vec<Skill> {    let mut skills = Vec::new();
+pub fn scan(dir: &Path, source: SkillSource) -> Vec<Skill> {
+    let mut skills = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return skills;
     };
@@ -73,7 +144,7 @@ pub fn scan(dir: &Path) -> Vec<Skill> {    let mut skills = Vec::new();
         let Ok(text) = std::fs::read_to_string(&md) else {
             continue;
         };
-        if let Some((name, description, content)) = parse_skill_md(&text) {
+        if let Some((name, description, content, requires, tools)) = parse_skill_md(&text) {
             let Some(name) = sanitize_name(&name) else {
                 tracing::warn!(path = %md.display(), "skill skipped: name sanitizes to empty");
                 continue;
@@ -83,9 +154,63 @@ pub fn scan(dir: &Path) -> Vec<Skill> {    let mut skills = Vec::new();
                 description,
                 content,
                 dir: path.clone(),
+                source,
+                requires,
+                tools,
             });
         }
     }
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+}
+
+/// Built-in skills bundled with the app. Resolution mirrors the pdfium
+/// lookup (production layouts first, dev fallback last):
+/// `<resource_dir>/skills`, exe-adjacent layouts incl. macOS
+/// `.app/Contents/Resources/skills`, then the source tree for cargo dev.
+pub fn builtin_skills_dir(resource_dir: Option<&Path>) -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(rd) = resource_dir {
+        candidates.push(rd.join("skills"));
+        candidates.push(rd.join("resources").join("skills"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("skills"));
+            candidates.push(dir.join("resources").join("skills"));
+            if let Some(res) = dir
+                .parent()
+                .and_then(|contents| contents.parent())
+                .map(|contents| contents.join("Resources"))
+            {
+                candidates.push(res.join("skills"));
+            }
+        }
+    }
+    candidates.push(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("skills"),
+    );
+    candidates.into_iter().find(|p| p.is_dir())
+}
+
+/// Merged scan of the built-in and user skill directories. On a name
+/// collision the BUILT-IN skill wins (built-ins are irreplaceable; imports
+/// colliding with them are rejected up front, so a collision here means
+/// someone dropped a folder into the user dir by hand — warn and ignore it).
+pub fn scan_all(builtin_dir: Option<&Path>, user_dir: &Path) -> Vec<Skill> {
+    let mut by_name: std::collections::HashMap<String, Skill> =
+        scan(user_dir, SkillSource::User)
+            .into_iter()
+            .map(|s| (s.name.clone(), s))
+            .collect();
+    for s in builtin_dir.map(|d| scan(d, SkillSource::Builtin)).unwrap_or_default() {
+        if by_name.insert(s.name.clone(), s.clone()).is_some() {
+            tracing::warn!(skill = %s.name, "用户目录中的同名技能被内置技能覆盖（内置不可替换）");
+        }
+    }
+    let mut skills: Vec<Skill> = by_name.into_values().collect();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
 }
@@ -140,29 +265,48 @@ pub struct SkillInfo {
     /// Directory holding SKILL.md.
     pub path: String,
     /// Latest review badge; `stale` = the skill changed since the review.
+    /// Always None for built-in skills (first-party, review-exempt).
     pub review: Option<crate::core::skill_review::ReviewBadge>,
+    pub source: SkillSource,
+    /// Declared dependencies (unprobed — see `probe_dependencies`).
+    pub requires: SkillRequires,
 }
 
-/// All external skills in the user skills directory, sorted by name, each
-/// with its review badge (recomputed hash → stale detection).
-pub async fn list_all(db: &SqlitePool, user_dir: &Path) -> Vec<SkillInfo> {
+/// All skills (built-in + user), sorted by name. Built-ins skip both the
+/// content hash and the review lookup; user skills only pay the hash when a
+/// review record exists (an unreviewed skill has nothing to go stale
+/// against — and hashing big skill dirs is what made the dialog slow).
+pub async fn list_all(db: &SqlitePool, builtin_dir: Option<&Path>, user_dir: &Path) -> Vec<SkillInfo> {
     let mut out = Vec::new();
-    for s in scan(user_dir) {
-        let hash = crate::core::skill_review::content_hash(&s.dir);
-        let review = crate::core::skill_review::review_badge(db, &s.name, &hash).await;
+    for s in scan_all(builtin_dir, user_dir) {
+        let review = match s.source {
+            SkillSource::Builtin => None,
+            SkillSource::User => match crate::core::skill_review::get_review(db, &s.name).await {
+                None => None,
+                Some(rec) => {
+                    let hash = crate::core::skill_review::content_hash(&s.dir);
+                    Some(crate::core::skill_review::ReviewBadge {
+                        verdict: rec.verdict,
+                        stale: rec.content_hash != hash,
+                    })
+                }
+            },
+        };
         out.push(SkillInfo {
             path: s.dir.to_string_lossy().to_string(),
             name: s.name,
             description: s.description,
             review,
+            source: s.source,
+            requires: s.requires,
         });
     }
     out
 }
 
 /// Full skill (incl. SKILL.md body) for the detail dialog.
-pub fn get(user_dir: &Path, name: &str) -> Option<(Skill, String)> {
-    scan(user_dir)
+pub fn get(builtin_dir: Option<&Path>, user_dir: &Path, name: &str) -> Option<(Skill, String)> {
+    scan_all(builtin_dir, user_dir)
         .into_iter()
         .find(|s| s.name == name)
         .map(|s| {
@@ -188,13 +332,19 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 /// Install a skill from a folder containing SKILL.md (copied into the user
-/// skills directory under its sanitized name). Errors on name conflicts.
-pub fn import_folder(user_dir: &Path, src: &Path) -> Result<SkillInfo, String> {
+/// skills directory under its sanitized name). Errors on name conflicts
+/// (with user skills OR built-ins — shadowing a built-in would be confusing).
+pub fn import_folder(
+    builtin_dir: Option<&Path>,
+    user_dir: &Path,
+    src: &Path,
+) -> Result<SkillInfo, String> {
     let md = src.join("SKILL.md");
     let text = std::fs::read_to_string(&md)
         .map_err(|_| "所选文件夹中没有可读取的 SKILL.md".to_string())?;
-    let (name, _, _) = parse_skill_md(&text).ok_or("SKILL.md 缺少 name 前言字段")?;
+    let (name, _, _, requires, _) = parse_skill_md(&text).ok_or("SKILL.md 缺少 name 前言字段")?;
     let name = sanitize_name(&name).ok_or("技能名无法转换为合法标识")?;
+    reject_builtin_conflict(builtin_dir, &name)?;
     let dest = user_dir.join(&name);
     if dest.exists() {
         return Err(format!("已存在同名技能「{name}」，请先删除或改名"));
@@ -202,10 +352,23 @@ pub fn import_folder(user_dir: &Path, src: &Path) -> Result<SkillInfo, String> {
     copy_dir(src, &dest)?;
     Ok(SkillInfo {
         path: dest.to_string_lossy().to_string(),
-        description: parse_skill_md(&text).map(|(_, d, _)| d).unwrap_or_default(),
+        description: parse_skill_md(&text).map(|(_, d, _, _, _)| d).unwrap_or_default(),
         name,
         review: None,
+        source: SkillSource::User,
+        requires,
     })
+}
+
+/// Built-in names are reserved: a user skill shadowing a built-in would make
+/// the plugins dialog show two cards for one tool name.
+fn reject_builtin_conflict(builtin_dir: Option<&Path>, name: &str) -> Result<(), String> {
+    if let Some(d) = builtin_dir {
+        if d.join(name).join("SKILL.md").is_file() {
+            return Err(format!("「{name}」与内置技能重名，请修改 SKILL.md 的 name 后再导入"));
+        }
+    }
+    Ok(())
 }
 
 /// Safety caps for zip imports (a skill is documentation + small scripts).
@@ -215,7 +378,11 @@ const ZIP_MAX_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
 /// Install a skill from a zip archive. The SKILL.md may sit at the archive
 /// root or inside a single top-level folder; everything alongside it is
 /// extracted. Zip-slip entries are rejected.
-pub fn import_zip(user_dir: &Path, zip_path: &Path) -> Result<SkillInfo, String> {
+pub fn import_zip(
+    builtin_dir: Option<&Path>,
+    user_dir: &Path,
+    zip_path: &Path,
+) -> Result<SkillInfo, String> {
     use std::io::Read;
     let file = std::fs::File::open(zip_path).map_err(|e| format!("无法打开压缩包：{e}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("无法读取压缩包：{e}"))?;
@@ -251,8 +418,10 @@ pub fn import_zip(user_dir: &Path, zip_path: &Path) -> Result<SkillInfo, String>
             break;
         }
     }
-    let (name, description, _) = parse_skill_md(&text).ok_or("SKILL.md 缺少 name 前言字段")?;
+    let (name, description, _, requires, _) =
+        parse_skill_md(&text).ok_or("SKILL.md 缺少 name 前言字段")?;
     let name = sanitize_name(&name).ok_or("技能名无法转换为合法标识")?;
+    reject_builtin_conflict(builtin_dir, &name)?;
     let dest = user_dir.join(&name);
     if dest.exists() {
         return Err(format!("已存在同名技能「{name}」，请先删除或改名"));
@@ -293,20 +462,64 @@ pub fn import_zip(user_dir: &Path, zip_path: &Path) -> Result<SkillInfo, String>
         description,
         name,
         review: None,
+        source: SkillSource::User,
+        requires,
     })
 }
 
-/// Delete an installed skill (removes its directory).
-pub fn delete(user_dir: &Path, name: &str) -> Result<(), String> {
+/// Delete an installed USER skill (removes its directory). Built-in skills
+/// are read-only parts of the app bundle and cannot be deleted.
+pub fn delete(builtin_dir: Option<&Path>, user_dir: &Path, name: &str) -> Result<(), String> {
     let safe = sanitize_name(name).ok_or("非法技能名")?;
     if safe != name {
         return Err("非法技能名".to_string());
     }
     let dir = user_dir.join(name);
     if !dir.is_dir() {
+        if let Some(b) = builtin_dir {
+            if b.join(name).join("SKILL.md").is_file() {
+                return Err("内置技能不可删除".to_string());
+            }
+        }
         return Err(format!("技能「{name}」不存在"));
     }
     std::fs::remove_dir_all(&dir).map_err(|e| format!("删除失败：{e}"))
+}
+
+/// One dependency's probe result for the detail dialog.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepStatus {
+    /// `binary` (system program) or `pip` (Python package).
+    pub kind: String,
+    pub name: String,
+    pub available: bool,
+}
+
+/// Probe a skill's declared dependencies (process spawns — call from the
+/// detail dialog, not the list path).
+pub fn probe_dependencies(requires: &SkillRequires) -> Vec<DepStatus> {
+    let mut out = Vec::new();
+    if requires.is_empty() {
+        return out;
+    }
+    for b in &requires.binaries {
+        out.push(DepStatus {
+            kind: "binary".to_string(),
+            name: b.clone(),
+            available: crate::core::skill_review::binary_available(b),
+        });
+    }
+    for p in &requires.pip {
+        out.push(DepStatus {
+            kind: "pip".to_string(),
+            name: p.clone(),
+            available: crate::core::skill_review::python_module_available(
+                &crate::core::skill_review::pip_to_module(p),
+            ),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -315,6 +528,19 @@ mod tests {
     use std::io::Write;
 
     const SKILL_MD: &str = "---\nname: demo-skill\ndescription: 演示\n---\n\n# 正文\n";
+
+    #[test]
+    fn parse_requires_inline_lists() {
+        let text = "---\nname: pptx\ndescription: 演示\ntools: [bash, file_write]\nrequires:\n  binaries: [python3, soffice]\n  pip: [python-pptx]\n---\n\n# 正文\n";
+        let (name, _, _, req, tools) = parse_skill_md(text).unwrap();
+        assert_eq!(name, "pptx");
+        assert_eq!(req.binaries, vec!["python3", "soffice"]);
+        assert_eq!(req.pip, vec!["python-pptx"]);
+        assert_eq!(tools, vec!["bash", "file_write"]);
+        // Frontmatter without requires parses to empty deps.
+        let (_, _, _, req2, _) = parse_skill_md(SKILL_MD).unwrap();
+        assert!(req2.is_empty());
+    }
 
     #[test]
     fn sanitize_name_produces_legal_tool_names() {
@@ -335,14 +561,21 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("SKILL.md"), SKILL_MD).unwrap();
         let lib = tmp.path().join("lib");
-        let info = import_folder(&lib, &src).unwrap();
+        let info = import_folder(None, &lib, &src).unwrap();
         assert_eq!(info.name, "demo-skill");
         assert_eq!(info.description, "演示");
         assert!(lib.join("demo-skill/SKILL.md").is_file());
         // Name conflict is an error, not an overwrite.
-        assert!(import_folder(&lib, &src).is_err());
-        delete(&lib, "demo-skill").unwrap();
+        assert!(import_folder(None, &lib, &src).is_err());
+        delete(None, &lib, "demo-skill").unwrap();
         assert!(!lib.join("demo-skill").exists());
+        // A built-in with the same name blocks deletion of the "missing"
+        // user skill and rejects imports.
+        let builtin = tmp.path().join("builtin");
+        std::fs::create_dir_all(builtin.join("demo-skill")).unwrap();
+        std::fs::write(builtin.join("demo-skill/SKILL.md"), SKILL_MD).unwrap();
+        assert!(delete(Some(&builtin), &lib, "demo-skill").is_err());
+        assert!(import_folder(Some(&builtin), &lib, &src).is_err());
     }
 
     fn build_zip(entries: &[(&str, &str)]) -> Vec<u8> {
@@ -365,7 +598,7 @@ mod tests {
         let zip_path = tmp.path().join("skill.zip");
         std::fs::write(&zip_path, data).unwrap();
         let lib = tmp.path().join("lib");
-        let info = import_zip(&lib, &zip_path).unwrap();
+        let info = import_zip(None, &lib, &zip_path).unwrap();
         assert_eq!(info.name, "demo-skill");
         assert!(lib.join("demo-skill/SKILL.md").is_file());
         assert!(lib.join("demo-skill/scripts/run.sh").is_file());
@@ -378,7 +611,7 @@ mod tests {
         let zip_path = tmp.path().join("evil.zip");
         std::fs::write(&zip_path, data).unwrap();
         let lib = tmp.path().join("lib");
-        assert!(import_zip(&lib, &zip_path).is_err());
+        assert!(import_zip(None, &lib, &zip_path).is_err());
         assert!(!tmp.path().join("evil.txt").exists());
     }
 

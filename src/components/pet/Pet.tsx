@@ -126,14 +126,14 @@ export function Pet() {
         if (getCurrentWindow().label !== 'main') return;
         (async () => {
           const win = getCurrentWindow();
-          // If the user was in another app, the panel opening may go
-          // unnoticed (Windows also blocks focus-stealing from background
-          // apps) — confirm through the ball's speech bubble. When the main
-          // window is already focused the panel itself is the feedback.
-          const focused = await win.isFocused().catch(() => true);
+          // Clicking the pet means "talk to it" and the panel lives in the
+          // main window — restore the window explicitly. setFocus alone does
+          // not unminimize on macOS / several Linux WMs.
           const minimized = await win.isMinimized().catch(() => false);
-          // Bring the main window to the front so the panel is visible.
-          win.setFocus().catch(() => {});
+          if (minimized) await win.unminimize().catch(() => {});
+          const visible = await win.isVisible().catch(() => true);
+          if (!visible) await win.show().catch(() => {});
+          await win.setFocus().catch(() => {});
           const st = usePetStore.getState();
           const ctx = usePetContextStore.getState().context;
           if (ctx && !st.session) {
@@ -141,8 +141,12 @@ export function Pet() {
           } else {
             st.setOpen(true);
           }
-          if (!focused || minimized) {
-            emit('pet:bubble', '已为你打开对话面板').catch(() => {});
+          // The restored panel is the feedback. Only when the window still
+          // isn't focused (e.g. Windows blocks focus-stealing while the user
+          // is in another app) confirm through the ball's speech bubble.
+          const focused = await win.isFocused().catch(() => true);
+          if (!focused) {
+            emit('pet:bubble', '对话面板已打开，请查看主窗口').catch(() => {});
           }
         })();
       });

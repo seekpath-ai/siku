@@ -2,12 +2,15 @@
 //!
 //! 原则：绝不触碰用户本机的 Python 环境（不往系统 python 里 pip install）。
 //! 依赖装在 Miniconda 的独立环境 `siku-office` 里：
-//! - 用户已有 conda（Miniconda/Anaconda/Miniforge）→ 在其中创建命名环境；
-//! - 没有 conda → 应用下载 Miniconda 静默安装到应用数据目录（<app_data>/
-//!   miniconda3，不注册系统 Python、不改 PATH），再在其中创建环境。
+//! - 用户已有 conda（Miniconda/Anaconda/Miniforge）→ 在其中创建命名环境
+//!   （用 --override-channels 走 conda-forge，绕开用户默认源的 ToS 门禁，
+//!   也不替用户改 conda 配置）；
+//! - 没有 conda（或现有 conda 创建环境失败）→ 应用下载 Miniconda 静默安装
+//!   到应用数据目录（<app_data>/miniconda3，不注册系统 Python、不改 PATH），
+//!   再在其中创建环境。
 //!
-//! 环境由办公三件套技能共享（python-pptx 现在用，后续 python-docx/openpyxl
-//! 进同一环境），避免每个技能各背一个数百 MB 的环境。
+//! 环境由办公三件套技能共享（python-pptx/python-docx/openpyxl 进同一环境），
+//! 避免每个技能各背一个数百 MB 的环境。
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +26,13 @@ const MANAGED_DIR_NAME: &str = "miniconda3";
 /// Miniconda 安装包地址（官方 + 清华镜像兜底）。
 const MINICONDA_OFFICIAL: &str = "https://repo.anaconda.com/miniconda";
 const MINICONDA_TUNA: &str = "https://mirrors.tuna.tsinghua.edu.cn/anaconda/miniconda";
+
+/// conda-forge 源（官方 + 清华镜像兜底）。创建环境时 --override-channels
+/// 走它：新版 Anaconda 对默认源（pkgs/main、pkgs/r、msys2）加了 ToS 门禁，
+/// 未 accept 时 conda create 直接报错，而替用户 accept 等于替用户改全局
+/// conda 状态——conda-forge 无此要求，且不受用户自定义 channel 影响。
+const CONDA_FORGE_OFFICIAL: &str = "https://conda.anaconda.org/conda-forge";
+const CONDA_FORGE_TUNA: &str = "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge";
 
 /// 环境探测结果。两者都可能为 None（本机没有任何 conda）。
 #[derive(Debug, Clone, Default)]
@@ -344,6 +354,63 @@ fn run_capture(cmd: &mut std::process::Command, what: &str) -> Result<String, St
     Ok(log)
 }
 
+/// 创建隔离环境：官方 conda-forge 失败时回退清华镜像再试一次。
+fn create_env(conda: &Path) -> Result<(), String> {
+    let args = |channel: &str| {
+        let mut cmd = std::process::Command::new(conda);
+        cmd.args([
+            "create",
+            "-y",
+            "-n",
+            ENV_NAME,
+            "--override-channels",
+            "-c",
+            channel,
+            &format!("python={ENV_PYTHON_VERSION}"),
+            "pip",
+        ]);
+        cmd
+    };
+    match run_capture(&mut args(CONDA_FORGE_OFFICIAL), "创建隔离环境") {
+        Ok(_) => Ok(()),
+        Err(e) => run_capture(&mut args(CONDA_FORGE_TUNA), "创建隔离环境（清华镜像）")
+            .map(|_| ())
+            .map_err(|e2| format!("{e}\n—— 清华镜像重试 ——\n{e2}")),
+    }
+}
+
+async fn run_create_env(conda: &Path) -> Result<(), String> {
+    let conda = conda.to_path_buf();
+    tokio::task::spawn_blocking(move || create_env(&conda))
+        .await
+        .map_err(|e| format!("创建隔离环境任务失败：{e}"))?
+}
+
+/// 下载并静默安装托管 Miniconda 到应用数据目录，返回 conda 可执行文件路径。
+async fn install_managed_conda(
+    app_data_dir: &Path,
+    progress: &Option<&ProgressFn>,
+) -> Result<PathBuf, String> {
+    let root = managed_root(app_data_dir);
+    if root.exists() && conda_exe_in(&root).is_none() {
+        // 半成品安装（上次中断/损坏），清掉重装，否则安装器会拒绝覆盖。
+        std::fs::remove_dir_all(&root).map_err(|e| format!("清理残留 Miniconda 失败：{e}"))?;
+    }
+    let installer = app_data_dir
+        .join("downloads")
+        .join(miniconda_installer_name()?);
+    download_miniconda(&installer, progress).await?;
+    report(progress, "正在安装 Miniconda（应用目录内，不改动系统 Python）…");
+    let root_clone = root.clone();
+    let installer_clone = installer.clone();
+    tokio::task::spawn_blocking(move || install_miniconda(&installer_clone, &root_clone))
+        .await
+        .map_err(|e| format!("安装任务失败：{e}"))??;
+    let _ = std::fs::remove_file(&installer);
+    conda_exe_in(&root)
+        .ok_or_else(|| format!("Miniconda 安装后未找到 conda（{}），请重试", root.display()))
+}
+
 /// 确保隔离环境可用：必要时下载安装托管 Miniconda、创建环境、装齐依赖。
 /// 返回环境 Python 解释器路径。耗时数分钟，调用方须给足超时。
 pub async fn ensure_env(
@@ -362,46 +429,27 @@ pub async fn ensure_env(
         return Ok(python);
     }
 
-    // 有 conda 无环境 → 直接建。
-    let conda = match env.conda {
+    // 有 conda 无环境 → 直接建；没有 conda → 先装托管 Miniconda。
+    let managed = managed_root(app_data_dir);
+    let mut conda = match env.conda {
         Some(c) => c,
-        None => {
-            // 无 conda：下载托管 Miniconda 静默安装到应用数据目录。
-            let root = managed_root(app_data_dir);
-            let installer = app_data_dir
-                .join("downloads")
-                .join(miniconda_installer_name()?);
-            download_miniconda(&installer, &progress).await?;
-            report(&progress, "正在安装 Miniconda（应用目录内，不改动系统 Python）…");
-            let root_clone = root.clone();
-            let installer_clone = installer.clone();
-            tokio::task::spawn_blocking(move || install_miniconda(&installer_clone, &root_clone))
-                .await
-                .map_err(|e| format!("安装任务失败：{e}"))??;
-            let _ = std::fs::remove_file(&installer);
-            conda_exe_in(&root).ok_or_else(|| {
-                format!("Miniconda 安装后未找到 conda（{}），请重试", root.display())
-            })?
-        }
+        None => install_managed_conda(app_data_dir, &progress).await?,
     };
 
-    report(&progress, &format!("正在创建隔离环境 {ENV_NAME}（Python {ENV_PYTHON_VERSION}）…"));
-    let conda_clone = conda.clone();
-    tokio::task::spawn_blocking(move || {
-        run_capture(
-            std::process::Command::new(&conda_clone).args([
-                "create",
-                "-y",
-                "-n",
-                ENV_NAME,
-                &format!("python={ENV_PYTHON_VERSION}"),
-                "pip",
-            ]),
-            "创建隔离环境",
-        )
-    })
-    .await
-    .map_err(|e| format!("创建隔离环境任务失败：{e}"))??;
+    report(
+        &progress,
+        &format!("正在创建隔离环境 {ENV_NAME}（Python {ENV_PYTHON_VERSION}）…"),
+    );
+    let mut create_result = run_create_env(&conda).await;
+
+    // 用户机器上的 conda 不可用（ToS 门禁、配置损坏、root 不可写等）时不
+    // 报错卡死，自动降级到应用托管 Miniconda 重建。托管 conda 失败才是真错误。
+    if create_result.is_err() && !conda.starts_with(&managed) {
+        report(&progress, "现有 conda 创建环境失败，改用应用托管 Miniconda…");
+        conda = install_managed_conda(app_data_dir, &progress).await?;
+        create_result = run_create_env(&conda).await;
+    }
+    create_result?;
 
     let python = resolve(app_data_dir).python.ok_or_else(|| {
         "隔离环境创建后未找到其 Python 解释器（conda 可能把环境建到了非常规位置），请重试"

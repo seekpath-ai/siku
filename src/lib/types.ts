@@ -385,6 +385,10 @@ export interface AgentStep {
 export interface AgentStreamEvent {
   type: 'thinking' | 'reasoning' | 'tool_call' | 'tool_approval_required' | 'tool_result' | 'step_complete' | 'delta' | 'done' | 'cancelled' | 'ask_user' | 'error';
   session_id: string;
+  /** Only sent with done/cancelled/error: the persisted assistant message id
+   *  (authoritative — build the reply bubble with it). Absent when the
+   *  persist failed; fall back to a local temp id then. */
+  id?: string | null;
   step_index?: number;
   content?: string;
   tool_call_id?: string;

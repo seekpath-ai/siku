@@ -36,10 +36,6 @@ interface ChatState {
   /** Search-result jump: scroll this message into view and flash it. The
    * nonce lets repeat jumps to the same message retrigger. */
   jumpTarget: { messageId: string; nonce: number } | null;
-  /** 会话级持久的静默替换映射（DB 消息 id → 沿用的临时 id）。增量对齐的
-   * 游标会越过旧轮次，每轮现算的映射会丢旧映射、推理步骤因此挂回真实
-   * id 而找不到气泡 —— 所以跨 reload 累积。会话切换时随消息一起清空。 */
-  twinTempByDbId: Record<string, string>;
 
   setSessions: (sessions: AgentSession[]) => void;
   setActiveSession: (id: string | null) => void;
@@ -50,6 +46,10 @@ interface ChatState {
   addMessage: (msg: ChatMessage) => void;
   /** Replace one message in place (e.g. after tagging it). */
   patchMessage: (msg: ChatMessage) => void;
+  /** 发送返回后把乐观临时气泡换成后端下发的权威 id：换 id 即换 React
+   * key，所以只在气泡仍以临时 id 存在时置换；若 DB 行已被抢先对齐并入
+   * （同 id 已存在），丢弃临时气泡去重。调用窗口 <50ms，miss 即无操作。 */
+  swapMessageId: (tempId: string, realId: string) => void;
   setAgentSteps: (steps: AgentStep[]) => void;
   addAgentStep: (step: AgentStep) => void;
   updateAgentStep: (stepIndex: number, updates: Partial<AgentStep>) => void;
@@ -70,8 +70,6 @@ interface ChatState {
   finalizeStreamingStep: (stepIndex: number) => void;
   clearStreamingSteps: () => void;
   removeSession: (id: string) => void;
-  /** 累积静默替换映射（见 twinTempByDbId 字段说明）。 */
-  mergeTwinTempIds: (pairs: Record<string, string>) => void;
   setPendingQuestions: (q: AskQuestion[] | null, sessionId?: string | null) => void;
   setPendingFirst: (p: { sessionId: string; text: string } | null) => void;
   setJumpTarget: (messageId: string | null) => void;
@@ -95,7 +93,6 @@ export const useChatStore = create<ChatState>((set) => ({
   pendingQuestionsSessionId: null,
   pendingFirst: null,
   jumpTarget: null,
-  twinTempByDbId: {},
 
   setSessions: (sessions) => set({ sessions }),
   setActiveSession: (id) =>
@@ -111,7 +108,6 @@ export const useChatStore = create<ChatState>((set) => ({
         streamTextStep: null,
         streamingSteps: [],
         currentStreamingStep: null,
-        twinTempByDbId: {},
         // Restore the target session's streaming/loading flags so the input
         // is only disabled while THAT session is actually generating.
         isStreaming: id ? !!s.streamingById[id] : false,
@@ -126,6 +122,14 @@ export const useChatStore = create<ChatState>((set) => ({
   addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
   patchMessage: (msg) =>
     set((s) => ({ messages: s.messages.map((m) => (m.id === msg.id ? msg : m)) })),
+  swapMessageId: (tempId, realId) =>
+    set((s) => {
+      if (!s.messages.some((m) => m.id === tempId)) return s;
+      if (s.messages.some((m) => m.id === realId)) {
+        return { messages: s.messages.filter((m) => m.id !== tempId) };
+      }
+      return { messages: s.messages.map((m) => (m.id === tempId ? { ...m, id: realId } : m)) };
+    }),
   setAgentSteps: (agentSteps) => set({ agentSteps }),
   addAgentStep: (step) => set((s) => ({ agentSteps: [...s.agentSteps, step] })),
   updateAgentStep: (stepIndex, updates) =>
@@ -280,7 +284,6 @@ export const useChatStore = create<ChatState>((set) => ({
         isLoading: wasActive ? false : s.isLoading,
         pendingQuestions: s.pendingQuestionsSessionId === id ? null : s.pendingQuestions,
         pendingQuestionsSessionId: s.pendingQuestionsSessionId === id ? null : s.pendingQuestionsSessionId,
-        twinTempByDbId: wasActive ? {} : s.twinTempByDbId,
       };
     }),
 
@@ -296,6 +299,4 @@ export const useChatStore = create<ChatState>((set) => ({
     set((s) => ({
       jumpTarget: messageId ? { messageId, nonce: (s.jumpTarget?.nonce ?? 0) + 1 } : null,
     })),
-  mergeTwinTempIds: (pairs) =>
-    set((s) => ({ twinTempByDbId: { ...s.twinTempByDbId, ...pairs } })),
 }));

@@ -975,7 +975,10 @@ pub(crate) async fn run_agent_turn(
     // here and this function serializes them into the assistant row, so the
     // ledger and the chat app share one source of truth.
     outbound: Option<crate::remote::router::OutboundQueue>,
-) -> Result<(), String> {
+    // Returns the persisted user message id: the frontend swaps its
+    // optimistic bubble to the authoritative id as soon as the call
+    // returns, so later DB alignment matches rows by id, not content.
+) -> Result<String, String> {
     // Reject a second concurrent turn for the same session (user double-send,
     // cron firing mid-turn, pet windows). The guard lives until the spawned
     // task's cleanup completes, so channel cleanup below is ownership-safe.
@@ -1526,6 +1529,9 @@ pub(crate) async fn run_agent_turn(
     // Moved into the turn task: the assistant row must carry whatever the
     // tool registered, and only this task knows the final turn state.
     let turn_outbound = outbound.clone();
+    // The turn task takes `user_message_id` by move; the caller gets a copy
+    // as the command's return value (authoritative id for the UI bubble).
+    let sent_user_message_id = user_message_id.clone();
 
     crate::spawn_tracked(&tracked, async move {
         // Held until cleanup below is done: guarantees no other turn for this
@@ -1685,15 +1691,19 @@ pub(crate) async fn run_agent_turn(
 
                 // Terminal event goes last: the frontend reloads the session
                 // history on done/cancelled, so it must observe committed rows.
+                // The persisted message id rides along so the frontend builds
+                // its reply bubble with the authoritative id directly.
                 let terminal = if let Some(err) = turn_error {
                     AgentEvent::Error {
                         session_id: sid.clone(),
                         content: err,
+                        id: message_id.clone(),
                     }
                 } else if cancelled {
                     AgentEvent::Cancelled {
                         session_id: sid.clone(),
                         content: display_content,
+                        id: message_id.clone(),
                         tokens_used,
                         tokens_in,
                         tokens_in_hit,
@@ -1703,6 +1713,7 @@ pub(crate) async fn run_agent_turn(
                     AgentEvent::Done {
                         session_id: sid.clone(),
                         content: display_content,
+                        id: message_id.clone(),
                         tokens_used,
                         tokens_in,
                         tokens_in_hit,
@@ -1731,15 +1742,20 @@ pub(crate) async fn run_agent_turn(
                         &format!("回合失败：{e}"),
                     ))
                 };
-                if let Err(db_err) = chat::save_chat_message(
+                let err_message_id = match chat::save_chat_message(
                     &db, &sid, "assistant", &error_content, None, None, None, None, None, None, None, None, None, failed_attachments.as_deref(),
                 ).await {
-                    error!(error = %db_err, "failed to persist agent error message");
-                }
+                    Ok(id) => Some(id),
+                    Err(db_err) => {
+                        error!(error = %db_err, "failed to persist agent error message");
+                        None
+                    }
+                };
                 mem.append("assistant", &error_content, None, None, None, None, None);
                 let _ = app_clone.emit("agent:event", &AgentEvent::Error {
                     session_id: sid.clone(),
                     content: e,
+                    id: err_message_id,
                 });
             }
         }
@@ -1785,11 +1801,13 @@ pub(crate) async fn run_agent_turn(
         }
     });
 
-    Ok(())
+    Ok(sent_user_message_id)
 }
 
 /// Send a message to the agent for processing.
 /// The agent response is streamed via Tauri events on the "agent:event" channel.
+/// Returns the persisted user message id so the frontend can swap its
+/// optimistic bubble to the authoritative id immediately.
 #[tauri::command]
 #[instrument(skip(state, app_handle))]
 pub async fn agent_send_message(
@@ -1798,7 +1816,7 @@ pub async fn agent_send_message(
     session_id: String,
     content: String,
     attachments: Option<Vec<crate::ai::llm::ImageAttachment>>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     run_agent_turn(&state, &app_handle, session_id, content, attachments, None, None).await
 }
 

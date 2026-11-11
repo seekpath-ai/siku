@@ -728,7 +728,7 @@ async fn process_batch(
 
     let mut reply_row: Option<ReplyRow> = None;
     let reply = match result {
-        Ok(()) => match wait_for_new_reply(&db, &session_id, baseline).await {
+        Ok(_) => match wait_for_new_reply(&db, &session_id, baseline).await {
             Some(row) if !row.content.trim().is_empty() => {
                 reply_row = Some(row);
                 reply_row.as_ref().map(|r| r.content.clone()).unwrap_or_default()

@@ -82,8 +82,9 @@ function HeroInput() {
 /** Fire the hero input's queued first message (optimistic bubble + send). */
 async function sendFirstMessage(sessionId: string, text: string) {
   const store = useChatStore.getState();
+  const tempId = `user_${Date.now()}`;
   store.addMessage({
-    id: `user_${Date.now()}`,
+    id: tempId,
     session_id: sessionId,
     role: 'user',
     content: text,
@@ -101,7 +102,8 @@ async function sendFirstMessage(sessionId: string, text: string) {
   });
   store.setSessionLoading(sessionId, true);
   try {
-    await agentSendMessage(sessionId, text);
+    const userMessageId = await agentSendMessage(sessionId, text);
+    useChatStore.getState().swapMessageId(tempId, userMessageId);
   } catch (err) {
     const st = useChatStore.getState();
     st.setSessionLoading(sessionId, false);
@@ -253,18 +255,7 @@ export function ChatPanel() {
             if (cancelled) return;
             const cur = useChatStore.getState();
             if (cur.activeSessionId !== p.session_id) return;
-            const { merged, twinTempByDbId } = mergeMessages(cur.messages, page.messages);
-            // 孪生替换会保留临时气泡（含旧的「发送中」附件状态）——把事件
-            // 携带的落定附件补到临时气泡上，否则卡片不翻转。
-            const tempId = twinTempByDbId.get(p.message_id);
-            if (tempId) {
-              const i = merged.findIndex((m) => m.id === tempId);
-              if (i >= 0) merged[i] = { ...merged[i], attachments: p.attachments };
-            }
-            cur.setMessages(merged);
-            if (twinTempByDbId.size > 0) {
-              cur.mergeTwinTempIds(Object.fromEntries(twinTempByDbId));
-            }
+            cur.setMessages(mergeMessages(cur.messages, page.messages));
           })
           .catch(() => {});
       },

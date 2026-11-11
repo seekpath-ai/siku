@@ -172,7 +172,7 @@ pub async fn run(
                     None => summary,
                 };
                 let (title, body) = match &result {
-                    Ok(()) => ("定时任务完成".to_string(), body),
+                    Ok(_) => ("定时任务完成".to_string(), body),
                     Err(e) => {
                         tracing::error!(session_id = %sid, error = %e, "cron fire failed");
                         ("定时任务失败".to_string(), format!("{body}\n{e}"))

@@ -1,53 +1,30 @@
 import type { ChatMessage } from '@/lib/types';
 
-/** 本地乐观气泡的 id 前缀（DB 行的 uuid 永不以这些开头）。 */
+/** 本地乐观气泡的 id 前缀（DB 行的 uuid 永不以这些开头）。正常路径下
+ * 气泡在发送返回 / done 时已换成权威 id，临时 id 只剩持久化失败的兜底。 */
 export const isTempMessageId = (id: string) =>
   id.startsWith('user_') || id.startsWith('error_') || id.startsWith('assistant_');
 
-export interface MergeResult {
-  merged: ChatMessage[];
-  /** DB 消息 id → 沿用的临时 id（步骤等按 message_id 关联的数据要随它改挂）。 */
-  twinTempByDbId: Map<string, string>;
-}
-
-/** 把 DB 拉取的（部分）历史并入当前消息列表。
+/** 把 DB 拉取的（部分）历史并入当前消息列表，按 id 取并集。
  *
  * 规则：
- * - 已持久化的行原样保留；
- * - 页里的新行按 DB 顺序追加；与临时气泡内容一致的助手行在原位换用临时
- *   id（静默替换 —— id 是 React key，换 id 会让气泡卸载重挂、markdown 重
- *   渲染，是 done 时闪跳的主因）；用户行不做替换（纯文本重挂载无感知）；
- * - 没有 DB 孪生、内容也未出现在列表里的临时消息保留在队尾：任何一条
- *   消息都不能因为增量页缺口而凭空消失。内容已存在的临时消息视为孪生
- *   已并入（如 chat:message_updated 的整表替换竞态），丢弃以去重。
+ * - 已持久化的行原样保留（含发送返回 / done 时已换上权威 id 的气泡，
+ *   页里的同一行因此被跳过，不会重复也不会重挂载）；
+ * - 页里的新行按 DB 顺序并入；
+ * - 没有 DB 对应行、内容也未出现在列表里的临时消息保留兜底：任何一条
+ *   消息都不能因为增量页缺口而凭空消失。内容已存在的临时消息视为同一
+ *   行已并入（如发送返回前的抢先对齐），丢弃以去重；
+ * - 最终按 created_at 稳定排序归位（增量页的新行不一定晚于全部现有行：
+ *   远程回合的回复可能与本地刚并入的下一轮提问交错）。
  */
-export function mergeMessages(current: ChatMessage[], pageRows: ChatMessage[]): MergeResult {
+export function mergeMessages(current: ChatMessage[], pageRows: ChatMessage[]): ChatMessage[] {
   const persisted = current.filter((m) => !isTempMessageId(m.id));
   const known = new Set(persisted.map((m) => m.id));
-  const tempMessages = current.filter((m) => isTempMessageId(m.id));
-  const usedTempIds = new Set<string>();
-  const twinTempByDbId = new Map<string, string>();
-
-  const fresh = pageRows
-    .filter((m) => !known.has(m.id))
-    .map((m) => {
-      const twin = tempMessages.find(
-        (t) => !usedTempIds.has(t.id) && t.role === m.role && t.content === m.content,
-      );
-      if (!twin) return m;
-      usedTempIds.add(twin.id);
-      if (m.role === 'assistant') {
-        twinTempByDbId.set(m.id, twin.id);
-        return twin;
-      }
-      return m;
-    });
+  const fresh = pageRows.filter((m) => !known.has(m.id));
 
   const base = [...persisted, ...fresh];
-  const orphans = tempMessages.filter(
-    (t) =>
-      !usedTempIds.has(t.id) &&
-      !base.some((m) => m.role === t.role && m.content === t.content),
+  const orphans = current.filter(
+    (m) => isTempMessageId(m.id) && !base.some((b) => b.role === m.role && b.content === m.content),
   );
   if (orphans.some((t) => t.role === 'user')) {
     // 用户消息的 DB 行应当在页里（发送即持久化）。走到这里说明游标或
@@ -58,11 +35,7 @@ export function mergeMessages(current: ChatMessage[], pageRows: ChatMessage[]): 
       pageCount: pageRows.length,
     });
   }
-  // 孪生替换打破「fresh 必新于 persisted」的假设：回复的 DB 行因临时孪生
-  // 占位落在 fresh，而更晚的用户行可能已被 chat:message_updated 的合并抢
-  // 先并入 persisted —— 直接拼接会把回复排到下一轮提问之后。统一按
-  // created_at 稳定排序归位（同时间戳保持现有相对顺序）。
   const merged = [...base, ...orphans];
   merged.sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0));
-  return { merged, twinTempByDbId };
+  return merged;
 }

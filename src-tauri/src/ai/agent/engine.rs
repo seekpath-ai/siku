@@ -74,6 +74,12 @@ pub enum AgentEvent {
     Done {
         session_id: String,
         content: String,
+        /// The persisted assistant message id (authoritative: the frontend
+        /// builds its reply bubble with it instead of reconciling a local
+        /// temp id). Absent when the persist failed — the bubble then stays
+        /// a local-only fallback.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tokens_used: Option<i32>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,6 +96,9 @@ pub enum AgentEvent {
     Cancelled {
         session_id: String,
         content: String,
+        /// Same contract as `Done::id` (partial reply persisted on cancel).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tokens_used: Option<i32>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,6 +111,9 @@ pub enum AgentEvent {
     Error {
         session_id: String,
         content: String,
+        /// Same contract as `Done::id` (the ❌ row persisted for history).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
 }
 

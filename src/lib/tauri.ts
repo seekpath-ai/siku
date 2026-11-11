@@ -457,12 +457,14 @@ export async function petDomains(): Promise<PetDomainInfo[]> {
   return invoke<PetDomainInfo[]>('pet_domains');
 }
 
+/** Returns the persisted user message id — swap the optimistic bubble to
+ *  this authoritative id so later DB alignment matches rows by id. */
 export async function agentSendMessage(
   sessionId: string,
   content: string,
   attachments?: ChatAttachment[],
-): Promise<void> {
-  return invoke<void>('agent_send_message', { sessionId, content, attachments });
+): Promise<string> {
+  return invoke<string>('agent_send_message', { sessionId, content, attachments });
 }
 
 /** Tool-approval decision. "approve" accepts optional modifiedArgs (the tool

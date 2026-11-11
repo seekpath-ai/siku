@@ -221,7 +221,13 @@ export const usePetStore = create<PetState>((set, get) => ({
       pendingApproval: null, pendingQuestions: null, streamingSteps: [], currentStreamingStep: null, error: null,
     }));
     try {
-      await agentSendMessage(session.id, text, attachments);
+      const userMessageId = await agentSendMessage(session.id, text, attachments);
+      // 换上权威 id：done 后的历史重载按 id 命中同一行，气泡不再重挂载。
+      set((s) => ({
+        messages: s.messages.some((m) => m.id === userMessageId)
+          ? s.messages.filter((m) => m.id !== userMsg.id)
+          : s.messages.map((m) => (m.id === userMsg.id ? { ...m, id: userMessageId } : m)),
+      }));
     } catch (err) {
       console.error('pet send:', err);
       set({ streaming: false, error: err instanceof Error ? err.message : String(err) });

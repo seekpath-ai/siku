@@ -227,8 +227,9 @@ export function MessageInput({ disabled }: Props) {
     setLoading(true);
     resetHeight();
 
+    const tempId = `user_${Date.now()}`;
     addMessage({
-      id: `user_${Date.now()}`,
+      id: tempId,
       session_id: activeSessionId,
       role: 'user',
       content,
@@ -246,7 +247,8 @@ export function MessageInput({ disabled }: Props) {
     });
 
     try {
-      await agentSendMessage(activeSessionId, content, chatAttachments);
+      const userMessageId = await agentSendMessage(activeSessionId, content, chatAttachments);
+      useChatStore.getState().swapMessageId(tempId, userMessageId);
     } catch (err) {
       setLoading(false);
       addMessage({

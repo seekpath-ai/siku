@@ -39,11 +39,11 @@ export function useStreamingChat() {
   // Re-read the persisted history after a turn completes so the local view
   // matches the DB (same post-run alignment the pet panel already does).
   // Incremental against the paginated view: fetch only rows NEWER than the
-  // newest persisted message and append, dropping the optimistic temp
-  // bubbles (their ids are `user_*`/`assistant_*`/`error_*` locals, never
-  // persisted — note the done-handler's `assistant_<ts>` bubble MUST be
-  // excluded, otherwise its just-now timestamp becomes the after-cursor and
-  // hides the very rows we're fetching).
+  // newest persisted message and merge by id. Temp bubbles (`user_*` /
+  // `assistant_*` / `error_*` locals — only left when the backend could not
+  // persist) MUST stay excluded from the cursor, otherwise their just-now
+  // timestamp becomes the after-cursor and hides the very rows we're
+  // fetching.
   const reloadSessionHistory = useCallback((sessionId: string) => {
     const reload = async () => {
       const state = useChatStore.getState();
@@ -69,24 +69,15 @@ export function useStreamingChat() {
       // The user switched away meanwhile; that session's history is loaded
       // by ChatPanel when it becomes active again.
       if (state.activeSessionId !== sessionId) return;
-      const { merged, twinTempByDbId } = mergeMessages(state.messages, page.messages);
-      // 孪生映射跨 reload 累积：增量游标会越过旧轮次，只靠当前页现算会
-      // 丢旧映射，旧回复的推理步骤挂回真实 id 后找不到临时气泡而消失。
-      const twinAll = { ...state.twinTempByDbId, ...Object.fromEntries(twinTempByDbId) };
+      const merged = mergeMessages(state.messages, page.messages);
       const lastAssistant = [...merged].reverse().find((m) => m.role === 'assistant');
-      // 步骤的 message_id 随静默替换改挂临时 id，否则推理卡按真实 id
-      // 索引、气泡按临时 id 渲染，两边对不上而消失。
-      const linked = steps.map((s) => {
-        const tempId = s.message_id ? twinAll[s.message_id] : undefined;
-        if (tempId) return { ...s, message_id: tempId };
-        if (s.message_id === null && lastAssistant) return { ...s, message_id: lastAssistant.id };
-        return s;
-      });
+      // 气泡与步骤都以后端下发的权威 id 关联（done 携带、发送返回置换），
+      // 只剩历史遗留的未挂接步骤兜底到最后一条回复。
+      const linked = steps.map((s) =>
+        s.message_id === null && lastAssistant ? { ...s, message_id: lastAssistant.id } : s,
+      );
       state.setMessages(merged);
       state.setAgentSteps(linked);
-      if (twinTempByDbId.size > 0) {
-        state.mergeTwinTempIds(Object.fromEntries(twinTempByDbId));
-      }
     };
     (async () => {
       try {
@@ -236,7 +227,9 @@ export function useStreamingChat() {
           finalizeStep(currentStep.step_index);
         }
         const finalContent = e.content || state.streamContent;
-        const messageId = `assistant_${Date.now()}`;
+        // 权威 id 随 done 下发（持久化先于事件）；缺省（持久化失败）时回退
+        // 本地临时 id，由增量对齐的孤儿兜底保留。
+        const messageId = e.id || `assistant_${Date.now()}`;
         if (finalContent) {
           state.addMessage({
             id: messageId,
@@ -293,7 +286,7 @@ export function useStreamingChat() {
           finalizeStep(currentStep.step_index);
         }
         const finalContent = e.content || state.streamContent;
-        const messageId = `assistant_${Date.now()}`;
+        const messageId = e.id || `assistant_${Date.now()}`;
         if (finalContent) {
           state.addMessage({
             id: messageId,
@@ -333,7 +326,7 @@ export function useStreamingChat() {
         // instead of vanishing with the stream buffers.
         const partial = state.streamContent;
         const errText = `❌ ${e.content || 'Unknown error'}`;
-        const messageId = `error_${Date.now()}`;
+        const messageId = e.id || `error_${Date.now()}`;
         state.addMessage({
           id: messageId,
           session_id: e.session_id,

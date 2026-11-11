@@ -72,6 +72,9 @@ pub(crate) const CORE_SYNC_TABLES: &[&str] = &[
 pub(crate) const OPTIONAL_SYNC_TABLES: &[&str] = &[
     "chat_sessions",
     "chat_messages",
+    // 推理过程（ReAct 步骤）：chat_messages 只存最终回复，推理/工具调用在
+    // 这张表；不同步它，跨设备打开的会话会静默丢失推理过程。
+    "agent_steps",
     "settings",
     "remote_chats",
     "remote_msg_ids",
@@ -944,34 +947,83 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         }
     }
 
-    // Migration: agent_steps for ReAct iterations (added 2026-08-07)
+    // Migration: agent_steps for ReAct iterations (added 2026-08-07; rebuilt
+    // into the CRR-compatible shape 2026-11 so the reasoning process syncs
+    // with chat history). CRRs require a non-nullable PK and forbid checked
+    // FKs and NOT NULL columns without DEFAULT — the legacy shape had all
+    // three, so legacy tables are rebuilt below. Session deletion cascades
+    // explicitly in chat::delete_chat_session / agent session delete.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS agent_steps (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
-            message_id TEXT REFERENCES chat_messages(id) ON DELETE CASCADE,
-            step_index INTEGER NOT NULL,
+            id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            message_id TEXT,
+            step_index INTEGER NOT NULL DEFAULT 0,
             reasoning_content TEXT,
             tool_calls TEXT,
-            created_at TEXT NOT NULL
+            narration TEXT,
+            created_at TEXT NOT NULL DEFAULT ''
         )"
     )
     .execute(&db)
     .await?;
+    // Legacy DBs predate these columns; add them before the rebuild copies
+    // rows by name.
+    add_column_if_missing(&db, "agent_steps", "message_id", "TEXT")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for agent_steps.message_id: {}", e))?;
+    add_column_if_missing(&db, "agent_steps", "narration", "TEXT")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for agent_steps.narration: {}", e))?;
+    // Rebuild legacy tables (checked FKs / nullable PK). The table has never
+    // been a CRR, so rewriting the shape leaves no sync tombstones.
+    let steps_fk_count: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM pragma_foreign_key_list('agent_steps')")
+            .fetch_one(&db)
+            .await?;
+    let steps_id_not_null = {
+        let info = sqlx::query("PRAGMA table_info(agent_steps)")
+            .fetch_all(&db)
+            .await?;
+        info.iter().any(|r| {
+            r.try_get::<String, _>("name").map(|n| n == "id").unwrap_or(false)
+                && r.try_get::<i64, _>("notnull").unwrap_or(0) == 1
+        })
+    };
+    if steps_fk_count.0 > 0 || !steps_id_not_null {
+        info!("running migration: rebuild agent_steps to the CRR-compatible shape");
+        sqlx::query("ALTER TABLE agent_steps RENAME TO agent_steps_old")
+            .execute(&db)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE agent_steps (
+                id TEXT PRIMARY KEY NOT NULL,
+                session_id TEXT NOT NULL DEFAULT '',
+                message_id TEXT,
+                step_index INTEGER NOT NULL DEFAULT 0,
+                reasoning_content TEXT,
+                tool_calls TEXT,
+                narration TEXT,
+                created_at TEXT NOT NULL DEFAULT ''
+            )"
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_steps (id, session_id, message_id, step_index, reasoning_content, tool_calls, narration, created_at)
+             SELECT id, session_id, message_id, step_index, reasoning_content, tool_calls, narration, created_at
+             FROM agent_steps_old"
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query("DROP TABLE agent_steps_old").execute(&db).await?;
+    }
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_agent_steps_session ON agent_steps(session_id)")
         .execute(&db)
         .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_agent_steps_message ON agent_steps(message_id)")
         .execute(&db)
         .await?;
-    add_column_if_missing(&db, "agent_steps", "message_id", "TEXT REFERENCES chat_messages(id) ON DELETE CASCADE")
-        .await
-        .map_err(|e| anyhow::anyhow!("migration failed for agent_steps.message_id: {}", e))?;
-    // Migration: per-round narration (tool rounds' visible text lives on the
-    // step instead of inside the final reply), added 2026-11.
-    add_column_if_missing(&db, "agent_steps", "narration", "TEXT")
-        .await
-        .map_err(|e| anyhow::anyhow!("migration failed for agent_steps.narration: {}", e))?;
 
     // Migration: rebuild translation_cache into the CRR-compatible shape
     // (added 2026-11). The table joins OPTIONAL_SYNC_TABLES; CRRs require a

@@ -403,7 +403,7 @@ export function SyncSettings() {
         <div className="flex items-center text-sm text-text-primary">
           同步聊天记录
           <HintIcon>
-            启用后同步 chat_sessions、chat_messages、translation_cache（译文缓存，可跨设备复用）等可选表；含密钥的全局设置不参与同步。清空译文缓存会同步到所有设备。
+            启用后同步 chat_sessions、chat_messages、agent_steps（推理过程）、translation_cache（译文缓存，可跨设备复用）等可选表；含密钥的全局设置不参与同步。清空译文缓存会同步到所有设备。
           </HintIcon>
         </div>
         <button

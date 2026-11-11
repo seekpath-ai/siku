@@ -106,6 +106,12 @@ pub async fn delete_chat_session(
         .map_err(|e| format!("db error: {e}"))?;
 
     // CRR tables declare no checked FKs: cascade explicitly.
+    sqlx::query("DELETE FROM agent_steps WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
+
     crate::core::agent_memory_service::delete_for_session(&state.db, &session_id)
         .await
         .map_err(|e| format!("db error: {e}"))?;

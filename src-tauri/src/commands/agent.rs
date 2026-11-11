@@ -2164,6 +2164,9 @@ pub async fn agent_delete_session(
         .bind(&session_id)
         .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
     // CRR tables declare no checked FKs: cascade explicitly.
+    sqlx::query("DELETE FROM agent_steps WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
     crate::core::agent_memory_service::delete_for_session(&state.db, &session_id)
         .await.map_err(|e| format!("db: {e}"))?;
     sqlx::query("DELETE FROM chat_sessions WHERE id = ?")

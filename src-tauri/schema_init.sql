@@ -370,14 +370,17 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);
 
 -- agent_steps: one row per ReAct iteration (thought + tool_calls + observations)
+-- CRR 形状（在 OPTIONAL_SYNC_TABLES 中）：主键 NOT NULL、无受检外键、
+-- NOT NULL 列均带 DEFAULT；删除会话由删除路径显式级联。
 CREATE TABLE IF NOT EXISTS agent_steps (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
-    message_id TEXT REFERENCES chat_messages(id) ON DELETE CASCADE,
-    step_index INTEGER NOT NULL,
+    id TEXT PRIMARY KEY NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    message_id TEXT,
+    step_index INTEGER NOT NULL DEFAULT 0,
     reasoning_content TEXT,
     tool_calls TEXT,
-    created_at TEXT NOT NULL
+    narration TEXT,
+    created_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_agent_steps_session ON agent_steps(session_id);
 CREATE INDEX IF NOT EXISTS idx_agent_steps_message ON agent_steps(message_id);

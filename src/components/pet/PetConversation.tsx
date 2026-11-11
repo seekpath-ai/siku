@@ -4,7 +4,7 @@ import { emit } from '@/lib/events';
 import { CollapsibleText } from '@/components/ui/CollapsibleText';
 import { useSkillMention } from '@/components/chat/useSkillMention';
 import { useNavigate } from '@tanstack/react-router';
-import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, Paperclip, FileText, CheckCircle2, AlertCircle, Square, Eraser } from 'lucide-react';
+import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, Paperclip, FileText, FilePlus2, CheckCircle2, AlertCircle, Square, Eraser } from 'lucide-react';
 import { usePetStore } from '@/stores/petStore';
 import type { PetContext } from '@/stores/petContextStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
@@ -851,9 +851,10 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
       )}
       {/* File drop overlay — the listener is window-wide (useFileDrop). */}
       {isDragging && (
-        <div className="absolute inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-[1px] pointer-events-none">
-          <div className="rounded-lg border-2 border-dashed border-primary bg-surface px-5 py-3 text-primary text-[12px] font-medium">
-            松开以添加附件
+        <div className="absolute inset-0 z-50 bg-background/70 backdrop-blur-[1px] pointer-events-none p-2">
+          <div className="w-full h-full rounded-xl border-2 border-dashed border-primary/60 flex flex-col items-center justify-center gap-1.5">
+            <FilePlus2 size={20} className="text-primary" />
+            <div className="text-primary text-[12px] font-medium">松开以添加附件</div>
           </div>
         </div>
       )}

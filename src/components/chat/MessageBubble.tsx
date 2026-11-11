@@ -315,24 +315,23 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
       )}
 
       <div
-        className={`relative rounded-2xl px-4 py-2.5 text-[14px] leading-relaxed ${
+        className={
           isUser
-            ? 'inline-block text-left max-w-[85%] bg-codex-surface border border-codex-border text-codex-primary'
-            : // Assistant replies span the full content column so the bubble's
-              // edges align with the reasoning card above it (fixed reading
-              // column instead of width drifting with content length).
-              'w-full bg-codex-surface/60 border border-codex-border/60 text-codex-primary'
-        }`}
+            ? // User: tinted pill (ChatGPT-style), no border/tail — the bubble
+              // exists to let the user scan for their own turns. bg uses the
+              // hover token: codex-surface sits only ~Δ7 from codex-bg in
+              // every theme, too faint to read as a pill without a border.
+              'relative inline-block text-left max-w-[85%] rounded-2xl px-4 py-2.5 text-[14px] leading-relaxed bg-codex-hover text-codex-primary'
+            : // Assistant: plain full-width text column aligned with the
+              // reasoning card above (no bubble — content is the container).
+              'relative w-full text-[14px] leading-relaxed text-codex-primary'
+        }
       >
-        {/* WeChat-style tail pointing toward the user's avatar */}
-        {isUser && (
-          <span className="absolute -right-[7px] top-3 h-0 w-0 border-y-[6px] border-l-[8px] border-y-transparent border-l-codex-surface" />
-        )}
         {isUser ? (
           <>
             <CollapsibleText
               maxHeight={240}
-              gradientFrom="from-codex-surface"
+              gradientFrom="from-codex-hover"
               buttonClassName="mt-1 inline-flex items-center gap-0.5 text-[11px] text-codex-muted hover:text-codex-primary transition-colors"
             >
               <UserText content={message.content} />

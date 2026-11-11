@@ -91,7 +91,9 @@ function StreamingBubble() {
         )}
 
         {streamContent && (
-          <div className="mt-2 inline-block text-left max-w-[85%] rounded-2xl px-4 py-2.5 bg-codex-surface/60 border border-codex-border/60 text-[14px] leading-relaxed text-codex-primary">
+          // Same plain full-width column as the finished assistant bubble in
+          // MessageBubble — otherwise the reply visibly restyles on done.
+          <div className="mt-2 w-full text-[14px] leading-relaxed text-codex-primary">
             <StreamingContent content={streamContent} />
           </div>
         )}

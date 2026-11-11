@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Send, Paperclip, BookOpen, Brain, Square, X, FileText, Scissors } from 'lucide-react';
+import { Send, Paperclip, BookOpen, Brain, Square, X, FileText, FilePlus2, Scissors } from 'lucide-react';
 import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
 import { agentSendMessage, agentCancel, agentMemoryGet, agentGetSession, agentSetApprovalConfig } from '@/lib/tauri';
@@ -442,9 +442,11 @@ export function MessageInput({ disabled }: Props) {
         </div>
       </div>
       {isDragging && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-[1px] pointer-events-none">
-          <div className="rounded-xl border-2 border-dashed border-primary bg-surface px-8 py-6 text-primary text-sm font-medium">
-            松开以添加附件
+        <div className="fixed inset-0 z-50 bg-background/70 backdrop-blur-[1px] pointer-events-none p-4">
+          <div className="w-full h-full rounded-2xl border-2 border-dashed border-primary/60 flex flex-col items-center justify-center gap-3">
+            <FilePlus2 size={36} className="text-primary" />
+            <div className="text-primary text-[15px] font-medium">松开以添加附件</div>
+            <div className="text-text-secondary/70 text-[12px]">图片内联发送，文档提取文本后附加</div>
           </div>
         </div>
       )}

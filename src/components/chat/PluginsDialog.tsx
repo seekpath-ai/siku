@@ -28,7 +28,8 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [detail, setDetail] = useState<SkillDetail | null>(null);
-  const [detailLoading, setDetailLoading] = useState(false);
+  /** 正在加载详情的技能名（null = 无）：只让被点击的卡片显示加载圈。 */
+  const [detailLoading, setDetailLoading] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   /** pip 依赖一键安装进行中（详情弹窗内）。 */
   const [installingDeps, setInstallingDeps] = useState(false);
@@ -121,13 +122,13 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   }, [reviewing, load]);
 
   const openDetail = async (name: string) => {
-    setDetailLoading(true);
+    setDetailLoading(name);
     try {
       setDetail(await skillsGet(name));
     } catch (err) {
       setError(String(err));
     } finally {
-      setDetailLoading(false);
+      setDetailLoading(null);
     }
   };
 
@@ -407,7 +408,7 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
                               ) : (
                                 reviewBadge(s)
                               )}
-                              {detailLoading && <Loader2 size={11} className="animate-spin text-text-secondary/40" />}
+                              {detailLoading === s.name && <Loader2 size={11} className="animate-spin text-text-secondary/40" />}
                             </div>
                             <p className="text-[11px] text-text-secondary leading-relaxed line-clamp-2">
                               {s.description || '（无描述）'}

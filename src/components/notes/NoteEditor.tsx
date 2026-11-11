@@ -972,7 +972,8 @@ export function NoteEditor({ note, notes, onUpdate, onUpdateAliases, onNavigate,
                     const ok = await confirm(
                       childCount > 0
                         ? `确定删除文件夹「${note.title}」吗？其中的 ${childCount} 个子项将一并删除，此操作不可撤销。`
-                        : `确定删除笔记「${note.title}」吗？此操作不可撤销。`
+                        : `确定删除笔记「${note.title}」吗？此操作不可撤销。`,
+                      { danger: true }
                     );
                     if (ok) onDelete?.(note.id, true);
                   }}

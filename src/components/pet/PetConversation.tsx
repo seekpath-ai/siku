@@ -336,7 +336,7 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
     if (!store.session || store.streaming) return;
     const ok = await confirm(
       '清空当前会话的全部对话记录？此操作不可恢复，下次打开将开始新会话。',
-      '清空会话记录'
+      { title: '清空会话记录', danger: true }
     );
     if (!ok) return;
     const sessionId = store.session.id;

@@ -129,7 +129,7 @@ export function LlmProviderSettings() {
   };
 
   const handleDelete = async (p: LlmProvider) => {
-    const ok = await confirm(`确定删除「${p.name}」？`, '删除提供商');
+    const ok = await confirm(`确定删除「${p.name}」？`, { title: '删除提供商', danger: true });
     if (!ok) return;
     try {
       await llmProviderDelete(p.id);

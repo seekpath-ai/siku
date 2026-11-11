@@ -48,7 +48,7 @@ export function VaultSwitcher({ vaults, currentVaultId, onSwitch, onCreate, onRe
   };
 
   const handleDelete = async (v: Vault) => {
-    const ok = await confirm(`确定删除库「${v.name}」吗？库中的所有笔记将一并删除，此操作不可撤销。`);
+    const ok = await confirm(`确定删除库「${v.name}」吗？库中的所有笔记将一并删除，此操作不可撤销。`, { danger: true });
     if (ok) onDelete(v.id);
   };
 

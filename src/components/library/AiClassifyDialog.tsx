@@ -494,7 +494,7 @@ export function AiClassifyDialog() {
     const subtree = [path, ...node.children.map((c) => `${path}/${c.name.trim()}`)];
     const affected = itemsRef.current.filter((it) => it.labels.some((l) => subtree.includes(l)));
     if (
-      !(await confirm(`删除类目「${path}」？其中 ${affected.length} 篇文献的相关归属会变为待定。`))
+      !(await confirm(`删除类目「${path}」？其中 ${affected.length} 篇文献的相关归属会变为待定。`, { danger: true }))
     )
       return;
     const next =
@@ -703,7 +703,8 @@ export function AiClassifyDialog() {
     if (!id) return;
     if (
       !(await confirm(
-        '撤销本次分类？本轮新建的类目与全部归属都会被移除（其他轮次和手动整理的保持不变）。'
+        '撤销本次分类？本轮新建的类目与全部归属都会被移除（其他轮次和手动整理的保持不变）。',
+        { danger: true }
       ))
     )
       return;

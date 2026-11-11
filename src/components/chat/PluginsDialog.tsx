@@ -187,7 +187,7 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   const removeSkill = async (name: string) => {
     const ok = await confirm(
       `删除技能「${name}」？其目录将被移除；挂载了它的会话下一轮起不再看到该技能。`,
-      '删除技能'
+      { title: '删除技能', danger: true }
     );
     if (!ok) return;
     try {

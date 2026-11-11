@@ -538,7 +538,7 @@ export function AgentList() {
     const project = projects.find((p) => p.id === id);
     const ok = await confirm(
       `删除项目「${project?.name ?? ''}」？项目下的对话会保留（变为无项目）。`,
-      '删除项目'
+      { title: '删除项目', danger: true }
     );
     if (ok) await removeProject(id);
   };
@@ -598,7 +598,7 @@ export function AgentList() {
     const session = sessions.find((s) => s.id === id);
     const ok = await confirm(
       `删除对话「${session?.title ?? ''}」？对话记录将被永久删除，无法恢复。`,
-      '删除对话'
+      { title: '删除对话', danger: true }
     );
     if (!ok) return;
     try {

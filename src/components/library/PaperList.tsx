@@ -1036,7 +1036,7 @@ export function PaperList() {
         ids.length > 1
           ? `永久删除后不可恢复（附件、笔记、标注一并删除），确定删除选中的 ${ids.length} 篇文献？`
           : '永久删除后不可恢复（附件、笔记、标注一并删除），确定？',
-        '永久删除'
+        { title: '永久删除', danger: true }
       );
       if (!ok) return;
       for (const id of ids) purgeMutation.mutate(id);

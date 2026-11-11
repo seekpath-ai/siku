@@ -341,7 +341,7 @@ export function AiTableDialog() {
   const deletePreset = async () => {
     if (!selectedPreset) return;
     const p = presets.find((x) => x.id === selectedPreset);
-    if (!p || !(await confirm(`删除模板「${p.name}」？`))) return;
+    if (!p || !(await confirm(`删除模板「${p.name}」？`, { danger: true }))) return;
     try {
       await aiTablePresetDelete(selectedPreset);
       setPresets(await aiTablePresetsList());

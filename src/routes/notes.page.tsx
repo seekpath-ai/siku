@@ -418,7 +418,8 @@ export function NotesPage() {
       const ok = await confirm(
         childCount > 0
           ? `确定删除文件夹「${target?.title ?? ''}」吗？其中的 ${childCount} 个子项将一并删除，此操作不可撤销。`
-          : `确定删除「${target?.title ?? ''}」吗？此操作不可撤销。`
+          : `确定删除「${target?.title ?? ''}」吗？此操作不可撤销。`,
+        { danger: true }
       );
       if (!ok) return;
     }
@@ -450,7 +451,8 @@ export function NotesPage() {
     const ok = await confirm(
       all.size > ids.length
         ? `确定删除选中的 ${ids.length} 项吗？连同子项共 ${all.size} 个对象将被删除，此操作不可撤销。`
-        : `确定删除选中的 ${ids.length} 项吗？此操作不可撤销。`
+        : `确定删除选中的 ${ids.length} 项吗？此操作不可撤销。`,
+      { danger: true }
     );
     if (!ok) return;
     try {
@@ -575,7 +577,7 @@ export function NotesPage() {
 
   const handleFileDelete = async (id: string) => {
     const target = files.find((f) => f.id === id);
-    const ok = await confirm(`确定删除「${target?.name ?? ''}」吗？此操作不可撤销。`);
+    const ok = await confirm(`确定删除「${target?.name ?? ''}」吗？此操作不可撤销。`, { danger: true });
     if (!ok) return;
     try {
       await filesDelete(id);

@@ -206,7 +206,7 @@ function CollectionTreeItem({
       icon: <Trash2 size={14} />,
       destructive: true,
       onClick: async () => {
-        const ok = await confirm(`确认删除集合 "${node.collection.name}"？其中的文献不会被删除。`, '删除集合');
+        const ok = await confirm(`确认删除集合 "${node.collection.name}"？其中的文献不会被删除。`, { title: '删除集合', danger: true });
         if (ok) {
           deleteMutation.mutate(node.collection.id);
         }
@@ -692,7 +692,7 @@ export function CollectionTree() {
               icon: <Trash2 size={14} />,
               destructive: true,
               onClick: async () => {
-                const ok = await confirm(`确认删除标签 "${tagMenu.tag.name}"？`, '删除标签');
+                const ok = await confirm(`确认删除标签 "${tagMenu.tag.name}"？`, { title: '删除标签', danger: true });
                 if (ok) {
                   deleteTag.mutate(tagMenu.tag.id);
                 }

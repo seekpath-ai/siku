@@ -207,13 +207,11 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
 
   const handleClearWorkspace = async () => {
     if (!workspacePath) return;
-    if (
-      !window.confirm(
-        `清空该会话工作区？\n\n${workspacePath}\n\n其中的文件会被永久删除，无法恢复。`
-      )
-    ) {
-      return;
-    }
+    const ok = await useDialogStore.getState().confirm(
+      `清空该会话工作区？\n\n${workspacePath}\n\n其中的文件会被永久删除，无法恢复。`,
+      { title: '清空工作区', danger: true }
+    );
+    if (!ok) return;
     try {
       await agentSessionWorkspaceClear(agent.id);
     } catch (err) {

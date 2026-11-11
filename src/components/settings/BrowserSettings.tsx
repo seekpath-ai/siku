@@ -109,7 +109,7 @@ export function BrowserSettings() {
   const resetProfile = useCallback(async () => {
     const ok = await confirm(
       '将删除自动化浏览器的全部数据（登录态、扩展、缓存），下次使用需要重新登录。这个操作不可撤销。',
-      '重置浏览器配置',
+      { title: '重置浏览器配置', danger: true },
     );
     if (!ok) return;
     try {

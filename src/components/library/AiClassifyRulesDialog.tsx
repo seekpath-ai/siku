@@ -123,7 +123,7 @@ export function AiClassifyRulesDialog() {
   };
 
   const remove = async (rule: ClassifyRule) => {
-    if (!(await confirm(`删除规则「${rule.name}」？已写入的分类不受影响。`))) return;
+    if (!(await confirm(`删除规则「${rule.name}」？已写入的分类不受影响。`, { danger: true }))) return;
     setBusyId(rule.id);
     try {
       await aiClassifyRuleDelete(rule.id);

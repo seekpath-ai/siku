@@ -34,7 +34,7 @@ pub async fn skills_get(state: State<'_, AppState>, name: String) -> Result<Skil
         SkillSource::Builtin => None,
         SkillSource::User => skill_review::get_review(&state.db, &name).await,
     };
-    let dependencies = skills::probe_dependencies(&skill.requires);
+    let dependencies = skills::probe_dependencies(&state.app_data_dir, &skill.requires);
     Ok(SkillDetail {
         name: skill.name,
         description: skill.description,
@@ -101,10 +101,17 @@ pub async fn skills_delete(state: State<'_, AppState>, name: String) -> Result<(
     Ok(())
 }
 
-/// Install the given pip packages with `python -m pip install --user`
-/// (no admin rights needed). Returns a short success line for display.
+/// 安装 pip 依赖到应用托管的隔离 conda 环境（siku-office）：环境已存在则
+/// 只补装缺失包；没有环境则创建；连 conda 都没有则先下载 Miniconda 静默
+/// 安装到应用数据目录（不写 PATH、不注册系统 Python）。整个过程不触碰
+/// 用户本机的 Python 环境。进度经 `skills:env-install` 事件推给前端。
+/// 返回给用户的简短结果说明。
 #[tauri::command]
-pub async fn skills_install_pip(packages: Vec<String>) -> Result<String, String> {
+pub async fn skills_env_install(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    packages: Vec<String>,
+) -> Result<String, String> {
     if packages.is_empty() {
         return Err("没有需要安装的依赖包".to_string());
     }
@@ -118,28 +125,16 @@ pub async fn skills_install_pip(packages: Vec<String>) -> Result<String, String>
     if !packages.iter().all(|p| legal(p)) {
         return Err("依赖包名包含非法字符".to_string());
     }
-    tokio::task::spawn_blocking(move || {
-        // python3 first, then python（Windows 通常只有后者）。
-        let python = ["python3", "python"]
-            .into_iter()
-            .find(|cmd| crate::core::skill_review::binary_available(cmd))
-            .ok_or_else(|| "未检测到 python3/python，请先安装 Python 3".to_string())?;
-        let output = crate::core::process::no_window(&mut std::process::Command::new(python))
-            .args(["-m", "pip", "install", "--user"])
-            .args(&packages)
-            .output()
-            .map_err(|e| format!("启动 pip 失败：{e}"))?;
-        let mut log = String::from_utf8_lossy(&output.stdout).to_string();
-        log.push_str(&String::from_utf8_lossy(&output.stderr));
-        if !output.status.success() {
-            let tail: String =
-                log.chars().rev().take(800).collect::<String>().chars().rev().collect();
-            return Err(format!("pip 安装失败：\n{tail}"));
-        }
-        Ok(format!("已通过 {python} 安装：{}", packages.join("、")))
-    })
-    .await
-    .map_err(|e| format!("安装任务失败：{e}"))?
+    use tauri::Emitter;
+    let cb: crate::core::skill_env::ProgressFn = Box::new(move |msg: &str| {
+        let _ = app_handle.emit("skills:env-install", serde_json::json!({ "message": msg }));
+    });
+    let python = crate::core::skill_env::ensure_env(&state.app_data_dir, &packages, Some(&cb)).await?;
+    Ok(format!(
+        "隔离环境已就绪（{}）：{}",
+        python.display(),
+        packages.join("、")
+    ))
 }
 
 /// Result of `skills_review_start`: the reviewer session to display plus the

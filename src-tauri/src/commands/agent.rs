@@ -1217,7 +1217,35 @@ pub(crate) async fn run_agent_turn(
         set.into_iter().collect()
     });
     registry.retain(merged_tools.as_deref());
-    registry.register_skills(all_skills, &selected_skills);
+
+    // 声明了 pip 依赖的技能（办公三件套）跑在隔离 conda 环境里：探测一次
+    // 随技能内容注入；环境未就绪时额外注册 skill_env_setup 安装工具
+    // （retain 之后注册，会话白名单不会把它过滤掉）。
+    let mounted_pip_packages: Vec<String> = {
+        let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for s in &all_skills {
+            if selected_skills.contains(&s.name) {
+                set.extend(s.requires.pip.iter().cloned());
+            }
+        }
+        let mut v: Vec<String> = set.into_iter().collect();
+        v.sort();
+        v
+    };
+    let skill_env = if mounted_pip_packages.is_empty() {
+        None
+    } else {
+        Some(crate::core::skill_env::resolve(&state.app_data_dir))
+    };
+    registry.register_skills(all_skills, &selected_skills, skill_env.as_ref());
+    if !mounted_pip_packages.is_empty() {
+        // 始终注册（不止未就绪时）：环境就绪但缺包（用户动过环境）时模型可以
+        // 调用它自愈补装；就绪态调用只是秒级的幂等补装。
+        registry.register(crate::ai::agent::tools::skill_env::SkillEnvSetupTool::new(
+            state.app_data_dir.clone(),
+            mounted_pip_packages,
+        ));
+    }
 
     // Outbound file sending (docs/remote-channels.md §7). The tool is
     // registered for EVERY remote turn — even when sending is not allowed —

@@ -6,7 +6,7 @@ import {
 import {
   skillsList, skillsGet, skillsImportFolder, skillsImportZip, skillsDelete,
   skillsOpenDirectory, agentSetSessionSkills, skillsReviewStart, skillsReviewCollect,
-  skillsInstallPip,
+  skillsEnvInstall,
   type SkillInfo, type SkillDetail,
 } from '@/lib/tauri';
 import type { AgentStreamEvent } from '@/lib/types';
@@ -31,6 +31,8 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   /** pip 依赖一键安装进行中（详情弹窗内）。 */
   const [installingDeps, setInstallingDeps] = useState(false);
+  /** 隔离环境安装的当前进度行（skills:env-install 事件推送）。 */
+  const [installProgress, setInstallProgress] = useState<string | null>(null);
   /** skill name → reviewer session id for in-flight AI reviews. */
   const [reviewing, setReviewing] = useState<Map<string, string>>(new Map());
   const { sessions, activeSessionId, setSessions } = useChatStore();
@@ -214,21 +216,30 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   const builtinSkills = filtered.filter((s) => s.source === 'builtin');
   const userSkills = filtered.filter((s) => s.source !== 'builtin');
 
-  /** 安装详情里缺失的 pip 依赖，然后刷新探测结果。 */
+  /** 安装缺失的 pip 依赖到应用托管的隔离 conda 环境（不碰系统 Python），
+   *  然后刷新探测结果。 */
   const installMissingDeps = async (detail: SkillDetail) => {
     const missing = detail.dependencies
       .filter((d) => d.kind === 'pip' && !d.available)
       .map((d) => d.name);
     if (missing.length === 0 || installingDeps) return;
     setInstallingDeps(true);
+    setInstallProgress(null);
+    // 下载 + 建环境要数分钟：订阅后端进度事件，按钮下方滚动显示当前阶段。
+    const { listen } = await import('@tauri-apps/api/event');
+    const unlisten = await listen<{ message: string }>('skills:env-install', (e) => {
+      setInstallProgress(e.payload.message);
+    });
     try {
-      const msg = await skillsInstallPip(missing);
+      const msg = await skillsEnvInstall(missing);
       await alert(msg, '安装依赖');
       await openDetail(detail.name);
     } catch (err) {
       setError(String(err));
     } finally {
+      unlisten();
       setInstallingDeps(false);
+      setInstallProgress(null);
     }
   };
 
@@ -473,10 +484,15 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
                         className="ml-auto flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] bg-primary/10 text-primary hover:bg-primary/20 transition-colors disabled:opacity-50"
                       >
                         {installingDeps && <Loader2 size={11} className="animate-spin" />}
-                        一键安装缺失依赖
+                        安装隔离环境依赖
                       </button>
                     )}
                   </div>
+                  {installingDeps && (
+                    <p className="text-[10px] text-primary/70 leading-relaxed">
+                      {installProgress ?? '正在准备…'}（首次需下载并安装 Miniconda，可能持续数分钟，请保持窗口打开）
+                    </p>
+                  )}
                   <div className="text-[11px] text-text-secondary">
                     {detail.dependencies.map((d) => (
                       <span
@@ -484,18 +500,22 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
                         className={`inline-block mr-1.5 px-1 rounded ${
                           d.available ? 'text-emerald-400/80' : 'text-red-400'
                         }`}
-                        title={d.kind === 'binary' ? '系统程序' : 'Python 包'}
+                        title={
+                          d.kind === 'binary'
+                            ? '系统程序'
+                            : `Python 包（隔离环境 siku-office）${d.hint ? `：${d.hint}` : ''}`
+                        }
                       >
                         {d.name}
                         {d.available ? '✓' : '✗'}
                       </span>
                     ))}
                   </div>
-                  {detail.dependencies.some((d) => d.kind === 'binary' && !d.available) && (
-                    <p className="text-[10px] text-text-secondary/50 leading-relaxed">
-                      缺失的系统程序需手动安装（soffice 来自 LibreOffice）；pip 包可用上方按钮一键安装。
-                    </p>
-                  )}
+                  <p className="text-[10px] text-text-secondary/50 leading-relaxed">
+                    pip 包安装在应用托管的隔离 conda 环境（siku-office），不影响系统 Python。
+                    {detail.dependencies.some((d) => d.kind === 'binary' && !d.available) &&
+                      ' 缺失的系统程序需手动安装（soffice 来自 LibreOffice）。'}
+                  </p>
                 </div>
               )}
               {detail.review && (

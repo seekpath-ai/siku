@@ -494,11 +494,17 @@ pub struct DepStatus {
     pub kind: String,
     pub name: String,
     pub available: bool,
+    /// 缺失时的补充指引（如 pip 依赖所在的隔离环境状态）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 /// Probe a skill's declared dependencies (process spawns — call from the
 /// detail dialog, not the list path).
-pub fn probe_dependencies(requires: &SkillRequires) -> Vec<DepStatus> {
+///
+/// pip 依赖探测的是隔离 conda 环境（siku-office），不是系统 Python——技能
+/// 脚本只在隔离环境里跑，系统环境装没装与可用性无关。
+pub fn probe_dependencies(app_data_dir: &Path, requires: &SkillRequires) -> Vec<DepStatus> {
     let mut out = Vec::new();
     if requires.is_empty() {
         return out;
@@ -508,16 +514,32 @@ pub fn probe_dependencies(requires: &SkillRequires) -> Vec<DepStatus> {
             kind: "binary".to_string(),
             name: b.clone(),
             available: crate::core::skill_review::binary_available(b),
+            hint: None,
         });
     }
-    for p in &requires.pip {
-        out.push(DepStatus {
-            kind: "pip".to_string(),
-            name: p.clone(),
-            available: crate::core::skill_review::python_module_available(
-                &crate::core::skill_review::pip_to_module(p),
-            ),
-        });
+    if !requires.pip.is_empty() {
+        let env = crate::core::skill_env::resolve(app_data_dir);
+        let missing_hint = if env.python.is_some() {
+            None
+        } else if env.conda.is_some() {
+            Some("隔离环境 siku-office 尚未创建".to_string())
+        } else {
+            Some("隔离环境 siku-office 尚未安装（将先装 Miniconda）".to_string())
+        };
+        for p in &requires.pip {
+            let module = crate::core::skill_review::pip_to_module(p);
+            let available = env
+                .python
+                .as_deref()
+                .map(|py| crate::core::skill_env::python_module_available_in(py, &module))
+                .unwrap_or(false);
+            out.push(DepStatus {
+                kind: "pip".to_string(),
+                name: p.clone(),
+                available,
+                hint: if available { None } else { missing_hint.clone() },
+            });
+        }
     }
     out
 }

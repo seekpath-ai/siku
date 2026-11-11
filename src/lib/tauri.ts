@@ -910,10 +910,12 @@ export interface SkillInfo {
 }
 
 export interface SkillDepStatus {
-  /** `binary`（系统程序）或 `pip`（Python 包）。 */
+  /** `binary`（系统程序）或 `pip`（Python 包，探测的是隔离环境 siku-office）。 */
   kind: string;
   name: string;
   available: boolean;
+  /** 缺失时的补充指引（隔离环境状态）。 */
+  hint?: string | null;
 }
 
 export interface SkillDetail {
@@ -941,8 +943,11 @@ export async function skillsGet(name: string): Promise<SkillDetail> {
 }
 
 /** pip install --user 一组依赖包，返回安装结果说明。 */
-export async function skillsInstallPip(packages: string[]): Promise<string> {
-  return invoke<string>('skills_install_pip', { packages });
+/** 安装 pip 依赖到应用托管的隔离 conda 环境（siku-office）：没有环境则创建，
+ *  没有 conda 则先下载 Miniconda 静默安装到应用数据目录（不碰系统 Python）。
+ *  进度经 `skills:env-install` 事件推送。 */
+export async function skillsEnvInstall(packages: string[]): Promise<string> {
+  return invoke<string>('skills_env_install', { packages });
 }
 
 /** Static scan report (deterministic, pre-LLM). */

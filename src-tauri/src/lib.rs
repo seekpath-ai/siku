@@ -997,7 +997,7 @@ pub fn run() {
             commands::skills::skills_import_folder,
             commands::skills::skills_import_zip,
             commands::skills::skills_delete,
-            commands::skills::skills_install_pip,
+            commands::skills::skills_env_install,
             commands::skills::skills_review_start,
             commands::skills::skills_review_collect,
             commands::skills::skills_open_directory,

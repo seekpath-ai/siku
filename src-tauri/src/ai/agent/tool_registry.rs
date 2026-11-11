@@ -37,6 +37,12 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Per-tool execution timeout (seconds). Most tools fit the default;
+    /// long installers (e.g. skill_env_setup downloading Miniconda) override it.
+    fn timeout_secs(&self) -> u64 {
+        320
+    }
+
     /// Execute the tool with the given arguments (as JSON Value).
     /// The registry injects `_working_dir` into args before dispatch.
     async fn execute(&self, args: serde_json::Value) -> Result<String, String>;
@@ -194,6 +200,11 @@ impl ToolRegistry {
             .unwrap_or(false)
     }
 
+    /// A tool's execution timeout (seconds); defaults to 320 when unknown.
+    pub fn timeout_secs(&self, name: &str) -> u64 {
+        self.tools.get(name).map(|t| t.timeout_secs()).unwrap_or(320)
+    }
+
     /// Keep only tools whose names are in `allowed`. `None` (the column was
     /// NULL or unparsable) keeps every tool — the backward-compatible default.
     /// `Some([])` keeps NOTHING: an explicitly empty list means "no tools".
@@ -219,17 +230,20 @@ impl ToolRegistry {
     /// tool-permission union). Only names in `selected` register — unmounted
     /// skills stay invisible to the model, so their descriptions cost no
     /// context. Call AFTER `retain` so mounted skills are always available.
+    /// `env` 是技能隔离 Python 环境的探测快照，随技能内容注入（声明了 pip
+    /// 依赖的技能据此告诉模型用哪个解释器 / 如何安装）。
     pub fn register_skills(
         &mut self,
         skills: Vec<crate::core::skills::Skill>,
         selected: &std::collections::HashSet<String>,
+        env: Option<&crate::core::skill_env::SkillEnv>,
     ) {
         if selected.is_empty() {
             return;
         }
         for skill in skills {
             if selected.contains(&skill.name) {
-                self.register(crate::ai::agent::tools::skill::SkillTool::new(skill));
+                self.register(crate::ai::agent::tools::skill::SkillTool::new(skill, env.cloned()));
             }
         }
     }

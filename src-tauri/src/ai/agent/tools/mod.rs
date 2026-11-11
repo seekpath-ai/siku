@@ -22,6 +22,7 @@ pub mod bash;
 pub mod tasks;
 pub mod ask_user;
 pub mod skill;
+pub mod skill_env;
 pub mod read_media_file;
 pub mod send_file_to_user;
 pub mod path;

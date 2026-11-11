@@ -2,7 +2,7 @@
 name: pptx
 description: 创建专业演示文稿（.pptx）。适合学术汇报、商务提案、讨论分享等场合。内置排版设计规范（字号、字体、行距、信息密度），产出可直接使用。当用户要求做 PPT、幻灯片、演示文稿时使用。
 requires:
-  binaries: [python3, soffice]
+  binaries: [soffice]
   pip: [python-pptx, pypdfium2]
 tools: [bash, file_write, file_read]
 ---
@@ -11,14 +11,25 @@ tools: [bash, file_write, file_read]
 
 用 `scripts/build_deck.py` 从 JSON 大纲生成 .pptx。**不要**自己用 python-pptx 从零写排版代码——设计规范已固化在脚本里，绕过它就放弃了质量保障。
 
+## 运行环境（先读）
+
+技能内容末尾附有「运行环境」块，两种状态：
+
+- **已就绪**：块里给出隔离环境的 Python 解释器绝对路径。下文所有 `python` 命令都换成这个路径执行。**禁止**使用系统 python3/python，**禁止**用 pip 往系统环境安装任何包。
+- **未就绪**：调用 `skill_env_setup` 工具自动安装（Miniconda + 依赖，不改动用户系统 Python，首次约需 3-10 分钟），装完用工具返回的解释器路径继续。安装失败或被拒绝时，告知用户也可在「插件 → 技能详情」里手动安装。
+
 ## 工作流程
 
-### 1. 确认场景与主题
+### 1. 确认场景与主题（必须先问，禁止猜测）
 
-先确定两个参数；用户没说就根据用途判断，拿不准就问一句：
+**用户没有明确说明场景或主题时，必须先调用 AskUserQuestion 工具询问，等用户选择后再继续。不要根据上下文自行推断，不要用默认值直接开工。**
+
+只有用户消息里已经明确写出（如「做一个学术汇报 PPT」「用于线上会议分享」「答辩用」）才可跳过对应问题的提问。「帮我做个 PPT」「把这篇文献做成幻灯片」这类说法**不算**明确，必须问。
+
+用 AskUserQuestion 一次问两项：
 
 - **场景**（决定字号体系，见 `references/design-tokens.md`）：
-  - `presentation` 普通教室/会议室演讲（默认）
+  - `presentation` 普通教室/会议室演讲（推荐默认项）
   - `hall` 大会场/礼堂
   - `online` 小屏幕/线上会议
   - `reading` 阅读型/打印型（不发演讲、供人自己看）
@@ -46,7 +57,7 @@ tools: [bash, file_write, file_read]
 ### 4. 生成
 
 ```bash
-python3 scripts/build_deck.py deck.json
+<运行环境块给出的 Python 解释器> scripts/build_deck.py deck.json
 ```
 
 脚本会**校验并拒绝**违反设计规范的内容（字号低于场景下限、要点过多、字段缺失），报错信息会告诉你怎么改；修正后重跑。生成成功输出 .pptx 的绝对路径。
@@ -54,7 +65,7 @@ python3 scripts/build_deck.py deck.json
 ### 5. 视觉自检（有 LibreOffice 时必做）
 
 ```bash
-python3 scripts/render_preview.py <产出.pptx>
+<运行环境块给出的 Python 解释器> scripts/render_preview.py <产出.pptx>
 ```
 
 它把每页渲染成 PNG（依赖 soffice + pypdfium2）。用 read_media_file **逐页查看**，检查：

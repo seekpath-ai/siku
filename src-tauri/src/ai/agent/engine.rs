@@ -1118,7 +1118,9 @@ impl AgentEngine {
                             async move {
                                 let start = std::time::Instant::now();
                                 let result = tokio::time::timeout(
-                                    std::time::Duration::from_secs(320),
+                                    std::time::Duration::from_secs(
+                                        self.tool_registry.timeout_secs(&tc.function.name),
+                                    ),
                                     self.tool_registry.execute(&tc.function.name, args.clone()),
                                 )
                                 .await;
@@ -1442,8 +1444,8 @@ impl AgentEngine {
                 }
 
                 let start = std::time::Instant::now();
-                // Allow long-running tools (e.g. bash up to 5min), but abort
-                // promptly when the user hits stop.
+                // Allow long-running tools (bash、技能环境安装等按 Tool::timeout_secs
+                // 自定上限，默认 320s), but abort promptly when the user hits stop.
                 let result = tokio::select! {
                     biased;
                     _ = self.cancel_token.cancelled() => {
@@ -1452,7 +1454,7 @@ impl AgentEngine {
                         break;
                     }
                     result = tokio::time::timeout(
-                        std::time::Duration::from_secs(320),
+                        std::time::Duration::from_secs(self.tool_registry.timeout_secs(&tc.function.name)),
                         self.tool_registry.execute(&tc.function.name, args.clone()),
                     ) => result,
                 };

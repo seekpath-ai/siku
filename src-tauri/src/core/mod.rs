@@ -40,6 +40,7 @@ pub mod review_sources;
 pub mod review_store;
 pub mod search_service;
 pub mod settings_service;
+pub mod skill_env;
 pub mod skill_review;
 pub mod skills;
 pub mod tag_service;

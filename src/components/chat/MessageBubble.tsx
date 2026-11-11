@@ -5,7 +5,8 @@ import type { AgentStep, ChatMessage } from '@/lib/types';
 import { parseToolCalls, stepsToPhases } from '@/lib/agentPhases';
 import { parseAttachments, isInlineImage, isOutboundFile } from '@/lib/attachments';
 import { FileAttachmentCard } from './FileAttachmentCard';
-import { useActiveAgentName } from '@/hooks/useActiveAgentName';
+import { AgentAvatar } from './AgentAvatar';
+import { useActiveAgentIdentity } from '@/hooks/useActiveAgentName';
 import { chatMessageTag, saveTextFile, agentGetTurnContext } from '@/lib/tauri';
 import { buildTurnMarkdown, turnExportFileName, type TurnContextSnapshot } from '@/lib/exportTurn';
 import { ExportTurnDialog } from './ExportTurnDialog';
@@ -132,7 +133,7 @@ function UserText({ content }: { content: string }) {
 // (message object, steps array from the memoized map) are referentially
 // stable, so history bubbles skip those renders entirely.
 function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlighted = false, collapseCardOnMount = false }: Props) {
-  const agentName = useActiveAgentName();
+  const { name: agentName, color: agentColor } = useActiveAgentIdentity();
   const [copied, setCopied] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
@@ -248,21 +249,19 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
     }
   };
 
-  const avatar = (
+  const avatar = isUser ? (
     <div
-      onContextMenu={isUser ? (e) => {
+      onContextMenu={(e) => {
         e.preventDefault();
         setCtxMenu({ x: e.clientX, y: e.clientY });
-      } : undefined}
-      title={isUser ? '右键查看本轮上下文' : undefined}
-      className={`w-8 h-8 rounded-full shrink-0 flex items-center justify-center text-[14px] font-semibold ${
-        isUser
-          ? 'bg-codex-surface border border-codex-border text-codex-primary cursor-context-menu'
-          : 'bg-gradient-to-br from-codex-accent to-emerald-700 text-black'
-      }`}
+      }}
+      title="右键查看本轮上下文"
+      className="w-8 h-8 rounded-full shrink-0 flex items-center justify-center text-[14px] font-semibold bg-codex-surface border border-codex-border text-codex-primary cursor-context-menu"
     >
-      {isUser ? <User size={16} /> : 'S'}
+      <User size={16} />
     </div>
+  ) : (
+    <AgentAvatar name={agentName} color={agentColor} size={32} className="mt-0.5" />
   );
 
   const content = (

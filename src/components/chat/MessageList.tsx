@@ -5,16 +5,11 @@ import { streamingToPhases } from '@/lib/agentPhases';
 import { MessageBubble } from './MessageBubble';
 import { StreamingContent } from './StreamingContent';
 import { ReasoningProcessCard } from './ReasoningProcessCard';
-import { useActiveAgentName } from '@/hooks/useActiveAgentName';
+import { AgentAvatar } from './AgentAvatar';
+import { useActiveAgentIdentity } from '@/hooks/useActiveAgentName';
 import { Brain } from 'lucide-react';
 
 const NEAR_BOTTOM_THRESHOLD = 120; // px
-
-const assistantAvatar = (
-  <div className="w-8 h-8 rounded-full shrink-0 flex items-center justify-center text-[14px] font-semibold bg-gradient-to-br from-codex-accent to-emerald-700 text-black">
-    S
-  </div>
-);
 
 /** Persisted history. Memoized so streaming updates (which re-render the
  * parent for auto-scroll) never re-render — and re-parse — old bubbles. */
@@ -67,7 +62,7 @@ const HistoryMessages = memo(function HistoryMessages({
 /** The live turn: subscribes to the streaming slice on its own, so the
  * history list above is fully isolated from per-flush updates. */
 function StreamingBubble() {
-  const agentName = useActiveAgentName();
+  const { name: agentName, color: agentColor } = useActiveAgentIdentity();
   const isStreaming = useChatStore((s) => s.isStreaming);
   const streamContent = useChatStore((s) => s.streamContent);
   const streamingSteps = useChatStore((s) => s.streamingSteps);
@@ -77,7 +72,7 @@ function StreamingBubble() {
 
   return (
     <div className="flex gap-3 flex-row">
-      {assistantAvatar}
+      <AgentAvatar name={agentName} color={agentColor} size={32} className="mt-0.5" />
       <div className="flex-1 min-w-0 pt-1">
         <div className="flex items-center gap-2 mb-1">
           <span className="text-[13px] font-semibold text-codex-primary">{agentName}</span>

@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Wrench, ChevronDown, ChevronRight, Loader2, CheckCircle2, XCircle, Clock, Timer } from 'lucide-react';
 import type { ToolCallInfo } from '@/lib/types';
-import { useActiveAgentName } from '@/hooks/useActiveAgentName';
+import { useActiveAgentIdentity } from '@/hooks/useActiveAgentName';
+import { AgentAvatar } from './AgentAvatar';
 import { formatFileToolApproval } from '@/lib/agent-tools';
 import { ApprovalCard } from './ApprovalCard';
 import { TerminalOutput } from './TerminalOutput';
@@ -42,7 +43,7 @@ const statusConfig: Record<string, { icon: React.ReactNode; label: string; color
 };
 
 export function ToolCallCard({ toolCall }: Props) {
-  const agentName = useActiveAgentName();
+  const { name: agentName, color: agentColor } = useActiveAgentIdentity();
   const [expanded, setExpanded] = useState(false);
   const status = statusConfig[toolCall.status] ?? statusConfig.pending;
 
@@ -64,9 +65,7 @@ export function ToolCallCard({ toolCall }: Props) {
           : JSON.stringify(displayArgs));
     return (
       <div className="flex gap-4">
-        <div className="w-8 h-8 rounded-full shrink-0 flex items-center justify-center text-[14px] font-semibold bg-gradient-to-br from-codex-accent to-emerald-700 text-black">
-          C
-        </div>
+        <AgentAvatar name={agentName} color={agentColor} size={32} className="mt-0.5" />
         <div className="flex-1 min-w-0 pt-1">
           <div className="flex items-center gap-2 mb-1">
             <span className="text-[13px] font-semibold text-codex-primary">{agentName}</span>
@@ -87,9 +86,7 @@ export function ToolCallCard({ toolCall }: Props) {
 
   return (
     <div className="flex gap-4">
-      <div className="w-8 h-8 rounded-full shrink-0 flex items-center justify-center text-[14px] font-semibold bg-gradient-to-br from-codex-accent to-emerald-700 text-black">
-        C
-      </div>
+      <AgentAvatar name={agentName} color={agentColor} size={32} className="mt-0.5" />
       <div className="flex-1 min-w-0 pt-1">
         <div className="flex items-center gap-2 mb-1">
           <span className="text-[13px] font-semibold text-codex-primary">{agentName}</span>

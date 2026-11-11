@@ -64,7 +64,7 @@ export function useSkillMention({
 }: Options) {
   const { alert } = useDialog();
   const reportError = useCallback(
-    (msg: string) => (onError ? onError(msg) : alert(msg, '技能')),
+    (msg: string) => (onError ? onError(msg) : alert(msg, { title: '技能', kind: 'error' })),
     [onError, alert],
   );
   const [open, setOpen] = useState(false);

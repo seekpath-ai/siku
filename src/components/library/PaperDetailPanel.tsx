@@ -55,6 +55,7 @@ import {
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { NoteEditor } from "@/components/notes/NoteEditor";
 import type { Paper, Note } from "@/lib/types";
+import { notify } from '@/lib/notify';
 
 type TabKey = "info" | "notes" | "tags";
 
@@ -560,7 +561,7 @@ function InfoTab({ paper }: { paper: Paper }) {
         (p) => p.id !== paper.id && !related.some((r) => r.id === p.id)
       );
       if (candidates.length === 0) {
-        await alert('没有可关联的文献', '添加关联');
+        notify('没有可关联的文献', 'info');
         return;
       }
       const choice = await select('选择要关联的文献：', {
@@ -574,7 +575,7 @@ function InfoTab({ paper }: { paper: Paper }) {
       await paperAddRelated(paper.id, choice);
       queryClient.invalidateQueries({ queryKey: ['paper-related', paper.id] });
     } catch (err) {
-      await alert(`添加关联失败: ${err}`, '添加关联');
+      await alert(`添加关联失败: ${err}`, { title: '添加关联', kind: 'error' });
     }
   };
   const handleRemoveRelated = async (relatedId: string) => {
@@ -582,7 +583,7 @@ function InfoTab({ paper }: { paper: Paper }) {
       await paperRemoveRelated(paper.id, relatedId);
       queryClient.invalidateQueries({ queryKey: ['paper-related', paper.id] });
     } catch (err) {
-      await alert(`取消关联失败: ${err}`);
+      await alert(`取消关联失败: ${err}`, { kind: 'error' });
     }
   };
 
@@ -602,7 +603,7 @@ function InfoTab({ paper }: { paper: Paper }) {
       await paperAddAttachment(paper.id, selected);
       queryClient.invalidateQueries({ queryKey: ['paper-attachments', paper.id] });
     } catch (err) {
-      await alert(`添加附件失败: ${err}`, '添加附件');
+      await alert(`添加附件失败: ${err}`, { title: '添加附件', kind: 'error' });
     }
   };
   const handleRemoveAttachment = async (attachmentId: string) => {
@@ -610,16 +611,16 @@ function InfoTab({ paper }: { paper: Paper }) {
       await paperRemoveAttachment(attachmentId);
       queryClient.invalidateQueries({ queryKey: ['paper-attachments', paper.id] });
     } catch (err) {
-      await alert(`删除附件失败: ${err}`);
+      await alert(`删除附件失败: ${err}`, { kind: 'error' });
     }
   };
   const handleExportAnnotations = async () => {
     try {
       const md = await paperExportAnnotations(paper.id);
       await navigator.clipboard.writeText(md);
-      await alert('已复制标注（Markdown）到剪贴板', '导出标注');
+      notify('已复制标注（Markdown）到剪贴板', 'success');
     } catch (err) {
-      await alert(`导出标注失败: ${err}`, '导出标注');
+      await alert(`导出标注失败: ${err}`, { title: '导出标注', kind: 'error' });
     }
   };
 
@@ -725,7 +726,7 @@ function InfoTab({ paper }: { paper: Paper }) {
       });
       setIsEditing(false);
     } catch (err) {
-      await alert(`保存元数据失败：${err}`, "保存元数据");
+      await alert(`保存元数据失败：${err}`, { title: "保存元数据", kind: 'error' });
     }
   };
 
@@ -960,7 +961,7 @@ function InfoTab({ paper }: { paper: Paper }) {
                 <div key={a.id} className="flex items-center gap-2 group">
                   <Paperclip size={12} className="text-text-secondary/50 shrink-0" />
                   <button
-                    onClick={() => paperOpenAttachment(a.id).catch((err) => alert(`打开失败: ${err}`))}
+                    onClick={() => paperOpenAttachment(a.id).catch((err) => alert(`打开失败: ${err}`, { kind: 'error' }))}
                     className="flex-1 min-w-0 text-left truncate text-xs text-text-primary hover:text-primary transition-colors"
                     title={a.file_path}
                   >

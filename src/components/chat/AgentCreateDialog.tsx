@@ -8,6 +8,7 @@ import { DEFAULT_TOOLS, isAllToolsSelected } from '@/lib/agent-tools';
 import { settingsAppGet, llmProviderList } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
 import { useDialog } from '@/hooks/useDialog';
+import { notify } from '@/lib/notify';
 import { Modal } from '@/components/ui/Modal';
 
 interface Props {
@@ -97,7 +98,7 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
   const handleCreate = async () => {
     if (!name.trim()) return;
     if (!useCustomLlm && !selectedProviderId) {
-      await alert('请选择一个模型提供商，或开启自定义 LLM');
+      notify('请选择一个模型提供商，或开启自定义 LLM', 'warning');
       return;
     }
     setCreating(true);
@@ -123,7 +124,7 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
       onClose();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      await alert(`创建失败: ${msg}`, '创建智能体失败');
+      await alert(`创建失败: ${msg}`, { title: '创建智能体失败', kind: 'error' });
     } finally {
       setCreating(false);
     }

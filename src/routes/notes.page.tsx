@@ -12,6 +12,7 @@ import { Modal } from '@/components/ui/Modal';
 import { Folder } from 'lucide-react';
 import { useShellStore } from '@/stores/shellStore';
 import { useDialog } from '@/hooks/useDialog';
+import { notify } from '@/lib/notify';
 import { usePetContextStore } from '@/stores/petContextStore';
 import { useTabStore } from '@/stores/tabStore';
 import { useNoteEditorStore } from '@/stores/noteEditorStore';
@@ -162,10 +163,10 @@ export function NotesPage() {
     if (!dir) return;
     try {
       const n = await vaultExport(currentVault.id, dir);
-      await alert(`已导出 ${n} 篇笔记到：\n${dir}`, '导出完成');
+      notify(`已导出 ${n} 篇笔记到：${dir}`, 'success');
     } catch (err) {
       console.error('export vault:', err);
-      await alert(`导出失败：${err}`, '导出失败');
+      await alert(`导出失败：${err}`, { title: '导出失败', kind: 'error' });
     }
   };
 
@@ -187,10 +188,10 @@ export function NotesPage() {
       if (r.files_imported > 0) parts.push(`${r.files_imported} 个文件`);
       if (r.unchanged > 0) parts.push(`${r.unchanged} 项内容未变化已跳过`);
       if (r.skipped > 0) parts.push(`${r.skipped} 个文件导入失败`);
-      await alert(parts.join('，'), '导入完成');
+      notify(parts.join('，'), r.skipped > 0 ? 'warning' : 'success');
     } catch (err) {
       console.error('import vault:', err);
-      await alert(`导入失败：${err}`, '导入失败');
+      await alert(`导入失败：${err}`, { title: '导入失败', kind: 'error' });
     } finally {
       unlisten();
       setImportProgress(null);
@@ -547,7 +548,7 @@ export function NotesPage() {
       }
     }
     if (failed.length > 0) {
-      await alert(`以下文件导入失败：\n${failed.join('\n')}`, '导入失败');
+      await alert(`以下文件导入失败：\n${failed.join('\n')}`, { title: '导入失败', kind: 'error' });
     }
     await loadFiles();
   };
@@ -607,7 +608,7 @@ export function NotesPage() {
       await filesOpen(id);
     } catch (err) {
       console.error('open file:', err);
-      await alert(`打开文件失败：${err}`, '打开失败');
+      await alert(`打开文件失败：${err}`, { title: '打开失败', kind: 'error' });
     }
   };
 
@@ -616,10 +617,10 @@ export function NotesPage() {
   const handleFileImportToLibrary = async (id: string) => {
     try {
       const paper = await filesImportToLibrary(id);
-      await alert(`已导入论文库：${paper.title || '未命名论文'}`, '导入成功');
+      notify(`已导入论文库：${paper.title || '未命名论文'}`, 'success');
     } catch (err) {
       console.error('import to library:', err);
-      await alert(`导入论文库失败：${err}`, '导入失败');
+      await alert(`导入论文库失败：${err}`, { title: '导入失败', kind: 'error' });
     }
   };
 

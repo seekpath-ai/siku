@@ -21,6 +21,7 @@ import { useAiTableStore } from '@/stores/aiTableStore';
 import { useReviewStore } from '@/stores/reviewStore';
 import { useAiClassifyStore } from '@/stores/aiClassifyStore';
 import { useDialog } from '@/hooks/useDialog';
+import { notify } from '@/lib/notify';
 import { listPapers } from '@/lib/tauri';
 import type { Collection, Tag as TagType } from '@/lib/types';
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
@@ -156,12 +157,12 @@ function CollectionTreeItem({
         try {
           const papers = await listPapers({ collection_id: node.collection.id, limit: 10000 });
           if (papers.length === 0) {
-            await alert('该集合下没有文献');
+            notify('该集合下没有文献', 'info');
             return;
           }
           useAiTableStore.getState().openWith(papers.map((p) => p.id));
         } catch (err) {
-          await alert(`获取集合文献失败: ${err}`);
+          await alert(`获取集合文献失败: ${err}`, { kind: 'error' });
         }
       },
     },
@@ -172,12 +173,12 @@ function CollectionTreeItem({
         try {
           const papers = await listPapers({ collection_id: node.collection.id, limit: 10000 });
           if (papers.length === 0) {
-            await alert('该集合下没有文献');
+            notify('该集合下没有文献', 'info');
             return;
           }
           useReviewStore.getState().openWith(papers.map((p) => p.id));
         } catch (err) {
-          await alert(`获取集合文献失败: ${err}`);
+          await alert(`获取集合文献失败: ${err}`, { kind: 'error' });
         }
       },
     },
@@ -188,7 +189,7 @@ function CollectionTreeItem({
         try {
           const papers = await listPapers({ collection_id: node.collection.id, limit: 10000 });
           if (papers.length === 0) {
-            await alert('该集合下没有文献');
+            notify('该集合下没有文献', 'info');
             return;
           }
           useAiClassifyStore.getState().openWith(
@@ -196,7 +197,7 @@ function CollectionTreeItem({
             { kind: 'collection', collectionId: node.collection.id, label: node.collection.name }
           );
         } catch (err) {
-          await alert(`获取集合文献失败: ${err}`);
+          await alert(`获取集合文献失败: ${err}`, { kind: 'error' });
         }
       },
     },
@@ -722,7 +723,7 @@ export function CollectionTree() {
                 try {
                   const papers = await listPapers({ limit: 10000 });
                   if (papers.length === 0) {
-                    await alert('图书馆里还没有文献');
+                    notify('图书馆里还没有文献', 'info');
                     return;
                   }
                   useAiClassifyStore.getState().openWith(
@@ -730,7 +731,7 @@ export function CollectionTree() {
                     { kind: 'all', collectionId: null, label: '我的图书馆' }
                   );
                 } catch (err) {
-                  await alert(`获取文献失败: ${err}`);
+                  await alert(`获取文献失败: ${err}`, { kind: 'error' });
                 }
               },
             },

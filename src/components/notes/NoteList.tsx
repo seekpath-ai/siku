@@ -17,6 +17,7 @@ import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
 import { MoveNoteDialog } from '@/components/notes/MoveNoteDialog';
 import { LockPasswordDialog } from '@/components/notes/LockPasswordDialog';
 import { useDialog } from '@/hooks/useDialog';
+import { notify } from '@/lib/notify';
 import { useNoteListStore } from '@/stores/noteListStore';
 import { useNoteLockStore, getAllUnlockedIds, useAllUnlockedSet } from '@/stores/noteLockStore';
 import { computeHiddenSet } from '@/lib/noteLock';
@@ -197,7 +198,7 @@ export function NoteList({
         if (onSetLocked) await onSetLocked(id, locked);
         else await notesSetLocked(id, locked);
       } catch (err) {
-        await alert(`${locked ? '锁定' : '解锁'}失败：${err}`);
+        await alert(`${locked ? '锁定' : '解锁'}失败：${err}`, { kind: 'error' });
       }
     },
     [onSetLocked, alert]
@@ -213,7 +214,7 @@ export function NoteList({
         }
         await applySetLocked(note.id, true);
       } catch (err) {
-        await alert(`锁定失败：${err}`);
+        await alert(`锁定失败：${err}`, { kind: 'error' });
       }
     },
     [applySetLocked, alert]
@@ -511,7 +512,7 @@ export function NoteList({
       // The system library folder name is reserved (notes only — renaming a
       // file to it is harmless since files never become folders).
       if (!isFile && name === '我的图书馆') {
-        alert('「我的图书馆」为系统保留名称，不能用于新建目录');
+        notify('「我的图书馆」为系统保留名称，不能用于新建目录', 'warning');
         cancelRename();
         return;
       }
@@ -523,7 +524,7 @@ export function NoteList({
     }
     setRenamingId(null);
     setRenameValue('');
-  }, [renamingId, renameValue, onRename, onFileRename, cancelRename, alert, noteMap, fileMap]);
+  }, [renamingId, renameValue, onRename, onFileRename, cancelRename, noteMap, fileMap]);
 
   const openContextMenu = useCallback((e: MouseEvent, node: TreeNode) => {
     e.preventDefault();
@@ -790,7 +791,7 @@ export function NoteList({
       const target = finalTarget ?? resolveDropTarget(e.clientX, e.clientY);
       if (!target) return;
       if (target.kind === 'folder' && isLockedView(target.id)) {
-        void alert('该文件夹已锁定，请先解锁');
+        notify('该文件夹已锁定，请先解锁', 'warning');
         return;
       }
       if (!isValidDrop(target, candId)) return;
@@ -848,7 +849,7 @@ export function NoteList({
         if (!paths.length) return;
         const target = resolveDropTarget(position.x, position.y);
         if (target.kind === 'folder' && isLockedView(target.id)) {
-          void alert('该文件夹已锁定，请先解锁');
+          notify('该文件夹已锁定，请先解锁', 'warning');
           return;
         }
         const parentId =
@@ -1023,7 +1024,7 @@ export function NoteList({
         label: `使用选中的 ${noteIds.length} 个对象创建新文件夹`,
         icon: <FolderPlus size={12} />,
         onClick: async () => {
-          if (lockedSkipped > 0) await alert(`已跳过 ${lockedSkipped} 个锁定项`);
+          if (lockedSkipped > 0) notify(`已跳过 ${lockedSkipped} 个锁定项`, 'info');
           await onBulkCreateFolder(noteIds);
           setSelectedIds(new Set());
         },
@@ -1034,7 +1035,7 @@ export function NoteList({
         label: `将 ${count - lockedSkipped} 个文件移动到...`,
         icon: <Move size={12} />,
         onClick: () => {
-          if (lockedSkipped > 0) void alert(`已跳过 ${lockedSkipped} 个锁定项`);
+          if (lockedSkipped > 0) notify(`已跳过 ${lockedSkipped} 个锁定项`, 'info');
           setMoveTargetIds([...noteIds, ...fileIds]);
         },
       });
@@ -1055,7 +1056,7 @@ export function NoteList({
         destructive: true,
         icon: <Trash2 size={12} />,
         onClick: () => {
-          if (lockedSkipped > 0) void alert(`已跳过 ${lockedSkipped} 个锁定项`);
+          if (lockedSkipped > 0) notify(`已跳过 ${lockedSkipped} 个锁定项`, 'info');
           if (noteIds.length > 0) {
             if (onBulkDelete) {
               // One confirmation covering the union of all subtrees.

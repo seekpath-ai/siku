@@ -3,6 +3,7 @@ import { listen } from '@/lib/events';
 import { X, Plus, Trash2, Play, Square, Download, Loader2, AlertTriangle, PanelRight, PanelLeftClose, PanelLeftOpen, Columns3, SlidersHorizontal, RefreshCw, Search } from 'lucide-react';
 import { useAiTableStore } from '@/stores/aiTableStore';
 import { useDialog } from '@/hooks/useDialog';
+import { notify } from '@/lib/notify';
 import { ModelOverrideSelect } from './ModelOverrideSelect';
 import { Modal } from '@/components/ui/Modal';
 import {
@@ -155,7 +156,7 @@ export function AiTableDialog() {
       setTerms((prev) => ({ ...prev, [key]: list2[0] }));
       setTermDraft((prev) => ({ ...prev, [key]: list2[0]?.terms.join(' ') ?? '' }));
     } catch (err) {
-      await alert(`保存检索词失败: ${err}`);
+      await alert(`保存检索词失败: ${err}`, { kind: 'error' });
     } finally {
       setTermBusy((prev) => ({ ...prev, [key]: false }));
     }
@@ -168,7 +169,7 @@ export function AiTableDialog() {
       setTermDraft((prev) => ({ ...prev, [key]: list.join(' ') }));
       await reloadTerms([{ key, prompt }]);
     } catch (err) {
-      await alert(`生成检索词失败: ${err}`);
+      await alert(`生成检索词失败: ${err}`, { kind: 'error' });
     } finally {
       setTermBusy((prev) => ({ ...prev, [key]: false }));
     }
@@ -268,7 +269,7 @@ export function AiTableDialog() {
   const startRun = async (ids?: string[], force = false) => {
     const cols = normalizedColumns();
     if (cols.length === 0) {
-      await alert('请先添加至少一列');
+      notify('请先添加至少一列', 'warning');
       return;
     }
     setColumns(cols);
@@ -283,7 +284,7 @@ export function AiTableDialog() {
       autoCollapseSidebar();
     } catch (err) {
       setRunning(false);
-      await alert(`启动抽取失败: ${err}`);
+      await alert(`启动抽取失败: ${err}`, { kind: 'error' });
     }
   };
 
@@ -318,7 +319,7 @@ export function AiTableDialog() {
   const savePreset = async () => {
     const cols = normalizedColumns();
     if (cols.length === 0) {
-      await alert('请先添加至少一列');
+      notify('请先添加至少一列', 'warning');
       return;
     }
     const name = await prompt('模板名称：', { placeholder: '如：实验类文献对比' });
@@ -327,7 +328,7 @@ export function AiTableDialog() {
       await aiTablePresetSave(null, name.trim(), cols);
       setPresets(await aiTablePresetsList());
     } catch (err) {
-      await alert(`保存模板失败: ${err}`);
+      await alert(`保存模板失败: ${err}`, { kind: 'error' });
     }
   };
 
@@ -346,7 +347,7 @@ export function AiTableDialog() {
       setPresets(await aiTablePresetsList());
       setSelectedPreset('');
     } catch (err) {
-      await alert(`删除模板失败: ${err}`);
+      await alert(`删除模板失败: ${err}`, { kind: 'error' });
     }
   };
 

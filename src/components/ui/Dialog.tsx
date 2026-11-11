@@ -1,10 +1,17 @@
 import { useState, useEffect, useRef } from 'react';
-import { AlertCircle, Check, ChevronDown, ChevronRight, HelpCircle, List, MessageSquareText, X } from 'lucide-react';
-import { useDialogStore } from '@/stores/dialogStore';
+import { AlertTriangle, Check, CheckCircle2, ChevronDown, ChevronRight, HelpCircle, Info, List, MessageSquareText, X, XCircle } from 'lucide-react';
+import { useDialogStore, type AlertKind } from '@/stores/dialogStore';
 import { Modal } from './Modal';
 
+const ALERT_KIND_ICON: Record<AlertKind, React.ReactNode> = {
+  success: <CheckCircle2 size={20} className="text-emerald-400" />,
+  error: <XCircle size={20} className="text-red-400" />,
+  warning: <AlertTriangle size={20} className="text-yellow-400" />,
+  info: <Info size={20} className="text-blue-400" />,
+};
+
 export function Dialog() {
-  const { open, type, title, message, promptOptions, selectOptions, close } = useDialogStore();
+  const { open, type, title, message, alertKind, confirmDanger, promptOptions, selectOptions, close } = useDialogStore();
   const [inputValue, setInputValue] = useState(promptOptions?.defaultValue ?? '');
   const [selectedValue, setSelectedValue] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -47,9 +54,9 @@ export function Dialog() {
 
   const icon =
     type === 'alert' ? (
-      <AlertCircle size={20} className="text-yellow-400" />
+      ALERT_KIND_ICON[alertKind]
     ) : type === 'confirm' ? (
-      <HelpCircle size={20} className="text-primary" />
+      <HelpCircle size={20} className={confirmDanger ? 'text-red-400' : 'text-primary'} />
     ) : type === 'select' ? (
       <List size={20} className="text-primary" />
     ) : (
@@ -174,7 +181,11 @@ export function Dialog() {
               close(type === 'prompt' ? inputValue.trim() || null : type === 'select' ? selectedValue : true)
             }
             disabled={type === 'select' && !selectedValue}
-            className="px-3.5 py-1.5 rounded-lg bg-primary/10 text-primary text-xs font-medium hover:bg-primary/20 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+              type === 'confirm' && confirmDanger
+                ? 'bg-red-500/10 text-red-400 hover:bg-red-500/20'
+                : 'bg-primary/10 text-primary hover:bg-primary/20'
+            }`}
           >
             {type === 'alert' ? '确定' : '确定'}
           </button>

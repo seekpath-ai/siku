@@ -108,7 +108,7 @@ function ResearchTopicPage() {
         navigate({ to: '/reader/$paperId', params: { paperId: res.paper_id } });
       }
     } catch (err) {
-      await alert(`导入失败：${err}`, '导入失败');
+      await alert(`导入失败：${err}`, { title: '导入失败', kind: 'error' });
     } finally {
       setImportingId(null);
     }
@@ -119,7 +119,7 @@ function ResearchTopicPage() {
       await researchUpdateSourceStatus(source.id, 'read');
       await loadSources(topicId);
     } catch (err) {
-      await alert(`操作失败：${err}`, '标记已读');
+      await alert(`操作失败：${err}`, { title: '标记已读', kind: 'error' });
     }
   };
 

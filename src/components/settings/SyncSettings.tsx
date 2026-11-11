@@ -66,7 +66,7 @@ export function SyncSettings() {
   const [outboxCount, setOutboxCount] = useState(0);
   const [flushingOutbox, setFlushingOutbox] = useState(false);
 
-  const { prompt } = useDialog();
+  const { prompt, alert } = useDialog();
 
   // LAN guest: 扫描到设备后点击即连接。配对码由用户在弹窗中手动输入
   // （以提供方设备上显示的为准），不再直接展示/自动使用 beacon 里的码。
@@ -83,9 +83,9 @@ export function SyncSettings() {
       setLanDiscovering(false);
     } catch (err) {
       console.error('Failed to connect local host:', err);
-      alert(`连接失败: ${err}`);
+      alert(`连接失败: ${err}`, { kind: 'error' });
     }
-  }, [prompt]);
+  }, [prompt, alert]);
 
   useEffect(() => {
     getSyncConfig()
@@ -163,11 +163,11 @@ export function SyncSettings() {
       setSyncStatus(status);
     } catch (err) {
       console.error('Failed to sync:', err);
-      alert(`同步失败: ${err}`);
+      alert(`同步失败: ${err}`, { kind: 'error' });
     } finally {
       setSyncing(false);
     }
-  }, []);
+  }, [alert]);
 
   const handleFlushOutbox = useCallback(async () => {
     setFlushingOutbox(true);
@@ -177,11 +177,11 @@ export function SyncSettings() {
       setOutboxCount(count);
     } catch (err) {
       console.error('Failed to flush outbox:', err);
-      alert(`邮箱重试失败: ${err}`);
+      alert(`邮箱重试失败: ${err}`, { kind: 'error' });
     } finally {
       setFlushingOutbox(false);
     }
-  }, []);
+  }, [alert]);
 
   const handleToggleOptionalSync = useCallback(async () => {
     const next = {
@@ -194,7 +194,7 @@ export function SyncSettings() {
       await setRemoteSyncConfig(next);
     } catch (err) {
       console.error('Failed to save sync config:', err);
-      alert(`保存同步设置失败: ${err}`);
+      alert(`保存同步设置失败: ${err}`, { kind: 'error' });
       setSyncConfig({
         ...syncConfig,
         sync_optional_data: !next.sync_optional_data,
@@ -202,7 +202,7 @@ export function SyncSettings() {
     } finally {
       setConfigSaving(false);
     }
-  }, [syncConfig]);
+  }, [syncConfig, alert]);
 
   const handleExportSeed = useCallback(async () => {
     if (!seedPassword) return;
@@ -221,11 +221,11 @@ export function SyncSettings() {
       setOfflineResult(`已导出到 ${path}`);
     } catch (err) {
       console.error('Failed to export seed:', err);
-      alert(`导出失败: ${err}`);
+      alert(`导出失败: ${err}`, { kind: 'error' });
     } finally {
       setSeedAction('idle');
     }
-  }, [seedPassword]);
+  }, [seedPassword, alert]);
 
   const handleImportSeed = useCallback(async () => {
     if (!seedPassword) return;
@@ -246,11 +246,11 @@ export function SyncSettings() {
       setOfflineResult(`已导入到 ${target}，请重启应用以生效`);
     } catch (err) {
       console.error('Failed to import seed:', err);
-      alert(`导入失败: ${err}`);
+      alert(`导入失败: ${err}`, { kind: 'error' });
     } finally {
       setSeedAction('idle');
     }
-  }, [seedPassword]);
+  }, [seedPassword, alert]);
 
   // ── User-facing sync status (cloud: 五态；LAN: 见 lanStateView) ──
   const fmtSyncTime = (iso?: string) => {
@@ -580,7 +580,7 @@ export function SyncSettings() {
                     await startLanDiscovery();
                   } catch (err) {
                     console.error('Failed to start LAN discovery:', err);
-                    alert(`启动局域网发现失败: ${err}`);
+                    alert(`启动局域网发现失败: ${err}`, { kind: 'error' });
                     setLanDiscovering(false);
                   }
                 }}

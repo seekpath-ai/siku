@@ -1,4 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { notifyError } from '@/lib/notify';
 import * as tauri from '@/lib/tauri';
 import { useNoteLockStore, getAllUnlockedIds } from '@/stores/noteLockStore';
 import type { ListPapersParams, Paper, PaperInput, PaperLinkMetadata, Collection, Tag, Note } from '@/lib/types';
@@ -100,7 +101,7 @@ export function useDeletePaper() {
     },
     onError: (err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
-      alert(`删除文献失败: ${msg}`);
+      notifyError(msg, '删除文献失败');
     },
   });
 }
@@ -117,7 +118,7 @@ export function useRestorePaper() {
     },
     onError: (err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
-      alert(`恢复文献失败: ${msg}`);
+      notifyError(msg, '恢复文献失败');
     },
   });
 }
@@ -134,7 +135,7 @@ export function usePurgePaper() {
     },
     onError: (err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
-      alert(`永久删除失败: ${msg}`);
+      notifyError(msg, '永久删除失败');
     },
   });
 }
@@ -155,7 +156,7 @@ export function usePaperSetFavorite() {
     },
     onError: (err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
-      alert(`星标操作失败: ${msg}`);
+      notifyError(msg, '星标操作失败');
       queryClient.invalidateQueries({ queryKey: ['papers'] });
     },
   });
@@ -177,7 +178,7 @@ export function usePaperSetReadStatus() {
     },
     onError: (err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
-      alert(`更新阅读状态失败: ${msg}`);
+      notifyError(msg, '更新阅读状态失败');
       queryClient.invalidateQueries({ queryKey: ['papers'] });
     },
   });

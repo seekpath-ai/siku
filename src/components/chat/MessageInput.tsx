@@ -104,7 +104,7 @@ export function MessageInput({ disabled }: Props) {
     disabled,
     enableShortcut: true,
     onAttached: () => textareaRef.current?.focus(),
-    onError: (msg, title) => alert(msg, title ?? '图片附件'),
+    onError: (msg, title) => alert(msg, { title: title ?? '图片附件', kind: 'error' }),
   });
 
   // Attach entry: both the picker and window drag & drop funnel into the
@@ -118,7 +118,7 @@ export function MessageInput({ disabled }: Props) {
       addTextPath: (path) => addTextPath(path, activeProject?.path),
     });
     if (failures.length > 0) {
-      await alert(failures.join('\n'), '附件读取失败');
+      await alert(failures.join('\n'), { title: '附件读取失败', kind: 'error' });
     }
   };
 

@@ -2,6 +2,9 @@ import { create } from 'zustand';
 
 export type DialogType = 'alert' | 'confirm' | 'prompt' | 'select';
 
+/** alert 的语义类型：决定图标与配色（与 notify 的 ToastKind 同一套语义）。 */
+export type AlertKind = 'success' | 'error' | 'warning' | 'info';
+
 export interface SelectOption {
   label: string;
   value: string;
@@ -24,19 +27,28 @@ interface SelectOptions {
   options: SelectOption[];
 }
 
+/** alert 的第二个参数：字符串等价于 { title }（旧调用形态）。 */
+export type AlertOptions = string | { title?: string; kind?: AlertKind };
+
+/** confirm 的第二个参数：字符串等价于 { title }。danger 用于删除/清空等
+ * 破坏性操作——确认按钮用红色，与普通确认区分。 */
+export type ConfirmOptions = string | { title?: string; danger?: boolean };
+
 interface DialogState {
   open: boolean;
   type: DialogType | null;
   title: string;
   message: string;
+  alertKind: AlertKind;
+  confirmDanger: boolean;
   promptOptions?: PromptOptions;
   selectOptions?: SelectOptions;
   resolve: ((value: unknown) => void) | null;
 }
 
 interface DialogActions {
-  alert: (message: string, title?: string) => Promise<void>;
-  confirm: (message: string, title?: string) => Promise<boolean>;
+  alert: (message: string, options?: AlertOptions) => Promise<void>;
+  confirm: (message: string, options?: ConfirmOptions) => Promise<boolean>;
   prompt: (message: string, options?: PromptOptions & { title?: string }) => Promise<string | null>;
   select: (message: string, options: SelectOptions & { title?: string }) => Promise<string | null>;
   close: (value?: string | boolean | null) => void;
@@ -47,6 +59,8 @@ const initialState: Omit<DialogState, 'resolve'> & { resolve: DialogState['resol
   type: null,
   title: '',
   message: '',
+  alertKind: 'info',
+  confirmDanger: false,
   promptOptions: undefined,
   selectOptions: undefined,
   resolve: null,
@@ -55,14 +69,18 @@ const initialState: Omit<DialogState, 'resolve'> & { resolve: DialogState['resol
 export const useDialogStore = create<DialogState & DialogActions>((set, get) => ({
   ...initialState,
 
-  alert: (message, title = '提示') =>
+  alert: (message, options = {}) =>
     new Promise((resolve) => {
+      const { title = '提示', kind = 'info' } =
+        typeof options === 'string' ? { title: options } : options;
       set({
         open: true,
         type: 'alert',
         title,
         message,
+        alertKind: kind,
         promptOptions: undefined,
+        selectOptions: undefined,
         resolve: () => {
           resolve();
           set({ open: false });
@@ -70,14 +88,18 @@ export const useDialogStore = create<DialogState & DialogActions>((set, get) => 
       });
     }),
 
-  confirm: (message, title = '确认') =>
+  confirm: (message, options = {}) =>
     new Promise((resolve) => {
+      const { title = '确认', danger = false } =
+        typeof options === 'string' ? { title: options } : options;
       set({
         open: true,
         type: 'confirm',
         title,
         message,
+        confirmDanger: danger,
         promptOptions: undefined,
+        selectOptions: undefined,
         resolve: (value) => {
           resolve(!!value);
           set({ open: false });
@@ -94,6 +116,7 @@ export const useDialogStore = create<DialogState & DialogActions>((set, get) => 
         title,
         message,
         promptOptions,
+        selectOptions: undefined,
         resolve: (value) => {
           resolve(value as string | null);
           set({ open: false });
@@ -110,6 +133,7 @@ export const useDialogStore = create<DialogState & DialogActions>((set, get) => 
         title,
         message,
         selectOptions,
+        promptOptions: undefined,
         resolve: (value) => {
           resolve(value as string | null);
           set({ open: false });

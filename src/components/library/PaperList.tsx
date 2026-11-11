@@ -60,6 +60,7 @@ import { useReviewStore } from '@/stores/reviewStore';
 import { useTabStore } from '@/stores/tabStore';
 import { openNoteTab } from '@/lib/openNote';
 import { useDialog } from '@/hooks/useDialog';
+import { notify } from '@/lib/notify';
 import { getAllUnlockedIds } from '@/stores/noteLockStore';
 import { parseJsonArray } from '@/lib/types';
 import { isoToDisplayFull } from '@/lib/time';
@@ -345,9 +346,9 @@ function PaperRow({
       // Refresh list + detail caches so the imported metadata shows up.
       queryClient.invalidateQueries({ queryKey: ['papers'] });
       queryClient.invalidateQueries({ queryKey: ['paper', paper.id] });
-      await alert('BibTeX 元数据已导入');
+      notify('BibTeX 元数据已导入', 'success');
     } catch (err) {
-      await alert(`导入失败: ${err}`);
+      await alert(`导入失败: ${err}`, { kind: 'error' });
     }
   };
 
@@ -357,7 +358,7 @@ function PaperRow({
     try {
       const dups = await paperFindDuplicates(paper.id);
       if (dups.length === 0) {
-        await alert('未发现重复项', '查重');
+        notify('未发现重复项', 'info');
         return;
       }
       const reasons = [...new Set(dups.map((d) => (d.match_reason === 'doi' ? 'DOI' : '标题')))].join('、');
@@ -373,12 +374,12 @@ function PaperRow({
       );
       if (!choice) return;
       await paperMerge(paper.id, choice);
-      await alert('已合并到当前条目', '合并重复项');
+      notify('已合并到当前条目', 'success');
       queryClient.invalidateQueries({ queryKey: ['paper', paper.id] });
       queryClient.invalidateQueries({ queryKey: ['papers'] });
     } catch (err) {
       console.error('查重失败:', err);
-      await alert(`查重失败: ${err}`, '查重');
+      await alert(`查重失败: ${err}`, { title: '查重', kind: 'error' });
     }
   };
 
@@ -417,18 +418,18 @@ function PaperRow({
             : totalChunks > 0
               ? `索引已重建：${totalChunks} 个文本分块，${figureLine}`
               : `未提取到可索引的文本（可能为扫描版 PDF）；${figureLine}`,
-          '重建索引'
+          { title: '重建索引', kind: failed > 0 ? 'error' : totalChunks > 0 ? 'success' : 'warning' }
         );
       } else {
         await alert(
           `重建完成：${ids.length - failed}/${ids.length} 篇成功，共 ${totalChunks} 个分块，${figureLine}` +
             (noText > 0 ? `，${noText} 篇无文本（可能为扫描版）` : '') +
             (failed > 0 ? `，${failed} 篇失败` : ''),
-          '重建索引'
+          { title: '重建索引', kind: failed > 0 ? 'warning' : 'success' }
         );
       }
     } catch (err) {
-      await alert(`重建索引失败: ${err}`, '重建索引');
+      await alert(`重建索引失败: ${err}`, { title: '重建索引', kind: 'error' });
     } finally {
       setReprocessing(false);
     }
@@ -438,7 +439,7 @@ function PaperRow({
     try {
       const notes = await notesList(paper.id, undefined, undefined, getAllUnlockedIds());
       if (notes.length === 0) {
-        await alert('该文献没有笔记');
+        notify('该文献没有笔记', 'info');
         return;
       }
       const md = notes.map((n) => `## ${n.title}\n\n${n.content}\n\n---\n`).join('\n');
@@ -451,7 +452,7 @@ function PaperRow({
       a.click();
       URL.revokeObjectURL(url);
     } catch (err) {
-      await alert(`导出失败: ${err}`);
+      await alert(`导出失败: ${err}`, { kind: 'error' });
     }
   };
 
@@ -486,18 +487,12 @@ function PaperRow({
         const fields = result.fields
           .map((field) => labels[field] ?? field)
           .join("、");
-        await alert(
-          fields ? `已补全：${fields}` : "元数据已补全。",
-          "补全元数据",
-        );
+        notify(fields ? `已补全：${fields}` : "元数据已补全。", 'success');
       } else {
-        await alert(
-          "未找到可补全的元数据，请检查 DOI 或标题后重试。",
-          "补全元数据",
-        );
+        notify("未找到可补全的元数据，请检查 DOI 或标题后重试。", 'warning');
       }
     } catch (err) {
-      await alert(`补全元数据失败：${err}`, "补全元数据");
+      await alert(`补全元数据失败：${err}`, { title: "补全元数据", kind: 'error' });
     } finally {
       setEnriching(false);
     }
@@ -518,9 +513,9 @@ function PaperRow({
     try {
       const text = await paperExport(ids, fmt as 'bibtex' | 'ris' | 'csl-json');
       await navigator.clipboard.writeText(text);
-      await alert('已复制到剪贴板', '导出引用');
+      notify('已复制到剪贴板', 'success');
     } catch (err) {
-      await alert(`导出失败: ${err}`, '导出引用');
+      await alert(`导出失败: ${err}`, { title: '导出引用', kind: 'error' });
     }
   };
 
@@ -532,9 +527,9 @@ function PaperRow({
     const key = (paper.citation_key?.trim() || fallback).replace(/\s+/g, '');
     try {
       await navigator.clipboard.writeText(key);
-      await alert(`已复制引用键：${key}`, '复制引用键');
+      notify(`已复制引用键：${key}`, 'success');
     } catch (err) {
-      await alert(`复制失败: ${err}`, '复制引用键');
+      await alert(`复制失败: ${err}`, { title: '复制引用键', kind: 'error' });
     }
   };
 
@@ -542,7 +537,7 @@ function PaperRow({
     const currentId = activeFilter.type === 'collection' ? activeFilter.id : null;
     const options = buildCollectionTree(collections ?? [], currentId);
     if (options.length === 0) {
-      await alert('没有可用的分类');
+      notify('没有可用的分类', 'info');
       return;
     }
     const collectionId = await select('选择要添加到的分类', {
@@ -563,7 +558,7 @@ function PaperRow({
     try {
       await revealPaperInSystem(paper.id);
     } catch (err) {
-      await alert(`打开目录失败: ${err}`);
+      await alert(`打开目录失败: ${err}`, { kind: 'error' });
     }
   };
 

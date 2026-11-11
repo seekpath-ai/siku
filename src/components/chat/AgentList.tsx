@@ -57,6 +57,7 @@ function remoteContextOf(context: string | null): { channel: string; chatId: str
 }
 import { buildSessionMarkdown, sessionExportFileName } from '@/lib/exportTurn';
 import { useDialog } from '@/hooks/useDialog';
+import { notify } from '@/lib/notify';
 import { AgentAvatar } from './AgentAvatar';
 import { AgentCreateDialog } from './AgentCreateDialog';
 import { AgentConfigPanel } from './AgentConfigPanel';
@@ -476,7 +477,7 @@ export function AgentList() {
       await revealInFileManager(path);
     } catch (err) {
       console.error('open workspace:', err);
-      await alert(`打开工作区失败: ${err}`);
+      await alert(`打开工作区失败: ${err}`, { kind: 'error' });
     }
   };
 
@@ -489,7 +490,7 @@ export function AgentList() {
         getAgentSteps(agent.id),
       ]);
       if (page.messages.length === 0) {
-        await alert('该会话还没有消息，无可导出内容');
+        notify('该会话还没有消息，无可导出内容', 'info');
         return;
       }
       const md = buildSessionMarkdown({
@@ -505,7 +506,7 @@ export function AgentList() {
       if (target) await saveTextFile(target, md);
     } catch (err) {
       console.error('export session:', err);
-      await alert(`导出会话失败: ${err}`);
+      await alert(`导出会话失败: ${err}`, { kind: 'error' });
     }
   };
 
@@ -529,7 +530,7 @@ export function AgentList() {
     try {
       await renameProject(id, name.trim());
     } catch (err) {
-      await alert(`重命名失败：${err}`, '重命名项目');
+      await alert(`重命名失败：${err}`, { title: '重命名项目', kind: 'error' });
     }
   };
 
@@ -656,7 +657,7 @@ export function AgentList() {
   // itself reports non-git / no-origin / unsupported-host states).
   const handlePullRequest = async () => {
     if (!activeProjectId) {
-      await alert('请先在下方项目列表选择一个项目', '拉取请求');
+      notify('请先在下方项目列表选择一个项目', 'warning');
       return;
     }
     const name = projects.find((p) => p.id === activeProjectId)?.name ?? '项目';
@@ -729,7 +730,7 @@ export function AgentList() {
             // Scheduled prompts are per-session; without an active session
             // the cron tab has nothing to bind to.
             if (!activeSessionId) {
-              void alert('请先在左侧选择一个会话', '计划任务');
+              notify('请先在左侧选择一个会话', 'warning');
               return;
             }
             setShowTaskCenter(true);

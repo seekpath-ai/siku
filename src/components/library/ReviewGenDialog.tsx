@@ -16,7 +16,7 @@ import {
   X,
 } from 'lucide-react';
 import { useReviewStore } from '@/stores/reviewStore';
-import { useDialog } from '@/hooks/useDialog';
+import { notify } from '@/lib/notify';
 import { openNoteTab } from '@/lib/openNote';
 import { ModelOverrideSelect } from './ModelOverrideSelect';
 import { ReviewReadingPanel, type ReviewCardDraft } from './ReviewReadingPanel';
@@ -274,7 +274,6 @@ function AuditReport({ audit, sources }: { audit: ReviewAudit; sources: ReviewSo
 
 export function ReviewGenDialog() {
   const { open, paperIds, runId, lastRunId, setRunId, resetRun, restoreRun, close } = useReviewStore();
-  const { alert } = useDialog();
   const navigate = useNavigate();
 
   const [step, setStep] = useState<Step>('form');
@@ -502,11 +501,11 @@ export function ReviewGenDialog() {
 
   const startReading = async () => {
     if (!question.trim()) {
-      await alert('请填写研究问题');
+      notify('请填写研究问题', 'warning');
       return;
     }
     if (paperIds.length === 0) {
-      await alert('请至少选择一篇文献');
+      notify('请至少选择一篇文献', 'warning');
       return;
     }
     setBusy(true);
@@ -624,7 +623,7 @@ export function ReviewGenDialog() {
       }))
       .filter((section) => section.title);
     if (cleaned.length === 0) {
-      await alert('大纲为空，请至少保留一节');
+      notify('大纲为空，请至少保留一节', 'warning');
       return;
     }
     outlineDirtyRef.current = true;

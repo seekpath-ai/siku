@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import { useAiClassifyStore } from '@/stores/aiClassifyStore';
 import { useDialog } from '@/hooks/useDialog';
+import { notify } from '@/lib/notify';
 import { ModelOverrideSelect } from './ModelOverrideSelect';
 import { Modal } from '@/components/ui/Modal';
 import {
@@ -374,11 +375,11 @@ export function AiClassifyDialog() {
   const start = async (dimOverride?: string) => {
     const dim = (dimOverride ?? dimensionValue).trim();
     if (papers === 0) {
-      await alert('该范围内没有文献');
+      notify('该范围内没有文献', 'info');
       return;
     }
     if (!dim) {
-      await alert('请填写分类维度');
+      notify('请填写分类维度', 'warning');
       return;
     }
     setRunning(true);
@@ -409,7 +410,7 @@ export function AiClassifyDialog() {
       void loadVocab(dim, target);
     } catch (err) {
       setRunning(false);
-      await alert(`启动分类失败: ${err}`);
+      await alert(`启动分类失败: ${err}`, { kind: 'error' });
     }
   };
 
@@ -580,7 +581,7 @@ export function AiClassifyDialog() {
     if (!id) return;
     const targets = pending.filter((it) => it.labels.length > 0);
     if (targets.length === 0) {
-      await alert('待审列表里没有带归属的文献');
+      notify('待审列表里没有带归属的文献', 'info');
       return;
     }
     setItems((prev) =>
@@ -614,7 +615,7 @@ export function AiClassifyDialog() {
     const id = runId;
     if (!id) return;
     if (paths.length === 0) {
-      await alert('请先添加至少一个类目');
+      notify('请先添加至少一个类目', 'warning');
       return;
     }
     if (!onlyMissing) {
@@ -634,7 +635,7 @@ export function AiClassifyDialog() {
       await aiClassifyReassign(id, providerId || null, onlyMissing);
     } catch (err) {
       setRunning(false);
-      await alert(`判定失败: ${err}`);
+      await alert(`判定失败: ${err}`, { kind: 'error' });
     }
   };
 
@@ -643,11 +644,11 @@ export function AiClassifyDialog() {
     if (!id || !run) return;
     if (target === 'preview') return;
     if (paths.length === 0) {
-      await alert('请先添加至少一个类目');
+      notify('请先添加至少一个类目', 'warning');
       return;
     }
     if (accepted.length === 0) {
-      await alert('还没有任何已接受的归属（待审的不会写入，请先在「待审」里确认）');
+      notify('还没有任何已接受的归属（待审的不会写入，请先在「待审」里确认）', 'info');
       return;
     }
     const planned = groups.flatMap((g) => {
@@ -691,7 +692,7 @@ export function AiClassifyDialog() {
       queryClient.invalidateQueries({ queryKey: ['papers'] });
       void loadVocab(run.dimension, run.target);
     } catch (err) {
-      await alert(`写回失败: ${err}`);
+      await alert(`写回失败: ${err}`, { kind: 'error' });
     } finally {
       setBusy(false);
     }
@@ -714,7 +715,7 @@ export function AiClassifyDialog() {
       queryClient.invalidateQueries({ queryKey: ['tags'] });
       queryClient.invalidateQueries({ queryKey: ['papers'] });
     } catch (err) {
-      await alert(`撤销失败: ${err}`);
+      await alert(`撤销失败: ${err}`, { kind: 'error' });
     } finally {
       setBusy(false);
     }
@@ -770,7 +771,7 @@ export function AiClassifyDialog() {
         if (target) await saveTextFile(target, md);
       }
     } catch (err) {
-      await alert(`导出失败: ${err}`);
+      await alert(`导出失败: ${err}`, { kind: 'error' });
     }
   };
 
@@ -818,7 +819,7 @@ export function AiClassifyDialog() {
         );
       }
     } catch (err) {
-      await alert(`更新词表失败: ${err}`);
+      await alert(`更新词表失败: ${err}`, { kind: 'error' });
     }
   };
 

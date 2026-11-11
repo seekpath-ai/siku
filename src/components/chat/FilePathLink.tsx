@@ -53,7 +53,7 @@ export function FilePathLink({ href }: { href?: string }) {
   const rest = candidate.startsWith(resolved) ? candidate.slice(resolved.length) : '';
 
   const run = (action: () => Promise<void>, title: string) => {
-    action().catch((err) => alert(String(err), title));
+    action().catch((err) => alert(String(err), { title, kind: 'error' }));
   };
 
   return (

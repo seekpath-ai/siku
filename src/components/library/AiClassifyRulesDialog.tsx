@@ -3,6 +3,7 @@ import { X, Loader2, Plus, Trash2, Play, BookMarked, AlertTriangle } from 'lucid
 import { useAiClassifyStore } from '@/stores/aiClassifyStore';
 import { useCollections } from '@/hooks/useLibrary';
 import { useDialog } from '@/hooks/useDialog';
+import { notify } from '@/lib/notify';
 import { Modal } from '@/components/ui/Modal';
 import {
   aiClassifyRuleDelete,
@@ -70,7 +71,7 @@ export function AiClassifyRulesDialog() {
 
   const create = async () => {
     if (!dimension.trim()) {
-      await alert('请填写分类维度');
+      notify('请填写分类维度', 'warning');
       return;
     }
     try {
@@ -92,7 +93,7 @@ export function AiClassifyRulesDialog() {
       setName('');
       await reload();
     } catch (err) {
-      await alert(`创建规则失败: ${err}`);
+      await alert(`创建规则失败: ${err}`, { kind: 'error' });
     }
   };
 
@@ -102,7 +103,7 @@ export function AiClassifyRulesDialog() {
       await aiClassifyRuleSetEnabled(rule.id, !rule.enabled);
       await reload();
     } catch (err) {
-      await alert(`更新失败: ${err}`);
+      await alert(`更新失败: ${err}`, { kind: 'error' });
     } finally {
       setBusyId(null);
     }
@@ -115,7 +116,7 @@ export function AiClassifyRulesDialog() {
       // The run is spawned: give it a moment, then refresh the summary column.
       setTimeout(() => void reload(), 4000);
     } catch (err) {
-      await alert(`启动失败: ${err}`);
+      await alert(`启动失败: ${err}`, { kind: 'error' });
     } finally {
       setBusyId(null);
     }
@@ -128,7 +129,7 @@ export function AiClassifyRulesDialog() {
       await aiClassifyRuleDelete(rule.id);
       await reload();
     } catch (err) {
-      await alert(`删除失败: ${err}`);
+      await alert(`删除失败: ${err}`, { kind: 'error' });
     } finally {
       setBusyId(null);
     }

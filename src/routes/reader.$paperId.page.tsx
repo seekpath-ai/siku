@@ -392,7 +392,7 @@ function ReaderView({ paperId }: { paperId: string }) {
         transRequestId,
       );
     } catch (err) {
-      await alert(`全文翻译失败: ${err}`, '全文翻译');
+      await alert(`全文翻译失败: ${err}`, { title: '全文翻译', kind: 'error' });
     } finally {
       setTransRunning(false);
       setTransProgress(null);

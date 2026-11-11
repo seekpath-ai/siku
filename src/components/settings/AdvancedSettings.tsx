@@ -9,6 +9,7 @@ import {
   revealInFileManager,
 } from '@/lib/tauri';
 import { SectionSaveButton } from '@/components/ui/SectionSaveButton';
+import { useDialogStore } from '@/stores/dialogStore';
 import type { AppSettings, EmbeddingStatus, EmbeddingProbe } from '@/lib/tauri';
 
 interface LimitField {
@@ -146,7 +147,7 @@ export function AdvancedSettings() {
       setDiagResult(out);
     } catch (err) {
       console.error('Failed to export diagnostics:', err);
-      alert(`导出诊断包失败: ${err}`);
+      useDialogStore.getState().alert(`导出诊断包失败: ${err}`, { kind: 'error' });
     } finally {
       setExportingDiag(false);
     }

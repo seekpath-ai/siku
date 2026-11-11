@@ -117,7 +117,7 @@ export function BrowserSettings() {
       reloadInfo();
       setMessage('已重置。下次打开浏览器是全新的配置。');
     } catch (e) {
-      alert(String(e), '重置失败');
+      alert(String(e), { title: '重置失败', kind: 'error' });
     }
   }, [alert, confirm, reloadInfo]);
 

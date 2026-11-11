@@ -12,6 +12,7 @@ import {
 import type { AgentStreamEvent } from '@/lib/types';
 import { useChatStore } from '@/stores/chatStore';
 import { useDialog } from '@/hooks/useDialog';
+import { notify } from '@/lib/notify';
 import { Modal } from '@/components/ui/Modal';
 import { SkillIcon } from './SkillIcon';
 
@@ -36,7 +37,7 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   /** skill name → reviewer session id for in-flight AI reviews. */
   const [reviewing, setReviewing] = useState<Map<string, string>>(new Map());
   const { sessions, activeSessionId, setSessions } = useChatStore();
-  const { confirm, alert } = useDialog();
+  const { confirm } = useDialog();
 
   const activeSession = sessions.find((s) => s.id === activeSessionId) ?? null;
   const mounted = new Set(activeSession?.selected_skills ?? []);
@@ -166,7 +167,7 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   /** Mount/unmount a skill on the ACTIVE session (per-session plugins). */
   const toggleMount = async (name: string) => {
     if (!activeSession) {
-      await alert('请先在左侧选择一个会话，再将技能挂载到该会话', '挂载技能');
+      notify('请先在左侧选择一个会话，再将技能挂载到该会话', 'warning');
       return;
     }
     const current = activeSession.selected_skills ?? [];
@@ -232,7 +233,7 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
     });
     try {
       const msg = await skillsEnvInstall(missing);
-      await alert(msg, '安装依赖');
+      notify(msg, 'success');
       await openDetail(detail.name);
     } catch (err) {
       setError(String(err));

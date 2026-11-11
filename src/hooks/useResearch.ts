@@ -10,7 +10,7 @@ const reportError = (action: string, err: unknown) => {
   console.error(`${action}:`, err);
   useDialogStore.getState().alert(
     `${action}失败：${err instanceof Error ? err.message : String(err)}`,
-    '科研追踪'
+    { title: '科研追踪', kind: 'error' }
   );
 };
 

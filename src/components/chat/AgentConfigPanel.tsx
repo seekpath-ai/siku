@@ -18,6 +18,8 @@ import { pickDirectory } from '@/lib/pickDirectory';
 import { ALL_TOOL_KEYS, isAllToolsSelected } from '@/lib/agent-tools';
 import { useProjectStore } from '@/stores/projectStore';
 import { Modal } from '@/components/ui/Modal';
+import { notify } from '@/lib/notify';
+import { useDialogStore } from '@/stores/dialogStore';
 
 interface Props {
   agent: AgentSession;
@@ -215,7 +217,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
     try {
       await agentSessionWorkspaceClear(agent.id);
     } catch (err) {
-      alert(`清空会话工作区失败: ${err}`);
+      useDialogStore.getState().alert(`清空会话工作区失败: ${err}`, { kind: 'error' });
     }
   };
 
@@ -227,7 +229,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
 
   const handleSave = async () => {
     if (!useCustomLlm && !selectedProviderId) {
-      alert('请选择一个模型提供商，或开启自定义 LLM');
+      notify('请选择一个模型提供商，或开启自定义 LLM', 'warning');
       return;
     }
     setSaving(true);
@@ -258,7 +260,7 @@ export function AgentConfigPanel({ agent, onClose, onSave }: Props) {
       });
       onClose();
     } catch (err) {
-      alert(`保存失败: ${err}`);
+      useDialogStore.getState().alert(`保存失败: ${err}`, { kind: 'error' });
     } finally {
       setSaving(false);
     }

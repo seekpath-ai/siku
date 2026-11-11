@@ -8,6 +8,7 @@ import type { AnnotationRow } from '@/lib/tauri';
 import { isoToDisplay } from '@/lib/time';
 import { ConfirmButton } from '@/components/ui/ConfirmButton';
 import { useDialog } from '@/hooks/useDialog';
+import { notify } from '@/lib/notify';
 
 const LANG_LABELS: Record<TargetLang, string> = { zh: '中文', en: 'English', ja: '日本語' };
 
@@ -70,7 +71,7 @@ export function SnippetPanel({ paperId, totalPages, onJumpToSnippet }: SnippetPa
     } catch (err) {
       console.error('删除摘录失败:', err);
       if (sn) addSnippet(sn);
-      await alert('删除摘录失败，已恢复。', '删除失败');
+      await alert('删除摘录失败，已恢复。', { title: '删除失败', kind: 'error' });
     }
   }, [removeSnippet, addSnippet, alert]);
 
@@ -113,7 +114,7 @@ export function SnippetPanel({ paperId, totalPages, onJumpToSnippet }: SnippetPa
     } catch (err) {
       console.error('清空摘录失败:', err);
       await reloadFromBackend().catch(() => {});
-      await alert('清空摘录失败，已恢复原数据。', '清空失败');
+      await alert('清空摘录失败，已恢复原数据。', { title: '清空失败', kind: 'error' });
     }
   }, [clearPaper, paperId, reloadFromBackend, alert]);
 
@@ -697,10 +698,10 @@ function SnippetCard({
       const note = snippet.paperId
         ? await noteAddExcerpt(snippet.paperId, content)
         : await notesCreate(title, content);
-      await alert(`已创建笔记「${note.title}」，可在笔记页查看`, '转为笔记');
+      notify(`已创建笔记「${note.title}」，可在笔记页查看`, 'success');
     } catch (err) {
       console.error('convert to note:', err);
-      await alert(`创建笔记失败：${err}`, '转为笔记');
+      await alert(`创建笔记失败：${err}`, { title: '转为笔记', kind: 'error' });
     }
   };
 

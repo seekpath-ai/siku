@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Trash2, Edit2, X, Star, Loader2, CheckCircle } from 'lucide-react';
 import { useDialog } from '@/hooks/useDialog';
+import { notify } from '@/lib/notify';
 import type { LlmProvider } from '@/lib/types';
 import {
   llmProviderList,
@@ -88,11 +89,11 @@ export function LlmProviderSettings() {
 
   const handleSave = async () => {
     if (!form.name?.trim()) {
-      await alert('请输入配置名称');
+      notify('请输入配置名称', 'warning');
       return;
     }
     if (!form.model?.trim()) {
-      await alert('请输入模型名称');
+      notify('请输入模型名称', 'warning');
       return;
     }
 
@@ -121,7 +122,7 @@ export function LlmProviderSettings() {
       resetForm();
       setSaved(true);
     } catch (err) {
-      await alert(`保存失败: ${err}`);
+      await alert(`保存失败: ${err}`, { kind: 'error' });
     } finally {
       setSaving(false);
     }
@@ -135,7 +136,7 @@ export function LlmProviderSettings() {
       await load();
       if (editingId === p.id) resetForm();
     } catch (err) {
-      await alert(`删除失败: ${err}`);
+      await alert(`删除失败: ${err}`, { kind: 'error' });
     }
   };
 
@@ -144,7 +145,7 @@ export function LlmProviderSettings() {
       await llmProviderSetDefault(p.id);
       await load();
     } catch (err) {
-      await alert(`设置默认失败: ${err}`);
+      await alert(`设置默认失败: ${err}`, { kind: 'error' });
     }
   };
 
@@ -152,9 +153,9 @@ export function LlmProviderSettings() {
     setValidatingId(p.id);
     try {
       await llmProviderValidate(p.id);
-      await alert('连接成功', '测试连接');
+      notify('连接成功', 'success');
     } catch (err) {
-      await alert(`连接失败: ${err}`, '测试连接');
+      await alert(`连接失败: ${err}`, { title: '测试连接', kind: 'error' });
     } finally {
       setValidatingId(null);
     }

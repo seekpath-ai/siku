@@ -4,11 +4,11 @@ import { emit } from '@/lib/events';
 import { CollapsibleText } from '@/components/ui/CollapsibleText';
 import { useSkillMention } from '@/components/chat/useSkillMention';
 import { useNavigate } from '@tanstack/react-router';
-import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, ImagePlus, CheckCircle2, AlertCircle, Square, Eraser } from 'lucide-react';
+import { Send, Loader2, NotebookPen, Quote, ChevronDown, ChevronRight, Scissors, X, Paperclip, FileText, CheckCircle2, AlertCircle, Square, Eraser } from 'lucide-react';
 import { usePetStore } from '@/stores/petStore';
 import type { PetContext } from '@/stores/petContextStore';
 import { useEvidenceStore } from '@/stores/evidenceStore';
-import { agentCancel, agentIsRunning, getChatMessages, getAgentSteps, noteCreateFromReply, readImageFile, settingsAppGet, settingsGet, settingsSet } from '@/lib/tauri';
+import { agentCancel, agentIsRunning, getChatMessages, getAgentSteps, noteCreateFromReply, settingsAppGet, settingsGet, settingsSet } from '@/lib/tauri';
 import { parseEvidence } from '@/lib/evidence';
 import { formatFileToolApproval } from '@/lib/agent-tools';
 import type { EvidenceEntry } from '@/lib/evidence';
@@ -17,12 +17,14 @@ import { assistantMarkdownComponents, assistantRehypePlugins, assistantRemarkPlu
 import { ApprovalCard } from '@/components/chat/ApprovalCard';
 import { PetAskUserDialog } from '@/components/chat/AskUserDialog';
 import { ApprovalPolicySwitch } from '@/components/chat/ApprovalPolicySwitch';
-import { parseAttachments } from '@/lib/attachments';
+import { parseAttachments, ATTACH_FILTERS, dispatchAttachmentPaths } from '@/lib/attachments';
 import { ReasoningProcessCard } from '@/components/chat/ReasoningProcessCard';
 import { AttachmentImage } from '@/components/ui/AttachmentImage';
 import { SessionModelBadge } from '@/components/chat/SessionModelBadge';
 import { useDialog } from '@/hooks/useDialog';
 import { useImageAttachments } from '@/hooks/useImageAttachments';
+import { useTextAttachments } from '@/hooks/useTextAttachments';
+import { useFileDrop } from '@/hooks/useFileDrop';
 import { useAgentEventStream } from '@/hooks/useAgentEventStream';
 import { streamingToPhases, stepsToPhases } from '@/lib/agentPhases';
 import type { AgentStreamEvent, AgentStep, ApprovalConfig, ChatAttachment, ChatMessage, ToolCallInfo } from '@/lib/types';
@@ -263,9 +265,6 @@ export const DOMAIN_NAMES: Record<string, string> = {
   chat: '对话总结',
 };
 
-const IMAGE_FILTERS = [
-  { name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] },
-];
 
 const QUICK_COMMANDS: Record<string, string[]> = {
   notes: ['整理这篇笔记', '提炼要点', '补充标签', '检查错别字'],
@@ -399,28 +398,42 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
     onError: (msg) => showToast('error', msg),
   });
 
-  // Image upload via the OS file picker (same pipeline as the main chat).
-  const handleAttachImage = async () => {
-    try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const selected = await open({ multiple: true, directory: false, filters: IMAGE_FILTERS });
-      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
-      for (const path of paths) {
-        if (typeof path !== 'string') continue;
-        const name = path.split(/[\\/]/).pop() || path;
-        if (images.some((a) => a.name === name)) continue;
-        const att = await readImageFile(path);
-        addImageData({
-          name: att.name || name,
-          mime: att.mime,
-          base64: att.base64,
-          previewUrl: `data:${att.mime};base64,${att.base64}`,
-        });
-      }
-    } catch (err) {
-      console.error('Image attach failed:', err);
+  // Text attachments (documents extracted to text) — same machinery as the
+  // main chat, so the pet window accepts the same files.
+  const {
+    attachments: textAttachments,
+    addPath: addTextPath,
+    removeAttachment,
+    clearAttachments,
+    toMessageBlock,
+  } = useTextAttachments();
+
+  // Attach entry: picker and window drag & drop both funnel into the shared
+  // dispatcher (images inline as base64, documents extracted to text).
+  const attachPaths = async (paths: string[]) => {
+    const failures = await dispatchAttachmentPaths(paths, {
+      imageExists: (name) => images.some((a) => a.name === name),
+      addImage: addImageData,
+      addTextPath: (path) => addTextPath(path),
+    });
+    if (failures.length > 0) {
+      showToast('error', failures.join('；'));
     }
   };
+
+  const handleAttach = async () => {
+    try {
+      const { open } = await import('@tauri-apps/plugin-dialog');
+      const selected = await open({ multiple: true, directory: false, filters: ATTACH_FILTERS });
+      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+      await attachPaths(paths.filter((p): p is string => typeof p === 'string'));
+    } catch (err) {
+      console.error('Attach failed:', err);
+    }
+  };
+
+  // OS file drag & drop (Tauri native): same pipeline as the picker.
+  const { isDragging } = useFileDrop(attachPaths);
 
   // Citation badge click: highlight the quoted evidence in the reader. The
   // paper id comes from the session context (reader/library pages); in a
@@ -786,15 +799,16 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
 
   const handleSend = async () => {
     const text = input.trim();
-    if ((!text && images.length === 0) || store.streaming) return;
+    if ((!text && images.length === 0 && textAttachments.length === 0) || store.streaming) return;
     const skillHint = skillMention.takeFocusHint();
     const attachments: ChatAttachment[] | undefined = images.length
       ? images.map((a) => ({ mime: a.mime, base64: a.base64, name: a.name }))
       : undefined;
     setInput('');
+    clearAttachments();
     clearImages();
     if (inputRef.current) inputRef.current.style.height = 'auto';
-    await store.send([skillHint, text].filter(Boolean).join('\n'), attachments);
+    await store.send([skillHint, toMessageBlock(), text].filter(Boolean).join('\n\n'), attachments);
   };
 
   const handleQuick = (cmd: string) => {
@@ -832,6 +846,14 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
             <AlertCircle size={13} className="mt-px shrink-0" />
           )}
           <span className="break-words">{toast.text}</span>
+        </div>
+      )}
+      {/* File drop overlay — the listener is window-wide (useFileDrop). */}
+      {isDragging && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-[1px] pointer-events-none">
+          <div className="rounded-lg border-2 border-dashed border-primary bg-surface px-5 py-3 text-primary text-[12px] font-medium">
+            松开以添加附件
+          </div>
         </div>
       )}
       {/* Messages */}
@@ -990,8 +1012,26 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
         <div className="relative rounded-lg border border-surface-hover bg-background transition-colors focus-within:border-primary/40">
           {skillMention.popover}
           {skillMention.chips}
-          {images.length > 0 && (
+          {(textAttachments.length > 0 || images.length > 0) && (
             <div className="flex flex-wrap gap-1.5 px-2 pt-2">
+              {textAttachments.map((a) => (
+                <span
+                  key={a.id}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-primary/10 text-primary text-[11px] max-w-[160px]"
+                  title={a.path}
+                >
+                  <FileText size={11} className="shrink-0" />
+                  <span className="truncate">{a.name}</span>
+                  <button
+                    type="button"
+                    onClick={() => removeAttachment(a.id)}
+                    className="hover:text-red-400 shrink-0"
+                    aria-label="移除附件"
+                  >
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
               {images.map((a) => (
                 <span
                   key={a.id}
@@ -1041,12 +1081,12 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
               {skillMention.button}
               <button
                 type="button"
-                onClick={handleAttachImage}
+                onClick={handleAttach}
                 disabled={store.streaming}
                 className="w-7 h-7 rounded-md border-0 bg-transparent text-text-secondary/70 flex items-center justify-center hover:bg-surface-hover hover:text-text-primary transition-colors disabled:opacity-40"
-                title="附加图片"
+                title="附加文件或图片"
               >
-                <ImagePlus size={15} />
+                <Paperclip size={15} />
               </button>
               <button
                 type="button"

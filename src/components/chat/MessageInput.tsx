@@ -2,10 +2,13 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { Send, Paperclip, BookOpen, Brain, Square, X, FileText, Scissors } from 'lucide-react';
 import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
-import { agentSendMessage, agentCancel, readDocumentFile, readImageFile, agentMemoryGet, agentGetSession, agentSetApprovalConfig } from '@/lib/tauri';
+import { agentSendMessage, agentCancel, agentMemoryGet, agentGetSession, agentSetApprovalConfig } from '@/lib/tauri';
 import { useActiveAgentName } from '@/hooks/useActiveAgentName';
 import { useDialog } from '@/hooks/useDialog';
 import { useImageAttachments } from '@/hooks/useImageAttachments';
+import { useTextAttachments } from '@/hooks/useTextAttachments';
+import { useFileDrop } from '@/hooks/useFileDrop';
+import { ATTACH_FILTERS, dispatchAttachmentPaths } from '@/lib/attachments';
 import { AgentMemoryModal } from './AgentMemoryModal';
 import { ApprovalPolicySwitch } from './ApprovalPolicySwitch';
 import { useSkillMention } from './useSkillMention';
@@ -17,29 +20,17 @@ interface Props {
   disabled?: boolean;
 }
 
-interface TextAttachment {
-  kind: 'text';
-  id: string;
-  path: string;
-  name: string;
-  content: string;
-}
-
-const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
-
-const ATTACH_FILTERS = [
-  { name: '所有文件', extensions: ['*'] },
-  { name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] },
-  { name: '文档', extensions: ['pdf', 'docx', 'xlsx', 'pptx'] },
-  { name: '文本文件', extensions: ['txt', 'md', 'json', 'ts', 'tsx', 'js', 'rs', 'py', 'css', 'html', 'yml', 'yaml', 'toml', 'csv', 'xml'] },
-];
-
 export function MessageInput({ disabled }: Props) {
   const agentName = useActiveAgentName();
   const { alert } = useDialog();
   const [input, setInput] = useState('');
-  const [textAttachments, setTextAttachments] = useState<TextAttachment[]>([]);
-  const [isDragging, setIsDragging] = useState(false);
+  const {
+    attachments: textAttachments,
+    addPath: addTextPath,
+    removeAttachment,
+    clearAttachments,
+    toMessageBlock,
+  } = useTextAttachments();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { activeSessionId, addMessage, setLoading, isStreaming, sessions, setSessions } = useChatStore();
   const activeSession = sessions.find((s) => s.id === activeSessionId) ?? null;
@@ -104,7 +95,6 @@ export function MessageInput({ disabled }: Props) {
   const {
     images,
     addImageData,
-    addImageFile,
     removeImage,
     clearImages,
     shotArmed,
@@ -117,9 +107,21 @@ export function MessageInput({ disabled }: Props) {
     onError: (msg, title) => alert(msg, title ?? '图片附件'),
   });
 
-  // Single attach entry: one picker for documents AND images; each path is
-  // dispatched by extension — images go inline as base64 (vision models),
-  // everything else is extracted to text with cache-based paging.
+  // Attach entry: both the picker and window drag & drop funnel into the
+  // shared dispatcher — each path is routed by extension (images inline as
+  // base64, documents extracted to text). cacheDir = session write dir when
+  // set, so the agent's file_read can page oversized extractions.
+  const attachPaths = async (paths: string[]) => {
+    const failures = await dispatchAttachmentPaths(paths, {
+      imageExists: (name) => images.some((a) => a.name === name),
+      addImage: addImageData,
+      addTextPath: (path) => addTextPath(path, activeProject?.path),
+    });
+    if (failures.length > 0) {
+      await alert(failures.join('\n'), '附件读取失败');
+    }
+  };
+
   const handleAttach = async () => {
     try {
       const { open } = await import('@tauri-apps/plugin-dialog');
@@ -130,65 +132,14 @@ export function MessageInput({ disabled }: Props) {
         filters: ATTACH_FILTERS,
       });
       const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
-      const failures: string[] = [];
-      for (const path of paths) {
-        if (typeof path !== 'string') continue;
-        const name = path.split(/[\\/]/).pop() || path;
-        const ext = name.split('.').pop()?.toLowerCase() ?? '';
-        try {
-          if (IMAGE_EXTS.has(ext)) {
-            if (images.some((a) => a.name === name)) continue;
-            const att = await readImageFile(path);
-            addImageData({
-              name: att.name || name,
-              mime: att.mime,
-              base64: att.base64,
-              previewUrl: `data:${att.mime};base64,${att.base64}`,
-            });
-          } else {
-            // cacheDir = session write dir when set, so the agent's file_read
-            // can page oversized extractions.
-            const content = await readDocumentFile(path, activeProject?.path);
-            setTextAttachments((prev) =>
-              prev.some((a) => a.path === path)
-                ? prev
-                : [...prev, { kind: 'text', id: `txt_${Date.now()}_${path.length}`, path, name, content }]
-            );
-          }
-        } catch (err) {
-          failures.push(`${name}: ${err}`);
-        }
-      }
-      if (failures.length > 0) {
-        await alert(failures.join('\n'), '附件读取失败');
-      }
+      await attachPaths(paths.filter((p): p is string => typeof p === 'string'));
     } catch (err) {
       console.error('Attach failed:', err);
     }
   };
 
-  const handleDrop = useCallback(
-    async (e: React.DragEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-      setIsDragging(false);
-      const files = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith('image/'));
-      for (const file of files) {
-        await addImageFile(file);
-      }
-    },
-    [addImageFile]
-  );
-
-  const handleDragOver = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(true);
-  }, []);
-
-  const handleDragLeave = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-  }, []);
+  // OS file drag & drop (Tauri native): anywhere in the window works.
+  const { isDragging } = useFileDrop(attachPaths);
 
   const handleStop = () => {
     if (activeSessionId) agentCancel(activeSessionId).catch(() => {});
@@ -209,9 +160,7 @@ export function MessageInput({ disabled }: Props) {
           )
           .join('\n\n')}\n</context>`
       : '';
-    const attachBlock = textAttachments
-      .map((a) => `<file name="${a.name}" path="${a.path}">\n${a.content}\n</file>`)
-      .join('\n');
+    const attachBlock = toMessageBlock();
     const skillHint = skillMention.takeFocusHint();
     const content = [skillHint, contextBlock, attachBlock, text].filter(Boolean).join('\n\n');
 
@@ -221,7 +170,7 @@ export function MessageInput({ disabled }: Props) {
         : undefined;
 
     setInput('');
-    setTextAttachments([]);
+    clearAttachments();
     clearImages();
     setContexts([]);
     setLoading(true);
@@ -322,9 +271,6 @@ export function MessageInput({ disabled }: Props) {
           className={`relative rounded-xl border p-1 transition-colors focus-within:bg-surface ${
             isDragging ? 'border-primary bg-primary/5' : 'border-surface-hover'
           }`}
-          onDrop={handleDrop}
-          onDragOver={handleDragOver}
-          onDragLeave={handleDragLeave}
         >
           {skillMention.popover}
           {skillMention.chips}
@@ -362,7 +308,7 @@ export function MessageInput({ disabled }: Props) {
                   <span className="truncate">{a.name}</span>
                   <button
                     type="button"
-                    onClick={() => setTextAttachments((prev) => prev.filter((x) => x.id !== a.id))}
+                    onClick={() => removeAttachment(a.id)}
                     className="hover:text-red-400 shrink-0"
                     aria-label="移除附件"
                   >
@@ -492,9 +438,16 @@ export function MessageInput({ disabled }: Props) {
           </div>
         </div>
         <div className="text-center text-[12px] text-text-secondary/60 mt-2">
-          Enter 发送 · Shift + Enter 换行 · @ 使用技能 · Ctrl+Shift+S 截图 · 拖拽/粘贴图片也可发送
+          Enter 发送 · Shift + Enter 换行 · @ 使用技能 · Ctrl+Shift+S 截图 · 拖拽文件到窗口即可附加
         </div>
       </div>
+      {isDragging && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 backdrop-blur-[1px] pointer-events-none">
+          <div className="rounded-xl border-2 border-dashed border-primary bg-surface px-8 py-6 text-primary text-sm font-medium">
+            松开以添加附件
+          </div>
+        </div>
+      )}
       {memoryOpen && activeSessionId && (
         <AgentMemoryModal
           sessionId={activeSessionId}

@@ -221,7 +221,8 @@ function PetMessage({ msg, onCitation, onSaveNote, saving }: {
   }
   return (
     <div className="flex justify-start">
-      <div className="max-w-[92%] prose prose-sm prose-invert max-w-none [&>*:first-child]:mt-0">
+      {/* w-full within the 95% cap so replies align with the reasoning card. */}
+      <div className="w-full max-w-[95%] prose prose-sm prose-invert max-w-none [&>*:first-child]:mt-0">
         <PetMarkdown content={msg.content} onCitation={onCitation} />
         {evidence.size > 0 && (
           <EvidenceListCard evidence={evidence} onCitation={onCitation} />
@@ -912,7 +913,7 @@ export function PetConversation({ context, liveSelection = true }: PetConversati
         })()}
         {store.streamContent && (
           <div className="flex justify-start">
-            <div className="max-w-[92%] prose prose-sm prose-invert max-w-none [&>*:first-child]:mt-0">
+            <div className="w-full max-w-[95%] prose prose-sm prose-invert max-w-none [&>*:first-child]:mt-0">
               <PetMarkdown content={store.streamContent} onCitation={handleCitation} />
               <span className="inline-block w-1.5 h-3.5 bg-primary animate-pulse ml-0.5 align-middle rounded-sm" />
             </div>

@@ -315,10 +315,13 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
       )}
 
       <div
-        className={`relative inline-block text-left max-w-[85%] rounded-2xl px-4 py-2.5 text-[14px] leading-relaxed ${
+        className={`relative rounded-2xl px-4 py-2.5 text-[14px] leading-relaxed ${
           isUser
-            ? 'bg-codex-surface border border-codex-border text-codex-primary'
-            : 'bg-codex-surface/60 border border-codex-border/60 text-codex-primary'
+            ? 'inline-block text-left max-w-[85%] bg-codex-surface border border-codex-border text-codex-primary'
+            : // Assistant replies span the full content column so the bubble's
+              // edges align with the reasoning card above it (fixed reading
+              // column instead of width drifting with content length).
+              'w-full bg-codex-surface/60 border border-codex-border/60 text-codex-primary'
         }`}
       >
         {/* WeChat-style tail pointing toward the user's avatar */}

@@ -5,6 +5,18 @@
       "bin/PDFIUM-LICENSE.txt",
       "ext/crsqlite.dll",
       "resources/skills"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "template": "nsis/installer.nsi",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "sidebarImage": "nsis/sidebar.bmp",
+        "headerImage": "nsis/header.bmp",
+        "uninstallerHeaderImage": "nsis/header.bmp",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false
+      }
+    }
   }
 }

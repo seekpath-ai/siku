@@ -24,7 +24,9 @@ pnpm tauri build --target x86_64-pc-windows-gnu
 
 顺序要点：**先改版本号再打 tag 最后编译**，保证 tag、仓库、二进制三者一致。
 
-CI 产物命名约束：productName 必须保持 ASCII（`siku`）。deb/rpm 包名规范不支持中文（会得到 `-1.5.0-1.x86_64.rpm` 空名产物）；Windows 的 NSIS/WiX 在 GitHub runner 非 UTF-8 代码页下也会因中文 productName 构建失败。中文桌面快捷方式后续用 NSIS 自定义模板实现，不走 productName。
+CI 产物命名约束：productName 必须保持 ASCII（`siku`）。deb/rpm 包名规范不支持中文（会得到 `-1.5.0-1.x86_64.rpm` 空名产物）；Windows 的 NSIS/WiX 在 GitHub runner 非 UTF-8 代码页下也会因中文 productName 构建失败。中文桌面快捷方式已通过 NSIS 自定义模板实现（见下），不走 productName。
+
+NSIS 定制（`src-tauri/nsis/`）：`installer.nsi` 基于官方模板（tauri-cli 2.11.2 对应版本）定制，快捷方式用 `SHORTCUTDISPLAYNAME`（思库）并清理旧 ASCII 快捷方式；`sidebar.bmp`（164x314）/`header.bmp`（150x57）是欢迎页侧图与页头图，品牌配置在 `tauri.windows.conf.json` 的 `bundle.windows.nsis`（含中英双语安装界面）。**升级 tauri-cli 大版本后需对照新版官方模板同步 `installer.nsi`**；重新生成品牌图：改 `src-tauri/nsis/brand.html` 后用 Playwright 对 `#sidebar`/`#header` 截图（164x314、150x57），再 `convert -type TrueColor BMP3:` 转 BMP。
 
 平台资源打包：tauri 按目标平台自动合并 `tauri.<平台>.conf.json`（无需 --config，CI ubuntu 任务显式传了是双保险）。**新增需要打包的资源文件时三个平台配置文件都要检查**：windows/macos/linux 各自的 resources 是自包含的，漏配会在用户机器上报 "crsqlite not found" 这类启动错误（开发机上不会暴露，因为会命中 `src-tauri/ext/` 的编译机路径）。
 

@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif; }
+
+  .sidebar {
+    width: 164px; height: 314px; background: #1A1A1E; position: relative;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    overflow: hidden;
+  }
+  .sidebar .glow {
+    position: absolute; inset: 0;
+    background: radial-gradient(ellipse at 50% 38%, rgba(230,126,34,0.16) 0%, transparent 65%);
+  }
+  .sidebar img.logo { width: 60px; height: 60px; margin-bottom: 14px; position: relative; }
+  .sidebar h1 {
+    font-size: 22px; font-weight: 700; letter-spacing: 0.14em; position: relative;
+    background: linear-gradient(135deg, #E67E22 0%, #F5A623 60%, #E67E22 100%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  }
+  .sidebar p { color: #9CA3AF; font-size: 10px; letter-spacing: 0.18em; margin-top: 8px; position: relative; }
+
+  .header {
+    width: 150px; height: 57px; background: #FFFFFF;
+    display: flex; align-items: center; justify-content: flex-end;
+    padding-right: 12px;
+  }
+  .header img.logo { width: 34px; height: 34px; }
+</style>
+</head>
+<body>
+  <div class="sidebar" id="sidebar">
+    <div class="glow"></div>
+    <img class="logo" src="../../public/splash-logo.svg" />
+    <h1>思库</h1>
+    <p>让灵感涌动</p>
+  </div>
+  <div class="header" id="header">
+    <img class="logo" src="../../public/logo-icon-v2.svg" />
+  </div>
+</body>
+</html>

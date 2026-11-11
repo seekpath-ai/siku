@@ -519,7 +519,7 @@ pub fn probe_dependencies(app_data_dir: &Path, requires: &SkillRequires) -> Vec<
     }
     if !requires.pip.is_empty() {
         let env = crate::core::skill_env::resolve(app_data_dir);
-        let missing_hint = if env.python.is_some() {
+        let missing_hint = if env.ready() {
             None
         } else if env.conda.is_some() {
             Some("隔离环境 siku-office 尚未创建".to_string())

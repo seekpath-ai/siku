@@ -53,9 +53,17 @@ export function SessionModelBadge({ session, onModelChange, maxWidthClass = 'max
   // sessions can carry a stale inline block next to the pool id). Showing
   // the inline block first made the badge disagree with the menu's check
   // mark — and with the model actually serving the turn.
-  const llm = session.llm_models?.[0];
-  const poolId = session.llm_provider_ids?.[0];
-  const pool = poolId ? providers.find((p) => p.id === poolId) : undefined;
+  const rawPoolId = session.llm_provider_ids?.[0];
+  const pool = rawPoolId ? providers.find((p) => p.id === rawPoolId) : undefined;
+  // Dangling pool ref (provider deleted, or session synced from a machine
+  // with a different provider pool): the runtime skips the stale inline
+  // snapshot too and falls back to the global default — mirror that here,
+  // otherwise the label shows the stale inline model while no menu row is
+  // checked. providers=[] may just mean the list hasn't loaded yet, so only
+  // treat the ref as dangling once it has.
+  const dangling = !!rawPoolId && !pool && providers.length > 0;
+  const poolId = dangling ? undefined : rawPoolId;
+  const llm = dangling ? undefined : session.llm_models?.[0];
   // Sessions that never picked a model (remote IM sessions, legacy rows) run
   // on the global default at runtime — show it instead of hiding the badge.
   const fallbackDefault = !pool && !llm ? providers.find((p) => p.is_default) : undefined;

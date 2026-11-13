@@ -35,7 +35,7 @@ pub enum SikuError {
     #[error("rate limited")]
     RateLimited,
 
-    #[error("API key not configured for provider {0}")]
+    #[error("提供商 {0} 未配置 API Key，请先在 设置 → 模型 中补全密钥")]
     MissingApiKey(String),
 
     #[error("unknown error: {0}")]

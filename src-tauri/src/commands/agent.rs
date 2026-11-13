@@ -74,6 +74,7 @@ async fn ensure_agent_config(
     app_settings: &crate::core::models::AppSettings,
     db: &sqlx::SqlitePool,
     has_pool_ref: bool,
+    require_llm: bool,
 ) -> Result<(), String> {
     // When the session references the provider pool, do NOT materialize an
     // inline llm_models block: the pool ref wins at runtime anyway, and a
@@ -99,7 +100,25 @@ async fn ensure_agent_config(
         if block.is_none() {
             block = app_settings.default_llm.clone();
         }
-        config.llm_models.push(block.unwrap_or_else(LlmConfigBlock::default));
+        // A block without a key (non-Ollama) can never serve a turn — legacy
+        // settings fallbacks and half-configured migration seeds included.
+        // Treat it as absent so the caller gets the clear "尚未配置模型"
+        // error instead of a misleading key error.
+        let block = block
+            .filter(|b| !b.api_key.is_empty() || b.provider.eq_ignore_ascii_case("ollama"));
+        match block {
+            Some(b) => config.llm_models.push(b),
+            // Never synthesize the placeholder block (DeepSeek + empty key):
+            // persisted into sessions it masqueraded as a configured custom
+            // LLM (badge/config panel showed "deepseek / deepseek-v4-flash")
+            // and turns died with a cryptic auth error. Creation paths leave
+            // llm_models empty instead — AgentConfig::active_llm() has a
+            // static fallback, and the model UI falls back to the pool.
+            None if require_llm => {
+                return Err("尚未配置模型，请先在 设置 → 模型 中添加提供商".to_string());
+            }
+            None => {}
+        }
     }
     if config.max_loops.is_none() {
         config.max_loops = Some(app_settings.default_max_loops);
@@ -234,12 +253,12 @@ pub async fn agent_memory_review(
     .map_err(|e| format!("db error: {e}"))?
     .ok_or_else(|| "session not found".to_string())?;
 
-    let config = build_agent_config(&state, &session).await?;
+    let config = build_agent_config(&state, &session, true).await?;
     let mut llm_config = config.active_llm().to_llm_config();
     if llm_config.api_key.is_empty()
         && llm_config.provider != crate::ai::llm::LlmProvider::Ollama
     {
-        return Err("API key not configured. Please set it in Settings.".to_string());
+        return Err("模型未配置 API Key，请先在 设置 → 模型 中补全密钥".to_string());
     }
     // The revised document must fit in one completion: a user-tuned low output
     // cap would silently truncate it into a broken document. 思考模型的推理与
@@ -301,9 +320,13 @@ pub async fn agent_memory_review(
 }
 
 /// Build an AgentConfig from a ChatSession row, filling defaults from app settings.
+/// `require_llm`: turn/LLM-consuming paths pass true so "no model configured"
+/// fails with a clear message; read/config-save paths pass false — renaming a
+/// session or mounting a skill must work on a machine without providers.
 async fn build_agent_config(
     state: &AppState,
     session: &ChatSession,
+    require_llm: bool,
 ) -> Result<AgentConfig, String> {
     let app_settings = settings_service::load_app_settings(&state.db).await?;
 
@@ -312,8 +335,10 @@ async fn build_agent_config(
 
     // Prefer provider pool references; fallback to legacy embedded llm_models.
     let mut llm_models: Vec<LlmConfigBlock> = Vec::new();
+    let mut had_pool_ref = false;
     if let Some(ids_json) = &session.llm_provider_ids {
         if let Ok(ids) = serde_json::from_str::<Vec<String>>(ids_json) {
+            had_pool_ref = !ids.is_empty();
             for id in ids {
                 match crate::core::llm_provider_service::resolve_block(&state.db, &id).await {
                     Ok(block) => llm_models.push(block),
@@ -322,12 +347,24 @@ async fn build_agent_config(
             }
         }
     }
-    if llm_models.is_empty() {
+    // The inline block is only a fallback for sessions that NEVER referenced
+    // the pool. When pool refs exist but all fail to resolve (provider deleted,
+    // or synced to a machine without that provider), the stale inline snapshot
+    // dates from the same era and is usually broken too — skip it and let
+    // ensure_agent_config fall back to the global default instead.
+    if llm_models.is_empty() && !had_pool_ref {
         llm_models = session
             .llm_models
             .as_ref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
+            .and_then(|s| serde_json::from_str::<Vec<LlmConfigBlock>>(s).ok())
+            .unwrap_or_default()
+            .into_iter()
+            // Placeholder blocks persisted by older versions (or by session
+            // creation before any provider existed) can never serve a turn —
+            // treat them as absent so the global default / clear error below
+            // kicks in. Ollama legitimately runs without a key.
+            .filter(|b| !b.api_key.is_empty() || b.provider.eq_ignore_ascii_case("ollama"))
+            .collect();
     }
 
     let approval: ApprovalConfig = match session
@@ -383,7 +420,7 @@ async fn build_agent_config(
         memory_dir: session.memory_dir.clone(),
         skills_dir: session.skills_dir.clone(),
     };
-    ensure_agent_config(&mut config, &app_settings, &state.db, false).await?;
+    ensure_agent_config(&mut config, &app_settings, &state.db, false, require_llm).await?;
     Ok(config)
 }
 
@@ -410,7 +447,7 @@ pub async fn agent_create_session(
         memory_dir: input.memory_dir.clone(),
         skills_dir: input.skills_dir.clone(),
     };
-    ensure_agent_config(&mut config, &app_settings, &state.db, !input.llm_provider_ids.is_empty()).await?;
+    ensure_agent_config(&mut config, &app_settings, &state.db, !input.llm_provider_ids.is_empty(), false).await?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_iso();
@@ -519,7 +556,7 @@ pub async fn agent_update_session(
         memory_dir: input.memory_dir.clone(),
         skills_dir: input.skills_dir.clone(),
     };
-    ensure_agent_config(&mut config, &app_settings, &state.db, !input.llm_provider_ids.is_empty()).await?;
+    ensure_agent_config(&mut config, &app_settings, &state.db, !input.llm_provider_ids.is_empty(), false).await?;
 
     let now = now_iso();
     let llm_json = serde_json::to_string(&config.llm_models).map_err(|e| format!("json: {e}"))?;
@@ -583,7 +620,7 @@ pub async fn agent_update_session(
     .await
     .map_err(|e| format!("db error: {e}"))?;
 
-    let config = build_agent_config(&state, &session).await?;
+    let config = build_agent_config(&state, &session, false).await?;
     Ok(session_to_json(
         session.id,
         config,
@@ -654,7 +691,7 @@ pub async fn agent_get_session(
     .map_err(|e| format!("db error: {e}"))?
     .ok_or_else(|| "session not found".to_string())?;
 
-    let config = build_agent_config(&state, &session).await?;
+    let config = build_agent_config(&state, &session, false).await?;
     Ok(session_to_json(
         session.id,
         config,
@@ -997,7 +1034,7 @@ pub(crate) async fn run_agent_turn(
     .map_err(|e| format!("db error: {e}"))?
     .ok_or_else(|| "session not found".to_string())?;
 
-    let mut config = build_agent_config(&state, &session).await?;
+    let mut config = build_agent_config(&state, &session, true).await?;
     // "Full" = no per-turn narrowing applied. Needed below to decide whether
     // the outbound-file tool may be exposed at all.
     let grant_full = tools_override.is_none();
@@ -1154,7 +1191,7 @@ pub(crate) async fn run_agent_turn(
     }
 
     if llm_config.api_key.is_empty() && llm_config.provider != llm::LlmProvider::Ollama {
-        return Err("API key not configured. Please set it in Settings.".to_string());
+        return Err("模型未配置 API Key，请先在 设置 → 模型 中补全密钥".to_string());
     }
     let llm_client = llm::client::create_llm_client(&llm_config)
         .map_err(|e| format!("failed to create LLM client: {e}"))?;

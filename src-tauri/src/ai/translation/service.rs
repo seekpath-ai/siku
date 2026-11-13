@@ -60,7 +60,7 @@ pub async fn translate_text(
     let model = llm_config.model.clone();
 
     if llm_config.api_key.is_empty() && llm_config.provider != llm::LlmProvider::Ollama {
-        return Err("API key not configured. Please set it in Settings.".to_string());
+        return Err("模型未配置 API Key，请先在 设置 → 模型 中补全密钥".to_string());
     }
 
     // Check cache first
@@ -124,7 +124,7 @@ pub async fn translate_text_stream(
     let model = llm_config.model.clone();
 
     if llm_config.api_key.is_empty() && llm_config.provider != llm::LlmProvider::Ollama {
-        return Err("API key not configured. Please set it in Settings.".to_string());
+        return Err("模型未配置 API Key，请先在 设置 → 模型 中补全密钥".to_string());
     }
 
     // Check cache first
@@ -280,7 +280,7 @@ pub async fn translate_texts_batch(
 
     let llm_config = crate::core::settings_service::load_llm_config(db).await?;
     if llm_config.api_key.is_empty() && llm_config.provider != llm::LlmProvider::Ollama {
-        return Err("API key not configured. Please set it in Settings.".to_string());
+        return Err("模型未配置 API Key，请先在 设置 → 模型 中补全密钥".to_string());
     }
     let model = llm_config.model.clone();
     let client: Arc<dyn llm::LlmClient> = Arc::from(

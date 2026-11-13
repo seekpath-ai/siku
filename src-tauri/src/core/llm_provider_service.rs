@@ -148,6 +148,43 @@ pub async fn delete_provider(db: &SqlitePool, id: &str) -> Result<(), String> {
         .execute(db)
         .await
         .map_err(|e| format!("db: {e}"))?;
+
+    // Scrub dangling references from sessions: build_agent_config would warn
+    // and fall back, but leaving the dead id around keeps the model badge
+    // showing nothing checked forever. chat_sessions is a CRR table, so the
+    // UPDATE propagates to synced devices (which may never have had this
+    // provider and would otherwise hold a dangling id from the start).
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, llm_provider_ids FROM chat_sessions WHERE llm_provider_ids LIKE ?",
+    )
+    .bind(format!("%{id}%"))
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("db: {e}"))?;
+    for (session_id, ids_json) in rows {
+        if let Ok(mut ids) = serde_json::from_str::<Vec<String>>(&ids_json) {
+            let before = ids.len();
+            ids.retain(|x| x != id);
+            if ids.len() != before {
+                let new_json = serde_json::to_string(&ids).map_err(|e| format!("json: {e}"))?;
+                sqlx::query("UPDATE chat_sessions SET llm_provider_ids = ? WHERE id = ?")
+                    .bind(&new_json)
+                    .bind(&session_id)
+                    .execute(db)
+                    .await
+                    .map_err(|e| format!("db: {e}"))?;
+            }
+        }
+    }
+    // The vision-model column references the same pool with a single id —
+    // NULL it out so image turns fall back to the clear "配置视觉模型" path
+    // instead of a resolve error against a provider that no longer exists.
+    sqlx::query("UPDATE chat_sessions SET vision_provider_id = NULL WHERE vision_provider_id = ?")
+        .bind(id)
+        .execute(db)
+        .await
+        .map_err(|e| format!("db: {e}"))?;
+
     info!(provider_id = %id, "deleted llm provider");
     Ok(())
 }
@@ -260,6 +297,21 @@ async fn ensure_seeded(db: &SqlitePool) -> Result<(), String> {
         .await
         .map_err(|e| format!("db: {e}"))?;
     if count > 0 {
+        // Record that seeding is done/pointless: without the marker, deleting
+        // EVERY provider resurrected the legacy-settings entry on the next
+        // read — the table being empty is a user decision, not a seed cue.
+        if settings_service::get_setting(db, "llm_providers.seeded")
+            .await?
+            .is_none()
+        {
+            settings_service::set_setting(db, "llm_providers.seeded", "1").await?;
+        }
+        return Ok(());
+    }
+    if settings_service::get_setting(db, "llm_providers.seeded")
+        .await?
+        .is_some()
+    {
         return Ok(());
     }
 
@@ -318,6 +370,7 @@ async fn ensure_seeded(db: &SqlitePool) -> Result<(), String> {
     .map_err(|e| format!("db: {e}"))?;
 
     info!(provider_id = %id, "seeded default llm provider from legacy settings");
+    settings_service::set_setting(db, "llm_providers.seeded", "1").await?;
     Ok(())
 }
 

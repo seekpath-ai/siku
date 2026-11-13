@@ -63,6 +63,7 @@ export const TOOL_CATEGORIES: AgentToolCategory[] = [
       { key: 'browser_tabs', label: 'browser_tabs — 标签页管理' },
       { key: 'browser_wait', label: 'browser_wait — 等待页面元素' },
       { key: 'browser_snapshot', label: 'browser_snapshot — 页面元素快照' },
+      { key: 'browser_read', label: 'browser_read — 读取页面正文' },
       { key: 'browser_click', label: 'browser_click — 点击元素' },
       { key: 'browser_type', label: 'browser_type — 输入文本' },
       { key: 'browser_scroll', label: 'browser_scroll — 滚动页面' },

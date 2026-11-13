@@ -313,6 +313,7 @@ impl ToolRegistry {
         registry.register(crate::ai::agent::tools::browser_nav::BrowserWaitTool);
         // DOM snapshot (the model's view of the page) and ref interactions.
         registry.register(crate::ai::agent::tools::browser_snapshot::BrowserSnapshotTool);
+        registry.register(crate::ai::agent::tools::browser_read::BrowserReadTool);
         registry.register(crate::ai::agent::tools::browser_interact::BrowserClickTool);
         registry.register(crate::ai::agent::tools::browser_interact::BrowserTypeTool);
         registry.register(crate::ai::agent::tools::browser_interact::BrowserScrollTool);

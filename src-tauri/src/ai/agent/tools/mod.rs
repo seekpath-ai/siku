@@ -30,6 +30,7 @@ pub mod research;
 pub mod browser;
 pub mod browser_nav;
 pub mod browser_snapshot;
+pub mod browser_read;
 pub mod browser_interact;
 pub mod browser_output;
 pub mod browser_captcha;

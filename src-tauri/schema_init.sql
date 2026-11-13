@@ -365,6 +365,12 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     tokens_in_hit INTEGER,
     tokens_out INTEGER,
     attachments TEXT,
+    -- Synced historical metadata: which machine produced the message. Used
+    -- only to warn the agent that earlier paths/environments belong to another
+    -- device; never used as this device's sandbox root.
+    origin_device_id TEXT NOT NULL DEFAULT '',
+    origin_device_name TEXT NOT NULL DEFAULT '',
+    origin_working_dir TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);

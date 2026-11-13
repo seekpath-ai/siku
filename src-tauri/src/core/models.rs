@@ -227,6 +227,13 @@ pub struct ChatMessage {
     /// chitchat; None = untagged. Tagging also copies the content to the
     /// corresponding store (memory / knowledge base) — see chat_message_tag.
     pub user_tag: Option<String>,
+    /// Snapshot of the machine that produced this message (synced historical
+    /// metadata — never used as a sandbox root). Lets the agent know that
+    /// earlier absolute paths / software environments belong to another
+    /// device when a conversation is continued elsewhere.
+    pub origin_device_id: String,
+    pub origin_device_name: String,
+    pub origin_working_dir: String,
     pub created_at: String,
 }
 

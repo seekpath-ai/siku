@@ -216,7 +216,7 @@ pub async fn get_chat_messages(
     after_id: Option<String>,
     limit: Option<i64>,
 ) -> Result<ChatMessagePage, String> {
-    const COLS: &str = "id, session_id, role, content, reasoning_content, tool_calls, tool_call_id, tool_name, citations, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, attachments, user_tag, created_at";
+    const COLS: &str = "id, session_id, role, content, reasoning_content, tool_calls, tool_call_id, tool_name, citations, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, attachments, user_tag, origin_device_id, origin_device_name, origin_working_dir, created_at";
 
     if let (Some(ts), Some(id)) = (after_created_at, after_id) {
         let messages = sqlx::query_as::<_, ChatMessage>(&format!(
@@ -377,7 +377,7 @@ pub async fn chat_message_tag(
     message_id: String,
     tag: Option<String>,
 ) -> Result<ChatMessage, String> {
-    const COLS: &str = "id, session_id, role, content, reasoning_content, tool_calls, tool_call_id, tool_name, citations, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, attachments, user_tag, created_at";
+    const COLS: &str = "id, session_id, role, content, reasoning_content, tool_calls, tool_call_id, tool_name, citations, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, attachments, user_tag, origin_device_id, origin_device_name, origin_working_dir, created_at";
     let msg = sqlx::query_as::<_, ChatMessage>(&format!("SELECT {COLS} FROM chat_messages WHERE id = ?"))
         .bind(&message_id)
         .fetch_optional(&state.db)
@@ -500,4 +500,29 @@ pub async fn save_chat_message(
         .map_err(|e| format!("db error: {e}"))?;
 
     Ok(id)
+}
+
+/// Attach the producing device + working directory to a message. Written as a
+/// follow-up UPDATE so the many existing `save_chat_message` call sites stay
+/// untouched; a failure only costs the cross-device hint, never the message.
+pub(crate) async fn set_message_origin(
+    db: &sqlx::SqlitePool,
+    message_id: &str,
+    device_id: &str,
+    device_name: &str,
+    working_dir: &str,
+) {
+    if let Err(e) = sqlx::query(
+        "UPDATE chat_messages SET origin_device_id = ?, origin_device_name = ?, origin_working_dir = ? \
+         WHERE id = ?",
+    )
+    .bind(device_id)
+    .bind(device_name)
+    .bind(working_dir)
+    .bind(message_id)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(message_id = %message_id, error = %e, "failed to persist chat message origin");
+    }
 }

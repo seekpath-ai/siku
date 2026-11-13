@@ -337,6 +337,10 @@ export interface ChatMessage {
   attachments: string | null; // JSON ChatAttachment[]
   /** Bubble tag: experience | knowledge | chitchat; null = untagged. */
   user_tag: string | null;
+  /** Device that produced this message (synced historical metadata). */
+  origin_device_id?: string;
+  origin_device_name?: string;
+  origin_working_dir?: string;
   created_at: string;
 }
 

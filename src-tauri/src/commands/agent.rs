@@ -179,48 +179,6 @@ fn agent_skills_dir(
         .unwrap_or_else(|| default_skills_dir(effective_base_dir(app_data_dir, data_dir)))
 }
 
-/// Build the truncation manifest from the older (not loaded) memory records:
-/// a zero-LLM-cost map of what fell out of the window — round count, time
-/// range, and the first line of each truncated user message — plus the recall
-/// escape hatch. Every line derives from stored records, so unlike an LLM
-/// summary it cannot hallucinate content that was never said.
-fn truncated_history_note(
-    older: &[crate::ai::agent::memory_store::MemoryRecord],
-    recall_available: bool,
-) -> Option<String> {
-    let users: Vec<_> = older.iter().filter(|r| r.role == "user").collect();
-    if users.is_empty() {
-        return None;
-    }
-    const MAX_ENTRIES: usize = 30;
-    let first = older.first()?.time.format("%Y-%m-%d");
-    let last = older.last()?.time.format("%Y-%m-%d");
-    let mut note = format!(
-        "# 更早的对话（未加载进上下文）\n本会话还有 {} 轮更早的对话（{} ~ {}）未加载。以下是每条用户消息的首行，仅供定位：\n",
-        users.len(),
-        first,
-        last
-    );
-    let shown = if users.len() > MAX_ENTRIES {
-        &users[users.len() - MAX_ENTRIES..]
-    } else {
-        &users[..]
-    };
-    for r in shown {
-        let first_line: String = r.content.lines().next().unwrap_or("").chars().take(60).collect();
-        note.push_str(&format!("- [{}] {}\n", r.time.format("%m-%d %H:%M"), first_line));
-    }
-    if users.len() > MAX_ENTRIES {
-        note.push_str(&format!("（更早的 {} 轮从略）\n", users.len() - MAX_ENTRIES));
-    }
-    if recall_available {
-        note.push_str("需要完整内容或当时的工具调用详情时，用 memory_recall 工具按关键词（query）或时间范围（from/to）查询。");
-    } else {
-        note.push_str("（历史检索工具 memory_recall 未启用，无法回查这些内容。）");
-    }
-    Some(note)
-}
-
 /// AI-assisted review of an agent's long-term memory: the session's own model
 /// proposes a revised document (drop stale/contradictory entries, merge
 /// duplicates, compress) with human-readable notes. The command NEVER applies
@@ -672,6 +630,35 @@ pub async fn agent_set_session_model(
     Ok(())
 }
 
+/// Bind the session to a folder on THIS device. `working_dir` is a
+/// device-local column (excluded from sync), so each machine keeps its own
+/// root even though the session row itself is shared. Deliberately does not
+/// bump `updated_at`: this change never leaves the device and must not win
+/// LWW against real synced edits.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn agent_set_session_working_dir(
+    state: State<'_, AppState>,
+    session_id: String,
+    working_dir: Option<String>,
+) -> Result<(), String> {
+    let dir = working_dir
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(d) = &dir {
+        if !std::path::Path::new(d).is_dir() {
+            return Err(format!("目录不存在：{d}"));
+        }
+    }
+    sqlx::query("UPDATE chat_sessions SET working_dir = ? WHERE id = ?")
+        .bind(&dir)
+        .bind(&session_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
+    Ok(())
+}
+
 /// Get a single agent session with full config
 #[tauri::command]
 #[instrument(skip(state))]
@@ -881,43 +868,13 @@ fn session_to_json(
     })
 }
 
-/// The reasoning to persist alongside a turn's assistant message.
-///
-/// A turn can span several ReAct rounds (think → tool → think → answer); the
-/// API expects per-message reasoning, but the memory file stores one assistant
-/// record per turn, so the rounds are concatenated in order. Capped at
-/// `REASONING_MEMORY_CAP` characters — everything here is replayed into the
-/// next turn's input context, and an unbounded thinking transcript would eat
-/// the context budget for no benefit.
-const REASONING_MEMORY_CAP: usize = 8_000;
-
+/// The reasoning persisted alongside a turn's assistant message (JSONL cache
+/// and the legacy step-less replay path). A turn can span several ReAct
+/// rounds; they are concatenated in order by the shared history helper.
 fn turn_reasoning_from_steps(steps: &[AgentStep]) -> Option<String> {
-    let mut out = String::new();
-    for step in steps {
-        let Some(reasoning) = step.reasoning_content.as_deref().map(str::trim) else {
-            continue;
-        };
-        if reasoning.is_empty() {
-            continue;
-        }
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str(reasoning);
-    }
-    if out.trim().is_empty() {
-        return None;
-    }
-    if out.chars().count() > REASONING_MEMORY_CAP {
-        // Keep the END: the tail is what the model was thinking just before it
-        // answered, which is the part worth continuing from.
-        let tail: String = out
-            .chars()
-            .skip(out.chars().count() - REASONING_MEMORY_CAP)
-            .collect();
-        return Some(format!("…（较早的思考已省略）\n{tail}"));
-    }
-    Some(out)
+    crate::ai::agent::history_store::concat_reasoning(
+        steps.iter().filter_map(|step| step.reasoning_content.as_deref()),
+    )
 }
 
 /// Where a session's scratch files go when it has no project folder.
@@ -1093,6 +1050,10 @@ pub(crate) async fn run_agent_turn(
         .clone()
         .filter(|w| !w.trim().is_empty());
     let mut workspace_note: Option<String> = None;
+    // True when the effective dir is the app-owned per-session workspace
+    // rather than a user-chosen folder. Such a path is meaningless on another
+    // device, so it is not recorded as the message origin's working dir.
+    let mut working_dir_is_auto = false;
 
     if let Some(wd) = working_dir.clone() {
         if std::path::Path::new(&wd).is_dir() {
@@ -1135,6 +1096,7 @@ pub(crate) async fn run_agent_turn(
                 // Carry over the reason (stale path) when there was one.
                 let reason = workspace_note.take().unwrap_or_else(|| "本会话未指定写入目录".to_string());
                 working_dir = Some(workspace.to_string_lossy().to_string());
+                working_dir_is_auto = true;
                 workspace_note = Some(write_dir_note(
                     &workspace.to_string_lossy(),
                     Some(&reason),
@@ -1149,6 +1111,26 @@ pub(crate) async fn run_agent_turn(
             }
         }
     }
+
+    // Snapshot the machine context for this turn's message rows. These are
+    // historical metadata on chat_messages: they sync so the agent can tell
+    // that an earlier turn ran on a different machine, but they are NEVER used
+    // as this device's sandbox root.
+    let current_device_id = device_settings.device_id.clone();
+    let current_device_name = settings_service::get_device_setting(
+        &state.db,
+        crate::commands::account::ACCOUNT_DEVICE_NAME_KEY,
+    )
+    .await
+    .ok()
+    .flatten()
+    .filter(|s| !s.trim().is_empty())
+    .unwrap_or_else(|| "当前设备".to_string());
+    let origin_working_dir = if working_dir_is_auto {
+        String::new()
+    } else {
+        working_dir.clone().unwrap_or_default()
+    };
 
     // Per-turn cancellation token. The engine and long-running tools/streams
     // watch it via `tokio::select!` so the user can abort promptly.
@@ -1345,36 +1327,41 @@ pub(crate) async fn run_agent_turn(
     );
     let memory = MemoryStore::new(memory_path.clone());
 
-    // Save user message to DB
     let attachments_json = attachments.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()).filter(|s| !s.is_empty());
-    let user_message_id = chat::save_chat_message(&state.db, &session_id, "user", &content, None, None, None, None, None, None, None, None, None, attachments_json.as_deref()).await?;
 
-    // Load history BEFORE appending current user message, then append it.
-    // The engine itself will prepend the current user message to the prompt.
-    // Following ShellAgent's approach, memory only persists user and final assistant
-    // messages; intermediate tool calls / tool results live in the DB (agent_steps).
-    let history_records = memory.load_recent(config.effective_max_memory_rounds());
-    info!(session_id=%session_id, records=%history_records.len(), "loading agent history from memory");
+    // History comes from the synced DB (chat_messages + agent_steps), not the
+    // local JSONL cache: a second device that receives the conversation has no
+    // local JSONL for it. Load BEFORE inserting this turn's user message so the
+    // engine prepends it exactly once.
+    let loaded_history = crate::ai::agent::history_store::load(
+        &state.db,
+        &session_id,
+        config.effective_max_memory_rounds(),
+        registry.has_tool("memory_recall"),
+    )
+    .await?;
+    info!(session_id=%session_id, records=loaded_history.entries.len(), "loading agent history from chat_messages");
     // Parallel timestamps for the turn-context snapshot (ChatMessage drops them).
-    let history_times: Vec<String> = history_records.iter().map(|r| r.time.to_rfc3339()).collect();
-    let mut history: Vec<ChatMessage> = history_records
-        .into_iter()
-        .map(|r| ChatMessage {
-            role: r.role,
-            content: r.content,
-            attachments: r.attachments,
+    let history_times: Vec<String> = loaded_history.entries.iter().map(|e| e.created_at.clone()).collect();
+    let mut history: Vec<ChatMessage> = loaded_history
+        .entries
+        .iter()
+        .map(|e| ChatMessage {
+            role: e.role.clone(),
+            content: e.content.clone(),
+            attachments: e.attachments.clone(),
             tool_calls: None,
             tool_call_id: None,
             name: None,
             // Replayed so the model can continue its earlier reasoning (and so
             // DeepSeek's thinking models do not 400 on a tools request).
-            reasoning_content: r.reasoning_content,
+            reasoning_content: e.reasoning_content.clone(),
         })
         .collect();
     // Attachments are base64 blobs; keeping them on every historical message
     // resends every past image on every turn. Keep them only on the most
     // recent message that carried any — older turns' images have already
-    // been described in the conversation. The JSONL memory file is untouched.
+    // been described in the conversation.
     if let Some(last_idx) = history.iter().rposition(|m| m.attachments.is_some()) {
         for (i, m) in history.iter_mut().enumerate() {
             if i != last_idx {
@@ -1382,24 +1369,22 @@ pub(crate) async fn run_agent_turn(
             }
         }
     }
+    let history_note = loaded_history.older_note.clone();
 
-    // Truncation manifest: when the loaded window leaves older conversation
-    // behind, hand the model a zero-LLM-cost map of what is missing (round
-    // count, time range, first line of each truncated user message) plus the
-    // recall escape hatch. Every line is derived from stored records — no
-    // summary model, no hallucination surface.
-    let history_note = {
-        let total = memory.total_records();
-        let loaded = history.len();
-        if total > loaded {
-            let all = memory.load_all();
-            let older_len = all.len().saturating_sub(loaded);
-            truncated_history_note(&all[..older_len], registry.has_tool("memory_recall"))
-        } else {
-            None
-        }
-    };
+    // Save user message to DB (after the history load so it is not duplicated
+    // in the prompt). The origin snapshot is written as a follow-up UPDATE.
+    let user_message_id = chat::save_chat_message(&state.db, &session_id, "user", &content, None, None, None, None, None, None, None, None, None, attachments_json.as_deref()).await?;
+    chat::set_message_origin(
+        &state.db,
+        &user_message_id,
+        &current_device_id,
+        &current_device_name,
+        &origin_working_dir,
+    )
+    .await;
 
+    // Local cache/backup only (the memory-dir setting and debugging); the
+    // model's history above is authoritative and comes from the synced DB.
     memory.append("user", &content, None, None, None, attachments_json.as_deref(), None);
 
     // Pet domain sessions: build a context hint for the system prompt so the
@@ -1425,6 +1410,34 @@ pub(crate) async fn run_agent_turn(
     // model guesses where a relative path lands, and a wrong guess is invisible
     // until a later file_read "cannot find" what the agent believes it wrote.
     let context_prompt = match (context_prompt, workspace_note) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    };
+
+    // L2: synced history may have been produced on another machine. Tell the
+    // model which machine produced it and which machine it is running on now,
+    // so absolute paths / software facts from the earlier turns are not
+    // silently treated as local truth.
+    let device_switch_note = crate::ai::agent::history_store::device_switch_note(
+        &loaded_history.entries,
+        &current_device_id,
+        &current_device_name,
+        &origin_working_dir,
+    );
+    let environment_note = format!(
+        "# 当前执行环境\n设备「{current_device_name}」；系统 {os}/{arch}；时区 {tz}；应用数据目录：{data}。此描述仅代表本机；历史中提到的其它设备环境不适用于本机。",
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        tz = chrono::Local::now().offset(),
+        data = state.app_data_dir.display(),
+    );
+    let context_prompt = match (context_prompt, device_switch_note) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    };
+    let context_prompt = match (context_prompt, Some(environment_note)) {
         (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
         (Some(a), None) => Some(a),
         (None, b) => b,
@@ -1589,6 +1602,9 @@ pub(crate) async fn run_agent_turn(
     let sid = session_id.clone();
     let app_clone = app_handle.clone();
     let spawn_memory_path = memory_path.clone();
+    let turn_device_id = current_device_id.clone();
+    let turn_device_name = current_device_name.clone();
+    let turn_origin_dir = origin_working_dir.clone();
     let cancel_tokens = state.cancel_tokens.clone();
     let tracked = state.background_tasks.clone();
     // Moved into the turn task: the assistant row must carry whatever the
@@ -1724,6 +1740,14 @@ pub(crate) async fn run_agent_turn(
 
                 // Persist each ReAct step linked to the final assistant message.
                 if let Some(ref mid) = message_id {
+                    chat::set_message_origin(
+                        &db,
+                        mid,
+                        &turn_device_id,
+                        &turn_device_name,
+                        &turn_origin_dir,
+                    )
+                    .await;
                     for step in steps {
                         if let Err(e) = sqlx::query(
                             "INSERT INTO agent_steps (id, session_id, message_id, step_index, reasoning_content, tool_calls, narration, created_at)
@@ -1742,6 +1766,7 @@ pub(crate) async fn run_agent_turn(
                             error!(error = %e, step_index = step.step_index, "failed to persist agent step");
                         }
                     }
+
                 }
 
                 mem.append(

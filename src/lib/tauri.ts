@@ -296,6 +296,16 @@ export async function agentGetSession(sessionId: string): Promise<AgentSession> 
   return invoke<AgentSession>('agent_get_session', { sessionId });
 }
 
+/** Bind this session to a folder on THIS device (device-local column; never
+ *  synced). Used when continuing a conversation that was last active on
+ *  another machine with different paths. */
+export async function agentSetSessionWorkingDir(
+  sessionId: string,
+  workingDir: string | null,
+): Promise<void> {
+  return invoke<void>('agent_set_session_working_dir', { sessionId, workingDir });
+}
+
 /** Quick-switch a session's model from the chat header badge. Writes ONLY
  *  the llm columns (agentUpdateSession is a full-config overwrite); takes
  *  effect on the next turn. */

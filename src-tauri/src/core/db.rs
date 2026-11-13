@@ -768,6 +768,24 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     add_column_if_missing(&db, "chat_messages", "user_tag", "TEXT")
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_messages.user_tag: {}", e))?;
+    // Message origin (2026-11): which device/working dir produced a turn.
+    // Historical metadata only — the path is never used as a sandbox root, it
+    // just lets the agent know that a synced earlier turn ran elsewhere.
+    add_column_if_missing(&db, "chat_messages", "origin_device_id", "TEXT NOT NULL DEFAULT ''")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chat_messages.origin_device_id: {}", e))?;
+    add_column_if_missing(&db, "chat_messages", "origin_device_name", "TEXT NOT NULL DEFAULT ''")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chat_messages.origin_device_name: {}", e))?;
+    add_column_if_missing(&db, "chat_messages", "origin_working_dir", "TEXT NOT NULL DEFAULT ''")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chat_messages.origin_working_dir: {}", e))?;
+    // The new columns make an already-registered CRR's triggers stale. Refresh
+    // now (no-op for non-CRRs) so an UPDATE between here and the optional-table
+    // registration below cannot fail with "expected N values, got M" — e.g.
+    // when optional sync is currently off but the table is still a CRR from an
+    // earlier run that crashed before dropping it.
+    refresh_stale_crr_triggers(&db, "chat_messages").await?;
 
     // Migration: sync chat_sessions columns added for agent features
     add_column_if_missing(&db, "chat_sessions", "llm_models", "TEXT")

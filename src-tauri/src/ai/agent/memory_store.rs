@@ -129,13 +129,16 @@ impl MemoryStore {
         self.write_meta(current + 1);
     }
 
-    /// Total number of records in the file (meta-cached). Used to detect
-    /// that the loaded window left older conversation behind.
+    /// Total number of records in the file (meta-cached). Kept for manual
+    /// recovery/inspection: agent history is loaded from the synced DB now.
+    #[allow(dead_code)]
     pub fn total_records(&self) -> usize {
         self.read_meta().unwrap_or_else(|| self.rebuild_meta())
     }
 
-    /// Load the most recent `max_rounds` of conversation.
+    /// Load the most recent `max_rounds` of conversation. Kept for manual
+    /// recovery/inspection (DB history is authoritative).
+    #[allow(dead_code)]
     pub fn load_recent(&self, max_rounds: usize) -> Vec<MemoryRecord> {
         let max_lines = max_rounds.saturating_mul(2).max(1);
         let lines = self.tail_lines(max_lines);
@@ -152,7 +155,8 @@ impl MemoryStore {
         records
     }
 
-    /// Load the full conversation memory.
+    /// Load the full conversation memory. Kept for manual recovery/inspection.
+    #[allow(dead_code)]
     pub fn load_all(&self) -> Vec<MemoryRecord> {
         if !self.file_path.exists() {
             return Vec::new();
@@ -185,6 +189,7 @@ impl MemoryStore {
 
 
     /// Read the last `max_lines` non-empty lines from the file efficiently.
+    #[allow(dead_code)]
     fn tail_lines(&self, max_lines: usize) -> Vec<String> {
         if !self.file_path.exists() {
             return Vec::new();

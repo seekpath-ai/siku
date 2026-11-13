@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { listen, type UnlistenFn } from '@/lib/events';
-import { Bot, Loader2, ArrowUp } from 'lucide-react';
+import { Bot, Loader2, ArrowUp, Laptop } from 'lucide-react';
 import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';
 import { ChatHeader } from './ChatHeader';
@@ -11,7 +11,9 @@ import { mergeMessages } from '@/lib/chatMerge';
 import { useProjectStore } from '@/stores/projectStore';
 import { usePetContextStore } from '@/stores/petContextStore';
 import { useStreamingChat } from '@/hooks/useStreamingChat';
-import { getChatMessages, getAgentSteps, agentRenameSession, agentSetSessionModel, agentIsRunning, agentCreateSession, agentSendMessage } from '@/lib/tauri';
+import { getChatMessages, getAgentSteps, agentRenameSession, agentSetSessionModel, agentIsRunning, agentCreateSession, agentSendMessage, getDeviceId, agentSetSessionWorkingDir } from '@/lib/tauri';
+import { pickDirectory } from '@/lib/pickDirectory';
+import { useDialogStore } from '@/stores/dialogStore';
 
 /** Empty-state hero input: typing here and hitting send creates a session
  * and immediately starts the first turn (Kimi-style "输入即开工"). The first
@@ -131,10 +133,51 @@ export function ChatPanel() {
   useStreamingChat();
   const { activeSessionId, sessions, isStreaming, setMessages, setAgentSteps, setSessions } =
     useChatStore();
+  const messages = useChatStore((s) => s.messages);
   const { projects } = useProjectStore();
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  // Current machine id, used to spot a conversation continued elsewhere.
+  const [deviceId, setDeviceId] = useState('');
+
+  useEffect(() => {
+    getDeviceId().then(setDeviceId).catch(() => {});
+  }, []);
+
+  // Remote changes (typically the other device continuing this conversation)
+  // should show up without closing/reopening the session. The event carries no
+  // table info, so re-fetch the newest page and merge it; older pages stay
+  // loaded. Skip while streaming to avoid fighting the live turn.
+  useEffect(() => {
+    if (!activeSessionId) return;
+    let unlisten: UnlistenFn | undefined;
+    listen('sync:remote_applied', () => {
+      if (useChatStore.getState().isStreaming) return;
+      void Promise.all([
+        getChatMessages(activeSessionId, { limit: MESSAGE_PAGE_SIZE }),
+        getAgentSteps(activeSessionId).catch(() => []),
+      ])
+        .then(([page, steps]) => {
+          const st = useChatStore.getState();
+          if (st.activeSessionId !== activeSessionId) return;
+          // Rows can be UPDATED on the peer (artifact links appended to an
+          // assistant message, message origin attached after the insert), and
+          // mergeMessages keeps existing ids verbatim. Refresh known rows from
+          // the page first so edits are not masked by the local copy.
+          const pageById = new Map(page.messages.map((m) => [m.id, m]));
+          const refreshed = st.messages.map((m) => pageById.get(m.id) ?? m);
+          st.setMessages(mergeMessages(refreshed, page.messages));
+          st.setAgentSteps(steps);
+        })
+        .catch((err) => console.error('Failed to refresh chat after sync:', err));
+    }).then((u) => {
+      unlisten = u;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [activeSessionId]);
 
   // Ctrl+F opens the in-conversation search bar.
   useEffect(() => {
@@ -149,6 +192,36 @@ export function ChatPanel() {
   }, [activeSessionId]);
 
   const activeSession = sessions.find((s) => s.id === activeSessionId) ?? null;
+
+  // The latest message's origin tells us whether this conversation is being
+  // continued here for the first time (messages are synced, so a fresh device
+  // sees the last turn produced by the other machine).
+  const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
+  const foreignOrigin =
+    !!lastMessage?.origin_device_id &&
+    !!deviceId &&
+    lastMessage.origin_device_id !== deviceId
+      ? {
+          name: lastMessage.origin_device_name || '另一台设备',
+          dir: lastMessage.origin_working_dir || '',
+        }
+      : null;
+
+  const bindLocalWorkingDir = async () => {
+    if (!activeSession) return;
+    const dir = await pickDirectory(activeSession.working_dir ?? '');
+    if (!dir) return;
+    try {
+      await agentSetSessionWorkingDir(activeSession.id, dir);
+      setSessions(
+        useChatStore
+          .getState()
+          .sessions.map((s) => (s.id === activeSession.id ? { ...s, working_dir: dir } : s)),
+      );
+    } catch (err) {
+      useDialogStore.getState().alert(`绑定工作目录失败：${err}`, { kind: 'error' });
+    }
+  };
 
   // Expose the focused conversation to the global pet.
   useEffect(() => {
@@ -167,6 +240,11 @@ export function ChatPanel() {
   // differ from the sidebar's current filter project.
   const sessionProject =
     projects.find((p) => p.id === activeSession?.project_id) ?? null;
+  // The effective local folder can come from the session override OR the
+  // project bound on this device (the turn falls back to the project dir).
+  const localBoundDir =
+    (activeSession?.working_dir?.trim() ? activeSession.working_dir : '') ||
+    (sessionProject?.path?.trim() ? sessionProject.path : '');
 
   useEffect(() => {
     if (!activeSessionId) return;
@@ -347,6 +425,28 @@ export function ChatPanel() {
         onModelChange={handleModelChange}
         onToggleSearch={() => setSearchOpen((v) => !v)}
       />
+      {activeSession && foreignOrigin && (
+        <div className="shrink-0 flex items-center gap-2 px-5 py-1.5 border-b border-surface-hover bg-warning/10 text-[11px] text-text-secondary">
+          <Laptop size={13} className="shrink-0 text-warning" />
+          <span className="truncate">
+            此会话最近在「{foreignOrigin.name}」上继续
+            {foreignOrigin.dir ? `（当时工作目录 ${foreignOrigin.dir}）` : ''}
+            ，历史中的路径/环境可能不属于本机。
+          </span>
+          {localBoundDir ? (
+            <span className="ml-auto shrink-0 text-text-secondary/60 truncate max-w-[220px]" title={localBoundDir}>
+              本机目录：{localBoundDir}
+            </span>
+          ) : (
+            <button
+              onClick={() => void bindLocalWorkingDir()}
+              className="ml-auto shrink-0 px-2 py-0.5 rounded bg-warning/20 text-text-primary hover:bg-warning/30 transition-colors"
+            >
+              绑定本机工作目录
+            </button>
+          )}
+        </div>
+      )}
       {searchOpen && <ChatSearchBar onClose={() => setSearchOpen(false)} />}
       <div className="flex-1 overflow-hidden relative">
         <MessageList onLoadOlder={loadOlderMessages} loadingOlder={loadingOlder} />

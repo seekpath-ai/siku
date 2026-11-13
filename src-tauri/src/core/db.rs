@@ -1776,6 +1776,15 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         .await
         .map_err(|e| anyhow::anyhow!("llm provider sync migration failed: {e}"))?;
 
+    // Move API keys that only lived in chat_sessions.llm_models into the pool,
+    // then fold the legacy app-level pointer into the pool's is_default star.
+    migrate_inline_session_keys(&db)
+        .await
+        .map_err(|e| anyhow::anyhow!("inline session key migration failed: {e}"))?;
+    migrate_default_provider_pointer(&db)
+        .await
+        .map_err(|e| anyhow::anyhow!("default provider pointer migration failed: {e}"))?;
+
     // Register core sync tables as CRDTs for multi-device sync.
     // This must happen AFTER all schema migrations so the CRR triggers match
     // the final table schemas. If columns are added after registration, the
@@ -2966,6 +2975,110 @@ async fn migrate_llm_providers_for_sync(db: &Db) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Move API keys that only exist in `chat_sessions.llm_models` into the
+/// provider pool and clear them from the session row. Runs on every startup
+/// (cheap query; no-op once clean) so sessions synced from older builds are
+/// also scrubbed. Empty-key blocks stay inline (they mean "use the global
+/// default").
+async fn migrate_inline_session_keys(db: &Db) -> anyhow::Result<()> {
+    use crate::ai::agent::config::LlmConfigBlock;
+
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id, llm_models, llm_provider_ids FROM chat_sessions \
+         WHERE llm_models IS NOT NULL AND trim(llm_models) NOT IN ('', '[]')",
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut cleaned = 0usize;
+    let mut linked = 0usize;
+    for (session_id, llm_models, provider_ids) in rows {
+        let Some(llm_models) = llm_models else {
+            continue;
+        };
+        let Ok(blocks) = serde_json::from_str::<Vec<LlmConfigBlock>>(&llm_models) else {
+            continue;
+        };
+        let keyed: Vec<LlmConfigBlock> = blocks
+            .iter()
+            .filter(|b| !b.api_key.trim().is_empty())
+            .cloned()
+            .collect();
+        if keyed.is_empty() {
+            continue;
+        }
+        let new_ids =
+            crate::core::llm_provider_service::ensure_blocks_as_providers(db, &keyed)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+        let mut ids: Vec<String> = provider_ids
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        for id in &new_ids {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        let remaining: Vec<LlmConfigBlock> = blocks
+            .iter()
+            .filter(|b| b.api_key.trim().is_empty())
+            .cloned()
+            .collect();
+        let remaining_json = serde_json::to_string(&remaining)?;
+        let ids_json = serde_json::to_string(&ids)?;
+        // No updated_at bump: the CRR column changes still sync, and bumping
+        // could let this local cleanup win LWW against real edits.
+        sqlx::query("UPDATE chat_sessions SET llm_models = ?, llm_provider_ids = ? WHERE id = ?")
+            .bind(remaining_json)
+            .bind(ids_json)
+            .bind(&session_id)
+            .execute(db)
+            .await?;
+        cleaned += 1;
+        linked += new_ids.len();
+    }
+    if cleaned > 0 {
+        info!(
+            sessions = cleaned,
+            providers = linked,
+            "moved inline session LLM keys into the provider pool"
+        );
+    }
+    Ok(())
+}
+
+/// Fold the legacy device-local `app_settings.default_llm_provider_id` into
+/// the pool's `is_default` star (the single default source from now on).
+/// Idempotent: the pointer is cleared after the first run.
+async fn migrate_default_provider_pointer(db: &Db) -> anyhow::Result<()> {
+    let mut settings = crate::core::settings_service::load_app_settings(db)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let Some(pointer) = settings.default_llm_provider_id.clone() else {
+        return Ok(());
+    };
+    let exists: Option<String> =
+        sqlx::query_scalar("SELECT id FROM llm_providers WHERE id = ?")
+            .bind(&pointer)
+            .fetch_optional(db)
+            .await?;
+    if exists.is_some() {
+        if let Err(e) =
+            crate::core::llm_provider_service::set_default_provider(db, &pointer).await
+        {
+            warn!(provider_id = %pointer, error = %e, "migrating default provider pointer failed");
+        } else {
+            info!(provider_id = %pointer, "migrated default provider pointer to is_default");
+        }
+    }
+    settings.default_llm_provider_id = None;
+    crate::core::settings_service::save_app_settings(db, &settings)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(())
+}
+
 /// Rebuild `projects` into the CRR-compatible shape and make `path`
 /// device-local:
 /// - `id` must be NOT NULL (SQLite's TEXT PRIMARY KEY stays nullable);
@@ -4075,6 +4188,195 @@ pub(crate) mod tests {
         .fetch_one(&db)
         .await?;
         assert_eq!(old_left, 0);
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Sessions used to persist inline API keys. The cleanup moves keyed
+    /// blocks into the provider pool, clears the keys from the session, keeps
+    /// empty-key blocks (Ollama / "use global default"), and is idempotent.
+    #[tokio::test]
+    async fn inline_session_keys_move_to_provider_pool() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-inline-keys-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = connect_with_crsqlite(&dir.join("test.db")).await?;
+
+        sqlx::query(
+            "CREATE TABLE llm_providers (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                api_key TEXT NOT NULL DEFAULT '',
+                base_url TEXT NOT NULL DEFAULT '',
+                proxy TEXT,
+                max_tokens INTEGER DEFAULT 4096,
+                temperature REAL DEFAULT 0.7,
+                extra_body TEXT,
+                is_default INTEGER DEFAULT 0,
+                is_vision INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE chat_sessions (
+                id TEXT PRIMARY KEY,
+                llm_models TEXT,
+                llm_provider_ids TEXT
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO chat_sessions (id, llm_models, llm_provider_ids) VALUES ('s1', ?, '[]')",
+        )
+        .bind(
+            r#"[{"provider":"deepseek","model":"deepseek-chat","api_key":"sk-inline","base_url":"https://api.deepseek.com/v1","max_tokens":4096,"temperature":0.7},{"provider":"ollama","model":"llama3","api_key":"","base_url":"http://localhost:11434"}]"#,
+        )
+        .execute(&db)
+        .await?;
+
+        super::migrate_inline_session_keys(&db).await?;
+
+        let (count, id, key): (i64, String, String) = sqlx::query_as(
+            "SELECT COUNT(*), id, api_key FROM llm_providers WHERE api_key = 'sk-inline'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(count, 1);
+        assert_eq!(
+            id,
+            crate::core::llm_provider_service::deterministic_id_for_key(
+                "deepseek",
+                "https://api.deepseek.com/v1",
+                "deepseek-chat",
+                "sk-inline"
+            )
+        );
+        assert_eq!(key, "sk-inline");
+
+        let (models, ids): (String, String) =
+            sqlx::query_as("SELECT llm_models, llm_provider_ids FROM chat_sessions WHERE id = 's1'")
+                .fetch_one(&db)
+                .await?;
+        assert!(!models.contains("sk-inline"), "session must not keep the key: {models}");
+        let parsed: serde_json::Value = serde_json::from_str(&models)?;
+        assert_eq!(parsed.as_array().map(|a| a.len()), Some(1), "{parsed}");
+        assert_eq!(parsed[0]["provider"], serde_json::json!("ollama"));
+        let parsed_ids: Vec<String> = serde_json::from_str(&ids)?;
+        assert_eq!(parsed_ids, vec![id.clone()]);
+
+        // Idempotent: the remaining block has no key, so nothing more happens.
+        super::migrate_inline_session_keys(&db).await?;
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM llm_providers")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(count, 1);
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// The legacy app_settings pointer folds into the pool's is_default star
+    /// and is cleared, leaving one default source.
+    #[tokio::test]
+    async fn default_provider_pointer_migrates_to_star() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-default-pointer-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = connect_with_crsqlite(&dir.join("test.db")).await?;
+
+        sqlx::query(
+            "CREATE TABLE llm_providers (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                api_key TEXT NOT NULL DEFAULT '',
+                base_url TEXT NOT NULL DEFAULT '',
+                proxy TEXT,
+                max_tokens INTEGER DEFAULT 4096,
+                temperature REAL DEFAULT 0.7,
+                extra_body TEXT,
+                is_default INTEGER DEFAULT 0,
+                is_vision INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE settings (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO llm_providers (id, name, provider, model, api_key, base_url, created_at, updated_at) \
+             VALUES ('p1', 'P1', 'deepseek', 'deepseek-chat', 'sk-1', 'https://api.deepseek.com/v1', 't', 't'), \
+                    ('p2', 'P2', 'openai', 'gpt-4o', 'sk-2', 'https://api.openai.com/v1', 't', 't')",
+        )
+        .execute(&db)
+        .await?;
+        let mut settings = crate::core::models::AppSettings::default();
+        settings.default_llm_provider_id = Some("p1".to_string());
+        let json = serde_json::to_string(&settings)?;
+        sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES ('app_settings', ?, 't')")
+            .bind(json)
+            .execute(&db)
+            .await?;
+
+        super::migrate_default_provider_pointer(&db).await?;
+
+        let (p1_default,): (i64,) =
+            sqlx::query_as("SELECT is_default FROM llm_providers WHERE id = 'p1'")
+                .fetch_one(&db)
+                .await?;
+        let (p2_default,): (i64,) =
+            sqlx::query_as("SELECT is_default FROM llm_providers WHERE id = 'p2'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(p1_default, 1);
+        assert_eq!(p2_default, 0);
+        let loaded = crate::core::settings_service::load_app_settings(&db)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        assert!(loaded.default_llm_provider_id.is_none());
+
+        // Idempotent.
+        super::migrate_default_provider_pointer(&db).await?;
+        let (p1_default,): (i64,) =
+            sqlx::query_as("SELECT is_default FROM llm_providers WHERE id = 'p1'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(p1_default, 1);
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;

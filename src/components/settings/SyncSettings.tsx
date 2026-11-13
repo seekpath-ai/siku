@@ -403,7 +403,7 @@ export function SyncSettings() {
         <div className="flex items-center text-sm text-text-primary">
           同步聊天记录
           <HintIcon>
-            启用后同步 chat_sessions、chat_messages、agent_steps（推理过程）、projects（项目元数据；目录路径保持本机，需在每台设备绑定）、session_artifacts（会话产物索引；文件本体走 blob 同步）、llm_providers（模型提供商，含 API Key；默认与代理保持本机）、translation_cache（译文缓存，可跨设备复用）等可选表；含密钥的全局设置不参与同步。清空译文缓存会同步到所有设备。
+            启用后同步 chat_sessions、chat_messages、agent_steps（推理过程）、projects（项目元数据；目录路径保持本机，需在每台设备绑定）、session_artifacts（会话产物索引；文件本体走 blob 同步）、llm_providers（模型提供商，含 API Key；默认与代理保持本机）、translation_cache（译文缓存，可跨设备复用）等可选表；含密钥的全局设置不参与同步。旧版 llm.* 设置键不再同步，内联会话密钥会迁入模型池。清空译文缓存会同步到所有设备。
           </HintIcon>
         </div>
         <button

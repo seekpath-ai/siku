@@ -134,7 +134,8 @@ pub async fn update_provider(
 /// Delete a provider.
 #[instrument(skip(db))]
 pub async fn delete_provider(db: &SqlitePool, id: &str) -> Result<(), String> {
-    // If this provider was the app-wide default, clear the stale reference.
+    // Legacy app-level default pointer (superseded by is_default, but old
+    // settings rows may still carry it).
     if let Ok(settings) = settings_service::load_app_settings(db).await {
         if settings.default_llm_provider_id.as_deref() == Some(id) {
             let mut updated = settings.clone();
@@ -253,24 +254,120 @@ pub async fn set_default_provider(db: &SqlitePool, id: &str) -> Result<LlmProvid
 /// that configured the same endpoint/model converge on one row. Providers
 /// created after the migration keep random UUIDs, which lets two accounts on
 /// the same endpoint/model coexist.
-pub(crate) fn deterministic_id(provider: &str, base_url: &str, model: &str) -> String {
+fn hash_uuid(input: &str) -> String {
     // Deliberately SHA-256 instead of the uuid crate's v5 feature: the id is
     // opaque and only needs to be stable, and this avoids adding a dependency
     // (uuid's v5 pulls sha1_smol). Format it as a UUID so the rest of the code
     // keeps treating ids uniformly.
     use sha2::{Digest, Sha256};
-    let normalized = format!(
+    let digest = Sha256::digest(input.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50; // version nibble (informational)
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
+fn normalized_identity(provider: &str, base_url: &str, model: &str) -> String {
+    format!(
         "{}|{}|{}",
         provider.trim().to_lowercase(),
         base_url.trim().trim_end_matches('/'),
         model.trim()
-    );
-    let digest = Sha256::digest(normalized.as_bytes());
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x50; // version nibble (5 = name-based, informational)
-    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
-    uuid::Uuid::from_bytes(bytes).to_string()
+    )
+}
+
+pub(crate) fn deterministic_id(provider: &str, base_url: &str, model: &str) -> String {
+    hash_uuid(&normalized_identity(provider, base_url, model))
+}
+
+/// Deterministic id for a provider that originated from an inline session
+/// LLM block. The key is part of the hash so two different accounts on the
+/// same endpoint/model stay distinct, while the same inline config on two
+/// devices converges on one provider row.
+pub(crate) fn deterministic_id_for_key(
+    provider: &str,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+) -> String {
+    hash_uuid(&format!(
+        "{}|key:{}",
+        normalized_identity(provider, base_url, model),
+        api_key
+    ))
+}
+
+/// Ensure keyed inline LLM blocks live in the provider pool and return their
+/// ids. Blocks with an empty key are left inline (they mean "use the global
+/// default"). This is what lets sessions stop persisting inline API keys.
+pub async fn ensure_blocks_as_providers(
+    db: &SqlitePool,
+    blocks: &[LlmConfigBlock],
+) -> Result<Vec<String>, String> {
+    let mut ids = Vec::new();
+    for block in blocks {
+        if block.api_key.trim().is_empty() {
+            continue;
+        }
+        let provider = block.provider.trim();
+        let model = block.model.trim();
+        let base_url = block.base_url.trim();
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM llm_providers              WHERE lower(provider) = lower(?) AND trim(model) = ?                AND rtrim(trim(base_url), '/') = rtrim(trim(?), '/') AND api_key = ?              LIMIT 1",
+        )
+        .bind(provider)
+        .bind(model)
+        .bind(base_url)
+        .bind(&block.api_key)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| format!("db: {e}"))?;
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                let id = deterministic_id_for_key(provider, base_url, model, &block.api_key);
+                let present: Option<String> =
+                    sqlx::query_scalar("SELECT id FROM llm_providers WHERE id = ?")
+                        .bind(&id)
+                        .fetch_optional(db)
+                        .await
+                        .map_err(|e| format!("db: {e}"))?;
+                if present.is_none() {
+                    let now = now_iso();
+                    let name = format!("{provider} / {model}");
+                    let extra_body = block
+                        .extra_body
+                        .as_ref()
+                        .map(|v| serde_json::to_string(v).unwrap_or_default());
+                    sqlx::query(
+                        "INSERT INTO llm_providers                          (id, name, provider, model, api_key, base_url, proxy, max_tokens,                           temperature, extra_body, is_default, is_vision, sort_order, created_at, updated_at)                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 100, ?, ?)",
+                    )
+                    .bind(&id)
+                    .bind(&name)
+                    .bind(provider)
+                    .bind(model)
+                    .bind(&block.api_key)
+                    .bind(base_url)
+                    .bind(&block.proxy)
+                    .bind(block.max_tokens.unwrap_or(4096))
+                    .bind(block.temperature.map(|t| t as f64).unwrap_or(0.7))
+                    .bind(&extra_body)
+                    .bind(if block.is_vision.unwrap_or(false) { 1 } else { 0 })
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(db)
+                    .await
+                    .map_err(|e| format!("db: {e}"))?;
+                }
+                id
+            }
+        };
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
 }
 
 /// Convert a provider row into an agent LLM config block.
@@ -504,7 +601,12 @@ impl std::fmt::Debug for LlmProviderInput {
 
 #[cfg(test)]
 mod tests {
-    use super::deterministic_id;
+    use super::{
+        deterministic_id, deterministic_id_for_key, ensure_blocks_as_providers,
+    };
+    use crate::ai::agent::config::LlmConfigBlock;
+    use crate::core::db::SCHEMA_INIT_SQL;
+    use sqlx::sqlite::SqlitePoolOptions;
 
     /// Same endpoint/model configured with different casing / trailing slash
     /// must derive the same id; a different model must not collide.
@@ -515,5 +617,81 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.len(), 36, "must stay UUID-shaped");
         assert_ne!(a, deterministic_id("deepseek", "https://api.deepseek.com/v1", "deepseek-reasoner"));
+    }
+
+    fn block(provider: &str, model: &str, api_key: &str) -> LlmConfigBlock {
+        LlmConfigBlock {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            api_key: api_key.to_string(),
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            proxy: None,
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            extra_body: None,
+            is_vision: None,
+            reasoning_passthrough: None,
+        }
+    }
+
+    /// Keyed inline blocks become pool rows with a stable id; empty keys are
+    /// skipped; a different key on the same endpoint/model stays distinct.
+    #[tokio::test]
+    async fn keyed_blocks_become_pool_providers_idempotently() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db).await.unwrap();
+
+        let blocks = vec![
+            block("deepseek", "deepseek-chat", "sk-a"),
+            block("deepseek", "deepseek-chat", ""),
+            block("openai", "gpt-4o", "sk-b"),
+        ];
+        let ids = ensure_blocks_as_providers(&db, &blocks).await.unwrap();
+        assert_eq!(ids.len(), 2, "empty-key blocks must be skipped");
+        assert_eq!(
+            ids[0],
+            deterministic_id_for_key(
+                "deepseek",
+                "https://api.deepseek.com/v1",
+                "deepseek-chat",
+                "sk-a"
+            )
+        );
+
+        let again = ensure_blocks_as_providers(&db, &blocks).await.unwrap();
+        assert_eq!(ids, again, "repeat conversion must reuse the same providers");
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM llm_providers")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let other = ensure_blocks_as_providers(
+            &db,
+            &[block("deepseek", "deepseek-chat", "sk-c")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(other.len(), 1);
+        assert_ne!(other[0], ids[0], "a different key is a different account");
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM llm_providers")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+
+        let (key, provider): (String, String) =
+            sqlx::query_as("SELECT api_key, provider FROM llm_providers WHERE id = ?")
+                .bind(&ids[0])
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(key, "sk-a");
+        assert_eq!(provider, "deepseek");
+        db.close().await;
     }
 }

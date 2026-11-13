@@ -77,7 +77,7 @@ export function AgentCreateDialog({ onClose, onCreate, projectPath }: Props) {
     Promise.all([settingsAppGet(), llmProviderList()])
       .then(([s, list]) => {
         setProviders(list);
-        setSelectedProviderId(s.default_llm_provider_id ?? list.find((p) => p.is_default)?.id ?? list[0]?.id ?? '');
+        setSelectedProviderId(list.find((p) => p.is_default)?.id ?? list[0]?.id ?? '');
         setApprovalMode(s.default_approval.mode);
         setExpireSec(s.default_approval.expire_sec ?? 60);
         setWhitelist((s.default_approval.whitelist ?? []).join(', '));

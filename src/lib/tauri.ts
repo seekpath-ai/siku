@@ -670,6 +670,7 @@ export interface SearchEngineConfig {
 
 export interface AppSettings {
   default_llm?: LlmConfigBlock;
+  /** @deprecated Default provider now lives on llm_providers.is_default. */
   default_llm_provider_id?: string | null;
   default_approval: ApprovalConfig;
   default_max_loops: number;

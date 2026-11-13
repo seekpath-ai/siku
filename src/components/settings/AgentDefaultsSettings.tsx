@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Loader2, FolderOpen } from 'lucide-react';
-import { settingsAppGet, settingsAppSave, llmProviderList, settingsGetDataDir } from '@/lib/tauri';
+import { settingsAppGet, settingsAppSave, llmProviderList, settingsGetDataDir, llmProviderSetDefault } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
 import { Combobox } from '@/components/ui/Combobox';
 import { SaveButton } from '@/components/ui/SaveButton';
@@ -32,11 +32,7 @@ export function AgentDefaultsSettings() {
   useEffect(() => {
     Promise.all([settingsAppGet(), llmProviderList(), settingsGetDataDir()])
       .then(([s, list, actual]) => {
-        setDefaultProviderId(
-          s.default_llm_provider_id && list.some((p) => p.id === s.default_llm_provider_id)
-            ? s.default_llm_provider_id
-            : (list.find((p) => p.is_default)?.id ?? '')
-        );
+        setDefaultProviderId(list.find((p) => p.is_default)?.id ?? list[0]?.id ?? '');
         setApproval({ ...s.default_approval });
         setMaxLoops(s.default_max_loops);
         setContextBudget(s.default_context_budget);
@@ -59,9 +55,15 @@ export function AgentDefaultsSettings() {
     setSaving(true);
     try {
       const current = await settingsAppGet();
+      // Single default source: the provider-pool star. The legacy
+      // app_settings pointer is dropped from the payload (the backend also
+      // migrated it away at startup).
+      if (defaultProviderId) {
+        await llmProviderSetDefault(defaultProviderId);
+      }
       await settingsAppSave({
         ...current,
-        default_llm_provider_id: defaultProviderId || null,
+        default_llm_provider_id: undefined,
         default_approval: approval,
         default_max_loops: maxLoops,
         default_context_budget: contextBudget,

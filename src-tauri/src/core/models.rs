@@ -512,10 +512,12 @@ fn default_search_engines() -> Vec<SearchEngineConfig> {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AppSettings {
-    /// Legacy inline LLM config. Kept for backward compatibility; prefer `default_llm_provider_id`.
+    /// Legacy inline LLM config. Kept for backward compatibility; the
+    /// `llm_providers` pool is canonical.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_llm: Option<crate::ai::agent::config::LlmConfigBlock>,
-    /// ID of the default LLM provider in the `llm_providers` pool.
+    /// Legacy default pointer. Migrated into `llm_providers.is_default` at
+    /// startup and no longer read at runtime.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_llm_provider_id: Option<String>,
     pub default_approval: crate::ai::agent::config::ApprovalConfig,

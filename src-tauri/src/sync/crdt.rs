@@ -15,6 +15,10 @@ use tracing::{info, instrument};
 pub fn is_non_syncable_setting_key(key: &str) -> bool {
     key == "app_settings"
         || key.starts_with("account.")
+        // Legacy LLM settings (llm.provider, llm.<provider>.api_key, ...) are
+        // superseded by the synced provider pool. Keep them local for the
+        // one-time seeding migration, but never replicate the keys again.
+        || key.starts_with("llm.")
         || key == crate::core::vault_service::CURRENT_VAULT_KEY
 }
 
@@ -1351,6 +1355,14 @@ mod tests {
             .bind("2026-01-01T00:00:00Z")
             .execute(&db)
             .await?;
+        // Legacy LLM settings are superseded by the provider pool; their keys
+        // must not replicate anymore either.
+        sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)")
+            .bind("llm.deepseek.api_key")
+            .bind("sk-legacy")
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&db)
+            .await?;
 
         let changes = export_changes_since(&db, 0).await?;
         let settings_keys: Vec<String> = changes
@@ -1371,6 +1383,10 @@ mod tests {
         assert!(
             !settings_keys.contains(&"account.sync_key".to_string()),
             "account.* secrets must never leave the device"
+        );
+        assert!(
+            !settings_keys.contains(&"llm.deepseek.api_key".to_string()),
+            "legacy llm.* keys must never leave the device"
         );
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;

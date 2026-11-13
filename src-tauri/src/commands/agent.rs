@@ -81,22 +81,18 @@ async fn ensure_agent_config(
     // stored inline copy makes the config UI believe the session uses a
     // custom LLM — reopening 个性设置 after switching to a pool model showed
     // the stale default model as "自定义" instead of the picked provider.
-    if !has_pool_ref && config.llm_models.is_empty() {
-        let mut block: Option<LlmConfigBlock> = None;
-        if let Some(provider_id) = &app_settings.default_llm_provider_id {
-            // The referenced provider may have been deleted since; fall back
-            // to the active provider pool instead of failing the whole request.
-            block = crate::core::llm_provider_service::resolve_block(db, provider_id)
-                .await
-                .ok();
-        }
-        if block.is_none() {
-            block = crate::core::llm_provider_service::get_default_provider(db)
-                .await
-                .ok()
-                .flatten()
-                .map(|p| crate::core::llm_provider_service::provider_to_block(&p));
-        }
+    // Only turn paths materialize a provider block. Config/read paths
+    // (require_llm=false) leave llm_models empty so sessions reference the
+    // pool instead of persisting a secret-bearing inline snapshot; runtime
+    // resolves the default dynamically. This also drops the old
+    // app_settings.default_llm_provider_id preference — is_default (migrated
+    // from it at startup) is the single default source.
+    if require_llm && !has_pool_ref && config.llm_models.is_empty() {
+        let mut block = crate::core::llm_provider_service::get_default_provider(db)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| crate::core::llm_provider_service::provider_to_block(&p));
         if block.is_none() {
             block = app_settings.default_llm.clone();
         }
@@ -390,11 +386,24 @@ pub async fn agent_create_session(
     input: AgentSessionInput,
 ) -> Result<serde_json::Value, String> {
     let app_settings = settings_service::load_app_settings(&state.db).await?;
+    // Never persist an inline API key: move keyed custom blocks into the
+    // provider pool and reference them instead. Empty-key blocks stay inline
+    // (they intentionally mean "use the global default").
+    let mut provider_ids = input.llm_provider_ids.clone();
+    let mut inline_blocks = input.llm_models.clone();
+    if provider_ids.is_empty() {
+        provider_ids = crate::core::llm_provider_service::ensure_blocks_as_providers(
+            &state.db,
+            &inline_blocks,
+        )
+        .await?;
+    }
+    inline_blocks.retain(|b| b.api_key.trim().is_empty());
     let mut config = AgentConfig {
         display_name: input.title.clone(),
         persona: input.system_prompt.clone(),
         system_prompt: input.system_prompt.clone(),
-        llm_models: input.llm_models,
+        llm_models: inline_blocks,
         tools: input.tools_enabled.clone(),
         approval: input.approval_config.unwrap_or_else(|| app_settings.default_approval.clone()),
         max_loops: input.max_loops.or(Some(app_settings.default_max_loops)),
@@ -405,7 +414,7 @@ pub async fn agent_create_session(
         memory_dir: input.memory_dir.clone(),
         skills_dir: input.skills_dir.clone(),
     };
-    ensure_agent_config(&mut config, &app_settings, &state.db, !input.llm_provider_ids.is_empty(), false).await?;
+    ensure_agent_config(&mut config, &app_settings, &state.db, !provider_ids.is_empty(), false).await?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_iso();
@@ -420,7 +429,7 @@ pub async fn agent_create_session(
         }
     }
     let llm_json = serde_json::to_string(&config.llm_models).map_err(|e| format!("json: {e}"))?;
-    let provider_ids_json = serde_json::to_string(&input.llm_provider_ids).map_err(|e| format!("json: {e}"))?;
+    let provider_ids_json = serde_json::to_string(&provider_ids).map_err(|e| format!("json: {e}"))?;
     let approval_json = serde_json::to_string(&config.approval).map_err(|e| format!("json: {e}"))?;
     let tools_json = serde_json::to_string(&config.tools).map_err(|e| format!("json: {e}"))?;
 
@@ -469,7 +478,7 @@ pub async fn agent_create_session(
         "tools_enabled": config.tools,
         "system_prompt": config.system_prompt,
         "llm_models": config.llm_models,
-        "llm_provider_ids": input.llm_provider_ids,
+        "llm_provider_ids": provider_ids,
         "approval_config": config.approval,
         "max_loops": config.max_loops,
         "max_tokens": config.max_tokens,
@@ -499,11 +508,24 @@ pub async fn agent_update_session(
     input: AgentSessionInput,
 ) -> Result<serde_json::Value, String> {
     let app_settings = settings_service::load_app_settings(&state.db).await?;
+    // Never persist an inline API key: move keyed custom blocks into the
+    // provider pool and reference them instead. Empty-key blocks stay inline
+    // (they intentionally mean "use the global default").
+    let mut provider_ids = input.llm_provider_ids.clone();
+    let mut inline_blocks = input.llm_models.clone();
+    if provider_ids.is_empty() {
+        provider_ids = crate::core::llm_provider_service::ensure_blocks_as_providers(
+            &state.db,
+            &inline_blocks,
+        )
+        .await?;
+    }
+    inline_blocks.retain(|b| b.api_key.trim().is_empty());
     let mut config = AgentConfig {
         display_name: input.title.clone(),
         persona: input.system_prompt.clone(),
         system_prompt: input.system_prompt.clone(),
-        llm_models: input.llm_models,
+        llm_models: inline_blocks,
         tools: input.tools_enabled.clone(),
         approval: input.approval_config.unwrap_or_else(|| app_settings.default_approval.clone()),
         max_loops: input.max_loops.or(Some(app_settings.default_max_loops)),
@@ -514,11 +536,11 @@ pub async fn agent_update_session(
         memory_dir: input.memory_dir.clone(),
         skills_dir: input.skills_dir.clone(),
     };
-    ensure_agent_config(&mut config, &app_settings, &state.db, !input.llm_provider_ids.is_empty(), false).await?;
+    ensure_agent_config(&mut config, &app_settings, &state.db, !provider_ids.is_empty(), false).await?;
 
     let now = now_iso();
     let llm_json = serde_json::to_string(&config.llm_models).map_err(|e| format!("json: {e}"))?;
-    let provider_ids_json = serde_json::to_string(&input.llm_provider_ids).map_err(|e| format!("json: {e}"))?;
+    let provider_ids_json = serde_json::to_string(&provider_ids).map_err(|e| format!("json: {e}"))?;
     let approval_json = serde_json::to_string(&config.approval).map_err(|e| format!("json: {e}"))?;
     let tools_json = serde_json::to_string(&config.tools).map_err(|e| format!("json: {e}"))?;
     // None = caller didn't send the field → keep the stored mount list.
@@ -614,9 +636,19 @@ pub async fn agent_set_session_model(
     llm_provider_ids: Vec<String>,
     llm_models: Vec<LlmConfigBlock>,
 ) -> Result<(), String> {
+    let mut provider_ids = llm_provider_ids;
+    let mut inline_blocks = llm_models;
+    if provider_ids.is_empty() {
+        provider_ids = crate::core::llm_provider_service::ensure_blocks_as_providers(
+            &state.db,
+            &inline_blocks,
+        )
+        .await?;
+    }
+    inline_blocks.retain(|b| b.api_key.trim().is_empty());
     let provider_ids_json =
-        serde_json::to_string(&llm_provider_ids).map_err(|e| format!("json: {e}"))?;
-    let llm_json = serde_json::to_string(&llm_models).map_err(|e| format!("json: {e}"))?;
+        serde_json::to_string(&provider_ids).map_err(|e| format!("json: {e}"))?;
+    let llm_json = serde_json::to_string(&inline_blocks).map_err(|e| format!("json: {e}"))?;
     sqlx::query(
         "UPDATE chat_sessions SET llm_models = ?, llm_provider_ids = ?, updated_at = ? WHERE id = ?"
     )
@@ -2077,12 +2109,10 @@ pub async fn pet_create_session(
         .ok()
         .flatten();
     let provider_ids: Option<Vec<String>> = default_provider.as_ref().map(|p| vec![p.id.clone()]);
-    let llm_models: Vec<LlmConfigBlock> = default_provider
-        .as_ref()
-        .map(|p| vec![crate::core::llm_provider_service::provider_to_block(p)])
-        .unwrap_or_default();
+    // Reference the provider only: the inline snapshot used to duplicate the
+    // API key into every pet session row (and then sync it).
+    let llm_models_json = "[]".to_string();
     let provider_ids_json = serde_json::to_string(&provider_ids).map_err(|e| format!("json: {e}"))?;
-    let llm_models_json = serde_json::to_string(&llm_models).map_err(|e| format!("json: {e}"))?;
 
     sqlx::query(
         // max_tokens / max_loops / context_budget bound explicitly as NULL:

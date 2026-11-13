@@ -475,16 +475,33 @@ async fn latest_remote_user_message_ms(
         .map(|timestamp| timestamp.timestamp_millis())
 }
 
-/// True when this inbound message is at or before the chat's already-synced
-/// latest user message. Callers should drop such messages before debouncing.
-async fn is_replay_before_watermark(db: &SqlitePool, msg: &InboundMessage) -> bool {
+/// Result of comparing an inbound message with the chat's already-synced
+/// latest user message. `Unknown` is the only case where the age guard is
+/// allowed to run: `Newer` means the watermark positively identified a new
+/// message, even if it is old because the device was offline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatermarkVerdict {
+    Replay,
+    Newer,
+    Unknown,
+}
+
+async fn watermark_verdict(db: &SqlitePool, msg: &InboundMessage) -> WatermarkVerdict {
     let Some(sent_at_ms) = msg.sent_at_ms else {
-        return false;
+        return WatermarkVerdict::Unknown;
     };
-    latest_remote_user_message_ms(db, &msg.channel, &msg.chat_id)
-        .await
-        .map(|latest| sent_at_ms <= latest)
-        .unwrap_or(false)
+    match latest_remote_user_message_ms(db, &msg.channel, &msg.chat_id).await {
+        Some(latest) if sent_at_ms <= latest => WatermarkVerdict::Replay,
+        Some(_) => WatermarkVerdict::Newer,
+        None => WatermarkVerdict::Unknown,
+    }
+}
+
+/// Whether the last-resort age guard applies. It must NOT run when the
+/// watermark positively identified a newer message: a message sent while the
+/// device was offline for an hour is still a new, unanswered message.
+fn age_guard_exceeded(verdict: WatermarkVerdict, sent_at_ms: i64, now_ms: i64) -> bool {
+    verdict == WatermarkVerdict::Unknown && now_ms - sent_at_ms > STALE_MESSAGE_MS
 }
 
 /// Content fingerprint used when the channel's message id is missing or
@@ -632,7 +649,8 @@ pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySin
     // Session watermark: the chat history already has this message (or a
     // newer one). This is the primary guard against cursor rollback and
     // msg_id churn; it does not depend on either.
-    if is_replay_before_watermark(&db, &msg).await {
+    let watermark = watermark_verdict(&db, &msg).await;
+    if watermark == WatermarkVerdict::Replay {
         let latest = latest_remote_user_message_ms(&db, &msg.channel, &msg.chat_id).await;
         tracing::info!(
             channel = %msg.channel, msg_id = %msg.msg_id, chat_id = %msg.chat_id,
@@ -642,16 +660,17 @@ pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySin
         return;
     }
 
-    // Stale-backlog guard: when a standby device takes over with a stale
-    // long-poll cursor, the server redelivers old messages. Dedup/watermark
-    // catch what the predecessor recorded; this catches the rest.
+    // The age guard is ONLY a fallback for the state where the watermark
+    // cannot answer. If the watermark positively identified a newer message,
+    // process it even when it is old: the user sent it while every device was
+    // offline and expects the answer.
     if let Some(sent_ms) = msg.sent_at_ms {
-        let age_ms = chrono::Utc::now().timestamp_millis() - sent_ms;
-        if age_ms > STALE_MESSAGE_MS {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if age_guard_exceeded(watermark, sent_ms, now_ms) {
             tracing::info!(
-                channel = %msg.channel, msg_id = %msg.msg_id, age_ms,
+                channel = %msg.channel, msg_id = %msg.msg_id, age_ms = now_ms - sent_ms,
                 role = %role, cursor_len,
-                "dropping stale remote message"
+                "dropping stale remote message (no session watermark)"
             );
             return;
         }
@@ -1591,15 +1610,59 @@ mod tests {
 
         for sent_at in [Some(latest), Some(latest - 1000)] {
             let msg = sample_inbound("replay", sent_at, "same old message");
-            assert!(
-                is_replay_before_watermark(&db, &msg).await,
+            assert_eq!(
+                watermark_verdict(&db, &msg).await,
+                WatermarkVerdict::Replay,
                 "sent_at={sent_at:?} should be at/before the watermark"
             );
         }
         let fresh = sample_inbound("fresh", Some(latest + 1), "new message");
-        assert!(!is_replay_before_watermark(&db, &fresh).await);
+        assert_eq!(
+            watermark_verdict(&db, &fresh).await,
+            WatermarkVerdict::Newer
+        );
         let no_timestamp = sample_inbound("no-ts", None, "unknown age");
-        assert!(!is_replay_before_watermark(&db, &no_timestamp).await);
+        assert_eq!(
+            watermark_verdict(&db, &no_timestamp).await,
+            WatermarkVerdict::Unknown
+        );
+        let other_chat = InboundMessage {
+            chat_id: "chat-unmapped".to_string(),
+            ..sample_inbound("other", Some(latest), "other chat")
+        };
+        assert_eq!(
+            watermark_verdict(&db, &other_chat).await,
+            WatermarkVerdict::Unknown
+        );
+    }
+
+    #[test]
+    fn age_guard_only_applies_when_watermark_is_unknown() {
+        let now = 1_700_000_000_000;
+        let two_hours_ago = now - 2 * 60 * 60 * 1000;
+        // Positively identified as a newer message: process even when old.
+        assert!(!age_guard_exceeded(
+            WatermarkVerdict::Newer,
+            two_hours_ago,
+            now
+        ));
+        // Replay is dropped by the watermark, not the age guard.
+        assert!(!age_guard_exceeded(
+            WatermarkVerdict::Replay,
+            two_hours_ago,
+            now
+        ));
+        // Unknown: age guard is the only thing left.
+        assert!(age_guard_exceeded(
+            WatermarkVerdict::Unknown,
+            now - 31 * 60 * 1000,
+            now
+        ));
+        assert!(!age_guard_exceeded(
+            WatermarkVerdict::Unknown,
+            now - 29 * 60 * 1000,
+            now
+        ));
     }
 
     #[tokio::test]

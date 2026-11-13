@@ -57,7 +57,7 @@ CREATE TABLE remote_chats (           -- 同步表（OPTIONAL_SYNC_TABLES）：�
 - **微信运行时态**（长轮询游标、context_tokens）拆成两个同步行：`remote_weixin_cursor`（每次轮询可能前进，15s 节流 + 退出终写）与 `remote_weixin_context_tokens`（按会话）。旧 `remote_weixin_state` 只做一次性迁移；cursor 与 token 同行的旧设计会让 token 写入把旧游标一起带回来，LWW 下可造成游标回退。
 - **单活仲裁**（`remote/mod.rs`）：连接同一时刻只允许一台设备持有。holder 确定性选举——relay 房间 presence（`api/devices` 返回 online 标记）中 device_id 最小者，所有设备独立计算同一结果，无锁无心跳；同步行 `remote_holder` 提供手动接管覆盖（设置页「在本机接管」），override 设备在线时优先。仲裁器每 45s 重估，presence 查询失败保持原角色（宁停勿双）；未登录同步账号时按单设备旧行为直连。渠道任务按 (want, config指纹) 跳过不变重启，健康连接不被 45s 周期打断。
 - **限流**：每用户 10 条/分钟滑动窗口；消息 ID 24h 去重（内存 LRU + app_data json 持久化）。
-- **接管重投加固**（2026-11-13 更新）：① **会话水位线**：入站时查该远程会话最新 `chat_messages` 用户消息时间，`sent_at <= 最新用户消息时间` 直接丢弃——不依赖游标和 msg_id，是主防线；② **跨设备去重**：`remote_msg_ids` 同步行（id=`channel:msg_id`），且每条带 `sent_at` 的消息额外写入 `channel:fp:<content-hash>`（含 channel/chat/user/sent_at/text/media），msg_id 为空或重投换 ID 时仍能命中；③ **初始同步门禁**：账号漫游模式下，微信长轮询要等 auto-sync 应用完第一页未满的 mailbox batch 才开始，避免冷启动拿旧游标 poll；④ **游标采纳 + 年龄护栏**：仍保留 10s 宽限/每轮采纳，年龄护栏收紧到 30 分钟。
+- **接管重投加固**（2026-11-13 更新）：① **会话水位线**：入站时查该远程会话最新 `chat_messages` 用户消息时间，`sent_at <= 最新用户消息时间` 直接丢弃——不依赖游标和 msg_id，是主防线；② **跨设备去重**：`remote_msg_ids` 同步行（id=`channel:msg_id`），且每条带 `sent_at` 的消息额外写入 `channel:fp:<content-hash>`（含 channel/chat/user/sent_at/text/media），msg_id 为空或重投换 ID 时仍能命中；③ **初始同步门禁**：账号漫游模式下，微信长轮询要等 auto-sync 应用完第一页未满的 mailbox batch 才开始，避免冷启动拿旧游标 poll；④ **游标采纳 + 年龄护栏**：仍保留 10s 宽限/每轮采纳；年龄护栏收紧到 30 分钟，且**只在水位线无法判断时生效**——水位线确认是新消息时不看年龄，确认是重投时直接丢弃。
 
 ## 4. 渠道协议要点
 

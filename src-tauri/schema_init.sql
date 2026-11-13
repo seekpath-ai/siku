@@ -330,14 +330,17 @@ CREATE TABLE IF NOT EXISTS agent_memories_local (
     updated_at TEXT NOT NULL DEFAULT ''
 );
 
--- llm_providers: unified LLM configuration pool
+-- llm_providers: unified LLM configuration pool (OPTIONAL_SYNC_TABLES).
+-- CRR shape: NOT NULL PK + defaults; `is_default` and `proxy` are device-local
+-- (see non_syncable_column) — each device keeps its own default and proxy.
+-- API keys DO sync through the optional-data channel (same envelope as notes).
 CREATE TABLE IF NOT EXISTS llm_providers (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    model TEXT NOT NULL,
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
     api_key TEXT NOT NULL DEFAULT '',
-    base_url TEXT NOT NULL,
+    base_url TEXT NOT NULL DEFAULT '',
     proxy TEXT,
     max_tokens INTEGER DEFAULT 4096,
     temperature REAL DEFAULT 0.7,
@@ -345,8 +348,8 @@ CREATE TABLE IF NOT EXISTS llm_providers (
     is_default INTEGER DEFAULT 0,
     is_vision INTEGER DEFAULT 0,
     sort_order INTEGER DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_llm_providers_default ON llm_providers(is_default);
 

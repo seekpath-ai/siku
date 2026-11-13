@@ -185,6 +185,10 @@ pub async fn delete_provider(db: &SqlitePool, id: &str) -> Result<(), String> {
         .await
         .map_err(|e| format!("db: {e}"))?;
 
+    // If the deleted provider was the local default, promote the first
+    // remaining one so the badge/config UI keeps a coherent default.
+    let _ = ensure_local_default_provider(db).await;
+
     info!(provider_id = %id, "deleted llm provider");
     Ok(())
 }
@@ -243,6 +247,32 @@ pub async fn set_default_provider(db: &SqlitePool, id: &str) -> Result<LlmProvid
     get_provider(db, id).await
 }
 
+/// Stable identity for a provider configuration.
+///
+/// Used ONLY by the one-time sync migration (and legacy seeding) so two devices
+/// that configured the same endpoint/model converge on one row. Providers
+/// created after the migration keep random UUIDs, which lets two accounts on
+/// the same endpoint/model coexist.
+pub(crate) fn deterministic_id(provider: &str, base_url: &str, model: &str) -> String {
+    // Deliberately SHA-256 instead of the uuid crate's v5 feature: the id is
+    // opaque and only needs to be stable, and this avoids adding a dependency
+    // (uuid's v5 pulls sha1_smol). Format it as a UUID so the rest of the code
+    // keeps treating ids uniformly.
+    use sha2::{Digest, Sha256};
+    let normalized = format!(
+        "{}|{}|{}",
+        provider.trim().to_lowercase(),
+        base_url.trim().trim_end_matches('/'),
+        model.trim()
+    );
+    let digest = Sha256::digest(normalized.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50; // version nibble (5 = name-based, informational)
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
 /// Convert a provider row into an agent LLM config block.
 pub fn provider_to_block(p: &LlmProvider) -> LlmConfigBlock {
     LlmConfigBlock {
@@ -287,6 +317,36 @@ async fn clear_default(db: &SqlitePool) -> Result<(), String> {
         .execute(db)
         .await
         .map_err(|e| format!("db: {e}"))?;
+    Ok(())
+}
+
+/// After sync (or on startup) a device may have providers but no local
+/// default star — `is_default` is device-local and thus never synced. Star the
+/// first provider so the model badge/config UI has a coherent default; runtime
+/// `get_default_provider` already falls back to the first row.
+pub async fn ensure_local_default_provider(db: &SqlitePool) -> Result<(), String> {
+    let has_default: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM llm_providers WHERE is_default = 1")
+            .fetch_one(db)
+            .await
+            .map_err(|e| format!("db: {e}"))?;
+    if has_default > 0 {
+        return Ok(());
+    }
+    let first: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM llm_providers ORDER BY sort_order, created_at LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("db: {e}"))?;
+    if let Some(id) = first {
+        sqlx::query("UPDATE llm_providers SET is_default = 1 WHERE id = ?")
+            .bind(&id)
+            .execute(db)
+            .await
+            .map_err(|e| format!("db: {e}"))?;
+        info!(provider_id = %id, "starred first synced llm provider as local default");
+    }
     Ok(())
 }
 
@@ -345,7 +405,9 @@ async fn ensure_seeded(db: &SqlitePool) -> Result<(), String> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.7);
 
-    let id = Uuid::new_v4().to_string();
+    // Deterministic so a legacy seed on device B merges with the migrated row
+    // on device A instead of creating a duplicate.
+    let id = deterministic_id(&provider, &base_url, &model);
     let now = now_iso();
     let name = format!("{} (迁移)", provider);
 
@@ -437,5 +499,21 @@ impl std::fmt::Debug for LlmProviderInput {
             .field("is_default", &self.is_default)
             .field("is_vision", &self.is_vision)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deterministic_id;
+
+    /// Same endpoint/model configured with different casing / trailing slash
+    /// must derive the same id; a different model must not collide.
+    #[test]
+    fn deterministic_id_normalizes_identity() {
+        let a = deterministic_id("DeepSeek", "https://api.deepseek.com/v1/", "deepseek-chat");
+        let b = deterministic_id("deepseek", "https://api.deepseek.com/v1", "deepseek-chat");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 36, "must stay UUID-shaped");
+        assert_ne!(a, deterministic_id("deepseek", "https://api.deepseek.com/v1", "deepseek-reasoner"));
     }
 }

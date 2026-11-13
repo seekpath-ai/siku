@@ -78,6 +78,8 @@ pub(crate) const OPTIONAL_SYNC_TABLES: &[&str] = &[
     "projects",
     // 会话产物索引：文件本体走 blob 同步，这里只同步元数据。
     "session_artifacts",
+    // 模型提供商池（含 API Key）。`is_default` / `proxy` 由各设备本地维护。
+    "llm_providers",
     // 推理过程（ReAct 步骤）：chat_messages 只存最终回复，推理/工具调用在
     // 这张表；不同步它，跨设备打开的会话会静默丢失推理过程。
     "agent_steps",
@@ -885,19 +887,19 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS llm_providers (
             id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            provider TEXT NOT NULL,
-            model TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            provider TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
             api_key TEXT NOT NULL DEFAULT '',
-            base_url TEXT NOT NULL,
+            base_url TEXT NOT NULL DEFAULT '',
             proxy TEXT,
             max_tokens INTEGER DEFAULT 4096,
             temperature REAL DEFAULT 0.7,
             extra_body TEXT,
             is_default INTEGER DEFAULT 0,
             sort_order INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
         )"
     )
     .execute(&db)
@@ -1767,6 +1769,13 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         .await
         .map_err(|e| anyhow::anyhow!("projects sync migration failed: {e}"))?;
 
+    // Providers join the optional sync tables; merge legacy random ids into
+    // deterministic ones and rewire session/app references BEFORE triggers are
+    // registered.
+    migrate_llm_providers_for_sync(&db)
+        .await
+        .map_err(|e| anyhow::anyhow!("llm provider sync migration failed: {e}"))?;
+
     // Register core sync tables as CRDTs for multi-device sync.
     // This must happen AFTER all schema migrations so the CRR triggers match
     // the final table schemas. If columns are added after registration, the
@@ -1838,6 +1847,12 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         info!("optional sync tables registered");
     } else {
         info!("optional sync disabled");
+    }
+
+    // Providers may have arrived from a peer without a local default star
+    // (`is_default` is device-local). Star the first one when none is set.
+    if let Err(e) = crate::core::llm_provider_service::ensure_local_default_provider(&db).await {
+        warn!(error = %e, "ensure local default llm provider failed");
     }
 
     info!("database initialized successfully");
@@ -2604,6 +2619,352 @@ async fn migrate_ai_feature_crr_tables(db: &Db) -> anyhow::Result<()> {
 }
 
 
+
+/// Provider row as read by the sync migration.
+#[derive(sqlx::FromRow)]
+struct LlmProviderSyncRow {
+    id: String,
+    name: String,
+    provider: String,
+    model: String,
+    api_key: String,
+    base_url: String,
+    proxy: Option<String>,
+    max_tokens: Option<i32>,
+    temperature: Option<f64>,
+    extra_body: Option<String>,
+    is_default: Option<i64>,
+    is_vision: Option<i64>,
+    sort_order: Option<i64>,
+    created_at: String,
+    updated_at: String,
+}
+
+/// One-time provider migration for cross-device sync:
+/// - rebuild `llm_providers` into the CRR shape (NOT NULL PK + defaults);
+/// - rewrite legacy random ids to deterministic ids derived from
+///   provider|base_url|model, merging duplicate configurations;
+/// - rewire `chat_sessions.llm_provider_ids` / `vision_provider_id`,
+///   `app_settings.default_llm_provider_id` and AI run records.
+///
+/// Idempotent via a device-local marker. `is_default` and `proxy` are NOT
+/// written by the sync path (see `non_syncable_column`); the local default is
+/// re-established after sync by `ensure_local_default_provider`.
+async fn migrate_llm_providers_for_sync(db: &Db) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+    use sqlx::Row;
+
+    const MARKER: &str = "llm.providers.sync_v1";
+
+    let cols = sqlx::query("PRAGMA table_info(llm_providers)").fetch_all(db).await?;
+    if cols.is_empty() {
+        return Ok(());
+    }
+
+    // Crash recovery: an interrupted rebuild may have left rows stranded while
+    // startup recreated an empty table.
+    let old_exists: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'llm_providers_old'",
+    )
+    .fetch_one(db)
+    .await?;
+    let mut recovered = false;
+    if old_exists > 0 {
+        sqlx::query(
+            "INSERT OR IGNORE INTO llm_providers \
+             (id, name, provider, model, api_key, base_url, proxy, max_tokens, temperature, \
+              extra_body, is_default, is_vision, sort_order, created_at, updated_at) \
+             SELECT id, name, provider, model, api_key, base_url, proxy, max_tokens, temperature, \
+                    extra_body, is_default, is_vision, sort_order, created_at, updated_at \
+             FROM llm_providers_old WHERE id IS NOT NULL",
+        )
+        .execute(db)
+        .await?;
+        sqlx::query("DROP TABLE llm_providers_old").execute(db).await?;
+        recovered = true;
+        info!("recovered stranded llm_providers_old rows after an interrupted migration");
+    }
+
+    let id_not_null = cols.iter().any(|r| {
+        r.try_get::<String, _>("name").map(|n| n == "id").unwrap_or(false)
+            && r.try_get::<i64, _>("notnull").unwrap_or(0) == 1
+    });
+    let defaults_ok = cols.iter().all(|r| {
+        r.try_get::<i64, _>("pk").unwrap_or(0) > 0
+            || r.try_get::<i64, _>("notnull").unwrap_or(0) == 0
+            || r.try_get::<Option<String>, _>("dflt_value").unwrap_or(None).is_some()
+    });
+    let indexes: Vec<(Option<String>,)> = sqlx::query_as(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'llm_providers'",
+    )
+    .fetch_all(db)
+    .await?;
+    let has_unique = indexes.iter().any(|(sql,)| {
+        sql.as_deref()
+            .map(|s| s.to_uppercase().contains("UNIQUE"))
+            .unwrap_or(false)
+    });
+    let shape_ok = id_not_null && defaults_ok && !has_unique;
+    let marked = crate::core::settings_service::get_device_setting(db, MARKER)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?
+        .is_some();
+    if shape_ok && marked && !recovered {
+        return Ok(());
+    }
+
+    let rows: Vec<LlmProviderSyncRow> = sqlx::query_as(
+        "SELECT COALESCE(id, '') AS id, name, provider, model, api_key, base_url, proxy, \
+                max_tokens, temperature, extra_body, is_default, is_vision, sort_order, \
+                created_at, updated_at \
+         FROM llm_providers",
+    )
+    .fetch_all(db)
+    .await?;
+
+    // Group by deterministic identity and pick a survivor per group.
+    let mut groups: HashMap<String, Vec<LlmProviderSyncRow>> = HashMap::new();
+    for row in rows {
+        let new_id = crate::core::llm_provider_service::deterministic_id(
+            &row.provider,
+            &row.base_url,
+            &row.model,
+        );
+        groups.entry(new_id).or_default().push(row);
+    }
+
+    struct MergedProvider {
+        id: String,
+        name: String,
+        provider: String,
+        model: String,
+        api_key: String,
+        base_url: String,
+        proxy: Option<String>,
+        max_tokens: i32,
+        temperature: f64,
+        extra_body: Option<String>,
+        is_default: i64,
+        is_vision: i64,
+        sort_order: i64,
+        created_at: String,
+        updated_at: String,
+    }
+
+    let mut mapping: Vec<(String, String)> = Vec::new();
+    let mut merged: Vec<MergedProvider> = Vec::new();
+    for (new_id, mut group) in groups {
+        group.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let survivor_idx = group
+            .iter()
+            .position(|r| !r.api_key.trim().is_empty())
+            .unwrap_or(0);
+        let survivor = &group[survivor_idx];
+        for r in &group {
+            if !r.id.is_empty() && r.id != new_id {
+                mapping.push((r.id.clone(), new_id.clone()));
+            }
+        }
+        let api_key = group
+            .iter()
+            .find(|r| !r.api_key.trim().is_empty())
+            .map(|r| r.api_key.clone())
+            .unwrap_or_else(|| survivor.api_key.clone());
+        let proxy = survivor
+            .proxy
+            .clone()
+            .or_else(|| group.iter().find_map(|r| r.proxy.clone()));
+        let is_default = if group.iter().any(|r| r.is_default.unwrap_or(0) != 0) { 1 } else { 0 };
+        let is_vision = if group.iter().any(|r| r.is_vision.unwrap_or(0) != 0) { 1 } else { 0 };
+        let sort_order = group
+            .iter()
+            .map(|r| r.sort_order.unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        let created_at = group
+            .iter()
+            .map(|r| r.created_at.clone())
+            .min()
+            .unwrap_or_default();
+        merged.push(MergedProvider {
+            id: new_id,
+            name: survivor.name.clone(),
+            provider: survivor.provider.clone(),
+            model: survivor.model.clone(),
+            api_key,
+            base_url: survivor.base_url.clone(),
+            proxy,
+            max_tokens: survivor
+                .max_tokens
+                .or_else(|| group.iter().find_map(|r| r.max_tokens))
+                .unwrap_or(4096),
+            temperature: survivor
+                .temperature
+                .or_else(|| group.iter().find_map(|r| r.temperature))
+                .unwrap_or(0.7),
+            extra_body: survivor
+                .extra_body
+                .clone()
+                .or_else(|| group.iter().find_map(|r| r.extra_body.clone())),
+            is_default,
+            is_vision,
+            sort_order,
+            created_at,
+            updated_at: survivor.updated_at.clone(),
+        });
+    }
+
+    // Drop CRR artifacts before renaming (dev builds only).
+    let clock_exists: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'llm_providers__crsql_clock'",
+    )
+    .fetch_one(db)
+    .await?;
+    if clock_exists > 0 {
+        drop_crr_objects(db, "llm_providers").await?;
+    }
+
+    let mut conn = db.acquire().await?;
+    let mut tx = conn.begin().await?;
+    sqlx::query("ALTER TABLE llm_providers RENAME TO llm_providers_old")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE llm_providers (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            provider TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            api_key TEXT NOT NULL DEFAULT '',
+            base_url TEXT NOT NULL DEFAULT '',
+            proxy TEXT,
+            max_tokens INTEGER DEFAULT 4096,
+            temperature REAL DEFAULT 0.7,
+            extra_body TEXT,
+            is_default INTEGER DEFAULT 0,
+            is_vision INTEGER DEFAULT 0,
+            sort_order INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+    for p in &merged {
+        sqlx::query(
+            "INSERT INTO llm_providers \
+             (id, name, provider, model, api_key, base_url, proxy, max_tokens, temperature, \
+              extra_body, is_default, is_vision, sort_order, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&p.id)
+        .bind(&p.name)
+        .bind(&p.provider)
+        .bind(&p.model)
+        .bind(&p.api_key)
+        .bind(&p.base_url)
+        .bind(&p.proxy)
+        .bind(p.max_tokens)
+        .bind(p.temperature)
+        .bind(&p.extra_body)
+        .bind(p.is_default)
+        .bind(p.is_vision)
+        .bind(p.sort_order)
+        .bind(&p.created_at)
+        .bind(&p.updated_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("DROP TABLE llm_providers_old").execute(&mut *tx).await?;
+    sqlx::query("DROP INDEX IF EXISTS idx_llm_providers_default")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_llm_providers_default ON llm_providers(is_default)")
+        .execute(&mut *tx)
+        .await?;
+
+    // Rewire references. Session JSON arrays are quoted strings, so replacing
+    // the opaque id substring is safe (ids are fixed-length UUIDs).
+    for (old_id, new_id) in &mapping {
+        let like = format!("%{old_id}%");
+        sqlx::query(
+            "UPDATE chat_sessions SET llm_provider_ids = replace(llm_provider_ids, ?, ?) \
+             WHERE llm_provider_ids LIKE ?",
+        )
+        .bind(old_id)
+        .bind(new_id)
+        .bind(&like)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE chat_sessions SET vision_provider_id = ? WHERE vision_provider_id = ?")
+            .bind(new_id)
+            .bind(old_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // app_settings.default_llm_provider_id is device-local and may point at a
+    // merged/deleted id.
+    if let Some((value,)) = sqlx::query_as::<_, (String,)>(
+        "SELECT value FROM settings WHERE key = 'app_settings'",
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&value) {
+            if let Some(current) = v
+                .get("default_llm_provider_id")
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+            {
+                if let Some((_, new_id)) = mapping.iter().find(|(old, _)| old == &current) {
+                    v["default_llm_provider_id"] =
+                        serde_json::Value::String(new_id.clone());
+                    let new_value = serde_json::to_string(&v)?;
+                    sqlx::query(
+                        "UPDATE settings SET value = ?, updated_at = ? WHERE key = 'app_settings'",
+                    )
+                    .bind(new_value)
+                    .bind(crate::core::time::now_iso())
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+        }
+    }
+
+    // Best-effort AI run records (tables may not exist on very old DBs).
+    for table in ["review_runs", "ai_classify_runs", "ai_classify_rules"] {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(&mut *tx)
+        .await?;
+        if exists == 0 {
+            continue;
+        }
+        for (old_id, new_id) in &mapping {
+            let sql = format!("UPDATE {table} SET provider_id = ? WHERE provider_id = ?");
+            sqlx::query(&sql)
+                .bind(new_id)
+                .bind(old_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+
+    tx.commit().await?;
+    // Release the pooled connection before writing the marker: the setting
+    // helper checks out its own connection, and the test pool (and a busy
+    // production pool) can otherwise deadlock here.
+    drop(conn);
+    crate::core::settings_service::set_device_setting(db, MARKER, "1")
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    info!(merged = merged.len(), rewired = mapping.len(), "migrated llm providers to deterministic sync ids");
+    Ok(())
+}
 
 /// Rebuild `projects` into the CRR-compatible shape and make `path`
 /// device-local:
@@ -3505,6 +3866,215 @@ pub(crate) mod tests {
         .fetch_one(&db)
         .await?;
         assert_eq!(old_left, 0, "projects_old must be dropped after recovery");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Provider sync migration: legacy random ids merge into deterministic
+    /// ids (provider|base_url|model), duplicate configs collapse, session and
+    /// app-settings references are rewired, the table becomes CRR-shaped, and
+    /// the whole thing is idempotent + crash-recoverable.
+    #[tokio::test]
+    async fn llm_providers_migration_merges_and_rewires() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-llm-providers-migrate-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = connect_with_crsqlite(&dir.join("test.db")).await?;
+
+        sqlx::query(
+            "CREATE TABLE llm_providers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                api_key TEXT NOT NULL DEFAULT '',
+                base_url TEXT NOT NULL,
+                proxy TEXT,
+                max_tokens INTEGER DEFAULT 4096,
+                temperature REAL DEFAULT 0.7,
+                extra_body TEXT,
+                is_default INTEGER DEFAULT 0,
+                is_vision INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query("CREATE INDEX idx_llm_providers_default ON llm_providers(is_default)")
+            .execute(&db)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE chat_sessions (
+                id TEXT PRIMARY KEY,
+                llm_provider_ids TEXT,
+                vision_provider_id TEXT
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE settings (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE device_settings (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&db)
+        .await?;
+
+        // Two identical deepseek configs (different ids, names, keys) plus one
+        // distinct openai provider.
+        sqlx::query(
+            "INSERT INTO llm_providers (id, name, provider, model, api_key, base_url, proxy, max_tokens, temperature, is_default, is_vision, sort_order, created_at, updated_at) \
+             VALUES \
+             ('old-1', 'DeepSeek A', 'DeepSeek', 'deepseek-chat', 'sk-a', 'https://api.deepseek.com/v1/', 'http://127.0.0.1:7890', 32768, 0.7, 1, 0, 2, '2026-01-01T00:00:01Z', '2026-01-03T00:00:00Z'), \
+             ('old-2', 'deepseek (迁移)', 'deepseek', 'deepseek-chat', '', 'https://api.deepseek.com/v1', NULL, 8192, 0.5, 0, 1, 1, '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z'), \
+             ('old-3', 'OpenAI', 'openai', 'gpt-4o', 'sk-b', 'https://api.openai.com/v1', NULL, 4096, 0.7, 0, 0, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO chat_sessions (id, llm_provider_ids, vision_provider_id) \
+             VALUES ('s1', '[\"old-1\"]', 'old-2')",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO settings (key, value, updated_at) VALUES ('app_settings', ?, 't')",
+        )
+        .bind(r#"{"default_llm_provider_id":"old-2","default_max_loops":100}"#)
+        .execute(&db)
+        .await?;
+
+        super::migrate_llm_providers_for_sync(&db).await?;
+
+        let deepseek_id = crate::core::llm_provider_service::deterministic_id(
+            "deepseek",
+            "https://api.deepseek.com/v1",
+            "deepseek-chat",
+        );
+        let (count, id, api_key, proxy, is_default, is_vision, sort_order): (
+            i64, String, String, Option<String>, i64, i64, i64,
+        ) = sqlx::query_as(
+            "SELECT COUNT(*), id, api_key, proxy, is_default, is_vision, sort_order \
+             FROM llm_providers WHERE lower(provider) = 'deepseek'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(count, 1, "duplicate deepseek configs must merge");
+        assert_eq!(id, deepseek_id, "id must be deterministic");
+        assert_eq!(api_key, "sk-a", "the non-empty key must survive");
+        assert_eq!(proxy.as_deref(), Some("http://127.0.0.1:7890"));
+        assert_eq!(is_default, 1, "is_default is OR-merged locally");
+        assert_eq!(is_vision, 1);
+        assert_eq!(sort_order, 1, "sort_order keeps the minimum");
+
+        let (openai_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM llm_providers WHERE lower(provider) = 'openai'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(openai_count, 1);
+
+        let (session_refs, vision): (String, String) =
+            sqlx::query_as("SELECT llm_provider_ids, vision_provider_id FROM chat_sessions WHERE id = 's1'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(session_refs, format!("[\"{deepseek_id}\"]"));
+        assert_eq!(vision, deepseek_id);
+
+        let (app_settings,): (String,) =
+            sqlx::query_as("SELECT value FROM settings WHERE key = 'app_settings'")
+                .fetch_one(&db)
+                .await?;
+        let parsed: serde_json::Value = serde_json::from_str(&app_settings)?;
+        assert_eq!(parsed["default_llm_provider_id"], serde_json::json!(deepseek_id));
+        assert_eq!(parsed["default_max_loops"], serde_json::json!(100));
+
+        let ddl: (String,) = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='llm_providers'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert!(ddl.0.contains("id TEXT PRIMARY KEY NOT NULL"), "{}", ddl.0);
+        let indexes: Vec<(Option<String>,)> = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='llm_providers'",
+        )
+        .fetch_all(&db)
+        .await?;
+        assert!(indexes.iter().all(|(sql,)| sql
+            .as_deref()
+            .map(|s| !s.to_uppercase().contains("UNIQUE"))
+            .unwrap_or(true)));
+
+        // Idempotent.
+        super::migrate_llm_providers_for_sync(&db).await?;
+        let (providers,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM llm_providers")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(providers, 2);
+
+        // Crash recovery: a stranded llm_providers_old must be merged back.
+        sqlx::query(
+            "CREATE TABLE llm_providers_old (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                api_key TEXT NOT NULL DEFAULT '',
+                base_url TEXT NOT NULL,
+                proxy TEXT,
+                max_tokens INTEGER DEFAULT 4096,
+                temperature REAL DEFAULT 0.7,
+                extra_body TEXT,
+                is_default INTEGER DEFAULT 0,
+                is_vision INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO llm_providers_old (id, name, provider, model, api_key, base_url, max_tokens, temperature, is_default, is_vision, sort_order, created_at, updated_at) \
+             VALUES ('old-4', 'Stranded', 'openai', 'gpt-4o-mini', 'sk-c', 'https://api.openai.com/v1', 4096, 0.7, 0, 0, 0, 't1', 't2')",
+        )
+        .execute(&db)
+        .await?;
+        super::migrate_llm_providers_for_sync(&db).await?;
+        let (recovered,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM llm_providers WHERE model = 'gpt-4o-mini'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(recovered, 1, "stranded provider must be merged back");
+        let (old_left,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='llm_providers_old'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(old_left, 0);
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;

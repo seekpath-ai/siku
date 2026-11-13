@@ -28,6 +28,8 @@ fn non_syncable_column(table: &str, cid: &str) -> bool {
     (table == "chat_sessions" && cid == "working_dir")
         // Project folders are per-device; only the metadata syncs.
         || (table == "projects" && cid == "path")
+        // Default model and proxy are machine-specific choices.
+        || (table == "llm_providers" && (cid == "is_default" || cid == "proxy"))
 }
 
 /// Whether the optional sync tables (chat_sessions, chat_messages, settings)
@@ -304,6 +306,9 @@ pub async fn apply_changes(db: &SqlitePool, msg: &ChangesetMessage) -> Result<u6
             .or_default()
             .push(c);
     }
+    // `is_default` is device-local and never synced: after providers arrive
+    // from a peer, make sure this device still has a starred default.
+    let providers_touched = groups.keys().any(|(table, _)| table == "llm_providers");
 
     // Apply with FK enforcement off. CRR tables no longer declare REFERENCES
     // (CR-SQLite forbids checked FKs on them), so this is a defensive no-op
@@ -336,6 +341,14 @@ pub async fn apply_changes(db: &SqlitePool, msg: &ChangesetMessage) -> Result<u6
         .await
         {
             tracing::warn!(error = %e, "rebuild creators after changeset failed");
+        }
+    }
+
+    if providers_touched {
+        if let Err(e) =
+            crate::core::llm_provider_service::ensure_local_default_provider(db).await
+        {
+            tracing::warn!(error = %e, "ensure local default llm provider after sync failed");
         }
     }
 
@@ -1075,6 +1088,75 @@ mod tests {
                 .fetch_one(&db_b)
                 .await?;
         assert_eq!(setting_value.0, "dark");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
+    /// Provider rows sync (including the API key) while `is_default` and
+    /// `proxy` stay device-local; applying them stars a local default.
+    #[tokio::test]
+    async fn llm_providers_sync_but_default_and_proxy_stay_local() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-crdt-provider-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a = connect_with_crsqlite(&dir.join("a.db")).await?;
+        let db_b = connect_with_crsqlite(&dir.join("b.db")).await?;
+        for db in [&db_a, &db_b] {
+            sqlx::query(SCHEMA_INIT_SQL).execute(db).await?;
+            register_crr_tables(db, CORE_SYNC_TABLES).await?;
+            register_crr_tables(db, OPTIONAL_SYNC_TABLES).await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO llm_providers \
+             (id, name, provider, model, api_key, base_url, proxy, max_tokens, temperature, \
+              is_default, is_vision, sort_order, created_at, updated_at) \
+             VALUES ('p1', 'DeepSeek', 'deepseek', 'deepseek-chat', 'sk-test', \
+                     'https://api.deepseek.com/v1', 'http://127.0.0.1:7890', 32768, 0.7, \
+                     1, 0, 0, '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')",
+        )
+        .execute(&db_a)
+        .await?;
+
+        let changes = export_changes_since(&db_a, 0).await?;
+        assert!(
+            changes
+                .changes
+                .iter()
+                .any(|c| c.table == "llm_providers" && c.cid == "api_key"),
+            "provider row (with key) must be exported"
+        );
+        assert!(
+            !changes.changes.iter().any(|c| c.table == "llm_providers"
+                && (c.cid == "is_default" || c.cid == "proxy")),
+            "device-local provider columns must not be exported"
+        );
+
+        apply_changes(&db_b, &changes).await?;
+
+        let (api_key, proxy, is_default): (String, Option<String>, i64) = sqlx::query_as(
+            "SELECT api_key, proxy, is_default FROM llm_providers WHERE id = 'p1'",
+        )
+        .fetch_one(&db_b)
+        .await?;
+        assert_eq!(api_key, "sk-test");
+        assert!(proxy.is_none(), "proxy must stay on the origin device");
+        assert_eq!(
+            is_default, 1,
+            "the receiver must star a local default after providers arrive"
+        );
 
         sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
         sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;

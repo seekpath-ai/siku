@@ -66,7 +66,8 @@ export function SessionModelBadge({ session, onModelChange, maxWidthClass = 'max
   const llm = dangling ? undefined : session.llm_models?.[0];
   // Sessions that never picked a model (remote IM sessions, legacy rows) run
   // on the global default at runtime — show it instead of hiding the badge.
-  const fallbackDefault = !pool && !llm ? providers.find((p) => p.is_default) : undefined;
+  const fallbackDefault =
+    !pool && !llm ? (providers.find((p) => p.is_default) ?? providers[0]) : undefined;
   // Name first: the provider TYPE ("deepseek") can't distinguish two instances
   // of the same provider (Aliyun-hosted vs official) — the user-given instance
   // name can. Inline custom configs have no name, so they keep provider/model.

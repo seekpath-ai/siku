@@ -76,6 +76,8 @@ pub(crate) const OPTIONAL_SYNC_TABLES: &[&str] = &[
     // device-local: a synced absolute path would be meaningless on the peer,
     // and the unique path index is incompatible with CRR anyway.
     "projects",
+    // 会话产物索引：文件本体走 blob 同步，这里只同步元数据。
+    "session_artifacts",
     // 推理过程（ReAct 步骤）：chat_messages 只存最终回复，推理/工具调用在
     // 这张表；不同步它，跨设备打开的会话会静默丢失推理过程。
     "agent_steps",
@@ -1735,6 +1737,29 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     migrate_sync_schema_v2(&db)
         .await
         .map_err(|e| anyhow::anyhow!("sync schema v2 migration failed: {e}"))?;
+
+    // Session artifact index (created for existing DBs; fresh installs get it
+    // from schema_init.sql). Only metadata syncs — the bytes live in the blob
+    // store and are requested through the existing attachment channel.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS session_artifacts (
+            id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            message_id TEXT NOT NULL DEFAULT '',
+            hash TEXT NOT NULL DEFAULT '',
+            ext TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL DEFAULT '',
+            size INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT ''
+        )",
+    )
+    .execute(&db)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_session_artifacts_session ON session_artifacts(session_id)",
+    )
+    .execute(&db)
+    .await?;
 
     // Projects join the optional sync tables; rebuild to the CRR shape and
     // make the folder path device-local BEFORE triggers are registered.

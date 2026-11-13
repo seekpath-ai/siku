@@ -377,6 +377,22 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id);
 
+-- session_artifacts: files the agent produced in a turn. Content lives in
+-- the blob store (content-addressed); this row is the synced index that lets
+-- other devices learn about the artifact and request the blob. CRR shape:
+-- NOT NULL PK + defaults, non-unique index.
+CREATE TABLE IF NOT EXISTS session_artifacts (
+    id TEXT PRIMARY KEY NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL DEFAULT '',
+    hash TEXT NOT NULL DEFAULT '',
+    ext TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    size INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_session_artifacts_session ON session_artifacts(session_id);
+
 -- agent_steps: one row per ReAct iteration (thought + tool_calls + observations)
 -- CRR 形状（在 OPTIONAL_SYNC_TABLES 中）：主键 NOT NULL、无受检外键、
 -- NOT NULL 列均带 DEFAULT；删除会话由删除路径显式级联。

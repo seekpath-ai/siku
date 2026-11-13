@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
-import { ImageOff } from 'lucide-react';
+import { ImageOff, Loader2 } from 'lucide-react';
+import { artifactResolve } from '@/lib/tauri';
+import { isArtifactUri, safeDecodeUri } from '@/lib/artifact';
+import { useSyncTick } from '@/stores/syncTickStore';
 import { ImageLightbox } from '@/components/ui/Modal';
 
 /** Git Bash (the agent's preferred shell on Windows) prints MSYS-style
@@ -30,11 +33,46 @@ function resolveImageSrc(src: string): string {
 export function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
   const [open, setOpen] = useState(false);
   const [failed, setFailed] = useState(false);
-  const resolved = src ? resolveImageSrc(src) : '';
+  const artifact = isArtifactUri(src);
+  const [artifactPath, setArtifactPath] = useState<string | null>(null);
+  const syncTick = useSyncTick((s) => s.tick);
+
+  useEffect(() => {
+    let live = true;
+    setArtifactPath(null);
+    setFailed(false);
+    if (!isArtifactUri(src)) return;
+    artifactResolve(safeDecodeUri(src))
+      .then((p) => {
+        if (live) setArtifactPath(p);
+      })
+      .catch(() => {
+        if (live) setFailed(true);
+      });
+    return () => {
+      live = false;
+    };
+  }, [src, syncTick]);
+
+  const resolved = artifact
+    ? artifactPath
+      ? convertFileSrc(artifactPath)
+      : ''
+    : src
+      ? resolveImageSrc(src)
+      : '';
 
   useEffect(() => setFailed(false), [resolved]);
 
   if (!src) return null;
+  if (artifact && !resolved && !failed) {
+    return (
+      <span className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-codex-border/50 text-[11px] text-codex-muted">
+        <Loader2 size={11} className="shrink-0 animate-spin" />
+        产物同步中…
+      </span>
+    );
+  }
   if (failed) {
     return (
       <span className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-codex-border/50 text-[11px] text-codex-muted">

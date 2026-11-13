@@ -545,6 +545,12 @@ export async function screenshotHotkeySync(): Promise<void> {
   return invoke<void>('screenshot_hotkey_sync');
 }
 
+/** Resolve a `siku://artifact/<hash>.<ext>` reference to this device's
+ *  absolute blob path (errors while the blob is still being synced). */
+export async function artifactResolve(uri: string): Promise<string> {
+  return invoke<string>('artifact_resolve', { uri });
+}
+
 /** Open a local file with the OS default application. Executable extensions
  * are refused backend-side; directories are revealed instead. */
 export async function openLocalPath(path: string): Promise<void> {

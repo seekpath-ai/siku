@@ -1147,6 +1147,11 @@ pub(crate) async fn run_agent_turn(
     } else {
         working_dir.clone().unwrap_or_default()
     };
+    // Effective dir scanned for files the turn produces (auto workspace
+    // included) + the wall-clock boundary used to distinguish them from
+    // pre-existing project files.
+    let artifact_scan_dir = working_dir.clone();
+    let turn_started_at = std::time::SystemTime::now();
 
     // Per-turn cancellation token. The engine and long-running tools/streams
     // watch it via `tokio::select!` so the user can abort promptly.
@@ -1458,6 +1463,32 @@ pub(crate) async fn run_agent_turn(
         (Some(a), None) => Some(a),
         (None, b) => b,
     };
+    // Files from earlier turns are listed with their local absolute paths so
+    // the agent can read them directly; only blobs already present locally
+    // are listed (a peer may still be fetching one).
+    let local_artifacts = crate::core::artifact_service::recent_local_paths(
+        &state.db,
+        &state.app_data_dir,
+        &session_id,
+        10,
+    )
+    .await;
+    let artifacts_note = if local_artifacts.is_empty() {
+        None
+    } else {
+        let mut note = String::from(
+            "# 本会话产物（已在本机可用）\n以下文件是此前回合产生、已随同步保存到本机的产物，可直接用文件工具读取：\n",
+        );
+        for (name, uri, path) in &local_artifacts {
+            note.push_str(&format!("- {name}（{uri}）：{path}\n"));
+        }
+        Some(note)
+    };
+    let context_prompt = match (context_prompt, artifacts_note) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    };
     let context_prompt = match (context_prompt, history_note) {
         (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
         (Some(a), None) => Some(a),
@@ -1621,6 +1652,8 @@ pub(crate) async fn run_agent_turn(
     let turn_device_id = current_device_id.clone();
     let turn_device_name = current_device_name.clone();
     let turn_origin_dir = origin_working_dir.clone();
+    let spawn_app_data_dir = state.app_data_dir.clone();
+    let spawn_scan_dir = artifact_scan_dir.clone();
     let cancel_tokens = state.cancel_tokens.clone();
     let tracked = state.background_tasks.clone();
     // Moved into the turn task: the assistant row must carry whatever the
@@ -1688,7 +1721,7 @@ pub(crate) async fn run_agent_turn(
                 // frontend's cancelled handler appends the marker itself.
                 // A turn that died on an LLM error keeps its partial text
                 // plus an ❌ marker (and its steps below), mirroring cancel.
-                let display_content = if final_content.trim().is_empty() {
+                let mut display_content = if final_content.trim().is_empty() {
                     "（模型未返回文本内容）".to_string()
                 } else {
                     final_content.clone()
@@ -1783,6 +1816,53 @@ pub(crate) async fn run_agent_turn(
                         }
                     }
 
+                    // Register files this turn wrote into the workspace, then
+                    // append device-independent references to the reply so the
+                    // user (and the next turn) can reach them from any device.
+                    let artifacts = crate::core::artifact_service::register_turn_artifacts(
+                        &db,
+                        &spawn_app_data_dir,
+                        &sid,
+                        mid,
+                        spawn_scan_dir.as_deref(),
+                        turn_started_at,
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!(error = %e, session_id = %sid, "artifact registration failed");
+                        Vec::new()
+                    });
+                    if !artifacts.is_empty() {
+                        let mut section = String::from("\n\n📎 本轮产物：\n");
+                        for a in &artifacts {
+                            let label = a.name.replace('[', "\\[").replace(']', "\\]");
+                            section.push_str(&format!(
+                                "- [{}]({})\n",
+                                label,
+                                crate::core::artifact_service::artifact_uri(&a.hash, &a.ext)
+                            ));
+                        }
+                        let mut new_content = persist_content.clone();
+                        new_content.push_str(&section);
+                        match sqlx::query("UPDATE chat_messages SET content = ? WHERE id = ?")
+                            .bind(&new_content)
+                            .bind(mid)
+                            .execute(&db)
+                            .await
+                        {
+                            Ok(_) => {
+                                // Extend the terminal event too: the frontend
+                                // inserts the assistant bubble from the event
+                                // before the incremental history reload, so
+                                // without this the links would only appear
+                                // after reopening the session.
+                                display_content.push_str(&section);
+                            }
+                            Err(e) => {
+                                warn!(error = %e, message_id = %mid, "failed to append artifact links");
+                            }
+                        }
+                    }
                 }
 
                 mem.append(
@@ -2239,6 +2319,9 @@ pub async fn agent_delete_session(
         .bind(&session_id)
         .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
     sqlx::query("DELETE FROM chat_messages WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
+    sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
         .bind(&session_id)
         .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
     // CRR tables declare no checked FKs: cascade explicitly.

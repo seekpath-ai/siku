@@ -1083,6 +1083,80 @@ mod tests {
         Ok(())
     }
 
+    /// Project metadata and session artifacts sync; a project's folder path
+    /// stays device-local, and a local binding on the peer must never
+    /// overwrite the origin device's path (or leak a foreign absolute path).
+    #[tokio::test]
+    async fn projects_and_artifacts_sync_metadata_but_not_local_paths(
+    ) -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-crdt-project-artifact-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a = connect_with_crsqlite(&dir.join("a.db")).await?;
+        let db_b = connect_with_crsqlite(&dir.join("b.db")).await?;
+        for db in [&db_a, &db_b] {
+            sqlx::query(SCHEMA_INIT_SQL).execute(db).await?;
+            register_crr_tables(db, CORE_SYNC_TABLES).await?;
+            register_crr_tables(db, OPTIONAL_SYNC_TABLES).await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO projects (id, name, path, archived, created_at, updated_at) \
+             VALUES ('p1', 'Proj', 'D:/work/proj', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&db_a)
+        .await?;
+        sqlx::query(
+            "INSERT INTO session_artifacts (id, session_id, message_id, hash, ext, name, size, created_at) \
+             VALUES ('a1', 's1', 'm1', 'deadbeef', 'md', 'report.md', 12, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&db_a)
+        .await?;
+
+        let changes = export_changes_since(&db_a, 0).await?;
+        apply_changes(&db_b, &changes).await?;
+
+        let (name, path): (String, String) =
+            sqlx::query_as("SELECT name, path FROM projects WHERE id = 'p1'")
+                .fetch_one(&db_b)
+                .await?;
+        assert_eq!(name, "Proj");
+        assert_eq!(path, "", "the project folder path must not sync");
+        let (hash, ext, art_name): (String, String, String) = sqlx::query_as(
+            "SELECT hash, ext, name FROM session_artifacts WHERE id = 'a1'",
+        )
+        .fetch_one(&db_b)
+        .await?;
+        assert_eq!((hash.as_str(), ext.as_str(), art_name.as_str()), ("deadbeef", "md", "report.md"));
+
+        // B binds its own local folder; that update must not travel back and
+        // clobber A's path.
+        sqlx::query("UPDATE projects SET path = '/home/me/proj' WHERE id = 'p1'")
+            .execute(&db_b)
+            .await?;
+        let b_changes = export_changes_since(&db_b, 0).await?;
+        apply_changes(&db_a, &b_changes).await?;
+        let (a_path,): (String,) =
+            sqlx::query_as("SELECT path FROM projects WHERE id = 'p1'")
+                .fetch_one(&db_a)
+                .await?;
+        assert_eq!(a_path, "D:/work/proj", "local binding must stay local");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
+    }
+
     /// translation_cache uses content-addressed primary keys
     /// (`source_hash:model`, see cache::store): two devices translating the
     /// same paragraph independently produce the SAME pk, so their rows merge

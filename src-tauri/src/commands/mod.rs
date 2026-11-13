@@ -3,6 +3,7 @@ pub mod agent;
 pub mod ai_classify;
 pub mod ai_table;
 pub mod annotation;
+pub mod artifacts;
 pub mod attachments;
 pub mod bookmarks;
 pub mod chat;

@@ -4,6 +4,8 @@ import { openLocalPath, revealInFileManager, resolveExistingPath } from '@/lib/t
 import { SIKU_PATH_SCHEME } from '@/lib/remarkFilePaths';
 import { useDialog } from '@/hooks/useDialog';
 import { ExternalLink } from '@/components/ui/ExternalLink';
+import { ArtifactLink } from './ArtifactLink';
+import { SIKU_ARTIFACT_SCHEME } from '@/lib/artifact';
 
 function fileName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
@@ -90,6 +92,9 @@ export function FilePathLink({ href }: { href?: string }) {
 export function MarkdownLink(props: React.AnchorHTMLAttributes<HTMLAnchorElement>) {
   if (props.href?.startsWith(SIKU_PATH_SCHEME)) {
     return <FilePathLink href={props.href} />;
+  }
+  if (props.href?.startsWith(SIKU_ARTIFACT_SCHEME)) {
+    return <ArtifactLink href={props.href}>{props.children}</ArtifactLink>;
   }
   return <ExternalLink {...props} />;
 }

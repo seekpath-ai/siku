@@ -114,6 +114,20 @@ pub async fn collect_missing_blob_hashes(
             consider(&rel);
         }
     }
+    // Session artifacts live in their own table (added later than the tables
+    // above). Query them separately and tolerate its absence so this helper
+    // still works on old/minimal databases during migration.
+    if let Ok(artifact_rows) = sqlx::query_as::<_, (String,)>(
+        "SELECT 'blobs/' || hash || '.' || ext FROM session_artifacts \
+         WHERE hash <> '' AND ext <> ''",
+    )
+    .fetch_all(db)
+    .await
+    {
+        for (rel_path,) in artifact_rows {
+            consider(&rel_path);
+        }
+    }
     Ok(missing)
 }
 

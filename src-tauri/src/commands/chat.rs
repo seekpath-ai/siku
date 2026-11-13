@@ -104,6 +104,11 @@ pub async fn delete_chat_session(
         .execute(&state.db)
         .await
         .map_err(|e| format!("db error: {e}"))?;
+    sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
 
     // CRR tables declare no checked FKs: cascade explicitly.
     sqlx::query("DELETE FROM agent_steps WHERE session_id = ?")

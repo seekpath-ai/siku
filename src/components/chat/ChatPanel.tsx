@@ -14,6 +14,7 @@ import { useStreamingChat } from '@/hooks/useStreamingChat';
 import { getChatMessages, getAgentSteps, agentRenameSession, agentSetSessionModel, agentIsRunning, agentCreateSession, agentSendMessage, getDeviceId, agentSetSessionWorkingDir } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
 import { useDialogStore } from '@/stores/dialogStore';
+import { useSyncTick } from '@/stores/syncTickStore';
 
 /** Empty-state hero input: typing here and hitting send creates a session
  * and immediately starts the first turn (Kimi-style "输入即开工"). The first
@@ -169,6 +170,7 @@ export function ChatPanel() {
           const refreshed = st.messages.map((m) => pageById.get(m.id) ?? m);
           st.setMessages(mergeMessages(refreshed, page.messages));
           st.setAgentSteps(steps);
+          useSyncTick.getState().bump();
         })
         .catch((err) => console.error('Failed to refresh chat after sync:', err));
     }).then((u) => {

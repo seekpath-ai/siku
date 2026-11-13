@@ -7,6 +7,7 @@ import { remarkFilePaths, SIKU_PATH_SCHEME } from '@/lib/remarkFilePaths';
 import { MarkdownCode, MarkdownPre } from './CodeBlock';
 import { MarkdownLink } from './FilePathLink';
 import { MarkdownImage } from './MarkdownImage';
+import { SIKU_ARTIFACT_SCHEME } from '@/lib/artifact';
 
 /** Shared ReactMarkdown wiring for assistant prose (MessageBubble history and
  *  StreamingContent live output must render identically). */
@@ -37,6 +38,7 @@ function fileUrlToLocalPath(url: string): string | null {
  *  not disappear after being visible as plain text during streaming. */
 export function markdownUrlTransform(url: string): string {
   if (url.startsWith(SIKU_PATH_SCHEME)) return url;
+  if (url.startsWith(SIKU_ARTIFACT_SCHEME)) return url;
   const filePath = fileUrlToLocalPath(url);
   if (filePath) return filePath;
   if (/^([A-Za-z]:[\\/]|[A-Za-z]:%5C|\\\\|\/(?!\/))/i.test(url)) return url;

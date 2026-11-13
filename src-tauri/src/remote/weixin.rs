@@ -101,6 +101,38 @@ pub fn spawn(
     });
 }
 
+/// In account-roaming mode, wait for the auto-sync proxy's first complete
+/// mailbox page. A legacy single-device setup (no account token) or a device
+/// with optional sync disabled must keep working immediately.
+async fn should_wait_for_initial_sync(db: &sqlx::SqlitePool) -> bool {
+    if crate::sync::engine::initial_sync_ready() {
+        return false;
+    }
+    let settings = crate::core::settings_service::load_device_settings(db)
+        .await
+        .unwrap_or_default();
+    if !settings.sync_optional_data {
+        return false;
+    }
+    let token = crate::core::settings_service::get_device_setting(
+        db,
+        crate::commands::account::ACCOUNT_TOKEN_KEY,
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    let relay = crate::core::settings_service::get_device_setting(
+        db,
+        crate::commands::account::ACCOUNT_RELAY_URL_KEY,
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    !token.is_empty() && !relay.is_empty()
+}
+
 async fn run_monitor(
     db: sqlx::SqlitePool,
     app: &AppHandle,
@@ -122,6 +154,36 @@ async fn run_monitor(
         typing: Arc::new(std::sync::Mutex::new(TypingCache::default())),
         typing_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
+    // Takeover after a cold start: the remote channel must not poll before
+    // the account's initial mailbox sync has applied the previous holder's
+    // cursor/`remote_msg_ids`/chat history. Otherwise a stale local cursor
+    // makes the WeChat server redeliver an already-answered message, and the
+    // dedup layers may not have arrived yet. The watermark in router.rs is
+    // the last-resort guard; this gate removes the common race entirely.
+    if should_wait_for_initial_sync(&db).await {
+        tracing::info!("weixin: waiting for initial account sync before polling");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if crate::sync::engine::initial_sync_ready() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "weixin: initial account sync not ready after 60s; starting poll anyway (watermark will guard replays)"
+                );
+                break;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+            }
+        }
+        tracing::info!(
+            ready = crate::sync::engine::initial_sync_ready(),
+            "weixin: initial account sync gate passed"
+        );
+    }
+
     // The long-poll cursor lives in the synced `remote_weixin_state` row so
     // a standby device taking over resumes where the previous holder left
     // off — no replayed backlog, no missed messages.
@@ -502,18 +564,18 @@ async fn handle_inbound(
 }
 
 async fn persist_updates_buf(db: &sqlx::SqlitePool, buf: &str) {
-    if let Ok(mut state) = crate::core::settings_service::load_weixin_state(db).await {
+    if let Ok(state) = crate::core::settings_service::load_weixin_state(db).await {
         if state.get_updates_buf == buf {
             return;
         }
-        state.get_updates_buf = buf.to_string();
-        let _ = crate::core::settings_service::save_weixin_state(db, &state).await;
+        // Cursor-only write: never rewrite the context-token row from here.
+        let _ = crate::core::settings_service::save_weixin_cursor(db, buf).await;
     }
 }
 
 async fn save_context_token(db: &sqlx::SqlitePool, chat_id: &str, token: &str) {
-    if let Ok(mut state) = crate::core::settings_service::load_weixin_state(db).await {
-        let map = &mut state.context_tokens;
+    if let Ok(state) = crate::core::settings_service::load_weixin_state(db).await {
+        let mut map = state.context_tokens;
         if map.get(chat_id) == Some(&token.to_string()) {
             return;
         }
@@ -525,7 +587,9 @@ async fn save_context_token(db: &sqlx::SqlitePool, chat_id: &str, token: &str) {
                 break;
             }
         }
-        let _ = crate::core::settings_service::save_weixin_state(db, &state).await;
+        // Token-only write: never carry a possibly stale cursor back into the
+        // synced cursor row.
+        let _ = crate::core::settings_service::save_weixin_context_tokens(db, &map).await;
     }
 }
 

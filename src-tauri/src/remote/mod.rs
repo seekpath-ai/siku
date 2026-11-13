@@ -91,6 +91,11 @@ pub struct RemoteManager {
 }
 
 impl RemoteManager {
+    /// Current single-active role, for diagnostics/logging.
+    pub async fn role_label(&self) -> String {
+        self.inner.lock().await.role.label().to_string()
+    }
+
     /// Re-evaluate arbitration, then start/stop channel tasks to match.
     /// Called at startup, after every settings save, and by the arbiter.
     pub async fn sync_config(&self, db: &sqlx::SqlitePool, app: &AppHandle) {

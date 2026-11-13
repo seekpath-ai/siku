@@ -463,6 +463,9 @@ pub async fn spawn_auto_sync_proxy(
     }
 
     sync_state.auto_stop.store(false, std::sync::atomic::Ordering::Relaxed);
+    // A new proxy generation means a fresh account/session: remote channels
+    // must wait for this generation's first complete mailbox page again.
+    crate::sync::engine::set_initial_sync_ready(false);
     let stop = sync_state.auto_stop.clone();
     let generation = sync_state
         .auto_generation
@@ -738,12 +741,19 @@ pub async fn spawn_auto_sync_proxy(
                                 let batch_is_empty = payload.messages.is_empty();
                                 if let Some(key) = &mailbox_key {
                                     let batch_full = payload.messages.len() >= 100;
-                                    if let Err(e) = crate::sync::engine::handle_mailbox_batch(
+                                    let applied = crate::sync::engine::handle_mailbox_batch(
                                         &db, &app_data_dir, key, &relay, payload.messages,
                                     )
-                                    .await
-                                    {
+                                    .await;
+                                    if let Err(e) = applied {
                                         tracing::warn!(error = %e, "auto-sync: mailbox batch failed");
+                                    } else if !batch_full {
+                                        // Last page of the initial drain: the
+                                        // synced cursor/remote_msg_ids/history
+                                        // have now been applied. Remote IM
+                                        // channels can safely poll.
+                                        crate::sync::engine::set_initial_sync_ready(true);
+                                        tracing::info!("auto-sync: initial mailbox sync complete");
                                     }
                                     // A large account-level archive is paged:
                                     // poll again while the last batch was full —
@@ -767,6 +777,7 @@ pub async fn spawn_auto_sync_proxy(
                                 } else if batch_is_empty {
                                     // 无 sync key 时无法解密应用非空 batch；但空 batch
                                     // 本身即「与云端一致」，与是否能解密无关。
+                                    crate::sync::engine::set_initial_sync_ready(true);
                                     crate::sync::engine::note_synced_now();
                                 }
                             }

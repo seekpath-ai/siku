@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
@@ -44,9 +45,9 @@ const SEEN_TTL_SECS: i64 = 24 * 3600;
 /// (deletes are sync traffic, so the table is allowed to just sit below).
 const REMOTE_MSG_IDS_CAP: i64 = 5000;
 /// Stale-backlog guard: server-redelivered messages older than this are
-/// dropped even when every dedup layer missed them — nobody expects an
-/// answer to a message sent hours ago.
-const STALE_MESSAGE_MS: i64 = 2 * 3600 * 1000;
+/// dropped even when every dedup layer missed them. The per-chat session
+/// watermark above is the primary defense; this is only the last resort.
+const STALE_MESSAGE_MS: i64 = 30 * 60 * 1000;
 /// How often an unapproved chat is reminded to pair.
 const PAIRING_NOTICE_INTERVAL_SECS: i64 = 3600;
 /// Max wait for a remote turn to persist its reply before giving up.
@@ -439,6 +440,90 @@ async fn db_seen_check_and_mark(db: &SqlitePool, channel: &str, msg_id: &str) ->
     }
 }
 
+/// The latest user-message timestamp already persisted for this remote chat.
+/// This is the version-independent replay watermark: if the synced chat
+/// history already contains a message from (or after) the inbound message's
+/// send time, the inbound is an old redelivery and must not start a new turn.
+async fn latest_remote_user_message_ms(
+    db: &SqlitePool,
+    channel: &str,
+    chat_id: &str,
+) -> Option<i64> {
+    let session_id: Option<String> = sqlx::query_scalar(
+        "SELECT session_id FROM remote_chats \
+         WHERE channel = ? AND chat_id = ? AND session_id IS NOT NULL LIMIT 1",
+    )
+    .bind(channel)
+    .bind(chat_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let session_id = session_id.filter(|id| !id.is_empty())?;
+    let created_at: Option<String> = sqlx::query_scalar(
+        "SELECT created_at FROM chat_messages \
+         WHERE session_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let created_at = created_at?;
+    chrono::DateTime::parse_from_rfc3339(&created_at)
+        .ok()
+        .map(|timestamp| timestamp.timestamp_millis())
+}
+
+/// True when this inbound message is at or before the chat's already-synced
+/// latest user message. Callers should drop such messages before debouncing.
+async fn is_replay_before_watermark(db: &SqlitePool, msg: &InboundMessage) -> bool {
+    let Some(sent_at_ms) = msg.sent_at_ms else {
+        return false;
+    };
+    latest_remote_user_message_ms(db, &msg.channel, &msg.chat_id)
+        .await
+        .map(|latest| sent_at_ms <= latest)
+        .unwrap_or(false)
+}
+
+/// Content fingerprint used when the channel's message id is missing or
+/// changes on redelivery. It deliberately includes the sender timestamp so a
+/// user intentionally sending the same text twice at different times is not
+/// collapsed, while the same message redelivered with a new/empty id is.
+fn inbound_fingerprint(msg: &InboundMessage) -> Option<String> {
+    let sent_at_ms = msg.sent_at_ms?;
+    let mut hash = Sha256::new();
+    for part in [
+        msg.channel.as_str(),
+        msg.chat_id.as_str(),
+        msg.user_id.as_str(),
+        msg.text.as_str(),
+    ] {
+        hash.update(part.as_bytes());
+        hash.update([0u8]);
+    }
+    hash.update(sent_at_ms.to_le_bytes());
+    for image in &msg.images {
+        hash.update(image.mime.as_bytes());
+        hash.update([0u8]);
+        hash.update(image.base64.as_bytes());
+        hash.update([0u8]);
+    }
+    if let Some(media) = &msg.media {
+        for part in [
+            media.kind.as_str(),
+            media.name.as_str(),
+            media.message_id.as_str(),
+            media.file_key.as_str(),
+        ] {
+            hash.update(part.as_bytes());
+            hash.update([0u8]);
+        }
+    }
+    Some(format!("{:x}", hash.finalize()))
+}
+
 /// Deletes are sync traffic, so pruning runs only when the table clearly
 /// exceeds the cap, then removes the oldest overflow in one statement.
 async fn prune_remote_msg_ids(db: &SqlitePool) {
@@ -491,24 +576,81 @@ static PENDING: Lazy<Mutex<HashMap<String, PendingBatch>>> =
 
 /// Entry point called by channel adapters for every inbound message.
 pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySink>) {
-    let app_data_dir = app.state::<AppState>().app_data_dir.clone();
+    let state = app.state::<AppState>();
+    let db = state.db.clone();
+    let app_data_dir = state.app_data_dir.clone();
+    let role = state.remote.role_label().await;
+    let cursor_len = if msg.channel == "weixin" {
+        crate::core::settings_service::load_weixin_state(&db)
+            .await
+            .map(|state| state.get_updates_buf.chars().count())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let age_ms = msg
+        .sent_at_ms
+        .map(|sent| chrono::Utc::now().timestamp_millis() - sent);
+    tracing::info!(
+        channel = %msg.channel,
+        chat_id = %msg.chat_id,
+        msg_id = %msg.msg_id,
+        sent_at_ms = ?msg.sent_at_ms,
+        age_ms = ?age_ms,
+        role = %role,
+        cursor_len,
+        relay_connected = crate::sync::engine::relay_connected(),
+        initial_sync_ready = crate::sync::engine::initial_sync_ready(),
+        images = msg.images.len(),
+        has_media = msg.media.is_some(),
+        "remote inbound message"
+    );
+
     if !msg.msg_id.is_empty() {
         if seen_check_and_mark(&app_data_dir, &msg.msg_id).await {
+            tracing::info!(channel = %msg.channel, msg_id = %msg.msg_id, "dropping duplicate remote message (local seen)");
             return;
         }
-        let db = app.state::<AppState>().db.clone();
         if db_seen_check_and_mark(&db, &msg.channel, &msg.msg_id).await {
+            tracing::info!(channel = %msg.channel, msg_id = %msg.msg_id, "dropping duplicate remote message (synced msg_id)");
             return;
         }
     }
+
+    // Fingerprint dedup: survives an empty or changed channel message id.
+    if let Some(fingerprint) = inbound_fingerprint(&msg) {
+        let key = format!("fp:{fingerprint}");
+        if db_seen_check_and_mark(&db, &msg.channel, &key).await {
+            tracing::info!(
+                channel = %msg.channel, msg_id = %msg.msg_id, chat_id = %msg.chat_id,
+                "dropping redelivered remote message (fingerprint)"
+            );
+            return;
+        }
+    }
+
+    // Session watermark: the chat history already has this message (or a
+    // newer one). This is the primary guard against cursor rollback and
+    // msg_id churn; it does not depend on either.
+    if is_replay_before_watermark(&db, &msg).await {
+        let latest = latest_remote_user_message_ms(&db, &msg.channel, &msg.chat_id).await;
+        tracing::info!(
+            channel = %msg.channel, msg_id = %msg.msg_id, chat_id = %msg.chat_id,
+            sent_at_ms = ?msg.sent_at_ms, latest_user_ms = ?latest,
+            "dropping replayed remote message (session watermark)"
+        );
+        return;
+    }
+
     // Stale-backlog guard: when a standby device takes over with a stale
-    // long-poll cursor, the server redelivers hours-old messages. Dedup
-    // catches what the predecessor recorded; this catches the rest.
+    // long-poll cursor, the server redelivers old messages. Dedup/watermark
+    // catch what the predecessor recorded; this catches the rest.
     if let Some(sent_ms) = msg.sent_at_ms {
         let age_ms = chrono::Utc::now().timestamp_millis() - sent_ms;
         if age_ms > STALE_MESSAGE_MS {
             tracing::info!(
                 channel = %msg.channel, msg_id = %msg.msg_id, age_ms,
+                role = %role, cursor_len,
                 "dropping stale remote message"
             );
             return;
@@ -1382,7 +1524,42 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
+        sqlx::query(
+            "CREATE TABLE remote_chats (
+                channel TEXT NOT NULL DEFAULT '',
+                chat_id TEXT NOT NULL DEFAULT '',
+                session_id TEXT
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_messages (
+                session_id TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
         db
+    }
+
+    fn sample_inbound(msg_id: &str, sent_at_ms: Option<i64>, text: &str) -> InboundMessage {
+        InboundMessage {
+            channel: "weixin".to_string(),
+            chat_id: "chat-1".to_string(),
+            kind: ChatKind::Private,
+            user_id: "user-1".to_string(),
+            user_name: String::new(),
+            msg_id: msg_id.to_string(),
+            sent_at_ms,
+            text: text.to_string(),
+            images: Vec::new(),
+            media: None,
+        }
     }
 
     #[tokio::test]
@@ -1393,6 +1570,50 @@ mod tests {
         // Same msg_id on another channel instance is a distinct message.
         assert!(!db_seen_check_and_mark(&db, "feishu:app1", "m1").await);
         assert!(db_seen_check_and_mark(&db, "feishu:app1", "m1").await);
+    }
+
+    #[tokio::test]
+    async fn session_watermark_drops_old_but_not_new_messages() {
+        let db = test_db().await;
+        sqlx::query("INSERT INTO remote_chats (channel, chat_id, session_id) VALUES ('weixin', 'chat-1', 's1')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let original = "2026-11-13T09:18:01.637Z";
+        sqlx::query("INSERT INTO chat_messages (session_id, role, created_at) VALUES ('s1', 'user', ?)")
+            .bind(original)
+            .execute(&db)
+            .await
+            .unwrap();
+        let latest = chrono::DateTime::parse_from_rfc3339(original)
+            .unwrap()
+            .timestamp_millis();
+
+        for sent_at in [Some(latest), Some(latest - 1000)] {
+            let msg = sample_inbound("replay", sent_at, "same old message");
+            assert!(
+                is_replay_before_watermark(&db, &msg).await,
+                "sent_at={sent_at:?} should be at/before the watermark"
+            );
+        }
+        let fresh = sample_inbound("fresh", Some(latest + 1), "new message");
+        assert!(!is_replay_before_watermark(&db, &fresh).await);
+        let no_timestamp = sample_inbound("no-ts", None, "unknown age");
+        assert!(!is_replay_before_watermark(&db, &no_timestamp).await);
+    }
+
+    #[tokio::test]
+    async fn fingerprint_dedups_redelivery_without_msg_id() {
+        let db = test_db().await;
+        let msg = sample_inbound("", Some(1_700_000_000_000), "hello");
+        let fingerprint = inbound_fingerprint(&msg).unwrap();
+        let key = format!("fp:{fingerprint}");
+        assert!(!db_seen_check_and_mark(&db, "weixin", &key).await);
+        assert!(db_seen_check_and_mark(&db, "weixin", &key).await);
+
+        // Same text sent at a different time is a new message, not a replay.
+        let later = sample_inbound("", Some(1_700_000_001_000), "hello");
+        assert_ne!(inbound_fingerprint(&later).unwrap(), fingerprint);
     }
 
     #[tokio::test]

@@ -196,7 +196,16 @@ pub async fn migrate_legacy_account_settings(db: &SqlitePool) -> Result<(), Stri
 
 // ---------------------------------------------------------------- remote channels (synced)
 
+/// Legacy combined runtime row. Kept for one-way migration and old clients;
+/// new code splits the cursor and context tokens into separate rows below.
 pub const REMOTE_WEIXIN_STATE_KEY: &str = "remote_weixin_state";
+/// Long-poll cursor: written on every cursor advance. Must never share a
+/// settings row with the chattier context tokens: last-writer-wins on the
+/// whole row can otherwise resurrect an older cursor.
+pub const REMOTE_WEIXIN_CURSOR_KEY: &str = "remote_weixin_cursor";
+pub const REMOTE_WEIXIN_CONTEXT_KEY: &str = "remote_weixin_context_tokens";
+/// Marker that the legacy combined row has been migrated to the split keys.
+pub const REMOTE_WEIXIN_V2_KEY: &str = "remote_weixin_state_v2";
 pub const REMOTE_HOLDER_KEY: &str = "remote_holder";
 /// Feishu bots + weixin binding roam in this dedicated synced settings row.
 /// NOT in `app_settings`: that row never syncs (it embeds LLM API keys),
@@ -234,21 +243,92 @@ pub async fn save_remote_config(
 }
 
 /// Load the synced weixin runtime state (long-poll cursor + context tokens).
+/// Cursor and tokens live in separate settings rows; a legacy combined row is
+/// migrated once (its value may be stale, so it only fills missing halves).
 pub async fn load_weixin_state(
     db: &SqlitePool,
 ) -> Result<crate::core::models::WeixinChannelState, String> {
-    match get_setting(db, REMOTE_WEIXIN_STATE_KEY).await? {
-        Some(v) => serde_json::from_str(&v).map_err(|e| format!("invalid weixin state: {e}")),
-        None => Ok(Default::default()),
+    let migrated = get_setting(db, REMOTE_WEIXIN_V2_KEY).await?.is_some();
+    let mut cursor = get_setting(db, REMOTE_WEIXIN_CURSOR_KEY)
+        .await?
+        .unwrap_or_default();
+    let mut context_tokens: std::collections::HashMap<String, String> =
+        match get_setting(db, REMOTE_WEIXIN_CONTEXT_KEY).await? {
+        Some(v) if !v.trim().is_empty() => serde_json::from_str(&v).unwrap_or_default(),
+        _ => Default::default(),
+    };
+
+    if !migrated {
+        let legacy = get_setting(db, REMOTE_WEIXIN_STATE_KEY).await?;
+        let had_legacy = legacy.is_some();
+        if let Some(legacy) = legacy {
+            if let Ok(old) =
+                serde_json::from_str::<crate::core::models::WeixinChannelState>(&legacy)
+            {
+                if cursor.is_empty() {
+                    cursor = old.get_updates_buf;
+                }
+                if context_tokens.is_empty() {
+                    context_tokens = old.context_tokens;
+                }
+            }
+        }
+        // Only mark migrated once there is something to migrate or split keys
+        // already exist. On a fresh device the legacy row may sync in later;
+        // writing the marker on the first empty load would make us ignore the
+        // previous holder's cursor forever — exactly the cold-start takeover
+        // race this migration is supposed to survive.
+        if had_legacy || !cursor.is_empty() || !context_tokens.is_empty() {
+            if !cursor.is_empty() {
+                set_setting(db, REMOTE_WEIXIN_CURSOR_KEY, &cursor).await?;
+            }
+            if !context_tokens.is_empty() {
+                let json =
+                    serde_json::to_string(&context_tokens).map_err(|e| format!("json: {e}"))?;
+                set_setting(db, REMOTE_WEIXIN_CONTEXT_KEY, &json).await?;
+            }
+            set_setting(db, REMOTE_WEIXIN_V2_KEY, "1").await?;
+        }
     }
+
+    Ok(crate::core::models::WeixinChannelState {
+        get_updates_buf: cursor,
+        context_tokens,
+    })
 }
 
+/// Persist ONLY the long-poll cursor. This is the hot path; it must not touch
+/// the context-token row.
+pub async fn save_weixin_cursor(db: &SqlitePool, cursor: &str) -> Result<(), String> {
+    set_setting(db, REMOTE_WEIXIN_CURSOR_KEY, cursor).await?;
+    if get_setting(db, REMOTE_WEIXIN_V2_KEY).await?.is_none() {
+        set_setting(db, REMOTE_WEIXIN_V2_KEY, "1").await?;
+    }
+    Ok(())
+}
+
+/// Persist ONLY the context-token map. This must not carry a cursor value: a
+/// context update on a standby device used to write back its stale cursor.
+pub async fn save_weixin_context_tokens(
+    db: &SqlitePool,
+    context_tokens: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    let json = serde_json::to_string(context_tokens).map_err(|e| format!("json: {e}"))?;
+    set_setting(db, REMOTE_WEIXIN_CONTEXT_KEY, &json).await?;
+    // Deliberately do NOT mark the legacy state migrated here: a token write
+    // can happen before a mixed-version peer's legacy cursor row has synced.
+    // `load_weixin_state` still fills the missing cursor from that row.
+    Ok(())
+}
+
+/// Write both halves (logout / fresh binding / one-time migration path).
 pub async fn save_weixin_state(
     db: &SqlitePool,
     state: &crate::core::models::WeixinChannelState,
 ) -> Result<(), String> {
-    let v = serde_json::to_string(state).map_err(|e| format!("json: {e}"))?;
-    set_setting(db, REMOTE_WEIXIN_STATE_KEY, &v).await
+    save_weixin_cursor(db, &state.get_updates_buf).await?;
+    save_weixin_context_tokens(db, &state.context_tokens).await?;
+    set_setting(db, REMOTE_WEIXIN_V2_KEY, "1").await
 }
 
 /// The manual-takeover record, if any.
@@ -393,5 +473,103 @@ pub async fn validate_llm_config(config: &crate::ai::llm::LlmConfig) -> Result<b
     match client.chat_completion(&test_messages, &[]).await {
         Ok(_) => Ok(true),
         Err(e) => Err(format!("LLM validation failed: {e}")),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn test_db() -> SqlitePool {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE settings (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn fresh_load_waits_for_late_legacy_state() {
+        let db = test_db().await;
+        // Startup before initial sync: no legacy row yet. Loading must NOT
+        // write the v2 marker, otherwise the row that syncs in later is
+        // ignored and the stale cursor race returns.
+        let empty = load_weixin_state(&db).await.unwrap();
+        assert!(empty.get_updates_buf.is_empty());
+        assert!(get_setting(&db, REMOTE_WEIXIN_V2_KEY).await.unwrap().is_none());
+
+        sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, 't')")
+            .bind(REMOTE_WEIXIN_STATE_KEY)
+            .bind(
+                serde_json::json!({
+                    "get_updates_buf": "cursor-from-office",
+                    "context_tokens": {}
+                })
+                .to_string(),
+            )
+            .execute(&db)
+            .await
+            .unwrap();
+        let loaded = load_weixin_state(&db).await.unwrap();
+        assert_eq!(loaded.get_updates_buf, "cursor-from-office");
+        assert!(get_setting(&db, REMOTE_WEIXIN_V2_KEY).await.unwrap().is_some());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn weixin_state_migrates_and_split_writes_do_not_clobber() {
+        let db = test_db().await;
+        let legacy = serde_json::json!({
+            "get_updates_buf": "cursor-old",
+            "context_tokens": {"chat-1": "token-1"}
+        });
+        sqlx::query(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, 't')",
+        )
+        .bind(REMOTE_WEIXIN_STATE_KEY)
+        .bind(legacy.to_string())
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let loaded = load_weixin_state(&db).await.unwrap();
+        assert_eq!(loaded.get_updates_buf, "cursor-old");
+        assert_eq!(loaded.context_tokens.get("chat-1").map(String::as_str), Some("token-1"));
+        assert!(get_setting(&db, REMOTE_WEIXIN_CURSOR_KEY).await.unwrap().is_some());
+        assert!(get_setting(&db, REMOTE_WEIXIN_V2_KEY).await.unwrap().is_some());
+
+        // A cursor-only write leaves tokens untouched.
+        save_weixin_cursor(&db, "cursor-new").await.unwrap();
+        let loaded = load_weixin_state(&db).await.unwrap();
+        assert_eq!(loaded.get_updates_buf, "cursor-new");
+        assert_eq!(loaded.context_tokens.get("chat-1").map(String::as_str), Some("token-1"));
+
+        // A token-only write leaves the cursor untouched.
+        let mut tokens = loaded.context_tokens.clone();
+        tokens.insert("chat-2".to_string(), "token-2".to_string());
+        save_weixin_context_tokens(&db, &tokens).await.unwrap();
+        let loaded = load_weixin_state(&db).await.unwrap();
+        assert_eq!(loaded.get_updates_buf, "cursor-new");
+        assert_eq!(loaded.context_tokens.get("chat-2").map(String::as_str), Some("token-2"));
+
+        // A fresh binding clears both and must not resurrect the legacy row.
+        save_weixin_state(&db, &Default::default()).await.unwrap();
+        let loaded = load_weixin_state(&db).await.unwrap();
+        assert!(loaded.get_updates_buf.is_empty());
+        assert!(loaded.context_tokens.is_empty());
+        db.close().await;
     }
 }

@@ -92,6 +92,21 @@ pub fn set_relay_connected(connected: bool) {
     RELAY_CONNECTED.store(connected, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// 进程级「账号初始同步已完成」标记：auto-sync proxy 收到并应用第一页
+/// 未满的 mailbox batch 后置位。远程渠道在账号漫游模式下要等它，避免
+/// 刚启动、同步游标/去重表还没落库时就拿旧游标长轮询。
+static INITIAL_SYNC_READY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 账号初始同步是否已完成（见 INITIAL_SYNC_READY）。
+pub fn initial_sync_ready() -> bool {
+    INITIAL_SYNC_READY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_initial_sync_ready(ready: bool) {
+    INITIAL_SYNC_READY.store(ready, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 进程级最近一次「与云端/对端达成一致」的时间。engine 会话的
 /// `mark_synced` 与 auto-sync proxy 的邮箱 batch 路径（无 engine 实例，
 /// 空 batch 即「与云端一致」的信号）都会更新它；`get_sync_status` 在会话

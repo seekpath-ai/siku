@@ -1017,6 +1017,7 @@ pub fn run() {
             commands::projects::projects_list,
             commands::projects::project_create,
             commands::projects::project_update,
+            commands::projects::project_bind_local_path,
             commands::projects::project_set_archived,
             commands::projects::project_delete,
             // Cron (scheduled agent prompts)

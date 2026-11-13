@@ -14,11 +14,13 @@ interface Props {
   onModelChange: (providerId: string) => void;
   /** Toggle the in-conversation search bar. */
   onToggleSearch: () => void;
+  /** Bind a synced project (empty path) to a local folder. */
+  onBindProject?: () => void;
 }
 
 /** Chat panel header: editable thread title + project chip + model badge.
  *  The badge doubles as a model switcher over the global provider pool. */
-export function ChatHeader({ session, projectName, projectPath, onRename, onModelChange, onToggleSearch }: Props) {
+export function ChatHeader({ session, projectName, projectPath, onRename, onModelChange, onToggleSearch, onBindProject }: Props) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(session.title);
   const [taskCenterOpen, setTaskCenterOpen] = useState(false);
@@ -76,10 +78,19 @@ export function ChatHeader({ session, projectName, projectPath, onRename, onMode
         {projectName && (
           <span
             className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-surface-hover/60 truncate max-w-[180px]"
-            title={projectPath}
+            title={projectPath || '本项目尚未在本机绑定目录'}
           >
             <FolderOpen size={11} className="shrink-0" />
             <span className="truncate">{projectName}</span>
+            {!projectPath && onBindProject && (
+              <button
+                onClick={onBindProject}
+                className="shrink-0 px-1 rounded bg-warning/20 text-text-primary hover:bg-warning/30"
+                title="在本机绑定项目目录"
+              >
+                绑定
+              </button>
+            )}
           </span>
         )}
         <SessionModelBadge session={session} onModelChange={onModelChange} />

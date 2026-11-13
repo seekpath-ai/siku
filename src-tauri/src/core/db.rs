@@ -72,6 +72,10 @@ pub(crate) const CORE_SYNC_TABLES: &[&str] = &[
 pub(crate) const OPTIONAL_SYNC_TABLES: &[&str] = &[
     "chat_sessions",
     "chat_messages",
+    // Project metadata (name/archived/timestamps). `path` is deliberately
+    // device-local: a synced absolute path would be meaningless on the peer,
+    // and the unique path index is incompatible with CRR anyway.
+    "projects",
     // 推理过程（ReAct 步骤）：chat_messages 只存最终回复，推理/工具调用在
     // 这张表；不同步它，跨设备打开的会话会静默丢失推理过程。
     "agent_steps",
@@ -1732,6 +1736,12 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         .await
         .map_err(|e| anyhow::anyhow!("sync schema v2 migration failed: {e}"))?;
 
+    // Projects join the optional sync tables; rebuild to the CRR shape and
+    // make the folder path device-local BEFORE triggers are registered.
+    migrate_projects_for_sync(&db)
+        .await
+        .map_err(|e| anyhow::anyhow!("projects sync migration failed: {e}"))?;
+
     // Register core sync tables as CRDTs for multi-device sync.
     // This must happen AFTER all schema migrations so the CRR triggers match
     // the final table schemas. If columns are added after registration, the
@@ -2570,6 +2580,130 @@ async fn migrate_ai_feature_crr_tables(db: &Db) -> anyhow::Result<()> {
 
 
 
+/// Rebuild `projects` into the CRR-compatible shape and make `path`
+/// device-local:
+/// - `id` must be NOT NULL (SQLite's TEXT PRIMARY KEY stays nullable);
+/// - every NOT NULL column needs a DEFAULT (crsql_as_crr requirement);
+/// - CRRs cannot carry UNIQUE indexes, so the unique path index becomes
+///   non-unique (paths are per-device and excluded from sync anyway).
+///
+/// Idempotent: no-ops once the live schema matches. Runs before CRR
+/// registration so triggers see the final shape.
+async fn migrate_projects_for_sync(db: &Db) -> anyhow::Result<()> {
+    use sqlx::Row;
+
+    let cols = sqlx::query("PRAGMA table_info(projects)").fetch_all(db).await?;
+    if cols.is_empty() {
+        return Ok(());
+    }
+
+    // Crash recovery: an interrupted rebuild may have left `projects_old`
+    // behind while startup's CREATE TABLE IF NOT EXISTS recreated an empty
+    // `projects`. Merge the stranded rows back before trusting the shape.
+    let old_exists: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'projects_old'",
+    )
+    .fetch_one(db)
+    .await?;
+    if old_exists > 0 {
+        sqlx::query(
+            "INSERT OR IGNORE INTO projects (id, name, path, archived, created_at, updated_at) \
+             SELECT id, name, path, archived, created_at, updated_at FROM projects_old",
+        )
+        .execute(db)
+        .await?;
+        sqlx::query("DROP TABLE projects_old").execute(db).await?;
+        info!("recovered stranded projects_old rows after an interrupted migration");
+    }
+
+    let id_not_null = cols.iter().any(|r| {
+        r.try_get::<String, _>("name").map(|n| n == "id").unwrap_or(false)
+            && r.try_get::<i64, _>("notnull").unwrap_or(0) == 1
+    });
+    // PK columns don't need a DEFAULT (chat_sessions is the precedent);
+    // non-PK NOT NULL columns do, or crsql_as_crr rejects the table.
+    let defaults_ok = cols.iter().all(|r| {
+        r.try_get::<i64, _>("pk").unwrap_or(0) > 0
+            || r.try_get::<i64, _>("notnull").unwrap_or(0) == 0
+            || r.try_get::<Option<String>, _>("dflt_value").unwrap_or(None).is_some()
+    });
+    let indexes: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'projects'",
+    )
+    .fetch_all(db)
+    .await?;
+    let unique_path = indexes.iter().any(|(_, sql)| {
+        sql.as_deref()
+            .map(|s| {
+                let up = s.to_uppercase();
+                up.contains("UNIQUE") && up.contains("PATH")
+            })
+            .unwrap_or(false)
+    });
+    if id_not_null && defaults_ok && !unique_path {
+        return Ok(());
+    }
+
+    // Defensive: a dev build may already have registered the table as a CRR.
+    let clock_exists: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'projects__crsql_clock'",
+    )
+    .fetch_one(db)
+    .await?;
+    if clock_exists > 0 {
+        drop_crr_objects(db, "projects").await?;
+    }
+
+    let rows: Vec<(String, String, String, i64, String, String)> = sqlx::query_as(
+        "SELECT id, name, path, archived, created_at, updated_at FROM projects",
+    )
+    .fetch_all(db)
+    .await?;
+
+    // Rebuild atomically: a crash between RENAME and DROP must not leave an
+    // empty `projects` with the real rows stranded in `projects_old`.
+    let mut conn = db.acquire().await?;
+    let mut tx = conn.begin().await?;
+    sqlx::query("ALTER TABLE projects RENAME TO projects_old")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE projects (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            path TEXT NOT NULL DEFAULT '',
+            archived INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+    for (id, name, path, archived, created_at, updated_at) in rows {
+        sqlx::query(
+            "INSERT INTO projects (id, name, path, archived, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(path)
+        .bind(archived)
+        .bind(created_at)
+        .bind(updated_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("DROP TABLE projects_old").execute(&mut *tx).await?;
+    sqlx::query("DROP INDEX IF EXISTS idx_projects_path")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(path)")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    info!("rebuilt projects for sync (path is device-local, id NOT NULL)");
+    Ok(())
+}
+
 /// Rebuild pre-sync tables whose schemas are incompatible with CRDT sync:
 ///
 /// - `vaults`: INTEGER AUTOINCREMENT PK → TEXT uuid PK. Autoincrement ids
@@ -3220,6 +3354,132 @@ pub(crate) mod tests {
         .fetch_one(&db)
         .await?;
         assert_eq!(clock.0, 1, "attachments must be registered as a CRR");
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
+        db.close().await;
+        Ok(())
+    }
+
+    /// Projects join OPTIONAL_SYNC_TABLES: the legacy shape (nullable id, no
+    /// defaults, UNIQUE path index) is rebuilt before CRR registration; the
+    /// local path survives, the unique index does not, and the migration is
+    /// idempotent.
+    #[tokio::test]
+    async fn projects_migration_makes_crr_shape_and_keeps_path() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-projects-migrate-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let db = connect_with_crsqlite(&dir.join("test.db")).await?;
+
+        sqlx::query(
+            "CREATE TABLE projects (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query("CREATE UNIQUE INDEX idx_projects_path ON projects(path)")
+            .execute(&db)
+            .await?;
+        sqlx::query(
+            "INSERT INTO projects (id, name, path, archived, created_at, updated_at)              VALUES ('p1', 'Legacy', 'D:/work/proj', 1, 't1', 't2')",
+        )
+        .execute(&db)
+        .await?;
+
+        super::migrate_projects_for_sync(&db).await?;
+
+        let ddl: (String,) = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='projects'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert!(
+            ddl.0.contains("id TEXT PRIMARY KEY NOT NULL"),
+            "projects PK must be NOT NULL: {}",
+            ddl.0
+        );
+        let indexes: Vec<(Option<String>,)> = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='projects'",
+        )
+        .fetch_all(&db)
+        .await?;
+        assert!(
+            indexes.iter().all(|(sql,)| sql
+                .as_deref()
+                .map(|s| !s.to_uppercase().contains("UNIQUE"))
+                .unwrap_or(true)),
+            "no unique index may survive on a CRR: {indexes:?}"
+        );
+        let (path, archived): (String, i64) =
+            sqlx::query_as("SELECT path, archived FROM projects WHERE id = 'p1'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(path, "D:/work/proj", "local path must survive");
+        assert_eq!(archived, 1);
+
+        // Idempotent: a second run keeps a single row.
+        super::migrate_projects_for_sync(&db).await?;
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM projects")
+            .fetch_one(&db)
+            .await?;
+        assert_eq!(count, 1);
+
+        // The rebuilt shape must be accepted by CR-SQLite.
+        register_crr_tables(&db, &["projects"]).await?;
+        let clock: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='projects__crsql_clock'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(clock.0, 1);
+
+        // Crash recovery: an interrupted rebuild leaves the real rows in
+        // `projects_old` while startup recreated an empty `projects`. The next
+        // migration must merge them back instead of treating the new (empty)
+        // shape as "already migrated".
+        sqlx::query(
+            "CREATE TABLE projects_old (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&db)
+        .await?;
+        sqlx::query(
+            "INSERT INTO projects_old (id, name, path, archived, created_at, updated_at) \
+             VALUES ('p2', 'Stranded', 'D:/stranded', 0, 't3', 't4')",
+        )
+        .execute(&db)
+        .await?;
+        super::migrate_projects_for_sync(&db).await?;
+        let (recovered,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM projects WHERE id = 'p2'")
+                .fetch_one(&db)
+                .await?;
+        assert_eq!(recovered, 1, "stranded rows must be merged back");
+        let (old_left,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='projects_old'",
+        )
+        .fetch_one(&db)
+        .await?;
+        assert_eq!(old_left, 0, "projects_old must be dropped after recovery");
 
         sqlx::query("SELECT crsql_finalize()").execute(&db).await?;
         db.close().await;

@@ -32,6 +32,17 @@ pub async fn project_update(
     crate::core::project_service::update(&state.db, &id, input).await
 }
 
+/// Bind a synced project to a folder on THIS device (device-local column).
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn project_bind_local_path(
+    state: State<'_, AppState>,
+    id: String,
+    path: String,
+) -> Result<(), String> {
+    crate::core::project_service::bind_local_path(&state.db, &id, &path).await
+}
+
 /// Archive or restore a project. Archived projects hide from the sidebar;
 /// their sessions are untouched.
 #[tauri::command]

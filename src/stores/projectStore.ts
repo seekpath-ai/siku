@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { projectsList, projectCreate, projectDelete, projectUpdate, projectSetArchived } from '@/lib/tauri';
+import { projectsList, projectCreate, projectDelete, projectUpdate, projectSetArchived, projectBindLocalPath } from '@/lib/tauri';
 import type { Project } from '@/lib/types';
 
 export type SidebarSortBy = 'priority' | 'updated' | 'manual';
@@ -19,6 +19,8 @@ interface ProjectState {
   removeProject: (id: string) => Promise<void>;
   renameProject: (id: string, name: string) => Promise<void>;
   archiveProject: (id: string, archived: boolean) => Promise<void>;
+  /** Bind a synced project (empty local path) to a folder on this device. */
+  bindPath: (id: string, path: string) => Promise<void>;
   switchProject: (id: string | null) => void;
   setSortBy: (s: SidebarSortBy) => void;
 }
@@ -82,6 +84,13 @@ export const useProjectStore = create<ProjectState>()(
           projects: s.projects.map((p) => (p.id === id ? { ...p, archived } : p)),
           // Archiving the selected project clears the filter.
           activeProjectId: archived && s.activeProjectId === id ? null : s.activeProjectId,
+        }));
+      },
+
+      bindPath: async (id, path) => {
+        await projectBindLocalPath(id, path);
+        set((s) => ({
+          projects: s.projects.map((p) => (p.id === id ? { ...p, path } : p)),
         }));
       },
 

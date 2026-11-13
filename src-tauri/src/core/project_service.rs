@@ -40,9 +40,13 @@ pub async fn get_by_id(db: &SqlitePool, id: &str) -> Result<Option<Project>, Str
     .map_err(|e| format!("db error: {e}"))
 }
 
-/// Path of a project, if it exists.
+/// Path of a project on THIS device, if bound. Synced projects arrive with an
+/// empty path (the folder is device-local) until the user binds a local one.
 pub async fn get_path(db: &SqlitePool, id: &str) -> Result<Option<String>, String> {
-    Ok(get_by_id(db, id).await?.map(|p| p.path))
+    Ok(get_by_id(db, id)
+        .await?
+        .map(|p| p.path)
+        .filter(|p| !p.trim().is_empty()))
 }
 
 fn folder_name(path: &str) -> String {
@@ -160,6 +164,32 @@ pub async fn update(db: &SqlitePool, id: &str, input: ProjectInput) -> Result<Pr
         .ok_or_else(|| format!("project not found: {id}"))
 }
 
+/// Bind a synced project to a folder on THIS device. `path` is excluded from
+/// sync (see `non_syncable_column`), and we deliberately do not bump
+/// `updated_at`: a device-local binding must not win LWW against real synced
+/// edits (rename/archive) on the peer.
+#[instrument(skip(db))]
+pub async fn bind_local_path(db: &SqlitePool, id: &str, path: &str) -> Result<(), String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("目录不能为空".to_string());
+    }
+    if !std::path::Path::new(path).is_dir() {
+        return Err(format!("目录不存在：{path}"));
+    }
+    let affected = sqlx::query("UPDATE projects SET path = ? WHERE id = ?")
+        .bind(path)
+        .bind(id)
+        .execute(db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?
+        .rows_affected();
+    if affected == 0 {
+        return Err(format!("项目不存在：{id}"));
+    }
+    Ok(())
+}
+
 #[instrument(skip(db))]
 pub async fn delete(db: &SqlitePool, id: &str) -> Result<(), String> {
     // Sessions lose their project reference instead of being deleted.
@@ -202,6 +232,31 @@ mod tests {
         .unwrap();
         assert!(target.is_dir());
         assert_eq!(p.name, "nested");
+        db.close().await;
+    }
+
+    /// A synced project arrives with an empty path; get_path must report
+    /// "unbound" instead of Some(""), and binding fills it locally.
+    #[tokio::test]
+    async fn empty_path_is_unbound_and_binding_fills_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path()).await;
+        sqlx::query(
+            "INSERT INTO projects (id, name, path, archived, created_at, updated_at) \
+             VALUES ('p1', 'synced', '', 0, 't', 't')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        assert_eq!(get_path(&db, "p1").await.unwrap(), None);
+
+        let target = dir.path().join("local");
+        std::fs::create_dir_all(&target).unwrap();
+        bind_local_path(&db, "p1", &target.to_string_lossy()).await.unwrap();
+        assert_eq!(
+            get_path(&db, "p1").await.unwrap(),
+            Some(target.to_string_lossy().to_string())
+        );
         db.close().await;
     }
 

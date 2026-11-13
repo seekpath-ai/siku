@@ -25,6 +25,8 @@ import {
 import { ContextMenu, type ContextMenuItem } from '@/components/ui/ContextMenu';
 import { useChatStore } from '@/stores/chatStore';
 import { useProjectStore } from '@/stores/projectStore';
+import { listen } from '@/lib/events';
+import { pickDirectory } from '@/lib/pickDirectory';
 import {
   agentListSessions,
   agentCreateSession,
@@ -148,6 +150,7 @@ export function AgentList() {
     removeProject,
     renameProject,
     archiveProject,
+    bindPath,
     switchProject,
     setSortBy,
   } = useProjectStore();
@@ -248,6 +251,20 @@ export function AgentList() {
   useEffect(() => {
     loadSessions();
   }, [loadSessions]);
+
+  // A synced project (metadata) or session may arrive while the sidebar is
+  // open; refresh both so a project created on the other device shows up
+  // without restarting the app.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen('sync:remote_applied', () => {
+      void load();
+      void loadSessions();
+    }).then((u) => {
+      unlisten = u;
+    });
+    return () => unlisten?.();
+  }, [load, loadSessions]);
 
   // Ctrl+Shift+N (AppShell) opens the new-agent dialog.
   useEffect(() => {
@@ -417,8 +434,9 @@ export function AgentList() {
 
   /** Items of the project right-click menu. */
   const projectMenuItems = (project: (typeof projects)[number]): ContextMenuItem[] => {
-    const items: ContextMenuItem[] = [
-      {
+    const items: ContextMenuItem[] = [];
+    if (project.path) {
+      items.push({
         label: '打开目录位置',
         icon: <FolderOpen size={14} />,
         onClick: () => {
@@ -426,8 +444,25 @@ export function AgentList() {
             console.error('reveal project dir:', err)
           );
         },
+      });
+    }
+    // A project synced from another device has no local folder yet. Binding is
+    // per device (the path column is excluded from sync).
+    items.push({
+      label: project.path ? '更换本机目录' : '绑定本机目录',
+      icon: <FolderOpen size={14} />,
+      onClick: () => {
+        void (async () => {
+          const dir = await pickDirectory(project.path || undefined);
+          if (!dir) return;
+          try {
+            await bindPath(project.id, dir);
+          } catch (err) {
+            alert(`绑定项目目录失败：${err}`, { title: '绑定项目目录', kind: 'error' });
+          }
+        })();
       },
-    ];
+    });
     if (!project.archived) {
       items.push(
         {

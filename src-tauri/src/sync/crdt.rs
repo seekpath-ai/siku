@@ -25,7 +25,9 @@ pub fn is_non_syncable_setting_key(key: &str) -> bool {
 /// stays device-local; peers run the session without a sandbox root until the
 /// user picks a directory locally.
 fn non_syncable_column(table: &str, cid: &str) -> bool {
-    table == "chat_sessions" && cid == "working_dir"
+    (table == "chat_sessions" && cid == "working_dir")
+        // Project folders are per-device; only the metadata syncs.
+        || (table == "projects" && cid == "path")
 }
 
 /// Whether the optional sync tables (chat_sessions, chat_messages, settings)

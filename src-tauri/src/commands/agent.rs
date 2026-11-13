@@ -1089,6 +1089,22 @@ pub(crate) async fn run_agent_turn(
         }
     }
 
+    // Sessions created from a project don't persist working_dir; on a synced
+    // device the project row may not have been bound yet, in which case
+    // `project_dir` is None and the auto workspace below still applies.
+    if working_dir.is_none() {
+        if let Some(p) = project_dir
+            .as_deref()
+            .filter(|p| !p.trim().is_empty() && std::path::Path::new(p).is_dir())
+        {
+            let reason = workspace_note
+                .take()
+                .unwrap_or_else(|| "会话未绑定写入目录，使用项目目录".to_string());
+            working_dir = Some(p.to_string());
+            workspace_note = Some(write_dir_note(p, Some(&reason)));
+        }
+    }
+
     if working_dir.is_none() {
         let workspace = session_workspace_dir(&state.app_data_dir, &session_id);
         match std::fs::create_dir_all(&workspace) {

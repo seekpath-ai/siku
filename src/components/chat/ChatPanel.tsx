@@ -207,6 +207,17 @@ export function ChatPanel() {
         }
       : null;
 
+  const bindProjectPath = async () => {
+    if (!sessionProject) return;
+    const dir = await pickDirectory(sessionProject.path ?? '');
+    if (!dir) return;
+    try {
+      await useProjectStore.getState().bindPath(sessionProject.id, dir);
+    } catch (err) {
+      useDialogStore.getState().alert(`绑定项目目录失败：${err}`, { kind: 'error' });
+    }
+  };
+
   const bindLocalWorkingDir = async () => {
     if (!activeSession) return;
     const dir = await pickDirectory(activeSession.working_dir ?? '');
@@ -424,6 +435,7 @@ export function ChatPanel() {
         onRename={handleRename}
         onModelChange={handleModelChange}
         onToggleSearch={() => setSearchOpen((v) => !v)}
+        onBindProject={() => void bindProjectPath()}
       />
       {activeSession && foreignOrigin && (
         <div className="shrink-0 flex items-center gap-2 px-5 py-1.5 border-b border-surface-hover bg-warning/10 text-[11px] text-text-secondary">

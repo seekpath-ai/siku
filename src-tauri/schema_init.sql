@@ -255,16 +255,18 @@ CREATE TABLE IF NOT EXISTS embeddings (
     created_at TEXT NOT NULL
 );
 
--- projects: Codex-style project (a local folder the agent works in)
+-- projects: Codex-style project (a local folder the agent works in).
+-- CRR shape (OPTIONAL_SYNC_TABLES): NOT NULL PK + defaults; `path` is
+-- device-local (see non_syncable_column) so each device binds its own folder.
 CREATE TABLE IF NOT EXISTS projects (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    path TEXT NOT NULL,
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
     archived INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_path ON projects(path);
+CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(path);
 
 -- chat_sessions
 CREATE TABLE IF NOT EXISTS chat_sessions (

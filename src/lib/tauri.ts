@@ -1102,6 +1102,11 @@ export async function prCreate(
   return invoke('pr_create', { projectId, title, body: body ?? null, base: base ?? null });
 }
 
+/** Bind a synced project to a folder on THIS device (device-local path). */
+export async function projectBindLocalPath(id: string, path: string): Promise<void> {
+  return invoke<void>('project_bind_local_path', { id, path });
+}
+
 export async function projectUpdate(id: string, input: { name?: string }): Promise<Project> {
   return invoke<Project>('project_update', { id, input });
 }

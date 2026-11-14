@@ -294,22 +294,28 @@ export function AgentList() {
   const sortSessions = useCallback(
     (list: AgentSession[]) => {
       const sorted = [...list];
+      // Pinning is a priority, not a sort mode: it must survive "最新更新"
+      // and "手动排序", otherwise the next turn in another conversation
+      // pushes a pinned conversation out of the pinned section.
+      const pinnedFirst = (a: AgentSession, b: AgentSession) =>
+        (b.is_pinned ? 1 : 0) - (a.is_pinned ? 1 : 0);
       switch (sortBy) {
         case 'updated':
-          sorted.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+          sorted.sort(
+            (a, b) => pinnedFirst(a, b) || b.updated_at.localeCompare(a.updated_at)
+          );
           break;
         case 'manual':
           sorted.sort(
             (a, b) =>
+              pinnedFirst(a, b) ||
               (a.sort_order ?? 0) - (b.sort_order ?? 0) ||
               b.updated_at.localeCompare(a.updated_at)
           );
           break;
         default: // priority
           sorted.sort(
-            (a, b) =>
-              (b.is_pinned ? 1 : 0) - (a.is_pinned ? 1 : 0) ||
-              b.updated_at.localeCompare(a.updated_at)
+            (a, b) => pinnedFirst(a, b) || b.updated_at.localeCompare(a.updated_at)
           );
       }
       return sorted;

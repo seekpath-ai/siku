@@ -741,10 +741,11 @@ pub async fn agent_pin_session(
     session_id: String,
     pinned: bool,
 ) -> Result<(), String> {
-    let now = now_iso();
-    sqlx::query("UPDATE chat_sessions SET is_pinned = ?, updated_at = ? WHERE id = ?")
+    // Do not bump updated_at here: pinning is not "latest usage". The
+    // sidebar keeps pinned rows first and sorts by the real last activity
+    // within each group.
+    sqlx::query("UPDATE chat_sessions SET is_pinned = ? WHERE id = ?")
         .bind(if pinned { 1 } else { 0 })
-        .bind(&now)
         .bind(&session_id)
         .execute(&state.db)
         .await

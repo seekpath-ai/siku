@@ -27,6 +27,7 @@ pub mod research;
 pub mod review;
 pub mod search;
 pub mod skills;
+pub mod storage;
 pub mod sync;
 pub mod system;
 pub mod browser;

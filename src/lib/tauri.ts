@@ -1143,6 +1143,38 @@ export async function settingsGetAll(): Promise<{ key: string; value: string; up
   return invoke('settings_get_all');
 }
 
+export interface StorageBreakdown {
+  files: number;
+  bytes: number;
+}
+
+export interface StorageFile {
+  name: string;
+  hash: string;
+  ext: string;
+  bytes: number;
+  path: string;
+}
+
+export interface StorageAudit {
+  data_dir: string;
+  blob_root: string;
+  scanned_at: string;
+  total: StorageBreakdown;
+  current: StorageBreakdown;
+  history_only: StorageBreakdown;
+  orphan: StorageBreakdown;
+  unknown: StorageBreakdown;
+  staging: StorageBreakdown;
+  trash: StorageBreakdown;
+  duplicate_ext_groups: number;
+  top_orphans: StorageFile[];
+}
+
+export async function storageAudit(): Promise<StorageAudit> {
+  return invoke<StorageAudit>('storage_audit');
+}
+
 export async function settingsGetDataDir(): Promise<string> {
   return invoke<string>('settings_get_data_dir');
 }

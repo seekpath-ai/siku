@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -36,6 +36,8 @@ pub struct StorageFile {
     pub ext: String,
     pub bytes: u64,
     pub path: String,
+    /// Unix milliseconds; `None` when metadata did not expose a mtime.
+    pub modified_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -94,6 +96,7 @@ struct BlobFile {
     key: String,
     bytes: u64,
     path: String,
+    modified_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -132,6 +135,7 @@ pub async fn audit_storage(db: &SqlitePool, app_data_dir: &Path) -> Result<Stora
                 ext: file.ext,
                 bytes: file.bytes,
                 path: file.path,
+                modified_at_ms: file.modified_at_ms,
             });
         }
     }
@@ -293,6 +297,7 @@ pub async fn gc_storage(
             ext: file.ext.clone(),
             bytes: file.bytes,
             path: file.path.clone(),
+            modified_at_ms: file.modified_at_ms,
         })
         .collect();
 
@@ -379,7 +384,13 @@ fn scan_blob_files(root: &Path) -> Result<ScanResult, String> {
             .next()
             .and_then(|c| c.as_os_str().to_str())
             .unwrap_or("");
-        let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let metadata = entry.metadata().ok();
+        let bytes = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified_at_ms = metadata
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64);
         match first {
             ".incoming" => {
                 result.staging.add(bytes);
@@ -408,6 +419,7 @@ fn scan_blob_files(root: &Path) -> Result<ScanResult, String> {
             key,
             bytes,
             path: path.to_string_lossy().into_owned(),
+            modified_at_ms,
         });
         result.total.add(bytes);
     }

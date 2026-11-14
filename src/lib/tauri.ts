@@ -1154,6 +1154,7 @@ export interface StorageFile {
   ext: string;
   bytes: number;
   path: string;
+  modified_at_ms: number | null;
 }
 
 export interface StorageAudit {

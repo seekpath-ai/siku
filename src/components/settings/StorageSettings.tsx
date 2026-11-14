@@ -45,6 +45,24 @@ function formatScannedAt(value: string): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN');
 }
 
+function formatModified(ms: number | null): string {
+  if (ms == null) return '修改时间未知';
+  const diff = Date.now() - ms;
+  if (diff < 0) return '时间异常';
+  const minutes = Math.floor(diff / 60_000);
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days} 天前`;
+  return new Date(ms).toLocaleDateString('zh-CN');
+}
+
+function isGcEligible(ms: number | null): boolean {
+  return ms != null && Date.now() - ms >= GC_GRACE_DAYS * 86_400_000;
+}
+
 function StatCard({
   label,
   data,
@@ -112,10 +130,20 @@ export function StorageSettings() {
     try {
       const plan = await storageGc(true, GC_GRACE_DAYS);
       if (plan.eligible.files === 0) {
+        const reasons: string[] = [];
+        if (plan.skipped_recent > 0) {
+          reasons.push(`${plan.skipped_recent} 个无引用文件未满 ${GC_GRACE_DAYS} 天宽限期`);
+        }
+        if (plan.errors.length > 0) {
+          reasons.push(`${plan.errors.length} 个文件无法读取修改时间`);
+        }
         await alert(
-          `没有符合条件的文件。只清理 ${GC_GRACE_DAYS} 天前、且当前和历史都没有引用的 blob；` +
-            '当前无引用文件可能都还在宽限期内。',
-          { title: '清理无引用文件', kind: 'info' },
+          `没有可清理的文件${reasons.length ? `：${reasons.join('；')}。` : '。'}
+
+` +
+            `只清理 ${GC_GRACE_DAYS} 天前、且当前和历史都没有引用的 blob；` +
+            '宽限期是为了避免误删刚写入或被其他设备引用的文件。',
+          { title: '清理旧的无引用文件', kind: 'info' },
         );
         return;
       }
@@ -261,7 +289,7 @@ export function StorageSettings() {
               data={audit.orphan}
               icon={FileWarning}
               tone="text-amber-400"
-              hint="本地数据库没有找到引用；先不要手动删除"
+              hint={`本地数据库没有找到引用；只有满 ${GC_GRACE_DAYS} 天的才会进入清理计划`}
             />
             <StatCard
               label="无法识别"
@@ -308,6 +336,7 @@ export function StorageSettings() {
                 type="button"
                 onClick={() => void handleGc()}
                 disabled={loading || gcBusy || trashBusy}
+                title={`只清理满 ${GC_GRACE_DAYS} 天、当前和历史都无引用的 blob`}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300 transition-colors hover:bg-amber-500/15 disabled:opacity-50"
               >
                 {gcBusy ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
@@ -338,6 +367,9 @@ export function StorageSettings() {
               <FileSearch size={14} />
               最大的无引用文件
             </div>
+            <p className="mt-1 text-[10px] text-text-secondary">
+              这里列出全部无引用文件；只有满 {GC_GRACE_DAYS} 天的才会被清理。
+            </p>
             {audit.top_orphans.length === 0 ? (
               <p className="mt-3 text-xs text-text-secondary">没有发现无引用 blob。</p>
             ) : (
@@ -352,8 +384,34 @@ export function StorageSettings() {
                       <div className="truncate text-text-primary" title={file.path}>
                         {file.name}
                       </div>
-                      <div className="text-[10px] text-text-secondary">
-                        {formatBytes(file.bytes)} · {file.ext || '无扩展名'}
+                      <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[10px] text-text-secondary">
+                        <span>{formatBytes(file.bytes)} · {file.ext || '无扩展名'}</span>
+                        <span
+                          title={
+                            file.modified_at_ms != null
+                              ? new Date(file.modified_at_ms).toLocaleString('zh-CN')
+                              : undefined
+                          }
+                        >
+                          {file.modified_at_ms == null
+                            ? '修改时间未知'
+                            : `修改于 ${formatModified(file.modified_at_ms)}`}
+                        </span>
+                        <span
+                          className={
+                            file.modified_at_ms == null
+                              ? 'text-text-secondary'
+                              : isGcEligible(file.modified_at_ms)
+                                ? 'text-emerald-400'
+                                : 'text-amber-400'
+                          }
+                        >
+                          {file.modified_at_ms == null
+                            ? '时间未知'
+                            : isGcEligible(file.modified_at_ms)
+                              ? '可清理'
+                              : '宽限期内'}
+                        </span>
                       </div>
                     </div>
                     <button

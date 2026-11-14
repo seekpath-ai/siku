@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { ChevronDown, ChevronRight, ChevronUp, FileImage, FolderOpen, Package } from 'lucide-react';
 import { artifactResolve, openLocalPath, revealInFileManager } from '@/lib/tauri';
@@ -159,8 +159,6 @@ function ProcessArtifact({ artifact }: { artifact: ArtifactEntry }) {
   );
 }
 
-const IMAGE_PREVIEW_LIMIT = 8;
-
 export function ArtifactSection({ artifacts }: { artifacts: ArtifactEntry[] }) {
   const primary = artifacts.filter((artifact) => {
     const kind = artifactKind(artifact.ext);
@@ -173,6 +171,24 @@ export function ArtifactSection({ artifacts }: { artifacts: ArtifactEntry[] }) {
   });
   const [processOpen, setProcessOpen] = useState(false);
   const [imagesOpen, setImagesOpen] = useState(false);
+  const [imageColumns, setImageColumns] = useState(5);
+  const imageGridRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    const grid = imageGridRef.current;
+    if (!grid) return;
+    const measure = () => {
+      const columns = window
+        .getComputedStyle(grid)
+        .gridTemplateColumns.split(/\s+/)
+        .filter(Boolean).length;
+      if (columns > 0) setImageColumns(columns);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(grid);
+    return () => observer.disconnect();
+  }, [images.length]);
 
   if (artifacts.length === 0) return null;
 
@@ -180,7 +196,10 @@ export function ArtifactSection({ artifacts }: { artifacts: ArtifactEntry[] }) {
   // they start collapsed so the final deliverable is the first thing seen.
   const processVisible = processOpen || (primary.length === 0 && images.length === 0);
 
-  const visibleImages = imagesOpen ? images : images.slice(0, IMAGE_PREVIEW_LIMIT);
+  // Collapsed: fill exactly two grid rows using the actual responsive column
+  // count. A fixed 8 left holes whenever the grid had 5, 6 or 7 columns.
+  const previewLimit = imageColumns * 2;
+  const visibleImages = imagesOpen ? images : images.slice(0, previewLimit);
   const hiddenImages = images.length - visibleImages.length;
 
   return (
@@ -203,12 +222,15 @@ export function ArtifactSection({ artifacts }: { artifacts: ArtifactEntry[] }) {
 
       {images.length > 0 && (
         <div className={primary.length > 0 ? 'mt-2' : ''}>
-          <div className="grid gap-1.5 [grid-template-columns:repeat(auto-fill,minmax(132px,1fr))]">
+          <div
+            ref={imageGridRef}
+            className="grid gap-1.5 [grid-template-columns:repeat(auto-fill,minmax(132px,1fr))]"
+          >
             {visibleImages.map((artifact) => (
               <ImageArtifact key={artifact.uri} artifact={artifact} />
             ))}
           </div>
-          {(images.length > IMAGE_PREVIEW_LIMIT || imagesOpen) && (
+          {(images.length > previewLimit || imagesOpen) && (
             <button
               type="button"
               onClick={() => setImagesOpen((open) => !open)}

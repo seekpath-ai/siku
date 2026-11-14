@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
-import { ChevronDown, ChevronRight, FileImage, FolderOpen, Package } from 'lucide-react';
+import { ChevronDown, ChevronRight, ChevronUp, FileImage, FolderOpen, Package } from 'lucide-react';
 import { artifactResolve, openLocalPath, revealInFileManager } from '@/lib/tauri';
 import { useDialog } from '@/hooks/useDialog';
 import { useSyncTick } from '@/stores/syncTickStore';
@@ -67,7 +67,7 @@ function RevealButton({ path, label }: { path: string; label: string }) {
           alert(String(err), { title: '在文件夹中显示', kind: 'error' }),
         );
       }}
-      className="shrink-0 rounded p-0.5 text-codex-muted opacity-100 hover:text-codex-primary sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100"
+      className="shrink-0 rounded-md bg-codex-bg/65 p-0.5 text-codex-muted opacity-100 shadow-sm backdrop-blur-sm hover:text-codex-primary sm:pointer-events-none sm:opacity-0 sm:group-hover:pointer-events-auto sm:group-hover:opacity-100 sm:focus-visible:opacity-100"
       title={`在文件夹中显示：${label}`}
     >
       <FolderOpen size={12} />
@@ -114,7 +114,7 @@ function ImageArtifact({ artifact }: { artifact: ArtifactEntry }) {
         className="block w-full text-left"
         title={path ?? (failed ? '尚未同步到本机' : '正在解析产物路径…')}
       >
-        <div className="flex aspect-[4/3] items-center justify-center overflow-hidden bg-codex-bg/50">
+        <div className="flex aspect-video items-center justify-center overflow-hidden bg-codex-bg/50">
           {path && !broken ? (
             <img
               src={convertFileSrc(path)}
@@ -132,7 +132,7 @@ function ImageArtifact({ artifact }: { artifact: ArtifactEntry }) {
         </div>
       </button>
       {path && (
-        <div className="absolute right-1 top-1 rounded bg-codex-bg/80 p-0.5 shadow-sm">
+        <div className="absolute right-1 top-1">
           <RevealButton path={path} label={artifact.label} />
         </div>
       )}
@@ -203,18 +203,19 @@ export function ArtifactSection({ artifacts }: { artifacts: ArtifactEntry[] }) {
 
       {images.length > 0 && (
         <div className={primary.length > 0 ? 'mt-2' : ''}>
-          <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-4">
+          <div className="grid gap-1.5 [grid-template-columns:repeat(auto-fill,minmax(132px,1fr))]">
             {visibleImages.map((artifact) => (
               <ImageArtifact key={artifact.uri} artifact={artifact} />
             ))}
           </div>
-          {hiddenImages > 0 && (
+          {(images.length > IMAGE_PREVIEW_LIMIT || imagesOpen) && (
             <button
               type="button"
-              onClick={() => setImagesOpen(true)}
-              className="mt-1.5 text-[11px] text-codex-muted hover:text-codex-primary"
+              onClick={() => setImagesOpen((open) => !open)}
+              className="mt-1.5 inline-flex items-center gap-0.5 text-[11px] text-codex-muted hover:text-codex-primary"
             >
-              展开余下 {hiddenImages} 张图片
+              {imagesOpen ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+              {imagesOpen ? '收起图片' : `展开余下 ${hiddenImages} 张图片`}
             </button>
           )}
         </div>

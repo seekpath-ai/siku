@@ -13,6 +13,8 @@ import { parseEvidence } from '@/lib/evidence';
 import { formatFileToolApproval } from '@/lib/agent-tools';
 import type { EvidenceEntry } from '@/lib/evidence';
 import { MarkdownLink } from '@/components/chat/FilePathLink';
+import { splitArtifactSection } from '@/lib/artifactSection';
+import { ArtifactSection } from '@/components/chat/ArtifactSection';
 import { assistantMarkdownComponents, assistantRehypePlugins, assistantRemarkPlugins, markdownUrlTransform } from '@/components/chat/markdownConfig';
 import { ApprovalCard } from '@/components/chat/ApprovalCard';
 import { PetAskUserDialog } from '@/components/chat/AskUserDialog';
@@ -72,52 +74,59 @@ function remarkCitations() {
 /** Shared markdown renderer for pet messages: markdown + math + evidence
  *  citation badges. (Exported for tests.) */
 export function PetMarkdown({ content, onCitation }: { content: string; onCitation?: (ev: EvidenceEntry) => void }) {
-  const { clean, evidence } = useMemo(() => parseEvidence(content), [content]);
+  // The backend appends the same `📎 本轮产物` Markdown footer used by the
+  // main chat. Split it before markdown rendering so the pet panel gets the
+  // same compact artifact grid instead of one block-level list row per file.
+  const split = useMemo(() => splitArtifactSection(content), [content]);
+  const { clean, evidence } = useMemo(() => parseEvidence(split.body), [split.body]);
   return (
-    <ReactMarkdown
-      remarkPlugins={[...assistantRemarkPlugins, remarkCitations]}
-      rehypePlugins={assistantRehypePlugins}
-      // Keep our internal cite: scheme (the default transform blanks
-      // non-whitelisted protocols); everything else defers to the shared
-      // transform (siku-path chips, local absolute paths for images).
-      urlTransform={(url) => (url.startsWith('cite:') ? url : markdownUrlTransform(url))}
-      components={{
-        ...assistantMarkdownComponents,
-        a: ({ href, children }: { href?: string; children?: React.ReactNode }) => {
-          const cite = /^cite:(\d+)$/.exec(href ?? '');
-          if (cite) {
-            const n = Number(cite[1]);
-            const ev = evidence.get(n);
-            const clickable = !!ev && !!onCitation;
-            return (
-              <button
-                type="button"
-                // Tooltip shows the quoted evidence itself, so a mismatched
-                // citation is diagnosable at a glance (quote content vs
-                // highlight position).
-                title={ev
-                  ? `${ev.page != null ? `第 ${ev.page} 页 · ` : ''}${ev.exact.length > 120 ? `${ev.exact.slice(0, 120)}…` : ev.exact}`
-                  : '未找到该引用的证据'}
-                disabled={!clickable}
-                onClick={() => ev && onCitation?.(ev)}
-                className={`inline-block align-super mx-0.5 px-1 rounded text-[10px] leading-4 ${
-                  clickable
-                    ? 'bg-primary/15 text-primary hover:bg-primary/30 cursor-pointer'
-                    : 'bg-surface-hover text-text-secondary/60 cursor-default'
-                }`}
-              >
-                {n}
-              </button>
-            );
-          }
-          // MarkdownLink handles siku-path: chips; the shared transform has
-          // already blanked javascript:/data: etc., so web links are safe.
-          return <MarkdownLink href={href}>{children}</MarkdownLink>;
-        },
-      }}
-    >
-      {clean}
-    </ReactMarkdown>
+    <>
+      <ReactMarkdown
+        remarkPlugins={[...assistantRemarkPlugins, remarkCitations]}
+        rehypePlugins={assistantRehypePlugins}
+        // Keep our internal cite: scheme (the default transform blanks
+        // non-whitelisted protocols); everything else defers to the shared
+        // transform (siku-path chips, local absolute paths for images).
+        urlTransform={(url) => (url.startsWith('cite:') ? url : markdownUrlTransform(url))}
+        components={{
+          ...assistantMarkdownComponents,
+          a: ({ href, children }: { href?: string; children?: React.ReactNode }) => {
+            const cite = /^cite:(\d+)$/.exec(href ?? '');
+            if (cite) {
+              const n = Number(cite[1]);
+              const ev = evidence.get(n);
+              const clickable = !!ev && !!onCitation;
+              return (
+                <button
+                  type="button"
+                  // Tooltip shows the quoted evidence itself, so a mismatched
+                  // citation is diagnosable at a glance (quote content vs
+                  // highlight position).
+                  title={ev
+                    ? `${ev.page != null ? `第 ${ev.page} 页 · ` : ''}${ev.exact.length > 120 ? `${ev.exact.slice(0, 120)}…` : ev.exact}`
+                    : '未找到该引用的证据'}
+                  disabled={!clickable}
+                  onClick={() => ev && onCitation?.(ev)}
+                  className={`inline-block align-super mx-0.5 px-1 rounded text-[10px] leading-4 ${
+                    clickable
+                      ? 'bg-primary/15 text-primary hover:bg-primary/30 cursor-pointer'
+                      : 'bg-surface-hover text-text-secondary/60 cursor-default'
+                  }`}
+                >
+                  {n}
+                </button>
+              );
+            }
+            // MarkdownLink handles siku-path: chips; the shared transform has
+            // already blanked javascript:/data: etc., so web links are safe.
+            return <MarkdownLink href={href}>{children}</MarkdownLink>;
+          },
+        }}
+      >
+        {clean}
+      </ReactMarkdown>
+      <ArtifactSection artifacts={split.artifacts} />
+    </>
   );
 }
 

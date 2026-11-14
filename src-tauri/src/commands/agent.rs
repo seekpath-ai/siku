@@ -2354,6 +2354,9 @@ pub async fn agent_delete_session(
     sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
         .bind(&session_id)
         .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
+    sqlx::query("DELETE FROM session_process_files WHERE session_id = ?")
+        .bind(&session_id)
+        .execute(&state.db).await.map_err(|e| format!("db: {e}"))?;
     // CRR tables declare no checked FKs: cascade explicitly.
     sqlx::query("DELETE FROM agent_steps WHERE session_id = ?")
         .bind(&session_id)

@@ -1763,6 +1763,36 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
     .execute(&db)
     .await?;
 
+    // Process files are local-only: the bytes stay in the user's working
+    // directory. No CRR registration and no blob copy.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS session_process_files (
+            id TEXT PRIMARY KEY NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            message_id TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL DEFAULT '',
+            path TEXT NOT NULL DEFAULT '',
+            ext TEXT NOT NULL DEFAULT '',
+            size INTEGER NOT NULL DEFAULT 0,
+            modified_at_ms INTEGER,
+            created_at TEXT NOT NULL DEFAULT ''
+        )",
+    )
+    .execute(&db)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_session_process_files_path
+         ON session_process_files(session_id, path)",
+    )
+    .execute(&db)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_session_process_files_session
+         ON session_process_files(session_id)",
+    )
+    .execute(&db)
+    .await?;
+
     // Projects join the optional sync tables; rebuild to the CRR shape and
     // make the folder path device-local BEFORE triggers are registered.
     migrate_projects_for_sync(&db)

@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
-import { ChevronDown, ChevronRight, ChevronUp, FileImage, FolderOpen, Package } from 'lucide-react';
-import { artifactResolve, openLocalPath, revealInFileManager } from '@/lib/tauri';
+import { ChevronDown, ChevronRight, ChevronUp, FileImage, FolderOpen, Loader2, Package, Save } from 'lucide-react';
+import { artifactResolve, artifactSaveAs, openLocalPath, revealInFileManager } from '@/lib/tauri';
 import { useDialog } from '@/hooks/useDialog';
 import { useSyncTick } from '@/stores/syncTickStore';
 import type { ArtifactEntry } from '@/lib/artifactSection';
@@ -56,6 +56,41 @@ function openArtifact(
   openLocalPath(path).catch((err) => alert(String(err), { title: '打开产物', kind: 'error' }));
 }
 
+function SaveAsButton({ uri, label, ext }: { uri: string; label: string; ext: string }) {
+  const { alert } = useDialog();
+  const [saving, setSaving] = useState(false);
+  const saveAs = async () => {
+    if (saving) return;
+    setSaving(true);
+    try {
+      const { save } = await import('@tauri-apps/plugin-dialog');
+      const target = await save({
+        defaultPath: label,
+        filters: ext ? [{ name: ext.toUpperCase(), extensions: [ext] }] : undefined,
+      });
+      if (!target) return;
+      await artifactSaveAs(uri, target);
+      await alert(`已保存到：${target}`, { title: '另存为', kind: 'success' });
+    } catch (err) {
+      await alert(String(err), { title: '另存为', kind: 'error' });
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <button
+      type="button"
+      onClick={() => void saveAs()}
+      disabled={saving}
+      className="inline-flex shrink-0 items-center gap-1 rounded-md border border-codex-border/60 bg-codex-bg/30 px-1.5 py-1 text-[10px] text-codex-muted hover:text-codex-primary disabled:opacity-50"
+      title="另存到用户选择的位置"
+    >
+      {saving ? <Loader2 size={11} className="animate-spin" /> : <Save size={11} />}
+      另存为
+    </button>
+  );
+}
+
 function RevealButton({ path, label }: { path: string; label: string }) {
   const { alert } = useDialog();
   return (
@@ -94,6 +129,7 @@ function PrimaryArtifact({ artifact }: { artifact: ArtifactEntry }) {
           {artifact.ext || 'file'}
         </div>
       </button>
+      <SaveAsButton uri={artifact.uri} label={artifact.label} ext={artifact.ext} />
       {path && <RevealButton path={path} label={artifact.label} />}
     </div>
   );
@@ -162,12 +198,12 @@ function ProcessArtifact({ artifact }: { artifact: ArtifactEntry }) {
 export function ArtifactSection({ artifacts }: { artifacts: ArtifactEntry[] }) {
   const primary = artifacts.filter((artifact) => {
     const kind = artifactKind(artifact.ext);
-    return kind === 'document' || kind === 'sheet';
+    return kind === 'document' || kind === 'sheet' || kind === 'archive';
   });
   const images = artifacts.filter((artifact) => artifactKind(artifact.ext) === 'image');
   const process = artifacts.filter((artifact) => {
     const kind = artifactKind(artifact.ext);
-    return kind !== 'document' && kind !== 'sheet' && kind !== 'image';
+    return kind !== 'document' && kind !== 'sheet' && kind !== 'image' && kind !== 'archive';
   });
   const [processOpen, setProcessOpen] = useState(false);
   const [imagesOpen, setImagesOpen] = useState(false);

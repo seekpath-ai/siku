@@ -10,7 +10,7 @@
 //! the absolute paths agents see in their tools.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sqlx::SqlitePool;
 
@@ -23,6 +23,9 @@ pub const ARTIFACT_SCHEME: &str = "siku://artifact/";
 const MAX_ARTIFACTS_PER_TURN: usize = 30;
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+/// Process files are local-only index rows; cap the list so a huge repo scan
+/// cannot insert hundreds of thousands of rows in one turn.
+const MAX_PROCESS_FILES_PER_TURN: usize = 200;
 const MAX_SCAN_ENTRIES: usize = 5_000;
 const MAX_SCAN_DEPTH: usize = 4;
 /// Filesystem mtime granularity (FAT: 2s) means "written this turn" needs a
@@ -78,11 +81,27 @@ pub fn resolve_uri(app_data_dir: &Path, uri: &str) -> Result<String, String> {
     }
 }
 
+#[derive(Debug)]
 struct Candidate {
     hash: String,
     ext: String,
     name: String,
     size: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessFile {
+    name: String,
+    path: String,
+    ext: String,
+    size: u64,
+    modified_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+struct ScanResult {
+    deliverables: Vec<Candidate>,
+    process: Vec<ProcessFile>,
 }
 
 fn sanitize_ext(ext: &str) -> String {
@@ -108,6 +127,28 @@ fn source_name(path: &Path) -> String {
         .collect()
 }
 
+/// Only these extensions enter the blob/sync pipeline. Everything else is a
+/// local process file (the user can delete it from the session artifact panel).
+fn is_deliverable_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "doc" | "docx"
+            | "rtf"
+            | "odt"
+            | "xls"
+            | "xlsx"
+            | "csv"
+            | "ods"
+            | "pdf"
+            | "ppt"
+            | "pptx"
+            | "odp"
+            | "md"
+            | "txt"
+            | "zip"
+    )
+}
+
 fn skip_dir(name: &str) -> bool {
     if name.starts_with('.') {
         return true;
@@ -122,6 +163,19 @@ fn skip_dir(name: &str) -> bool {
             | "__pycache__"
             | "blobs"
             | "snapshots"
+            // Browser profiles / caches are tool scratch, not deliverables
+            // and not useful process files.
+            | "user data"
+            | "cache"
+            | "code cache"
+            | "gpucache"
+            | "crashpad"
+            | "service worker"
+            | "local storage"
+            | "session storage"
+            | "indexeddb"
+            | "temp"
+            | "tmp"
     )
 }
 
@@ -175,44 +229,64 @@ fn scan_and_copy(
     dir: &Path,
     app_data_dir: &Path,
     since: SystemTime,
-) -> Result<Vec<Candidate>, String> {
+) -> Result<ScanResult, String> {
     let mut files = Vec::new();
     let mut seen = 0usize;
     collect_files(dir, 0, since, &mut files, &mut seen);
     files.sort_by_key(|(mtime, _, _)| *mtime);
 
-    let mut out = Vec::new();
+    let mut result = ScanResult::default();
     let mut total = 0u64;
-    for (_, path, size) in files {
-        if out.len() >= MAX_ARTIFACTS_PER_TURN || total + size > MAX_TOTAL_BYTES {
-            break;
-        }
+    for (modified, path, size) in files {
         let ext = sanitize_ext(path.extension().and_then(|e| e.to_str()).unwrap_or("bin"));
-        // Read + hash + content-addressed write. The file could disappear
-        // between scan and read (tool cleanup); skip instead of failing the
-        // whole registration.
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let rel = match crate::file_store::write_blob(app_data_dir, &bytes, &ext) {
-            Ok(rel) => rel,
-            Err(e) => {
-                tracing::warn!(error = %e, path = %path.display(), "artifact blob write failed");
+        if is_deliverable_ext(&ext) {
+            if result.deliverables.len() >= MAX_ARTIFACTS_PER_TURN
+                || total + size > MAX_TOTAL_BYTES
+            {
                 continue;
             }
-        };
-        let Some((hash, ext)) = crate::file_store::parse_blob_path(&rel) else {
+            // Read + hash + content-addressed write. The file could disappear
+            // between scan and read (tool cleanup); skip instead of failing the
+            // whole registration.
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let rel = match crate::file_store::write_blob(app_data_dir, &bytes, &ext) {
+                Ok(rel) => rel,
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path.display(), "artifact blob write failed");
+                    continue;
+                }
+            };
+            let Some((hash, ext)) = crate::file_store::parse_blob_path(&rel) else {
+                continue;
+            };
+            total += size;
+            result.deliverables.push(Candidate {
+                hash,
+                ext,
+                name: source_name(&path),
+                size,
+            });
             continue;
-        };
-        total += size;
-        out.push(Candidate {
-            hash,
-            ext,
+        }
+
+        // Local process file: keep metadata only. No blob, no sync.
+        if result.process.len() >= MAX_PROCESS_FILES_PER_TURN {
+            continue;
+        }
+        result.process.push(ProcessFile {
             name: source_name(&path),
+            path: path.to_string_lossy().into_owned(),
+            ext,
             size,
+            modified_at_ms: modified
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_millis() as i64),
         });
     }
-    Ok(out)
+    Ok(result)
 }
 
 /// Register files written into `dir` since `since` as artifacts of the turn
@@ -235,16 +309,45 @@ pub async fn register_turn_artifacts(
     let scan_root = dir.clone();
     let app_dir = app_data_dir.to_path_buf();
     let since = since.checked_sub(MTIME_SLACK).unwrap_or(since);
-    let candidates =
-        tokio::task::spawn_blocking(move || scan_and_copy(&scan_root, &app_dir, since))
-            .await
-            .map_err(|e| format!("artifact scan task failed: {e}"))??;
-    if candidates.is_empty() {
+    let scan = tokio::task::spawn_blocking(move || scan_and_copy(&scan_root, &app_dir, since))
+        .await
+        .map_err(|e| format!("artifact scan task failed: {e}"))??;
+    if scan.deliverables.is_empty() && scan.process.is_empty() {
         return Ok(Vec::new());
     }
 
+    // Process files stay in the working directory. The local table is not a
+    // CRR and never enters blob sync; it only powers the session artifact
+    // panel. A path can be produced again in a later turn, so upsert it.
+    for p in scan.process {
+        sqlx::query(
+            "INSERT INTO session_process_files \
+             (id, session_id, message_id, name, path, ext, size, modified_at_ms, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(session_id, path) DO UPDATE SET \
+               message_id = excluded.message_id, \
+               name = excluded.name, \
+               ext = excluded.ext, \
+               size = excluded.size, \
+               modified_at_ms = excluded.modified_at_ms, \
+               created_at = excluded.created_at",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(session_id)
+        .bind(message_id)
+        .bind(&p.name)
+        .bind(&p.path)
+        .bind(&p.ext)
+        .bind(p.size as i64)
+        .bind(p.modified_at_ms)
+        .bind(now_iso())
+        .execute(db)
+        .await
+        .map_err(|e| format!("db error: {e}"))?;
+    }
+
     let mut out = Vec::new();
-    for c in candidates {
+    for c in scan.deliverables {
         // The same content rewritten in a later turn is already registered
         // for this session; skip the duplicate index row (the blob stays).
         let exists: Option<(String,)> = sqlx::query_as(
@@ -355,6 +458,28 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
+        sqlx::query(
+            "CREATE TABLE session_process_files (
+                id TEXT PRIMARY KEY NOT NULL,
+                session_id TEXT NOT NULL DEFAULT '',
+                message_id TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                path TEXT NOT NULL DEFAULT '',
+                ext TEXT NOT NULL DEFAULT '',
+                size INTEGER NOT NULL DEFAULT 0,
+                modified_at_ms INTEGER,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE UNIQUE INDEX idx_session_process_files_path ON session_process_files(session_id, path)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
 
         let old = root.path().join("old.txt");
         std::fs::write(&old, "old").unwrap();
@@ -362,6 +487,13 @@ mod tests {
         filetime_set(&old, old_mtime);
         let new = root.path().join("report.md");
         std::fs::write(&new, "fresh report").unwrap();
+        // Images and generic tool files must stay local process files.
+        std::fs::write(root.path().join("chart.png"), "png").unwrap();
+        std::fs::write(root.path().join("settings.dat"), "data").unwrap();
+        // Browser profile internals must be ignored before the process index.
+        let profile = root.path().join("chrome").join("User Data").join("Default");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("f_00b858"), "profile").unwrap();
 
         let since = SystemTime::now() - Duration::from_secs(60);
         let artifacts = register_turn_artifacts(
@@ -384,6 +516,19 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(rows.len(), 1);
+        let process: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, ext FROM session_process_files ORDER BY name")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            process,
+            vec![
+                ("chart.png".to_string(), "png".to_string()),
+                ("settings.dat".to_string(), "dat".to_string())
+            ],
+            "images/generic files are local process files; Chrome profile is ignored"
+        );
         assert_eq!(rows[0].0, "s1");
         let uri = artifact_uri(&rows[0].1, &rows[0].2);
         let resolved = resolve_uri(app.path(), &uri).unwrap();

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Pencil, FolderOpen, CalendarClock, Search } from 'lucide-react';
+import { Pencil, FolderOpen, CalendarClock, Search, Package } from 'lucide-react';
 import type { AgentSession } from '@/lib/types';
 import { AgentAvatar } from './AgentAvatar';
 import { SessionModelBadge } from './SessionModelBadge';
@@ -14,13 +14,16 @@ interface Props {
   onModelChange: (providerId: string) => void;
   /** Toggle the in-conversation search bar. */
   onToggleSearch: () => void;
+  /** Toggle the session artifact sidebar. */
+  onToggleArtifacts: () => void;
+  artifactsOpen: boolean;
   /** Bind a synced project (empty path) to a local folder. */
   onBindProject?: () => void;
 }
 
 /** Chat panel header: editable thread title + project chip + model badge.
  *  The badge doubles as a model switcher over the global provider pool. */
-export function ChatHeader({ session, projectName, projectPath, onRename, onModelChange, onToggleSearch, onBindProject }: Props) {
+export function ChatHeader({ session, projectName, projectPath, onRename, onModelChange, onToggleSearch, onToggleArtifacts, artifactsOpen, onBindProject }: Props) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(session.title);
   const [taskCenterOpen, setTaskCenterOpen] = useState(false);
@@ -97,6 +100,16 @@ export function ChatHeader({ session, projectName, projectPath, onRename, onMode
       </div>
 
       <div className="flex-1" />
+
+      <button
+        onClick={onToggleArtifacts}
+        title={artifactsOpen ? '关闭会话产物侧栏' : '打开会话产物侧栏'}
+        className={`p-1.5 rounded hover:bg-surface-hover ${
+          artifactsOpen ? 'text-primary' : 'text-text-secondary hover:text-text-primary'
+        }`}
+      >
+        <Package size={14} />
+      </button>
 
       <button
         onClick={onToggleSearch}

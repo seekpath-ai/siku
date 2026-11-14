@@ -396,6 +396,25 @@ CREATE TABLE IF NOT EXISTS session_artifacts (
 );
 CREATE INDEX IF NOT EXISTS idx_session_artifacts_session ON session_artifacts(session_id);
 
+-- session_process_files: device-local index of generated process files. Unlike
+-- session_artifacts, these rows are deliberately NOT synced and the bytes never
+-- enter the blob store: the file already lives in the local working directory.
+CREATE TABLE IF NOT EXISTS session_process_files (
+    id TEXT PRIMARY KEY NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    ext TEXT NOT NULL DEFAULT '',
+    size INTEGER NOT NULL DEFAULT 0,
+    modified_at_ms INTEGER,
+    created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_process_files_path
+    ON session_process_files(session_id, path);
+CREATE INDEX IF NOT EXISTS idx_session_process_files_session
+    ON session_process_files(session_id);
+
 -- agent_steps: one row per ReAct iteration (thought + tool_calls + observations)
 -- CRR 形状（在 OPTIONAL_SYNC_TABLES 中）：主键 NOT NULL、无受检外键、
 -- NOT NULL 列均带 DEFAULT；删除会话由删除路径显式级联。

@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { listen, type UnlistenFn } from '@/lib/events';
 import { Bot, Loader2, ArrowUp, Laptop } from 'lucide-react';
 import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';
 import { ChatHeader } from './ChatHeader';
 import { ChatSearchBar } from './ChatSearchBar';
+import { ArtifactSidebar } from './ArtifactSidebar';
 import { AskUserDialog } from './AskUserDialog';
 import { useChatStore, MESSAGE_PAGE_SIZE } from '@/stores/chatStore';
 import { mergeMessages } from '@/lib/chatMerge';
@@ -139,6 +140,7 @@ export function ChatPanel() {
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [artifactsOpen, setArtifactsOpen] = useState(false);
   // Current machine id, used to spot a conversation continued elsewhere.
   const [deviceId, setDeviceId] = useState('');
 
@@ -413,6 +415,20 @@ export function ChatPanel() {
     }
   };
 
+  const reloadAfterArtifactDelete = useCallback(async () => {
+    if (!activeSessionId) return;
+    try {
+      const page = await getChatMessages(activeSessionId, { limit: MESSAGE_PAGE_SIZE });
+      const st = useChatStore.getState();
+      if (st.activeSessionId !== activeSessionId) return;
+      const pageById = new Map(page.messages.map((m) => [m.id, m]));
+      const refreshed = st.messages.map((m) => pageById.get(m.id) ?? m);
+      st.setMessages(mergeMessages(refreshed, page.messages));
+    } catch (err) {
+      console.error('Failed to refresh messages after artifact delete:', err);
+    }
+  }, [activeSessionId]);
+
   if (!activeSession) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-8 text-text-secondary">
@@ -437,6 +453,8 @@ export function ChatPanel() {
         onRename={handleRename}
         onModelChange={handleModelChange}
         onToggleSearch={() => setSearchOpen((v) => !v)}
+        onToggleArtifacts={() => setArtifactsOpen((v) => !v)}
+        artifactsOpen={artifactsOpen}
         onBindProject={() => void bindProjectPath()}
       />
       {activeSession && foreignOrigin && (
@@ -462,12 +480,22 @@ export function ChatPanel() {
         </div>
       )}
       {searchOpen && <ChatSearchBar onClose={() => setSearchOpen(false)} />}
-      <div className="flex-1 overflow-hidden relative">
-        <MessageList onLoadOlder={loadOlderMessages} loadingOlder={loadingOlder} />
-        {loadingMessages && (
-          <div className="absolute inset-0 flex items-center justify-center bg-background/60 backdrop-blur-[1px]">
-            <Loader2 size={20} className="animate-spin text-text-secondary" />
-          </div>
+      <div className="flex-1 min-h-0 overflow-hidden flex">
+        <div className="flex-1 min-w-0 relative">
+          <MessageList onLoadOlder={loadOlderMessages} loadingOlder={loadingOlder} />
+          {loadingMessages && (
+            <div className="absolute inset-0 flex items-center justify-center bg-background/60 backdrop-blur-[1px]">
+              <Loader2 size={20} className="animate-spin text-text-secondary" />
+            </div>
+          )}
+        </div>
+        {artifactsOpen && (
+          <ArtifactSidebar
+            sessionId={activeSession.id}
+            refreshToken={`${messages.length}:${isStreaming}`}
+            onClose={() => setArtifactsOpen(false)}
+            onChanged={() => void reloadAfterArtifactDelete()}
+          />
         )}
       </div>
       <MessageInput disabled={isStreaming} />

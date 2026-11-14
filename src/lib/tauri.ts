@@ -551,6 +551,40 @@ export async function artifactResolve(uri: string): Promise<string> {
   return invoke<string>('artifact_resolve', { uri });
 }
 
+export type SessionArtifactKind = 'deliverable' | 'process';
+
+export interface SessionArtifactItem {
+  id: string;
+  kind: SessionArtifactKind;
+  name: string;
+  ext: string;
+  size: number;
+  path: string | null;
+  uri: string | null;
+  modified_at_ms: number | null;
+  created_at: string;
+}
+
+export async function sessionArtifactsList(sessionId: string): Promise<SessionArtifactItem[]> {
+  return invoke<SessionArtifactItem[]>('session_artifacts_list', { sessionId });
+}
+
+export async function artifactSaveAs(uri: string, savePath: string): Promise<void> {
+  return invoke<void>('artifact_save_as', { uri, savePath });
+}
+
+export interface ArtifactDeleteResult {
+  deleted: number;
+  errors: string[];
+}
+
+export async function sessionArtifactsDelete(
+  sessionId: string,
+  items: Array<{ id: string; kind: SessionArtifactKind }>
+): Promise<ArtifactDeleteResult> {
+  return invoke<ArtifactDeleteResult>('session_artifacts_delete', { sessionId, items });
+}
+
 /** Open a local file with the OS default application. Executable extensions
  * are refused backend-side; directories are revealed instead. */
 export async function openLocalPath(path: string): Promise<void> {

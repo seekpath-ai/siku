@@ -1,9 +1,11 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { FolderOpen, Paperclip } from 'lucide-react';
+import { FolderOpen } from 'lucide-react';
 import { artifactResolve, openLocalPath, revealInFileManager } from '@/lib/tauri';
 import { artifactUriLabel, isArtifactUri, safeDecodeUri } from '@/lib/artifact';
 import { useDialog } from '@/hooks/useDialog';
 import { useSyncTick } from '@/stores/syncTickStore';
+import { ArtifactTypeIcon } from './artifactVisual';
+import { artifactExt } from './artifactMeta';
 
 /** Chip for a `siku://artifact/<hash>.<ext>` link: resolves the blob on THIS
  *  device (it may still be arriving from a peer) and opens/reveals it with the
@@ -41,8 +43,8 @@ export function ArtifactLink({ href, children }: { href?: string; children?: Rea
   };
 
   return (
-    <span className="inline-flex items-center gap-1 max-w-full align-middle px-1.5 py-0.5 mx-0.5 rounded-md bg-codex-hover/60 border border-codex-border/50 text-[12px] text-codex-primary">
-      <Paperclip size={11} className="shrink-0 text-codex-muted" />
+    <span className="group inline-flex items-center gap-1 max-w-full align-middle px-1.5 py-0.5 mx-0.5 rounded-md bg-codex-hover/60 border border-codex-border/50 text-[12px] text-codex-primary">
+      <ArtifactTypeIcon ext={artifactExt(uri)} size={12} />
       <button
         type="button"
         onClick={() => {
@@ -64,7 +66,7 @@ export function ArtifactLink({ href, children }: { href?: string; children?: Rea
         <button
           type="button"
           onClick={() => run(() => revealInFileManager(path), '在文件夹中显示')}
-          className="shrink-0 text-codex-muted hover:text-codex-primary"
+          className="shrink-0 text-codex-muted opacity-100 hover:text-codex-primary sm:opacity-0 sm:group-hover:opacity-100 sm:focus-visible:opacity-100"
           title="在文件夹中显示"
         >
           <FolderOpen size={11} />

@@ -25,6 +25,8 @@ import {
 import { normalizeMathDelimiters } from '@/lib/mathDelimiters';
 import { ContextMenu } from '@/components/ui/ContextMenu';
 import { CollapsibleText } from '@/components/ui/CollapsibleText';
+import { splitArtifactSection } from '@/lib/artifactSection';
+import { ArtifactSection } from './ArtifactSection';
 
 interface Props {
   message: ChatMessage;
@@ -193,11 +195,20 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
   }, [tagMenuOpen]);
 
   // LLMs commonly emit \(...\) / \[...\] math; remark-math only reads $..$.
-  // Normalize before render (code spans/blocks are left intact). Hook stays
-  // above the early return below.
+  // Normalize before render (code spans/blocks are left intact). The artifact
+  // footer is split out first so it can be rendered as a compact grid instead
+  // of one block-level Markdown list row per file. Hook stays above the early
+  // return below.
+  const splitContent = useMemo(
+    () =>
+      isUser
+        ? { body: message.content, artifacts: [] }
+        : splitArtifactSection(message.content),
+    [isUser, message.content],
+  );
   const normalizedContent = useMemo(
-    () => (isUser ? message.content : normalizeMathDelimiters(message.content)),
-    [isUser, message.content]
+    () => (isUser ? splitContent.body : normalizeMathDelimiters(splitContent.body)),
+    [isUser, splitContent.body]
   );
 
   if (isSystem || isTool) return null;
@@ -362,6 +373,7 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
                 {normalizedContent}
               </ReactMarkdown>
             </div>
+            <ArtifactSection artifacts={splitContent.artifacts} />
             {/* Files this reply sent to the user's chat app (remote IM only). */}
             {message.attachments && outboundFiles.length > 0 && (
               <div className="flex flex-wrap gap-2 mt-2">

@@ -1175,6 +1175,39 @@ export async function storageAudit(): Promise<StorageAudit> {
   return invoke<StorageAudit>('storage_audit');
 }
 
+export interface StorageGcResult {
+  dry_run: boolean;
+  older_than_days: number;
+  eligible: StorageBreakdown;
+  moved: StorageBreakdown;
+  skipped_recent: number;
+  skipped_referenced: number;
+  trash_dir: string | null;
+  files: StorageFile[];
+  errors: string[];
+}
+
+export interface StorageTrashResult {
+  files: number;
+  bytes: number;
+}
+
+export async function storageGc(
+  dryRun: boolean,
+  olderThanDays: number
+): Promise<StorageGcResult> {
+  return invoke<StorageGcResult>('storage_gc', { dryRun, olderThanDays });
+}
+
+export async function storageEmptyTrash(): Promise<StorageTrashResult> {
+  return invoke<StorageTrashResult>('storage_empty_trash');
+}
+
+/** Ensure blobs/.trash exists and reveal it with the OS file manager. */
+export async function storageOpenTrash(): Promise<void> {
+  return invoke<void>('storage_open_trash');
+}
+
 export async function settingsGetDataDir(): Promise<string> {
   return invoke<string>('settings_get_data_dir');
 }

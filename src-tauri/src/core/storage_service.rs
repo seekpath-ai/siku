@@ -1,13 +1,13 @@
-//! Read-only local storage audit.
+//! Local storage audit and conservative garbage collection.
 //!
-//! The blob store is content-addressed (`blobs/<sha256>.<ext>`). There is no
-//! delete-on-unreference yet, so the only safe first step is to *measure*:
-//! scan the directory, collect every blob reference from the synced database,
-//! and report current/history/unreferenced/staging/trash breakdowns. Nothing
-//! here deletes or moves a file.
+//! The blob store is content-addressed (`blobs/<sha256>.<ext>`). Audit is
+//! read-only; GC only moves old, locally-unreferenced blobs into
+//! `blobs/.trash/` (never straight to deletion). History-only references,
+//! unknown files, `.incoming` staging and `.trash` itself are always kept.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -56,6 +56,36 @@ pub struct StorageAudit {
     pub top_orphans: Vec<StorageFile>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageGcResult {
+    pub dry_run: bool,
+    pub older_than_days: u64,
+    /// All old, locally-unreferenced blobs selected by this pass.
+    pub eligible: StorageBreakdown,
+    /// Files actually moved in apply mode (zero for a dry run).
+    pub moved: StorageBreakdown,
+    pub skipped_recent: u64,
+    pub skipped_referenced: u64,
+    pub trash_dir: Option<String>,
+    /// A preview of the selected files (capped).
+    pub files: Vec<StorageFile>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StorageTrashResult {
+    pub files: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug)]
+struct StorageSnapshot {
+    root: PathBuf,
+    scan: ScanResult,
+    current: HashSet<String>,
+    history: HashSet<String>,
+}
+
 #[derive(Debug, Clone)]
 struct BlobFile {
     name: String,
@@ -79,12 +109,72 @@ struct ScanResult {
 /// Run the read-only audit. Filesystem walking is blocking, so it happens on a
 /// blocking worker; reference extraction is async DB reads.
 pub async fn audit_storage(db: &SqlitePool, app_data_dir: &Path) -> Result<StorageAudit, String> {
+    let snapshot = snapshot_storage(db, app_data_dir).await?;
+    let root = snapshot.root;
+    let scan = snapshot.scan;
+    let current = snapshot.current;
+    let history = snapshot.history;
+
+    let mut current_breakdown = StorageBreakdown::default();
+    let mut history_breakdown = StorageBreakdown::default();
+    let mut orphan_breakdown = StorageBreakdown::default();
+    let mut top_orphans = Vec::new();
+    for file in scan.blobs {
+        if current.contains(&file.key) {
+            current_breakdown.add(file.bytes);
+        } else if history.contains(&file.key) {
+            history_breakdown.add(file.bytes);
+        } else {
+            orphan_breakdown.add(file.bytes);
+            top_orphans.push(StorageFile {
+                name: file.name,
+                hash: file.hash,
+                ext: file.ext,
+                bytes: file.bytes,
+                path: file.path,
+            });
+        }
+    }
+    top_orphans.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    top_orphans.truncate(20);
+
+    Ok(StorageAudit {
+        data_dir: app_data_dir.to_string_lossy().into_owned(),
+        blob_root: root.to_string_lossy().into_owned(),
+        scanned_at: crate::core::time::now_iso(),
+        total: scan.total,
+        current: current_breakdown,
+        history_only: history_breakdown,
+        orphan: orphan_breakdown,
+        unknown: scan.unknown,
+        staging: scan.staging,
+        trash: scan.trash,
+        duplicate_ext_groups: scan.duplicate_ext_groups,
+        top_orphans,
+    })
+}
+
+async fn snapshot_storage(
+    db: &SqlitePool,
+    app_data_dir: &Path,
+) -> Result<StorageSnapshot, String> {
     let root = file_store::blob_dir(app_data_dir);
     let scan_root = root.clone();
     let scan = tokio::task::spawn_blocking(move || scan_blob_files(&scan_root))
         .await
         .map_err(|e| format!("storage scan task failed: {e}"))??;
+    let (current, history) = collect_references(db).await?;
+    Ok(StorageSnapshot {
+        root,
+        scan,
+        current,
+        history,
+    })
+}
 
+async fn collect_references(
+    db: &SqlitePool,
+) -> Result<(HashSet<String>, HashSet<String>), String> {
     let mut current = HashSet::new();
     let mut history = HashSet::new();
 
@@ -139,43 +229,136 @@ pub async fn audit_storage(db: &SqlitePool, app_data_dir: &Path) -> Result<Stora
     .await?;
     collect_agent_steps(db, &mut history).await?;
 
-    let mut current_breakdown = StorageBreakdown::default();
-    let mut history_breakdown = StorageBreakdown::default();
-    let mut orphan_breakdown = StorageBreakdown::default();
-    let mut top_orphans = Vec::new();
-    for file in scan.blobs {
-        if current.contains(&file.key) {
-            current_breakdown.add(file.bytes);
-        } else if history.contains(&file.key) {
-            history_breakdown.add(file.bytes);
-        } else {
-            orphan_breakdown.add(file.bytes);
-            top_orphans.push(StorageFile {
-                name: file.name,
-                hash: file.hash,
-                ext: file.ext,
-                bytes: file.bytes,
-                path: file.path,
-            });
+    Ok((current, history))
+}
+
+/// Move old, locally-unreferenced blobs into `blobs/.trash/<timestamp>/`.
+/// Dry-run returns the same selection without touching the filesystem.
+pub async fn gc_storage(
+    db: &SqlitePool,
+    app_data_dir: &Path,
+    older_than_days: u64,
+    dry_run: bool,
+) -> Result<StorageGcResult, String> {
+    let days = older_than_days.max(1);
+    let snapshot = snapshot_storage(db, app_data_dir).await?;
+    let now = SystemTime::now();
+    let grace = Duration::from_secs(days.saturating_mul(86_400));
+    let mut result = StorageGcResult {
+        dry_run,
+        older_than_days: days,
+        eligible: StorageBreakdown::default(),
+        moved: StorageBreakdown::default(),
+        skipped_recent: 0,
+        skipped_referenced: 0,
+        trash_dir: None,
+        files: Vec::new(),
+        errors: Vec::new(),
+    };
+    let mut candidates = Vec::new();
+    for file in snapshot.scan.blobs {
+        if snapshot.current.contains(&file.key) || snapshot.history.contains(&file.key) {
+            result.skipped_referenced += 1;
+            continue;
+        }
+        let age = std::fs::metadata(&file.path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok());
+        match age {
+            Some(age) if age < grace => {
+                result.skipped_recent += 1;
+                continue;
+            }
+            Some(_) => {}
+            None => {
+                result.errors.push(format!(
+                    "无法读取修改时间，跳过：{}",
+                    file.name
+                ));
+                continue;
+            }
+        }
+        result.eligible.add(file.bytes);
+        candidates.push(file);
+    }
+
+    candidates.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    result.files = candidates
+        .iter()
+        .take(20)
+        .map(|file| StorageFile {
+            name: file.name.clone(),
+            hash: file.hash.clone(),
+            ext: file.ext.clone(),
+            bytes: file.bytes,
+            path: file.path.clone(),
+        })
+        .collect();
+
+    if dry_run || candidates.is_empty() {
+        return Ok(result);
+    }
+
+    let trash_dir = snapshot
+        .root
+        .join(".trash")
+        .join(chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string());
+    for file in candidates {
+        let rel = match Path::new(&file.path).strip_prefix(&snapshot.root) {
+            Ok(rel) if !rel.as_os_str().is_empty() => rel,
+            _ => {
+                result.errors.push(format!("路径不在 blob 根目录，跳过：{}", file.path));
+                continue;
+            }
+        };
+        if rel
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+        {
+            result.errors.push(format!("拒绝不安全的路径：{}", file.path));
+            continue;
+        }
+        let dest = trash_dir.join(rel);
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                result.errors.push(format!("创建回收站目录失败：{e}"));
+                continue;
+            }
+        }
+        if dest.exists() {
+            result.errors.push(format!("回收站目标已存在：{}", dest.display()));
+            continue;
+        }
+        match std::fs::rename(&file.path, &dest) {
+            Ok(()) => result.moved.add(file.bytes),
+            Err(e) => result.errors.push(format!("移动失败 {}：{e}", file.name)),
         }
     }
-    top_orphans.sort_by(|a, b| b.bytes.cmp(&a.bytes));
-    top_orphans.truncate(20);
+    if result.moved.files > 0 {
+        result.trash_dir = Some(trash_dir.to_string_lossy().into_owned());
+    }
+    Ok(result)
+}
 
-    Ok(StorageAudit {
-        data_dir: app_data_dir.to_string_lossy().into_owned(),
-        blob_root: root.to_string_lossy().into_owned(),
-        scanned_at: crate::core::time::now_iso(),
-        total: scan.total,
-        current: current_breakdown,
-        history_only: history_breakdown,
-        orphan: orphan_breakdown,
-        unknown: scan.unknown,
-        staging: scan.staging,
-        trash: scan.trash,
-        duplicate_ext_groups: scan.duplicate_ext_groups,
-        top_orphans,
-    })
+/// Permanently delete the contents of `blobs/.trash`. The caller must confirm
+/// this separately; normal GC never calls it.
+pub fn empty_trash(app_data_dir: &Path) -> Result<StorageTrashResult, String> {
+    let trash = file_store::blob_dir(app_data_dir).join(".trash");
+    if !trash.exists() {
+        return Ok(StorageTrashResult::default());
+    }
+    let mut result = StorageTrashResult::default();
+    for entry in WalkDir::new(&trash).follow_links(false).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            result.files += 1;
+            result.bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    std::fs::remove_dir_all(&trash)
+        .map_err(|e| format!("清空回收站失败：{e}"))?;
+    let _ = std::fs::create_dir_all(&trash);
+    Ok(result)
 }
 
 fn scan_blob_files(root: &Path) -> Result<ScanResult, String> {
@@ -451,6 +634,82 @@ mod tests {
         assert_eq!(audit.duplicate_ext_groups, 1, "a.pdf + a.bin share a hash");
         assert_eq!(audit.top_orphans.len(), 2);
         assert_eq!(audit.top_orphans[0].bytes, 30, "largest orphan first");
+        db.close().await;
+    }
+
+    fn set_mtime(path: &Path, modified: SystemTime) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gc_moves_only_old_unreferenced_blobs_to_trash() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = file_store::blob_dir(dir.path());
+        std::fs::create_dir_all(&blobs).unwrap();
+
+        let referenced = hash('a');
+        let history = hash('b');
+        let old_orphan = hash('e');
+        let recent_orphan = hash('f');
+        let referenced_path = blobs.join(format!("{referenced}.pdf"));
+        let history_path = blobs.join(format!("{history}.png"));
+        let old_path = blobs.join(format!("{old_orphan}.bin"));
+        let recent_path = blobs.join(format!("{recent_orphan}.bin"));
+        std::fs::write(&referenced_path, vec![0u8; 10]).unwrap();
+        std::fs::write(&history_path, vec![0u8; 20]).unwrap();
+        std::fs::write(&old_path, vec![0u8; 30]).unwrap();
+        std::fs::write(&recent_path, vec![0u8; 40]).unwrap();
+
+        let old = SystemTime::now() - Duration::from_secs(8 * 86_400);
+        set_mtime(&referenced_path, old);
+        set_mtime(&history_path, old);
+        set_mtime(&old_path, old);
+
+        let db = test_db().await;
+        sqlx::query("INSERT INTO papers (file_path) VALUES (?)")
+            .bind(format!("blobs/{referenced}.pdf"))
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO note_versions (content) VALUES (?)")
+            .bind(format!("![](blobs/{history}.png)"))
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let plan = gc_storage(&db, dir.path(), 7, true).await.unwrap();
+        assert!(plan.dry_run);
+        assert_eq!(plan.eligible.files, 1);
+        assert_eq!(plan.eligible.bytes, 30);
+        assert_eq!(plan.moved.files, 0);
+        assert_eq!(plan.skipped_recent, 1);
+        assert_eq!(plan.skipped_referenced, 2);
+        assert!(old_path.exists(), "dry run must not move files");
+        assert_eq!(plan.files[0].name, format!("{old_orphan}.bin"));
+
+        let applied = gc_storage(&db, dir.path(), 7, false).await.unwrap();
+        assert!(!applied.dry_run);
+        assert_eq!(applied.moved.files, 1);
+        assert_eq!(applied.moved.bytes, 30);
+        assert!(applied.trash_dir.is_some());
+        assert!(!old_path.exists());
+        assert!(recent_path.exists(), "recent orphan must be kept");
+        assert!(referenced_path.exists(), "referenced blob must be kept");
+        assert!(history_path.exists(), "history-only blob must be kept");
+
+        let after = audit_storage(&db, dir.path()).await.unwrap();
+        assert_eq!(after.trash.files, 1);
+        assert_eq!(after.orphan.files, 1, "only the recent orphan remains");
+        assert_eq!(after.total.files, 3);
+
+        let emptied = empty_trash(dir.path()).unwrap();
+        assert_eq!(emptied.files, 1);
+        assert_eq!(emptied.bytes, 30);
+        assert!(!old_path.exists());
+        let final_audit = audit_storage(&db, dir.path()).await.unwrap();
+        assert_eq!(final_audit.trash.files, 0);
         db.close().await;
     }
 }

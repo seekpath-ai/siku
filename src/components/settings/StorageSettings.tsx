@@ -14,12 +14,18 @@ import {
   Trash2,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
+import { useDialog } from '@/hooks/useDialog';
 import {
   revealInFileManager,
   storageAudit,
+  storageEmptyTrash,
+  storageGc,
+  storageOpenTrash,
   type StorageAudit,
   type StorageBreakdown,
 } from '@/lib/tauri';
+
+const GC_GRACE_DAYS = 7;
 
 function formatBytes(bytes: number): string {
   if (!bytes) return '0 B';
@@ -68,9 +74,12 @@ function StatCard({
 }
 
 export function StorageSettings() {
+  const { confirm, alert } = useDialog();
   const [audit, setAudit] = useState<StorageAudit | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [gcBusy, setGcBusy] = useState(false);
+  const [trashBusy, setTrashBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -92,6 +101,71 @@ export function StorageSettings() {
     revealInFileManager(path).catch((err) => setError(String(err)));
   };
 
+  const openTrash = () => {
+    storageOpenTrash().catch((err) => setError(String(err)));
+  };
+
+  const handleGc = async () => {
+    if (gcBusy) return;
+    setGcBusy(true);
+    setError(null);
+    try {
+      const plan = await storageGc(true, GC_GRACE_DAYS);
+      if (plan.eligible.files === 0) {
+        await alert(
+          `没有符合条件的文件。只清理 ${GC_GRACE_DAYS} 天前、且当前和历史都没有引用的 blob；` +
+            '当前无引用文件可能都还在宽限期内。',
+          { title: '清理无引用文件', kind: 'info' },
+        );
+        return;
+      }
+      const ok = await confirm(
+        `将 ${plan.eligible.files.toLocaleString('zh-CN')} 个文件（${formatBytes(plan.eligible.bytes)}）移到回收站？\n\n` +
+          `只处理 ${GC_GRACE_DAYS} 天前、当前和历史都没有引用的 blob。` +
+          '文件会移到 blobs/.trash，不会永久删除。',
+        { title: '清理无引用文件', danger: true },
+      );
+      if (!ok) return;
+      const result = await storageGc(false, GC_GRACE_DAYS);
+      await refresh();
+      const failure = result.errors.length
+        ? `\n\n${result.errors.length} 个文件失败，例如：${result.errors[0]}`
+        : '';
+      await alert(
+        `已移动 ${result.moved.files} 个文件（${formatBytes(result.moved.bytes)}）到回收站。${failure}`,
+        { title: '清理完成', kind: result.errors.length ? 'warning' : 'success' },
+      );
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setGcBusy(false);
+    }
+  };
+
+  const handleEmptyTrash = async () => {
+    if (trashBusy || !audit || audit.trash.files === 0) return;
+    const ok = await confirm(
+      `永久删除回收站中的 ${audit.trash.files.toLocaleString('zh-CN')} 个文件` +
+        `（${formatBytes(audit.trash.bytes)}）？此操作无法恢复。`,
+      { title: '清空回收站', danger: true },
+    );
+    if (!ok) return;
+    setTrashBusy(true);
+    setError(null);
+    try {
+      const result = await storageEmptyTrash();
+      await refresh();
+      await alert(`已永久删除 ${result.files} 个文件（${formatBytes(result.bytes)}）。`, {
+        title: '回收站已清空',
+        kind: 'success',
+      });
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setTrashBusy(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div>
@@ -100,8 +174,8 @@ export function StorageSettings() {
           <span>存储审计</span>
         </div>
         <p className="mt-1 text-xs leading-relaxed text-text-secondary">
-          只读扫描本地 blob 与数据库引用，统计当前引用、仅历史引用、无引用文件和同步临时文件。
-          本页不会删除或移动任何文件。
+          扫描本地 blob 与数据库引用，统计当前引用、仅历史引用、无引用文件和同步临时文件。
+          审计本身只读；清理操作只把旧的无引用 blob 移到回收站。
         </p>
       </div>
 
@@ -223,6 +297,44 @@ export function StorageSettings() {
 
           <div className="rounded-xl border border-surface-hover bg-surface p-4">
             <div className="flex items-center gap-2 text-xs font-medium text-text-secondary">
+              <Trash2 size={14} />
+              清理
+            </div>
+            <p className="mt-1 text-[11px] leading-relaxed text-text-secondary">
+              只处理 {GC_GRACE_DAYS} 天前、当前和历史都没有引用的 blob；先移到回收站，不直接删除。
+            </p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void handleGc()}
+                disabled={loading || gcBusy || trashBusy}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300 transition-colors hover:bg-amber-500/15 disabled:opacity-50"
+              >
+                {gcBusy ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
+                {gcBusy ? '正在扫描…' : '清理无引用文件'}
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleEmptyTrash()}
+                disabled={loading || gcBusy || trashBusy || audit.trash.files === 0}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300 transition-colors hover:bg-rose-500/15 disabled:opacity-50"
+              >
+                {trashBusy ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
+                清空回收站
+              </button>
+              <button
+                type="button"
+                onClick={openTrash}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-surface-hover px-3 py-2 text-xs text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary"
+              >
+                <FolderOpen size={14} />
+                打开回收站
+              </button>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-surface-hover bg-surface p-4">
+            <div className="flex items-center gap-2 text-xs font-medium text-text-secondary">
               <FileSearch size={14} />
               最大的无引用文件
             </div>
@@ -261,8 +373,8 @@ export function StorageSettings() {
           <div className="flex items-start gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 text-[11px] leading-relaxed text-amber-300/90">
             <AlertTriangle size={14} className="mt-0.5 shrink-0" />
             <span>
-              这是只读审计。无引用不等于可以立即删除：文件可能刚写入、还未落库，或被其他设备引用。
-              真正的清理需要后续的回收站与引用计数策略。
+              审计本身不会删除文件。清理只会把满足宽限期、当前与历史都无引用的 blob 移到回收站；
+              只有“清空回收站”才会永久删除。无引用也不等于可以立即删除：文件可能刚写入，或被其他设备引用。
             </span>
           </div>
         </>

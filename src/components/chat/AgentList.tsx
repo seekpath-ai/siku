@@ -347,16 +347,6 @@ export function AgentList() {
     });
   };
 
-  // On first load, expand the project containing the active session so its
-  // row isn't hidden inside a collapsed project.
-  const autoExpandedRef = useRef(false);
-  useEffect(() => {
-    if (autoExpandedRef.current || sessions.length === 0) return;
-    autoExpandedRef.current = true;
-    const active = sessions.find((s) => s.id === useChatStore.getState().activeSessionId);
-    if (active?.project_id) setExpandedProjects(new Set([active.project_id]));
-  }, [sessions]);
-
   const handleContextMenu = (e: React.MouseEvent, agentId: string) => {
     e.preventDefault();
     e.stopPropagation();

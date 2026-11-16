@@ -381,15 +381,25 @@ async fn apply_changes_inner(
             .iter()
             .find(|c| c.cid == "updated_at")
             .and_then(|c| c.val.as_deref());
-        if let Some(peer_ts) = peer_ts {
-            if let Some(local_ts) = local_updated_at(&mut *tx, table, pk).await? {
-                if local_ts_is_newer(&local_ts, peer_ts) {
-                    skipped += group.len();
-                    continue;
-                }
+        let local_is_newer = if let Some(peer_ts) = peer_ts {
+            match local_updated_at(&mut *tx, table, pk).await? {
+                Some(local_ts) => local_ts_is_newer(&local_ts, peer_ts),
+                None => false,
             }
-        }
+        } else {
+            false
+        };
         for change in group {
+            // Project membership is a separate decision from the session's
+            // mutable content. A newer local updated_at (e.g. a message or
+            // title edit on this device) must not discard the peer's move
+            // between projects; CR-SQLite still resolves the project_id cell
+            // by its column version.
+            let project_membership = table == "chat_sessions" && change.cid == "project_id";
+            if local_is_newer && !project_membership {
+                skipped += 1;
+                continue;
+            }
             // Defense in depth: peers running older builds may still send
             // device-local columns (e.g. chat_sessions.working_dir).
             if non_syncable_column(table, &change.cid) {
@@ -1843,6 +1853,71 @@ mod tests {
         // Ordinary ordering still holds across precisions.
         assert!(local_ts_is_newer("2026-06-16T10:30:01Z", "2026-06-16T10:30:00.999Z"));
         assert!(!local_ts_is_newer("2026-06-16T10:29:59Z", "2026-06-16T10:30:00Z"));
+    }
+
+    /// A newer local session timestamp must not discard the peer's project
+    /// membership change. The session row's updated_at covers chat content and
+    /// titles; moving between projects is a separate decision.
+    #[tokio::test]
+    async fn newer_local_session_does_not_drop_project_move() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "siku-crdt-project-move-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+
+        let db_a = connect_with_crsqlite(&dir.join("a.db")).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db_a).await?;
+        register_crr_tables(&db_a, CORE_SYNC_TABLES).await?;
+        register_crr_tables(&db_a, OPTIONAL_SYNC_TABLES).await?;
+        let db_b = connect_with_crsqlite(&dir.join("b.db")).await?;
+        sqlx::query(SCHEMA_INIT_SQL).execute(&db_b).await?;
+        register_crr_tables(&db_b, CORE_SYNC_TABLES).await?;
+        register_crr_tables(&db_b, OPTIONAL_SYNC_TABLES).await?;
+
+        sqlx::query(
+            "INSERT INTO chat_sessions (id, title, created_at, updated_at)              VALUES ('s1', 'Chat One', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&db_a)
+        .await?;
+        apply_changes(&db_b, &export_changes_since(&db_a, 0).await?).await?;
+
+        // B edits the session locally, making its updated_at newer than A's
+        // upcoming project move.
+        sqlx::query(
+            "UPDATE chat_sessions SET title = 'B-local', updated_at = '2026-01-03T00:00:00Z'              WHERE id = 's1'",
+        )
+        .execute(&db_b)
+        .await?;
+
+        // A moves the session into project p1 with an older timestamp.
+        sqlx::query(
+            "UPDATE chat_sessions SET project_id = 'p1', updated_at = '2026-01-02T00:00:00Z'              WHERE id = 's1'",
+        )
+        .execute(&db_a)
+        .await?;
+
+        apply_changes(&db_b, &export_changes_since(&db_a, 0).await?).await?;
+        let project: (Option<String>,) =
+            sqlx::query_as("SELECT project_id FROM chat_sessions WHERE id = 's1'")
+                .fetch_one(&db_b)
+                .await?;
+        assert_eq!(
+            project.0.as_deref(),
+            Some("p1"),
+            "project_id must apply even when the local session timestamp is newer"
+        );
+
+        sqlx::query("SELECT crsql_finalize()").execute(&db_a).await?;
+        sqlx::query("SELECT crsql_finalize()").execute(&db_b).await?;
+        db_a.close().await;
+        db_b.close().await;
+        Ok(())
     }
 
     /// Equal `updated_at` on both sides must NOT drop the peer's change

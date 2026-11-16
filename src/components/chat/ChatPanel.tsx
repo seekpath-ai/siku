@@ -12,7 +12,7 @@ import { mergeMessages } from '@/lib/chatMerge';
 import { useProjectStore } from '@/stores/projectStore';
 import { usePetContextStore } from '@/stores/petContextStore';
 import { useStreamingChat } from '@/hooks/useStreamingChat';
-import { getChatMessages, getAgentSteps, agentRenameSession, agentSetSessionModel, agentIsRunning, agentCreateSession, agentSendMessage, getDeviceId, agentSetSessionWorkingDir } from '@/lib/tauri';
+import { getChatMessages, getAgentSteps, agentRenameSession, agentSetSessionModel, agentIsRunning, agentCreateSession, agentSendMessage, getDeviceId, agentSetSessionWorkingDir, agentSessionWorkspace } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
 import { useDialogStore } from '@/stores/dialogStore';
 import { useSyncTick } from '@/stores/syncTickStore';
@@ -141,6 +141,7 @@ export function ChatPanel() {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [artifactsOpen, setArtifactsOpen] = useState(false);
+  const [autoWorkspace, setAutoWorkspace] = useState<string | null>(null);
   // Current machine id, used to spot a conversation continued elsewhere.
   const [deviceId, setDeviceId] = useState('');
 
@@ -255,11 +256,42 @@ export function ChatPanel() {
   // differ from the sidebar's current filter project.
   const sessionProject =
     projects.find((p) => p.id === activeSession?.project_id) ?? null;
-  // The effective local folder can come from the session override OR the
-  // project bound on this device (the turn falls back to the project dir).
-  const localBoundDir =
-    (activeSession?.working_dir?.trim() ? activeSession.working_dir : '') ||
-    (sessionProject?.path?.trim() ? sessionProject.path : '');
+  // The effective local folder can come from the session override, the
+  // project bound on this device, or the app-owned session workspace. The
+  // latter is a perfectly valid local binding, so it must not trigger the
+  //「绑定本机工作目录」prompt just because the session has no explicit path.
+  const explicitLocalDir = activeSession?.working_dir?.trim() || '';
+  const projectLocalDir = sessionProject?.path?.trim() || '';
+  const localBoundDir = explicitLocalDir || projectLocalDir || autoWorkspace || '';
+  const localDirSource = explicitLocalDir
+    ? '会话目录'
+    : projectLocalDir
+      ? '项目目录'
+      : autoWorkspace
+        ? '自动工作区'
+        : '';
+
+  useEffect(() => {
+    if (!activeSessionId) {
+      setAutoWorkspace(null);
+      return;
+    }
+    if (explicitLocalDir || projectLocalDir) {
+      setAutoWorkspace(null);
+      return;
+    }
+    let cancelled = false;
+    agentSessionWorkspace(activeSessionId)
+      .then((path) => {
+        if (!cancelled) setAutoWorkspace(path);
+      })
+      .catch(() => {
+        if (!cancelled) setAutoWorkspace(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionId, explicitLocalDir, projectLocalDir]);
 
   useEffect(() => {
     if (!activeSessionId) return;
@@ -469,6 +501,7 @@ export function ChatPanel() {
           {localBoundDir ? (
             <span className="ml-auto shrink-0 text-text-secondary/60 truncate max-w-[220px]" title={localBoundDir}>
               本机目录：{localBoundDir}
+              {localDirSource ? `（${localDirSource}）` : ''}
             </span>
           ) : (
             <button

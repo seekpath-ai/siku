@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -17,6 +17,34 @@ use crate::core::time;
 
 fn now_iso() -> String {
     time::now_iso()
+}
+
+/// A workspace may not be the app-data directory, a descendant of it, or an
+/// ancestor of it. Pointing a conversation at app data makes the agent write
+/// next to the live database, logs and session memory (and historically let
+/// the artifact scanner index those runtime files).
+fn is_forbidden_working_dir(path: &Path, app_data_dir: &Path) -> bool {
+    let Ok(candidate) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(app_data) = std::fs::canonicalize(app_data_dir) else {
+        return false;
+    };
+    if candidate == app_data || app_data.starts_with(&candidate) {
+        return true;
+    }
+    if candidate.starts_with(&app_data) {
+        // The per-session auto workspace is the one legitimate app-data
+        // child. Everything else (DB, memory, logs) is app runtime state.
+        let managed = app_data.join("agent_workspaces");
+        let managed = std::fs::canonicalize(&managed).unwrap_or(managed);
+        return !candidate.starts_with(&managed);
+    }
+    false
+}
+
+fn forbidden_working_dir_message() -> &'static str {
+    "不能将会话工作目录设为思库应用数据目录、其子目录或上级目录；请选择普通项目文件夹。"
 }
 
 /// Per-session turn mutex. cancel_tokens / approval_senders / ask_senders
@@ -423,10 +451,21 @@ pub async fn agent_create_session(
     let web_proxy = input.web_proxy.clone();
     // Default the write directory to the project's folder when not specified.
     let mut working_dir = input.working_dir.clone();
+    if let Some(wd) = working_dir.as_deref() {
+        if is_forbidden_working_dir(Path::new(wd), &state.app_data_dir) {
+            return Err(forbidden_working_dir_message().to_string());
+        }
+    }
     if working_dir.is_none() {
         if let Some(pid) = &input.project_id {
             working_dir = crate::core::project_service::get_path(&state.db, pid).await?;
         }
+    }
+    if working_dir
+        .as_deref()
+        .is_some_and(|wd| is_forbidden_working_dir(Path::new(wd), &state.app_data_dir))
+    {
+        working_dir = None;
     }
     let llm_json = serde_json::to_string(&config.llm_models).map_err(|e| format!("json: {e}"))?;
     let provider_ids_json = serde_json::to_string(&provider_ids).map_err(|e| format!("json: {e}"))?;
@@ -549,6 +588,12 @@ pub async fn agent_update_session(
         .as_ref()
         .map(|v| serde_json::to_string(v).map_err(|e| format!("json: {e}")))
         .transpose()?;
+
+    if let Some(wd) = input.working_dir.as_deref() {
+        if is_forbidden_working_dir(Path::new(wd), &state.app_data_dir) {
+            return Err(forbidden_working_dir_message().to_string());
+        }
+    }
 
     sqlx::query(
         "UPDATE chat_sessions SET
@@ -680,6 +725,9 @@ pub async fn agent_set_session_working_dir(
     if let Some(d) = &dir {
         if !std::path::Path::new(d).is_dir() {
             return Err(format!("目录不存在：{d}"));
+        }
+        if is_forbidden_working_dir(Path::new(d), &state.app_data_dir) {
+            return Err(forbidden_working_dir_message().to_string());
         }
     }
     sqlx::query("UPDATE chat_sessions SET working_dir = ? WHERE id = ?")
@@ -1497,23 +1545,17 @@ pub(crate) async fn run_agent_turn(
         (None, b) => b,
     };
     // Files from earlier turns are listed with their local absolute paths so
-    // the agent can read them directly; only blobs already present locally
-    // are listed (a peer may still be fetching one).
-    let local_artifacts = crate::core::artifact_service::recent_local_paths(
-        &state.db,
-        &state.app_data_dir,
-        &session_id,
-        10,
-    )
-    .await;
+    // the agent can read them directly. Sync is opt-in, so these are all local.
+    let local_artifacts =
+        crate::core::artifact_service::recent_local_paths(&state.db, &session_id, 10).await;
     let artifacts_note = if local_artifacts.is_empty() {
         None
     } else {
         let mut note = String::from(
-            "# 本会话产物（已在本机可用）\n以下文件是此前回合产生、已随同步保存到本机的产物，可直接用文件工具读取：\n",
+            "# 本会话产物（本机文件）\n以下文件是此前回合产生、仍在工作目录中的产物，可直接用文件工具读取：\n",
         );
-        for (name, uri, path) in &local_artifacts {
-            note.push_str(&format!("- {name}（{uri}）：{path}\n"));
+        for (name, path) in &local_artifacts {
+            note.push_str(&format!("- {name}：{path}\n"));
         }
         Some(note)
     };
@@ -1754,7 +1796,7 @@ pub(crate) async fn run_agent_turn(
                 // frontend's cancelled handler appends the marker itself.
                 // A turn that died on an LLM error keeps its partial text
                 // plus an ❌ marker (and its steps below), mirroring cancel.
-                let mut display_content = if final_content.trim().is_empty() {
+                let display_content = if final_content.trim().is_empty() {
                     "（模型未返回文本内容）".to_string()
                 } else {
                     final_content.clone()
@@ -1849,10 +1891,10 @@ pub(crate) async fn run_agent_turn(
                         }
                     }
 
-                    // Register files this turn wrote into the workspace, then
-                    // append device-independent references to the reply so the
-                    // user (and the next turn) can reach them from any device.
-                    let artifacts = crate::core::artifact_service::register_turn_artifacts(
+                    // Index files this turn wrote into the workspace. This is
+                    // local-only; blob/sync is created only when the user
+                    // explicitly selects an artifact in the sidebar.
+                    if let Err(e) = crate::core::artifact_service::register_turn_artifacts(
                         &db,
                         &spawn_app_data_dir,
                         &sid,
@@ -1861,40 +1903,8 @@ pub(crate) async fn run_agent_turn(
                         turn_started_at,
                     )
                     .await
-                    .unwrap_or_else(|e| {
+                    {
                         warn!(error = %e, session_id = %sid, "artifact registration failed");
-                        Vec::new()
-                    });
-                    if !artifacts.is_empty() {
-                        let mut section = String::from("\n\n📎 本轮产物：\n");
-                        for a in &artifacts {
-                            let label = a.name.replace('[', "\\[").replace(']', "\\]");
-                            section.push_str(&format!(
-                                "- [{}]({})\n",
-                                label,
-                                crate::core::artifact_service::artifact_uri(&a.hash, &a.ext)
-                            ));
-                        }
-                        let mut new_content = persist_content.clone();
-                        new_content.push_str(&section);
-                        match sqlx::query("UPDATE chat_messages SET content = ? WHERE id = ?")
-                            .bind(&new_content)
-                            .bind(mid)
-                            .execute(&db)
-                            .await
-                        {
-                            Ok(_) => {
-                                // Extend the terminal event too: the frontend
-                                // inserts the assistant bubble from the event
-                                // before the incremental history reload, so
-                                // without this the links would only appear
-                                // after reopening the session.
-                                display_content.push_str(&section);
-                            }
-                            Err(e) => {
-                                warn!(error = %e, message_id = %mid, "failed to append artifact links");
-                            }
-                        }
                     }
                 }
 
@@ -2691,4 +2701,27 @@ pub async fn settings_ensure_directories(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod workspace_guard_tests {
+    use super::is_forbidden_working_dir;
+
+    #[test]
+    fn app_data_children_and_ancestors_are_forbidden_workspaces() {
+        let root = tempfile::tempdir().unwrap();
+        let app_data = root.path().join("com.siku.reader");
+        let memory = app_data.join("memory");
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&memory).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        assert!(is_forbidden_working_dir(&app_data, &app_data));
+        assert!(is_forbidden_working_dir(&memory, &app_data));
+        assert!(is_forbidden_working_dir(root.path(), &app_data));
+        let auto = app_data.join("agent_workspaces").join("session-1");
+        std::fs::create_dir_all(&auto).unwrap();
+        assert!(!is_forbidden_working_dir(&auto, &app_data));
+        assert!(!is_forbidden_working_dir(&project, &app_data));
+    }
 }

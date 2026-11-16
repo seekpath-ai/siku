@@ -15,25 +15,29 @@ import {
   Package,
   Presentation,
   RefreshCw,
+  Video,
   Save,
   Trash2,
+  Upload,
   X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useDialog } from '@/hooks/useDialog';
 import { useSyncTick } from '@/stores/syncTickStore';
+import { localArtifactSaveAs, sessionArtifactsSync } from '@/lib/tauri';
 import { artifactResolve, artifactSaveAs, openLocalPath, revealInFileManager, sessionArtifactsDelete, sessionArtifactsList, type SessionArtifactItem } from '@/lib/tauri';
 import { ArtifactTypeIcon } from './artifactVisual';
 
-type Category = 'document' | 'sheet' | 'slide' | 'image' | 'code' | 'data' | 'archive' | 'other';
-type TypeFilter = 'all' | 'document' | 'image' | 'code' | 'other';
+type Category = 'document' | 'sheet' | 'slide' | 'image' | 'video' | 'code' | 'data' | 'archive' | 'other';
+type TypeFilter = 'all' | 'document' | 'image' | 'video' | 'code' | 'other';
 
-const CATEGORY_ORDER: Category[] = ['document', 'sheet', 'slide', 'image', 'code', 'data', 'archive', 'other'];
+const CATEGORY_ORDER: Category[] = ['document', 'sheet', 'slide', 'image', 'video', 'code', 'data', 'archive', 'other'];
 const CATEGORY_META: Record<Category, { label: string; icon: LucideIcon }> = {
   document: { label: '文档', icon: FileText },
   sheet: { label: '表格', icon: FileSpreadsheet },
   slide: { label: '演示', icon: Presentation },
   image: { label: '图片', icon: FileImage },
+  video: { label: '视频', icon: Video },
   code: { label: '代码 / 脚本', icon: FileCode2 },
   data: { label: '数据', icon: Database },
   archive: { label: '压缩包', icon: FileArchive },
@@ -46,6 +50,7 @@ function categoryOf(ext: string): Category {
   if (['xls', 'xlsx', 'csv', 'ods'].includes(e)) return 'sheet';
   if (['ppt', 'pptx', 'odp'].includes(e)) return 'slide';
   if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif'].includes(e)) return 'image';
+  if (['mp4', 'webm', 'mov', 'm4v', 'mkv', 'avi'].includes(e)) return 'video';
   if (['py', 'ps1', 'sh', 'bash', 'zsh', 'ts', 'tsx', 'js', 'jsx', 'rs', 'go', 'java', 'c', 'cc', 'cpp', 'h', 'hpp', 'html', 'css', 'scss', 'rb', 'php'].includes(e)) return 'code';
   if (['json', 'yaml', 'yml', 'toml', 'xml', 'sql', 'db', 'sqlite'].includes(e)) return 'data';
   if (['zip', 'tar', 'gz', 'tgz', '7z', 'rar', 'bz2', 'xz'].includes(e)) return 'archive';
@@ -106,6 +111,7 @@ export function ArtifactSidebar({ sessionId, refreshToken, onClose, onChanged }:
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<Category>>(new Set());
 
   const load = useCallback(async () => {
@@ -133,7 +139,7 @@ export function ArtifactSidebar({ sessionId, refreshToken, onClose, onChanged }:
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return items.filter((item) => {
-      if (localOnly && item.kind !== 'process') return false;
+      if (localOnly && item.synced) return false;
       if (typeFilter !== 'all') {
         const category = categoryOf(item.ext);
         const typeMatches =
@@ -176,6 +182,7 @@ export function ArtifactSidebar({ sessionId, refreshToken, onClose, onChanged }:
   };
 
   const allFilteredSelected = filtered.length > 0 && filtered.every((item) => selected.has(itemKey(item)));
+  const localSelectedCount = items.filter((item) => selected.has(itemKey(item)) && item.kind === 'local' && !item.synced).length;
   const toggleAll = () => {
     setSelected((current) => {
       if (allFilteredSelected) {
@@ -191,7 +198,7 @@ export function ArtifactSidebar({ sessionId, refreshToken, onClose, onChanged }:
 
   const openItem = async (item: SessionArtifactItem) => {
     try {
-      const path = item.kind === 'deliverable'
+      const path = item.kind === 'synced'
         ? item.uri ? await artifactResolve(item.uri) : null
         : item.path;
       if (!path) throw new Error('产物尚未同步到本机');
@@ -203,7 +210,7 @@ export function ArtifactSidebar({ sessionId, refreshToken, onClose, onChanged }:
 
   const revealItem = async (item: SessionArtifactItem) => {
     try {
-      const path = item.kind === 'deliverable'
+      const path = item.kind === 'synced'
         ? item.uri ? await artifactResolve(item.uri) : null
         : item.path;
       if (!path) throw new Error('产物尚未同步到本机');
@@ -214,7 +221,7 @@ export function ArtifactSidebar({ sessionId, refreshToken, onClose, onChanged }:
   };
 
   const saveItem = async (item: SessionArtifactItem) => {
-    if (item.kind !== 'deliverable' || !item.uri) return;
+    if (item.kind === 'synced' && !item.uri) return;
     try {
       const { save } = await import('@tauri-apps/plugin-dialog');
       const target = await save({
@@ -222,17 +229,53 @@ export function ArtifactSidebar({ sessionId, refreshToken, onClose, onChanged }:
         filters: item.ext ? [{ name: item.ext.toUpperCase(), extensions: [item.ext] }] : undefined,
       });
       if (!target) return;
-      await artifactSaveAs(item.uri, target);
+      if (item.kind === 'local') {
+        await localArtifactSaveAs(sessionId, item.id, target);
+      } else if (item.uri) {
+        await artifactSaveAs(item.uri, target);
+      }
       await alert(`已保存到：${target}`, { title: '另存为', kind: 'success' });
     } catch (err) {
       await alert(String(err), { title: '另存为', kind: 'error' });
     }
   };
 
+  const syncSelected = async () => {
+    const targets = items.filter(
+      (item) => selected.has(itemKey(item)) && item.kind === 'local' && !item.synced,
+    );
+    if (targets.length === 0 || syncing || busy) return;
+    const total = targets.reduce((sum, item) => sum + Math.max(0, item.size), 0);
+    const ok = await confirm(
+      `将选中的 ${targets.length} 个本地文件（${formatBytes(total)}）同步到其他设备？\n\n` +
+        '同步会复制一份到 blob，并创建跨设备产物索引；本地原文件保留。',
+      { title: '同步产物' },
+    );
+    if (!ok) return;
+    setSyncing(true);
+    setError(null);
+    try {
+      const result = await sessionArtifactsSync(sessionId, targets.map((item) => item.id));
+      await load();
+      useSyncTick.getState().bump();
+      onChanged?.();
+      if (result.errors.length > 0) {
+        await alert(`已同步 ${result.synced} 个；失败 ${result.errors.length} 个：\n${result.errors[0]}`, {
+          title: '同步产物',
+          kind: 'warning',
+        });
+      }
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
   const deleteSelected = async () => {
     const targets = items.filter((item) => selected.has(itemKey(item)));
     if (targets.length === 0 || busy) return;
-    const hasSynced = targets.some((item) => item.kind === 'deliverable');
+    const hasSynced = targets.some((item) => item.synced);
     const ok = await confirm(
       `确定删除选中的 ${targets.length} 个产物？\n\n` +
         '仅本地文件会移到应用回收站；' +
@@ -248,6 +291,7 @@ export function ArtifactSidebar({ sessionId, refreshToken, onClose, onChanged }:
         targets.map((item) => ({ id: item.id, kind: item.kind })),
       );
       await load();
+      useSyncTick.getState().bump();
       onChanged?.();
       if (result.errors.length > 0) {
         await alert(`已删除 ${result.deleted} 个；失败 ${result.errors.length} 个：\n${result.errors[0]}`, {
@@ -279,7 +323,7 @@ export function ArtifactSidebar({ sessionId, refreshToken, onClose, onChanged }:
           <div className="text-[12px] font-medium text-codex-primary">会话产物</div>
           <div className="text-[10px] text-codex-muted">
             {items.length} 个 · {formatBytes(totalBytes)}
-            {items.some((item) => item.kind === 'process') ? ' · 仅本地文件不同步' : ''}
+            {items.some((item) => !item.synced) ? ' · 仅本地文件不同步' : ''}
           </div>
         </div>
         <button
@@ -307,6 +351,7 @@ export function ArtifactSidebar({ sessionId, refreshToken, onClose, onChanged }:
             ['all', '全部'],
             ['document', '文档'],
             ['image', '图片'],
+            ['video', '视频'],
             ['code', '代码/脚本'],
             ['other', '其它'],
           ] as const).map(([key, label]) => (
@@ -333,7 +378,7 @@ export function ArtifactSidebar({ sessionId, refreshToken, onClose, onChanged }:
           />
           仅本地
           <span className="text-codex-muted/70">
-            {items.filter((item) => item.kind === 'process').length}
+            {items.filter((item) => !item.synced).length}
           </span>
         </label>
         <input
@@ -397,8 +442,8 @@ export function ArtifactSidebar({ sessionId, refreshToken, onClose, onChanged }:
                           <div className="flex items-center gap-1 text-[9px] text-codex-muted">
                             <span>{formatBytes(item.size)}</span>
                             {formatTime(item) && <span>· {formatTime(item)}</span>}
-                            <span className={item.kind === 'process' ? 'text-amber-400/80' : 'text-emerald-400/80'}>
-                              {item.kind === 'process' ? '仅本地' : '已同步'}
+                            <span className={item.synced ? 'text-emerald-400/80' : 'text-amber-400/80'}>
+                              {item.synced ? '已同步' : '仅本地'}
                             </span>
                           </div>
                         </div>
@@ -411,7 +456,7 @@ export function ArtifactSidebar({ sessionId, refreshToken, onClose, onChanged }:
                           >
                             <ExternalLink size={11} />
                           </button>
-                          {item.kind === 'deliverable' && (
+                          {(
                             <button
                               type="button"
                               onClick={() => void saveItem(item)}
@@ -454,9 +499,18 @@ export function ArtifactSidebar({ sessionId, refreshToken, onClose, onChanged }:
         <span className="text-[10px] text-codex-muted">已选 {selected.size}</span>
         <button
           type="button"
+          onClick={() => void syncSelected()}
+          disabled={localSelectedCount === 0 || syncing || busy}
+          className="ml-auto inline-flex items-center gap-1 rounded-md border border-sky-500/30 bg-sky-500/10 px-2 py-1 text-[10px] text-sky-300 hover:bg-sky-500/20 disabled:opacity-40"
+        >
+          {syncing ? <Loader2 size={11} className="animate-spin" /> : <Upload size={11} />}
+          同步
+        </button>
+        <button
+          type="button"
           onClick={() => void deleteSelected()}
-          disabled={selected.size === 0 || busy}
-          className="ml-auto inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-1 text-[10px] text-red-300 hover:bg-red-500/20 disabled:opacity-40"
+          disabled={selected.size === 0 || syncing || busy}
+          className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-1 text-[10px] text-red-300 hover:bg-red-500/20 disabled:opacity-40"
         >
           {busy ? <Loader2 size={11} className="animate-spin" /> : <Trash2 size={11} />}
           删除

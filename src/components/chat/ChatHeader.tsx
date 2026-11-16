@@ -19,11 +19,14 @@ interface Props {
   artifactsOpen: boolean;
   /** Bind a synced project (empty path) to a local folder. */
   onBindProject?: () => void;
+  /** The session has its own local working directory; the project path is
+   *  optional and must not show a redundant 「绑定」 prompt. */
+  hasLocalWorkingDir?: boolean;
 }
 
 /** Chat panel header: editable thread title + project chip + model badge.
  *  The badge doubles as a model switcher over the global provider pool. */
-export function ChatHeader({ session, projectName, projectPath, onRename, onModelChange, onToggleSearch, onToggleArtifacts, artifactsOpen, onBindProject }: Props) {
+export function ChatHeader({ session, projectName, projectPath, onRename, onModelChange, onToggleSearch, onToggleArtifacts, artifactsOpen, onBindProject, hasLocalWorkingDir = false }: Props) {
   const [editing, setEditing] = useState(false);
   const [title, setTitle] = useState(session.title);
   const [taskCenterOpen, setTaskCenterOpen] = useState(false);
@@ -85,7 +88,7 @@ export function ChatHeader({ session, projectName, projectPath, onRename, onMode
           >
             <FolderOpen size={11} className="shrink-0" />
             <span className="truncate">{projectName}</span>
-            {!projectPath && onBindProject && (
+            {!projectPath && !hasLocalWorkingDir && onBindProject && (
               <button
                 onClick={onBindProject}
                 className="shrink-0 px-1 rounded bg-warning/20 text-text-primary hover:bg-warning/30"

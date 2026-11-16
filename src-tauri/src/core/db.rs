@@ -1775,20 +1775,27 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
             ext TEXT NOT NULL DEFAULT '',
             size INTEGER NOT NULL DEFAULT 0,
             modified_at_ms INTEGER,
+            artifact_id TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT ''
         )",
     )
     .execute(&db)
     .await?;
-    sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_session_process_files_path
-         ON session_process_files(session_id, path)",
+    // Older builds enforced one row per (session, path); artifacts now need
+    // one row per turn so the same file can belong to multiple replies.
+    sqlx::query("DROP INDEX IF EXISTS idx_session_process_files_path")
+        .execute(&db)
+        .await?;
+    add_column_if_missing(
+        &db,
+        "session_process_files",
+        "artifact_id",
+        "TEXT NOT NULL DEFAULT ''",
     )
-    .execute(&db)
     .await?;
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_session_process_files_session
-         ON session_process_files(session_id)",
+        "CREATE INDEX IF NOT EXISTS idx_session_process_files_message
+         ON session_process_files(session_id, message_id)",
     )
     .execute(&db)
     .await?;

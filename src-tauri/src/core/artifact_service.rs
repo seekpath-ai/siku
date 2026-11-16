@@ -18,26 +18,14 @@ use crate::core::time::now_iso;
 
 pub const ARTIFACT_SCHEME: &str = "siku://artifact/";
 
-/// Per-turn registration bounds: a runaway build must not turn into hundreds
-/// of blob writes right after the answer.
-const MAX_ARTIFACTS_PER_TURN: usize = 30;
-const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
-/// Process files are local-only index rows; cap the list so a huge repo scan
-/// cannot insert hundreds of thousands of rows in one turn.
-const MAX_PROCESS_FILES_PER_TURN: usize = 200;
+/// Every file produced in a turn is a local artifact row. Cap the list so a
+/// huge repo scan cannot insert hundreds of thousands of rows in one turn.
+const MAX_FILES_PER_TURN: usize = 200;
 const MAX_SCAN_ENTRIES: usize = 5_000;
 const MAX_SCAN_DEPTH: usize = 4;
 /// Filesystem mtime granularity (FAT: 2s) means "written this turn" needs a
 /// little slack or a file written at the turn boundary could be missed.
 const MTIME_SLACK: Duration = Duration::from_secs(5);
-
-#[derive(Debug, Clone)]
-pub struct Artifact {
-    pub hash: String,
-    pub ext: String,
-    pub name: String,
-}
 
 pub fn artifact_uri(hash: &str, ext: &str) -> String {
     format!("{ARTIFACT_SCHEME}{hash}.{ext}")
@@ -81,16 +69,8 @@ pub fn resolve_uri(app_data_dir: &Path, uri: &str) -> Result<String, String> {
     }
 }
 
-#[derive(Debug)]
-struct Candidate {
-    hash: String,
-    ext: String,
-    name: String,
-    size: u64,
-}
-
 #[derive(Debug, Clone)]
-struct ProcessFile {
+struct LocalFile {
     name: String,
     path: String,
     ext: String,
@@ -100,8 +80,7 @@ struct ProcessFile {
 
 #[derive(Debug, Default)]
 struct ScanResult {
-    deliverables: Vec<Candidate>,
-    process: Vec<ProcessFile>,
+    files: Vec<LocalFile>,
 }
 
 fn sanitize_ext(ext: &str) -> String {
@@ -125,28 +104,6 @@ fn source_name(path: &Path) -> String {
         .chars()
         .take(120)
         .collect()
-}
-
-/// Only these extensions enter the blob/sync pipeline. Everything else is a
-/// local process file (the user can delete it from the session artifact panel).
-fn is_deliverable_ext(ext: &str) -> bool {
-    matches!(
-        ext,
-        "doc" | "docx"
-            | "rtf"
-            | "odt"
-            | "xls"
-            | "xlsx"
-            | "csv"
-            | "ods"
-            | "pdf"
-            | "ppt"
-            | "pptx"
-            | "odp"
-            | "md"
-            | "txt"
-            | "zip"
-    )
 }
 
 fn skip_dir(name: &str) -> bool {
@@ -213,7 +170,7 @@ fn collect_files(
         let Ok(meta) = entry.metadata() else {
             continue;
         };
-        if meta.len() == 0 || meta.len() > MAX_ARTIFACT_BYTES {
+        if meta.len() == 0 {
             continue;
         }
         let Ok(modified) = meta.modified() else {
@@ -225,57 +182,19 @@ fn collect_files(
     }
 }
 
-fn scan_and_copy(
-    dir: &Path,
-    app_data_dir: &Path,
-    since: SystemTime,
-) -> Result<ScanResult, String> {
+fn scan_turn_files(dir: &Path, since: SystemTime) -> Result<ScanResult, String> {
     let mut files = Vec::new();
     let mut seen = 0usize;
     collect_files(dir, 0, since, &mut files, &mut seen);
     files.sort_by_key(|(mtime, _, _)| *mtime);
 
     let mut result = ScanResult::default();
-    let mut total = 0u64;
     for (modified, path, size) in files {
+        if result.files.len() >= MAX_FILES_PER_TURN {
+            break;
+        }
         let ext = sanitize_ext(path.extension().and_then(|e| e.to_str()).unwrap_or("bin"));
-        if is_deliverable_ext(&ext) {
-            if result.deliverables.len() >= MAX_ARTIFACTS_PER_TURN
-                || total + size > MAX_TOTAL_BYTES
-            {
-                continue;
-            }
-            // Read + hash + content-addressed write. The file could disappear
-            // between scan and read (tool cleanup); skip instead of failing the
-            // whole registration.
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            let rel = match crate::file_store::write_blob(app_data_dir, &bytes, &ext) {
-                Ok(rel) => rel,
-                Err(e) => {
-                    tracing::warn!(error = %e, path = %path.display(), "artifact blob write failed");
-                    continue;
-                }
-            };
-            let Some((hash, ext)) = crate::file_store::parse_blob_path(&rel) else {
-                continue;
-            };
-            total += size;
-            result.deliverables.push(Candidate {
-                hash,
-                ext,
-                name: source_name(&path),
-                size,
-            });
-            continue;
-        }
-
-        // Local process file: keep metadata only. No blob, no sync.
-        if result.process.len() >= MAX_PROCESS_FILES_PER_TURN {
-            continue;
-        }
-        result.process.push(ProcessFile {
+        result.files.push(LocalFile {
             name: source_name(&path),
             path: path.to_string_lossy().into_owned(),
             ext,
@@ -289,136 +208,71 @@ fn scan_and_copy(
     Ok(result)
 }
 
-/// Register files written into `dir` since `since` as artifacts of the turn
-/// that just produced `message_id`. Returns the newly registered rows.
+/// Index files written into `dir` since `since` for the turn that produced
+/// `message_id`. This only writes the device-local file table: bytes remain in
+/// the workspace and are copied into the blob store only when the user asks to
+/// sync an artifact from the sidebar.
 pub async fn register_turn_artifacts(
     db: &SqlitePool,
-    app_data_dir: &Path,
+    _app_data_dir: &Path,
     session_id: &str,
     message_id: &str,
     dir: Option<&str>,
     since: SystemTime,
-) -> Result<Vec<Artifact>, String> {
+) -> Result<(), String> {
     let Some(dir) = dir.filter(|d| !d.trim().is_empty()) else {
-        return Ok(Vec::new());
+        return Ok(());
     };
     let dir = PathBuf::from(dir);
     if !dir.is_dir() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let scan_root = dir.clone();
-    let app_dir = app_data_dir.to_path_buf();
     let since = since.checked_sub(MTIME_SLACK).unwrap_or(since);
-    let scan = tokio::task::spawn_blocking(move || scan_and_copy(&scan_root, &app_dir, since))
+    let scan = tokio::task::spawn_blocking(move || scan_turn_files(&scan_root, since))
         .await
         .map_err(|e| format!("artifact scan task failed: {e}"))??;
-    if scan.deliverables.is_empty() && scan.process.is_empty() {
-        return Ok(Vec::new());
-    }
 
-    // Process files stay in the working directory. The local table is not a
-    // CRR and never enters blob sync; it only powers the session artifact
-    // panel. A path can be produced again in a later turn, so upsert it.
-    for p in scan.process {
+    for f in scan.files {
         sqlx::query(
             "INSERT INTO session_process_files \
-             (id, session_id, message_id, name, path, ext, size, modified_at_ms, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(session_id, path) DO UPDATE SET \
-               message_id = excluded.message_id, \
-               name = excluded.name, \
-               ext = excluded.ext, \
-               size = excluded.size, \
-               modified_at_ms = excluded.modified_at_ms, \
-               created_at = excluded.created_at",
+             (id, session_id, message_id, name, path, ext, size, modified_at_ms, artifact_id, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(session_id)
         .bind(message_id)
-        .bind(&p.name)
-        .bind(&p.path)
-        .bind(&p.ext)
-        .bind(p.size as i64)
-        .bind(p.modified_at_ms)
+        .bind(&f.name)
+        .bind(&f.path)
+        .bind(&f.ext)
+        .bind(f.size as i64)
+        .bind(f.modified_at_ms)
         .bind(now_iso())
         .execute(db)
         .await
         .map_err(|e| format!("db error: {e}"))?;
     }
-
-    let mut out = Vec::new();
-    for c in scan.deliverables {
-        // The same content rewritten in a later turn is already registered
-        // for this session; skip the duplicate index row (the blob stays).
-        let exists: Option<(String,)> = sqlx::query_as(
-            "SELECT id FROM session_artifacts WHERE session_id = ? AND hash = ? LIMIT 1",
-        )
-        .bind(session_id)
-        .bind(&c.hash)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| format!("db error: {e}"))?;
-        if exists.is_some() {
-            continue;
-        }
-        let id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO session_artifacts (id, session_id, message_id, hash, ext, name, size, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(session_id)
-        .bind(message_id)
-        .bind(&c.hash)
-        .bind(&c.ext)
-        .bind(&c.name)
-        .bind(c.size as i64)
-        .bind(now_iso())
-        .execute(db)
-        .await
-        .map_err(|e| format!("db error: {e}"))?;
-        // Proactively push small blobs to the account archive so the peer can
-        // open them without waiting for a request round-trip.
-        crate::sync::attachments::mark_blob_pending_push(db, app_data_dir, &c.hash, &c.ext).await;
-        out.push(Artifact {
-            hash: c.hash,
-            ext: c.ext,
-            name: c.name,
-        });
-    }
-    Ok(out)
+    Ok(())
 }
 
-/// Newest artifacts of a session that are present locally, for the turn
-/// prompt (`name`, `siku://...` URI, absolute path). Missing blobs are skipped:
-/// the model must not be told to read a file that is not here yet.
+/// Newest local files of a session, for the next turn's context prompt.
 pub async fn recent_local_paths(
     db: &SqlitePool,
-    app_data_dir: &Path,
     session_id: &str,
     limit: i64,
-) -> Vec<(String, String, String)> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT name, hash, ext FROM session_artifacts \
-         WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+) -> Vec<(String, String)> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, path FROM session_process_files \
+         WHERE session_id = ? ORDER BY COALESCE(modified_at_ms, 0) DESC, created_at DESC LIMIT ?",
     )
     .bind(session_id)
     .bind(limit.clamp(1, 50))
     .fetch_all(db)
     .await
     .unwrap_or_default();
-    let mut out = Vec::new();
-    for (name, hash, ext) in rows {
-        let path = crate::file_store::blob_path(app_data_dir, &hash, &ext);
-        if path.exists() {
-            out.push((
-                name,
-                artifact_uri(&hash, &ext),
-                path.to_string_lossy().into_owned(),
-            ));
-        }
-    }
-    out
+    rows.into_iter()
+        .filter(|(_, path)| Path::new(path).is_file())
+        .collect()
 }
 
 #[cfg(test)]
@@ -439,25 +293,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registers_only_files_written_since_turn_start() {
+    async fn indexes_all_turn_files_locally_without_blobs() {
         let root = tempfile::tempdir().unwrap();
         let app = tempfile::tempdir().unwrap();
         let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::query(
-            "CREATE TABLE session_artifacts (
-                id TEXT PRIMARY KEY NOT NULL,
-                session_id TEXT NOT NULL DEFAULT '',
-                message_id TEXT NOT NULL DEFAULT '',
-                hash TEXT NOT NULL DEFAULT '',
-                ext TEXT NOT NULL DEFAULT '',
-                name TEXT NOT NULL DEFAULT '',
-                size INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT ''
-            )",
-        )
-        .execute(&db)
-        .await
-        .unwrap();
         sqlx::query(
             "CREATE TABLE session_process_files (
                 id TEXT PRIMARY KEY NOT NULL,
@@ -468,14 +307,9 @@ mod tests {
                 ext TEXT NOT NULL DEFAULT '',
                 size INTEGER NOT NULL DEFAULT 0,
                 modified_at_ms INTEGER,
+                artifact_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT ''
             )",
-        )
-        .execute(&db)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE UNIQUE INDEX idx_session_process_files_path ON session_process_files(session_id, path)",
         )
         .execute(&db)
         .await
@@ -483,60 +317,48 @@ mod tests {
 
         let old = root.path().join("old.txt");
         std::fs::write(&old, "old").unwrap();
-        let old_mtime = SystemTime::now() - Duration::from_secs(3600);
-        filetime_set(&old, old_mtime);
-        let new = root.path().join("report.md");
-        std::fs::write(&new, "fresh report").unwrap();
-        // Images and generic tool files must stay local process files.
+        filetime_set(&old, SystemTime::now() - Duration::from_secs(3600));
+        std::fs::write(root.path().join("report.md"), "fresh report").unwrap();
         std::fs::write(root.path().join("chart.png"), "png").unwrap();
         std::fs::write(root.path().join("settings.dat"), "data").unwrap();
-        // Browser profile internals must be ignored before the process index.
+        // Browser profile internals are skipped as tool scratch.
         let profile = root.path().join("chrome").join("User Data").join("Default");
         std::fs::create_dir_all(&profile).unwrap();
         std::fs::write(profile.join("f_00b858"), "profile").unwrap();
 
-        let since = SystemTime::now() - Duration::from_secs(60);
-        let artifacts = register_turn_artifacts(
+        register_turn_artifacts(
             &db,
             app.path(),
             "s1",
             "m1",
             Some(&root.path().to_string_lossy()),
-            since,
+            SystemTime::now() - Duration::from_secs(60),
         )
         .await
         .unwrap();
-        assert_eq!(artifacts.len(), 1, "{artifacts:?}");
-        assert_eq!(artifacts[0].name, "report.md");
-        assert_eq!(artifacts[0].ext, "md");
 
-        let rows: Vec<(String, String, String, i64)> =
-            sqlx::query_as("SELECT session_id, hash, ext, size FROM session_artifacts")
-                .fetch_all(&db)
-                .await
-                .unwrap();
-        assert_eq!(rows.len(), 1);
-        let process: Vec<(String, String)> =
-            sqlx::query_as("SELECT name, ext FROM session_process_files ORDER BY name")
-                .fetch_all(&db)
-                .await
-                .unwrap();
-        assert_eq!(
-            process,
-            vec![
-                ("chart.png".to_string(), "png".to_string()),
-                ("settings.dat".to_string(), "dat".to_string())
-            ],
-            "images/generic files are local process files; Chrome profile is ignored"
-        );
-        assert_eq!(rows[0].0, "s1");
-        let uri = artifact_uri(&rows[0].1, &rows[0].2);
-        let resolved = resolve_uri(app.path(), &uri).unwrap();
-        assert!(resolved.ends_with(&format!(".{}", rows[0].2)));
-        assert!(Path::new(&resolved).exists());
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT name, ext, path, artifact_id FROM session_process_files ORDER BY name",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[0].0, "chart.png");
+        assert_eq!(rows[1].0, "report.md");
+        assert_eq!(rows[2].0, "settings.dat");
+        assert!(rows.iter().all(|row| row.3.is_empty()), "nothing is synced by default");
 
-        // Re-registering the same content is a no-op (same session + hash).
-        let again = register_turn_artifacts(
+        let blobs = crate::file_store::blob_dir(app.path());
+        assert!(!blobs.exists(), "scanning must not create a blob store");
+
+        let recent = recent_local_paths(&db, "s1", 10).await;
+        assert_eq!(recent.len(), 3);
+        assert!(recent.iter().any(|(name, _)| name == "report.md"));
+
+        // A second turn creates its own rows; it must not overwrite the first
+        // turn's message association.
+        register_turn_artifacts(
             &db,
             app.path(),
             "s1",
@@ -546,12 +368,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(again.is_empty());
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM session_process_files")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 6);
+        db.close().await;
     }
 
-    /// `std::fs` has no set-mtime; use the libc-free `filetime`-less trick:
-    /// write the file via a subprocess? No — tests run on Linux/macOS/Windows
-    /// with `std` only. Use `std::fs::File::set_times` (Rust 1.75+).
     fn filetime_set(path: &std::path::Path, t: SystemTime) {
         let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_times(std::fs::FileTimes::new().set_modified(t))

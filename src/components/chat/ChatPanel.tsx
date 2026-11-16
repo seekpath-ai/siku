@@ -456,6 +456,7 @@ export function ChatPanel() {
         onToggleArtifacts={() => setArtifactsOpen((v) => !v)}
         artifactsOpen={artifactsOpen}
         onBindProject={() => void bindProjectPath()}
+        hasLocalWorkingDir={!!activeSession.working_dir?.trim()}
       />
       {activeSession && foreignOrigin && (
         <div className="shrink-0 flex items-center gap-2 px-5 py-1.5 border-b border-surface-hover bg-warning/10 text-[11px] text-text-secondary">

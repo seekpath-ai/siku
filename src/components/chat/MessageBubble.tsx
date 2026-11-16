@@ -373,7 +373,11 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
                 {normalizedContent}
               </ReactMarkdown>
             </div>
-            <ArtifactSection artifacts={splitContent.artifacts} />
+            <ArtifactSection
+              artifacts={splitContent.artifacts}
+              sessionId={message.session_id}
+              messageId={message.id}
+            />
             {/* Files this reply sent to the user's chat app (remote IM only). */}
             {message.attachments && outboundFiles.length > 0 && (
               <div className="flex flex-wrap gap-2 mt-2">

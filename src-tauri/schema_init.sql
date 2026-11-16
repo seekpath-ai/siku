@@ -408,12 +408,13 @@ CREATE TABLE IF NOT EXISTS session_process_files (
     ext TEXT NOT NULL DEFAULT '',
     size INTEGER NOT NULL DEFAULT 0,
     modified_at_ms INTEGER,
+    artifact_id TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT ''
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_session_process_files_path
-    ON session_process_files(session_id, path);
 CREATE INDEX IF NOT EXISTS idx_session_process_files_session
     ON session_process_files(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_process_files_message
+    ON session_process_files(session_id, message_id);
 
 -- agent_steps: one row per ReAct iteration (thought + tool_calls + observations)
 -- CRR 形状（在 OPTIONAL_SYNC_TABLES 中）：主键 NOT NULL、无受检外键、

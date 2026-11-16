@@ -6,11 +6,12 @@ import {
   FileSpreadsheet,
   FileText,
   Presentation,
+  Video,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { SIKU_ARTIFACT_SCHEME } from '@/lib/artifact';
 
-export type ArtifactKind = 'document' | 'image' | 'sheet' | 'code' | 'archive' | 'other';
+export type ArtifactKind = 'document' | 'image' | 'video' | 'sheet' | 'code' | 'archive' | 'other';
 
 export function artifactExt(uri: string): string {
   if (!uri.startsWith(SIKU_ARTIFACT_SCHEME)) return '';
@@ -24,6 +25,7 @@ export function artifactKind(ext: string): ArtifactKind {
   if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif', 'ico'].includes(e)) {
     return 'image';
   }
+  if (['mp4', 'webm', 'mov', 'm4v', 'mkv', 'avi'].includes(e)) return 'video';
   if (['xls', 'xlsx', 'csv', 'ods'].includes(e)) return 'sheet';
   if (['ppt', 'pptx', 'key', 'odp'].includes(e)) return 'document';
   if (['pdf', 'doc', 'docx', 'md', 'txt', 'rtf', 'odt'].includes(e)) return 'document';
@@ -43,6 +45,7 @@ export function artifactKind(ext: string): ArtifactKind {
 const ICONS: Record<ArtifactKind, LucideIcon> = {
   document: FileText,
   image: FileImage,
+  video: Video,
   sheet: FileSpreadsheet,
   code: FileCode2,
   archive: FileArchive,
@@ -52,6 +55,7 @@ const ICONS: Record<ArtifactKind, LucideIcon> = {
 const COLORS: Record<ArtifactKind, string> = {
   document: 'text-sky-400',
   image: 'text-emerald-400',
+  video: 'text-fuchsia-400',
   sheet: 'text-lime-400',
   code: 'text-amber-400',
   archive: 'text-purple-400',

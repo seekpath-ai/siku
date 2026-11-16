@@ -551,11 +551,13 @@ export async function artifactResolve(uri: string): Promise<string> {
   return invoke<string>('artifact_resolve', { uri });
 }
 
-export type SessionArtifactKind = 'deliverable' | 'process';
+export type SessionArtifactKind = 'local' | 'synced';
 
 export interface SessionArtifactItem {
   id: string;
   kind: SessionArtifactKind;
+  synced: boolean;
+  message_id: string;
   name: string;
   ext: string;
   size: number;
@@ -567,6 +569,34 @@ export interface SessionArtifactItem {
 
 export async function sessionArtifactsList(sessionId: string): Promise<SessionArtifactItem[]> {
   return invoke<SessionArtifactItem[]>('session_artifacts_list', { sessionId });
+}
+
+export async function sessionTurnFiles(
+  sessionId: string,
+  messageId: string
+): Promise<SessionArtifactItem[]> {
+  return invoke<SessionArtifactItem[]>('session_turn_files', { sessionId, messageId });
+}
+
+export interface ArtifactSyncResult {
+  synced: number;
+  bytes: number;
+  errors: string[];
+}
+
+export async function sessionArtifactsSync(
+  sessionId: string,
+  ids: string[]
+): Promise<ArtifactSyncResult> {
+  return invoke<ArtifactSyncResult>('session_artifacts_sync', { sessionId, ids });
+}
+
+export async function localArtifactSaveAs(
+  sessionId: string,
+  id: string,
+  savePath: string
+): Promise<void> {
+  return invoke<void>('local_artifact_save_as', { sessionId, id, savePath });
 }
 
 export async function artifactSaveAs(uri: string, savePath: string): Promise<void> {

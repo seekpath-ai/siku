@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use tauri::State;
 use tracing::instrument;
 
@@ -14,18 +16,42 @@ fn builtin_skills_dir(state: &AppState) -> Option<&std::path::Path> {
     state.builtin_skills_dir.as_deref()
 }
 
+const IGNORED_DEPS_KEY: &str = "skills.ignored_dependencies";
+
+async fn ignored_dependencies(db: &sqlx::SqlitePool) -> HashMap<String, Vec<String>> {
+    crate::core::settings_service::get_device_setting(db, IGNORED_DEPS_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default()
+}
+
+fn apply_ignored(deps: &mut [DepStatus], ignored: &[String]) {
+    for dep in deps {
+        dep.ignored = ignored.iter().any(|n| n == &dep.name);
+    }
+}
+
 /// List installed skills (built-in first-party + user-imported) for the
 /// plugins dialog.
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn skills_list(state: State<'_, AppState>) -> Result<Vec<SkillInfo>, String> {
-    Ok(skills::list_all(
+    let mut list = skills::list_all(
         &state.db,
         &state.app_data_dir,
         builtin_skills_dir(&state),
         &user_skills_dir(&state),
     )
-    .await)
+    .await;
+    let ignored = ignored_dependencies(&state.db).await;
+    for skill in &mut list {
+        if let Some(names) = ignored.get(&skill.name) {
+            apply_ignored(&mut skill.dependencies, names);
+        }
+    }
+    Ok(list)
 }
 
 /// Full skill detail (incl. SKILL.md body + review record + probed
@@ -56,7 +82,7 @@ pub async fn skills_get(state: State<'_, AppState>, name: String) -> Result<Skil
         },
     };
     let declared = !skill.requires.is_empty();
-    let dependencies = if declared {
+    let mut dependencies = if declared {
         skills::probe_dependencies_cached(&state.app_data_dir, &skill.requires, &skill.dir)
     } else {
         record
@@ -64,6 +90,10 @@ pub async fn skills_get(state: State<'_, AppState>, name: String) -> Result<Skil
             .map(|rec| skills::probe_review_dependencies(&state.app_data_dir, rec, &skill.dir))
             .unwrap_or_default()
     };
+    let ignored = ignored_dependencies(&state.db).await;
+    if let Some(names) = ignored.get(&name) {
+        apply_ignored(&mut dependencies, names);
+    }
     let dependency_source = if declared {
         "declared".to_string()
     } else if record.is_some() {
@@ -191,6 +221,73 @@ pub async fn skills_env_install(
         python.display(),
         packages.join("、")
     ))
+}
+
+/// Per-package install for the plugins dialog. Unlike `skills_env_install`,
+/// this returns one outcome per package so a bad inferred name cannot block
+/// the whole batch.
+#[tauri::command]
+pub async fn skills_env_install_many(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    packages: Vec<String>,
+) -> Result<Vec<crate::core::skill_env::InstallOutcome>, String> {
+    if packages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let legal = |p: &str| {
+        !p.is_empty()
+            && p.len() <= 64
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '[' | ']'))
+    };
+    if !packages.iter().all(|p| legal(p)) {
+        return Err("依赖包名包含非法字符".to_string());
+    }
+    use tauri::Emitter;
+    let cb: crate::core::skill_env::ProgressFn = Box::new(move |msg: &str| {
+        let _ = app_handle.emit("skills:env-install", serde_json::json!({ "message": msg }));
+    });
+    let out = crate::core::skill_env::install_packages_individually(
+        &state.app_data_dir,
+        &packages,
+        Some(&cb),
+    )
+    .await?;
+    skills::clear_dependency_cache();
+    Ok(out)
+}
+
+/// Python path of the isolated environment, for copy/manual-install escape.
+#[tauri::command]
+pub fn skills_env_python(state: State<'_, AppState>) -> Option<String> {
+    crate::core::skill_env::resolve(&state.app_data_dir)
+        .python
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+/// Persist a local ignore override for an inferred dependency. This is
+/// device-local: it never edits the skill's SKILL.md and does not sync.
+#[tauri::command]
+pub async fn skills_set_dependency_ignored(
+    state: State<'_, AppState>,
+    skill: String,
+    dependency: String,
+    ignored: bool,
+) -> Result<(), String> {
+    let mut map = ignored_dependencies(&state.db).await;
+    let names = map.entry(skill).or_default();
+    if ignored {
+        if !names.contains(&dependency) {
+            names.push(dependency);
+        }
+    } else {
+        names.retain(|n| n != &dependency);
+    }
+    let value = serde_json::to_string(&map).map_err(|e| format!("json: {e}"))?;
+    crate::core::settings_service::set_device_setting(&state.db, IGNORED_DEPS_KEY, &value).await?;
+    skills::clear_dependency_cache();
+    Ok(())
 }
 
 /// Result of `skills_review_start`: the reviewer session to display plus the

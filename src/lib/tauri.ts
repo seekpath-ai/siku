@@ -1005,8 +1005,18 @@ export interface SkillDepStatus {
   available: boolean;
   /** 可选依赖（如 LibreOffice 视觉自检）不阻塞挂载。 */
   optional?: boolean;
+  /** 本地忽略的误报依赖。 */
+  ignored?: boolean;
   /** 缺失时的补充指引（隔离环境状态）。 */
   hint?: string | null;
+}
+
+export interface SkillInstallResult {
+  name: string;
+  ok: boolean;
+  error?: string | null;
+  /** "not_found" | "network" | "failed" */
+  code?: string | null;
 }
 
 export interface SkillDetail {
@@ -1043,6 +1053,25 @@ export async function skillsGet(name: string): Promise<SkillDetail> {
  *  进度经 `skills:env-install` 事件推送。 */
 export async function skillsEnvInstall(packages: string[]): Promise<string> {
   return invoke<string>('skills_env_install', { packages });
+}
+
+/** Per-package install: one bad inferred name cannot fail the whole batch. */
+export async function skillsEnvInstallMany(packages: string[]): Promise<SkillInstallResult[]> {
+  return invoke<SkillInstallResult[]>('skills_env_install_many', { packages });
+}
+
+/** Isolated Python path, used for copy/manual-install escape. */
+export async function skillsEnvPython(): Promise<string | null> {
+  return invoke<string | null>('skills_env_python');
+}
+
+/** Persist/remove a device-local ignore override for an inferred dependency. */
+export async function skillsSetDependencyIgnored(
+  skill: string,
+  dependency: string,
+  ignored: boolean,
+): Promise<void> {
+  return invoke<void>('skills_set_dependency_ignored', { skill, dependency, ignored });
 }
 
 /** Static scan report (deterministic, pre-LLM). */

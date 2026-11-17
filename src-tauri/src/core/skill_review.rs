@@ -238,19 +238,6 @@ pub fn python_module_available(module: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Common Python standard-library / built-in modules that must not become
-/// inferred pip packages when a user skill has no `requires` metadata.
-const STDLIB_MODULES: &[&str] = &[
-    "os", "sys", "re", "json", "math", "time", "datetime", "pathlib", "typing",
-    "collections", "itertools", "functools", "subprocess", "shutil", "tempfile",
-    "argparse", "logging", "unittest", "dataclasses", "enum", "io", "csv", "sqlite3",
-    "hashlib", "base64", "random", "statistics", "decimal", "fractions", "glob",
-    "threading", "multiprocessing", "asyncio", "urllib", "http", "html", "xml",
-    "zipfile", "tarfile", "gzip", "struct", "socket", "ssl", "email", "uuid",
-    "textwrap", "pprint", "traceback", "warnings", "contextlib", "copy", "pickle",
-    "concurrent", "ctypes", "platform", "getpass", "webbrowser", "tkinter", "venv",
-];
-
 /// Import module name → pip distribution name for common packages. Unknown
 /// modules fall back to the module name, which is correct for most pip names.
 fn module_to_pip(module: &str) -> Option<&str> {
@@ -269,13 +256,16 @@ fn module_to_pip(module: &str) -> Option<&str> {
         "requests" => Some("requests"),
         "lxml" => Some("lxml"),
         "fpdf" => Some("fpdf2"),
-        _ if STDLIB_MODULES.contains(&module) || module.starts_with('_') => None,
-        _ => Some(module),
+        // Unknown modules are intentionally NOT treated as pip packages:
+        // names like Node's `process` are not PyPI distributions and would
+        // otherwise make a whole batch install fail. Authors can declare
+        // uncommon packages explicitly in `requires`.
+        _ => None,
     }
 }
 
 /// Extract referenced binaries and pip packages from the skill's text.
-fn extract_dependencies(all_text: &str) -> Vec<Dependency> {
+fn extract_dependencies(all_text: &str, python_text: &str) -> Vec<Dependency> {
     let mut deps: Vec<Dependency> = Vec::new();
     for bin in KNOWN_BINARIES {
         let pat = format!(r"(?i)(?:^|[^a-z0-9-]){}(?:[^a-z0-9-]|$)", regex::escape(bin));
@@ -317,7 +307,7 @@ fn extract_dependencies(all_text: &str) -> Vec<Dependency> {
     )
     .unwrap();
     let python_ok = binary_available("python3");
-    for cap in import_re.captures_iter(all_text) {
+    for cap in import_re.captures_iter(python_text) {
         let module = cap
             .get(1)
             .or_else(|| cap.get(2))
@@ -352,6 +342,7 @@ pub fn static_scan(dir: &Path) -> StaticReport {    let rules: Vec<(Rule, regex:
     let files = collect_files(dir);
     let mut findings = Vec::new();
     let mut all_text = String::new();
+    let mut python_text = String::new();
     let mut scanned = Vec::new();
 
     for file in &files {
@@ -368,6 +359,11 @@ pub fn static_scan(dir: &Path) -> StaticReport {    let rules: Vec<(Rule, regex:
         scanned.push(rel.clone());
         all_text.push_str(&text);
         all_text.push('\n');
+        let is_python = rel.ends_with(".py") || rel.ends_with(".pyw");
+        if is_python {
+            python_text.push_str(&text);
+            python_text.push('\n');
+        }
         for (line_no, line) in text.lines().enumerate() {
             for (rule, re) in &rules {
                 if let Some(m) = re.find(line) {
@@ -396,7 +392,7 @@ pub fn static_scan(dir: &Path) -> StaticReport {    let rules: Vec<(Rule, regex:
 
     StaticReport {
         findings,
-        dependencies: extract_dependencies(&all_text),
+        dependencies: extract_dependencies(&all_text, &python_text),
         verdict: verdict.into(),
         content_hash: content_hash(dir),
         scanned_files: scanned,
@@ -581,11 +577,12 @@ mod tests {
 
     #[test]
     fn imports_without_requirements_are_inferred_and_stdlib_skipped() {
-        let deps = extract_dependencies("import os\nimport pptx\nfrom docx import Document\n");
+        let deps = extract_dependencies("", "import os\nimport process\nimport pptx\nfrom docx import Document\n");
         let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"python-pptx"), "{names:?}");
         assert!(names.contains(&"python-docx"), "{names:?}");
         assert!(!names.contains(&"os"), "{names:?}");
+        assert!(!names.contains(&"process"), "{names:?}");
         assert!(deps
             .iter()
             .filter(|d| d.name == "python-pptx")

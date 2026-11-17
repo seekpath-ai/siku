@@ -463,6 +463,36 @@ pub async fn ensure_env(
 }
 
 /// 用环境内的 pip 安装依赖；pypi 官方源失败时回退清华镜像。
+/// Outcome of one package install attempt. Returning one row per package keeps
+/// a bad inferred name from failing the whole batch.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallOutcome {
+    pub name: String,
+    pub ok: bool,
+    pub error: Option<String>,
+    /// "not_found" | "network" | "failed"
+    pub code: Option<String>,
+}
+
+fn install_error_code(err: &str) -> &'static str {
+    if err.contains("No matching distribution found")
+        || err.contains("Could not find a version that satisfies")
+        || err.contains("No matching distribution")
+    {
+        "not_found"
+    } else if err.contains("timed out")
+        || err.contains("Connection")
+        || err.contains("Temporary failure")
+        || err.contains("Network")
+        || err.contains("SSL")
+    {
+        "network"
+    } else {
+        "failed"
+    }
+}
+
 async fn pip_install(python: &Path, packages: &[String], progress: &Option<&ProgressFn>) -> Result<(), String> {
     let python = python.to_path_buf();
     let packages: Vec<String> = packages.to_vec();
@@ -476,8 +506,13 @@ async fn pip_install(python: &Path, packages: &[String], progress: &Option<&Prog
         };
         match run_capture(&mut base_args(&[]), "安装依赖包") {
             Ok(log) => Ok(log),
+            Err(e) if install_error_code(&e) == "not_found" => {
+                // A missing distribution is not a network problem; retrying a
+                // mirror only wastes time and hides the real cause.
+                Err(e)
+            }
             Err(e) => {
-                // 网络原因回退清华镜像重试一次。
+                // Network/transient failure: fall back to the Tsinghua mirror.
                 run_capture(
                     &mut base_args(&["-i", "https://pypi.tuna.tsinghua.edu.cn/simple"]),
                     "安装依赖包（镜像重试）",
@@ -489,6 +524,39 @@ async fn pip_install(python: &Path, packages: &[String], progress: &Option<&Prog
     .await
     .map_err(|e| format!("安装依赖任务失败：{e}"))??;
     Ok(())
+}
+
+/// Ensure the isolated env exists, then install each package separately so one
+/// invalid/unavailable package cannot block the rest. Returns per-package
+/// outcomes; env-creation failures still return Err.
+pub async fn install_packages_individually(
+    app_data_dir: &Path,
+    packages: &[String],
+    progress: Option<&ProgressFn>,
+) -> Result<Vec<InstallOutcome>, String> {
+    ensure_env(app_data_dir, &[], progress).await?;
+    let _guard = install_lock().lock().await;
+    let python = resolve(app_data_dir)
+        .python
+        .ok_or_else(|| "隔离环境已创建，但未找到 Python 解释器".to_string())?;
+    let mut out = Vec::with_capacity(packages.len());
+    for package in packages {
+        match pip_install(&python, std::slice::from_ref(package), &progress).await {
+            Ok(_) => out.push(InstallOutcome {
+                name: package.clone(),
+                ok: true,
+                error: None,
+                code: None,
+            }),
+            Err(err) => out.push(InstallOutcome {
+                name: package.clone(),
+                ok: false,
+                code: Some(install_error_code(&err).to_string()),
+                error: Some(err),
+            }),
+        }
+    }
+    Ok(out)
 }
 
 /// 静默安装 Miniconda 到指定目录。Unix 用 `-b -p`；Windows 用 NSIS 静默
@@ -539,7 +607,22 @@ fn install_miniconda(installer: &Path, root: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn install_errors_are_classified_before_retry() {
+        assert_eq!(
+            install_error_code("ERROR: No matching distribution found for process"),
+            "not_found"
+        );
+        assert_eq!(
+            install_error_code("Could not find a version that satisfies the requirement process"),
+            "not_found"
+        );
+        assert_eq!(install_error_code("Connection timed out"), "network");
+        assert_eq!(install_error_code("permission denied"), "failed");
+    }
+
     /// conda 布局：根目录下按平台放 conda 可执行文件与 envs/<name>/python。
+
     fn fake_conda(root: &Path, with_env: bool) {
         let (exe, py): (&str, &str) = if cfg!(windows) {
             ("Scripts/conda.exe", "python.exe")

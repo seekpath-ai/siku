@@ -668,6 +668,9 @@ pub struct DepStatus {
     /// Optional deps (e.g. LibreOffice preview) never block mounting.
     #[serde(default)]
     pub optional: bool,
+    /// Locally ignored false-positive inferred dependency.
+    #[serde(default)]
+    pub ignored: bool,
     /// 缺失时的补充指引（如 pip 依赖所在的隔离环境状态）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -689,6 +692,7 @@ pub fn probe_dependencies(app_data_dir: &Path, requires: &SkillRequires) -> Vec<
             name: name.to_string(),
             available: crate::core::skill_review::binary_available(name),
             optional,
+            ignored: false,
             hint: None,
         });
     };
@@ -719,6 +723,7 @@ pub fn probe_dependencies(app_data_dir: &Path, requires: &SkillRequires) -> Vec<
                 name: p.to_string(),
                 available,
                 optional,
+                ignored: false,
                 hint: if available { None } else { missing_hint.clone() },
             });
         };

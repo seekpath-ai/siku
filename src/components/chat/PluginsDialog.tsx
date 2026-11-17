@@ -6,8 +6,8 @@ import {
 import {
   skillsList, skillsGet, skillsImportFolder, skillsImportZip, skillsDelete,
   skillsOpenDirectory, agentSetSessionSkills, skillsReviewStart, skillsReviewCollect,
-  skillsEnvInstall,
-  type SkillInfo, type SkillDetail,
+  skillsEnvInstallMany, skillsEnvPython, skillsSetDependencyIgnored,
+  type SkillInfo, type SkillDetail, type SkillInstallResult,
 } from '@/lib/tauri';
 import type { AgentStreamEvent } from '@/lib/types';
 import { useChatStore } from '@/stores/chatStore';
@@ -40,6 +40,8 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   /** pip 依赖一键安装进行中（详情弹窗内）。 */
   const [installingDeps, setInstallingDeps] = useState(false);
   const [installingCard, setInstallingCard] = useState<string | null>(null);
+  const [depSelection, setDepSelection] = useState<Set<string>>(new Set());
+  const [depResults, setDepResults] = useState<{ skill: string; results: SkillInstallResult[] } | null>(null);
   /** 隔离环境安装的当前进度行（skills:env-install 事件推送）。 */
   const [installProgress, setInstallProgress] = useState<string | null>(null);
   /** skill name → reviewer session id for in-flight AI reviews. */
@@ -140,6 +142,7 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
     const cached = skillDetailCache.get(name);
     if (cached) {
       setDetail(cached);
+      setDepSelection(defaultSelection(cached));
       setDetailLoading(null);
       return;
     }
@@ -148,6 +151,7 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
       const next = await skillsGet(name);
       skillDetailCache.set(name, next);
       setDetail(next);
+      setDepSelection(defaultSelection(next));
     } catch (err) {
       setError(String(err));
     } finally {
@@ -228,6 +232,20 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
         }
       }
     }
+    if (isAdding) {
+      const deps =
+        detail?.name === name
+          ? detail.dependencies
+          : skills.find((s) => s.name === name)?.dependencies ?? [];
+      const missing = deps.filter((d) => !d.available && !d.optional && !d.ignored);
+      if (missing.length > 0) {
+        const ok = await confirm(
+          `缺少运行依赖：${missing.map((d) => d.name).join('、')}。挂载后相关功能可能不可用，仍要挂载吗？`,
+          { title: '依赖未齐' },
+        );
+        if (!ok) return;
+      }
+    }
     const next = current.includes(name)
       ? current.filter((n) => n !== name)
       : [...current, name];
@@ -278,59 +296,147 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   const builtinSkills = filtered.filter((s) => s.source === 'builtin');
   const userSkills = filtered.filter((s) => s.source !== 'builtin');
 
-  /** Install missing pip dependencies directly from a plugin card. */
-  const installForCard = async (skill: SkillInfo) => {
-    const missing = skill.dependencies
-      .filter((d) => d.kind === 'pip' && !d.available)
-      .map((d) => d.name);
-    if (missing.length === 0 || installingCard || installingDeps) return;
-    setInstallingCard(skill.name);
+  /** Dependencies selected by default when opening the detail page. Declared
+   *  packages are opt-in checked; review-inferred packages are NOT installed
+   *  automatically (they are heuristics and may be false positives). */
+  const defaultSelection = (d: SkillDetail) =>
+    new Set(
+      d.dependencies
+        .filter(
+          (dep) =>
+            dep.kind === 'pip' &&
+            !dep.available &&
+            !dep.ignored &&
+            d.dependencySource === 'declared'
+        )
+        .map((dep) => dep.name)
+    );
+
+  const runInstall = async (skillName: string, packages: string[]) => {
+    if (packages.length === 0) return;
     setInstallProgress(null);
     const { listen } = await import('@tauri-apps/api/event');
     const unlisten = await listen<{ message: string }>('skills:env-install', (e) => {
       setInstallProgress(e.payload.message);
     });
     try {
-      const msg = await skillsEnvInstall(missing);
-      notify(msg, 'success');
+      const results = await skillsEnvInstallMany(packages);
+      setDepResults({ skill: skillName, results });
       skillDetailCache.clear();
       await load();
+      if (detail?.name === skillName) {
+        const next = await skillsGet(skillName);
+        skillDetailCache.set(skillName, next);
+        setDetail(next);
+        setDepSelection(defaultSelection(next));
+      }
     } catch (err) {
       setError(String(err));
     } finally {
       unlisten();
-      setInstallingCard(null);
       setInstallProgress(null);
+      skillsListCache = null;
     }
   };
 
-  /** 安装缺失的 pip 依赖到应用托管的隔离 conda 环境（不碰系统 Python），
-   *  然后刷新探测结果。 */
-  const installMissingDeps = async (detail: SkillDetail) => {
-    const missing = detail.dependencies
-      .filter((d) => d.kind === 'pip' && !d.available)
+  /** Declared deps may be installed in one click; review-inferred deps must be
+   *  inspected/selected in the detail dialog. */
+  const installForCard = async (skill: SkillInfo) => {
+    if (skill.dependencySource === 'review') {
+      await openDetail(skill.name);
+      return;
+    }
+    const missing = skill.dependencies
+      .filter((d) => d.kind === 'pip' && !d.available && !d.ignored)
       .map((d) => d.name);
-    if (missing.length === 0 || installingDeps) return;
-    setInstallingDeps(true);
-    setInstallProgress(null);
-    // 下载 + 建环境要数分钟：订阅后端进度事件，按钮下方滚动显示当前阶段。
-    const { listen } = await import('@tauri-apps/api/event');
-    const unlisten = await listen<{ message: string }>('skills:env-install', (e) => {
-      setInstallProgress(e.payload.message);
-    });
+    if (missing.length === 0 || installingCard || installingDeps) return;
+    setInstallingCard(skill.name);
     try {
-      const msg = await skillsEnvInstall(missing);
-      notify(msg, 'success');
+      await runInstall(skill.name, missing);
+    } finally {
+      setInstallingCard(null);
+    }
+  };
+
+  const installSelectedDeps = async (d: SkillDetail) => {
+    if (installingDeps) return;
+    const packages = detailDependencies(d).filter(
+      (dep) => dep.kind === 'pip' && !dep.available && !dep.ignored && depSelection.has(dep.name)
+    );
+    if (packages.length === 0) return;
+    setInstallingDeps(true);
+    try {
+      await runInstall(d.name, packages.map((dep) => dep.name));
+    } finally {
+      setInstallingDeps(false);
+    }
+  };
+
+  const detailDependencies = (d: SkillDetail) => d.dependencies;
+
+  const retryFailed = async () => {
+    if (!depResults) return;
+    const failed = depResults.results.filter((r) => !r.ok).map((r) => r.name);
+    if (failed.length === 0) return;
+    await runInstall(depResults.skill, failed);
+  };
+
+  const ignoreDependency = async (skillName: string, dependency: string) => {
+    try {
+      await skillsSetDependencyIgnored(skillName, dependency, true);
       skillDetailCache.clear();
-      await openDetail(detail.name);
+      setDepResults((prev) =>
+        prev ? { ...prev, results: prev.results.filter((r) => r.name !== dependency) } : prev
+      );
       await load();
+      if (detail?.name === skillName) {
+        const next = await skillsGet(skillName);
+        skillDetailCache.set(skillName, next);
+        setDetail(next);
+        setDepSelection(defaultSelection(next));
+      }
     } catch (err) {
       setError(String(err));
-    } finally {
-      unlisten();
-      setInstallingDeps(false);
-      setInstallProgress(null);
     }
+  };
+
+  const restoreDependency = async (skillName: string, dependency: string) => {
+    try {
+      await skillsSetDependencyIgnored(skillName, dependency, false);
+      skillDetailCache.clear();
+      await load();
+      if (detail?.name === skillName) {
+        const next = await skillsGet(skillName);
+        skillDetailCache.set(skillName, next);
+        setDetail(next);
+        setDepSelection(defaultSelection(next));
+      }
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  const copyFailedInstallCommand = async () => {
+    if (!depResults) return;
+    const failed = depResults.results.filter((r) => !r.ok).map((r) => r.name);
+    if (failed.length === 0) return;
+    const python = await skillsEnvPython().catch(() => null);
+    const command = `${python ? `"${python}"` : 'python'} -m pip install ${failed.join(' ')}`;
+    try {
+      await navigator.clipboard.writeText(command);
+      notify('安装命令已复制，可在终端手动执行', 'success');
+    } catch {
+      setError(`无法复制命令，请手动执行：${command}`);
+    }
+  };
+
+  const toggleDepSelection = (name: string) => {
+    setDepSelection((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
   };
 
   /** Review state badge: 绿=通过 / 黄=注意 / 红=风险；stale（审查后内容变更）按待复审显示。 */
@@ -482,10 +588,10 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
                       <div className="grid grid-cols-2 gap-2.5">
                         {group.items.map((s) => {
                           const missingRequired = s.dependencies.filter(
-                            (d) => !d.available && !d.optional
+                            (d) => !d.available && !d.optional && !d.ignored
                           );
                           const missingOptional = s.dependencies.filter(
-                            (d) => !d.available && d.optional
+                            (d) => !d.available && d.optional && !d.ignored
                           );
                           const missingPip = missingRequired.filter((d) => d.kind === 'pip');
                           const missingBin = missingRequired.filter((d) => d.kind !== 'pip');
@@ -573,7 +679,7 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
                                     disabled={installingCard !== null || installingDeps}
                                     className="rounded-md bg-primary/15 px-2 py-1 text-[10px] text-primary hover:bg-primary/25 disabled:opacity-50"
                                   >
-                                    安装依赖
+                                    {s.dependencySource === 'review' ? '选择依赖' : '安装依赖'}
                                   </button>
                                 ) : missingBin.length > 0 ? (
                                   <span
@@ -744,45 +850,92 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
                 <div className="rounded-lg border border-surface-hover bg-background p-3 space-y-2">
                   <div className="flex items-center gap-2">
                     <span className="text-[12px] font-medium text-text-primary">运行依赖</span>
-                    {detail.dependencies.some((d) => d.kind === 'pip' && !d.available) && (
-                      <button
-                        onClick={() => void installMissingDeps(detail)}
-                        disabled={installingDeps || installingCard !== null}
-                        className="ml-auto flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] bg-primary/10 text-primary hover:bg-primary/20 transition-colors disabled:opacity-50"
-                      >
-                        {installingDeps && <Loader2 size={11} className="animate-spin" />}
-                        安装隔离环境依赖
-                      </button>
+                    {detail.dependencySource === 'review' && (
+                      <span className="text-[10px] text-amber-300/80">审查推断，默认不安装</span>
                     )}
+                    <button
+                      onClick={() => void installSelectedDeps(detail)}
+                      disabled={
+                        installingDeps ||
+                        installingCard !== null ||
+                        !detail.dependencies.some(
+                          (d) =>
+                            d.kind === 'pip' &&
+                            !d.available &&
+                            !d.ignored &&
+                            depSelection.has(d.name)
+                        )
+                      }
+                      className="ml-auto flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] bg-primary/10 text-primary hover:bg-primary/20 transition-colors disabled:opacity-50"
+                    >
+                      {installingDeps && <Loader2 size={11} className="animate-spin" />}
+                      安装选中（{depSelection.size}）
+                    </button>
                   </div>
                   {installingDeps && (
                     <p className="text-[10px] text-primary/70 leading-relaxed">
                       {installProgress ?? '正在准备…'}（首次需下载并安装 Miniconda，可能持续数分钟，请保持窗口打开）
                     </p>
                   )}
-                  <div className="text-[11px] text-text-secondary">
+                  <div className="space-y-1">
                     {detail.dependencies.map((d) => (
-                      <span
+                      <div
                         key={`${d.kind}-${d.name}`}
-                        className={`inline-block mr-1.5 px-1 rounded ${
-                          d.available ? 'text-emerald-400/80' : 'text-red-400'
+                        className={`flex items-center gap-2 rounded-md px-1.5 py-1 text-[11px] ${
+                          d.ignored ? 'opacity-50' : ''
                         }`}
-                        title={
-                          d.kind === 'binary'
-                            ? '系统程序'
-                            : `Python 包（隔离环境 siku-office）${d.hint ? `：${d.hint}` : ''}`
-                        }
                       >
-                        {d.name}
-                        {d.optional ? '（可选）' : ''}
-                        {d.available ? '✓' : '✗'}
-                      </span>
+                        {d.kind === 'pip' && !d.available && !d.ignored ? (
+                          <input
+                            type="checkbox"
+                            checked={depSelection.has(d.name)}
+                            onChange={() => toggleDepSelection(d.name)}
+                            className="accent-primary"
+                          />
+                        ) : (
+                          <span className="w-3" />
+                        )}
+                        <span
+                          className={
+                            d.ignored
+                              ? 'text-text-secondary/60 line-through'
+                              : d.available
+                                ? 'text-emerald-400/80'
+                                : d.optional
+                                  ? 'text-text-secondary/70'
+                                  : 'text-red-400'
+                          }
+                          title={
+                            d.kind === 'binary'
+                              ? '系统程序'
+                              : `Python 包（隔离环境 siku-office）${d.hint ? `：${d.hint}` : ''}`
+                          }
+                        >
+                          {d.name}
+                          {d.optional ? '（可选）' : ''}
+                          {d.ignored ? '（已忽略）' : d.available ? ' ✓' : ' ✗'}
+                        </span>
+                        {!d.available && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              d.ignored
+                                ? void restoreDependency(detail.name, d.name)
+                                : void ignoreDependency(detail.name, d.name)
+                            }
+                            className="ml-auto text-[10px] text-text-secondary/50 hover:text-primary"
+                          >
+                            {d.ignored ? '恢复' : '忽略'}
+                          </button>
+                        )}
+                      </div>
                     ))}
                   </div>
                   <p className="text-[10px] text-text-secondary/50 leading-relaxed">
                     pip 包安装在应用托管的隔离 conda 环境（siku-office），不影响系统 Python。
-                    {detail.dependencies.some((d) => d.kind === 'binary' && !d.available && !d.optional) &&
-                      ' 缺失的系统程序需手动安装（soffice 来自 LibreOffice）。'}
+                    {detail.dependencies.some(
+                      (d) => d.kind === 'binary' && !d.available && !d.optional && !d.ignored
+                    ) && ' 缺失的系统程序需手动安装（soffice 来自 LibreOffice）。'}
                   </p>
                 </div>
               )}
@@ -899,6 +1052,78 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
           </div>
         </div>
       )}
+
+      {depResults && (() => {
+        const failed = depResults.results.filter((r) => !r.ok);
+        const installed = depResults.results.filter((r) => r.ok);
+        return (
+          <div className="absolute inset-0 z-20 flex items-center justify-center">
+            <div className="absolute inset-0 bg-black/40" onClick={() => setDepResults(null)} />
+            <div className="relative w-[460px] max-w-[90%] max-h-[70%] overflow-y-auto bg-surface border border-surface-hover rounded-xl shadow-2xl p-4 space-y-3">
+              <div className="text-sm font-medium text-text-primary">依赖安装结果</div>
+              {installed.length > 0 && (
+                <div className="text-[11px] text-emerald-300">
+                  已安装：{installed.map((r) => r.name).join('、')}
+                </div>
+              )}
+              {failed.length === 0 ? (
+                <p className="text-[11px] text-text-secondary">全部选中依赖已安装。</p>
+              ) : (
+                <div className="space-y-2">
+                  <p className="text-[11px] text-amber-300">
+                    以下依赖安装失败。可以跳过、忽略误报，或复制命令手动安装；依赖不阻塞挂载。
+                  </p>
+                  {failed.map((r) => (
+                    <div key={r.name} className="rounded-lg border border-surface-hover bg-background p-2 space-y-1">
+                      <div className="flex items-center gap-2 text-[12px]">
+                        <span className="font-mono text-text-primary">{r.name}</span>
+                        <span className="text-[10px] text-red-400">
+                          {r.code === 'not_found' ? 'PyPI 无此包' : r.code === 'network' ? '网络失败' : '安装失败'}
+                        </span>
+                        <button
+                          onClick={() => void ignoreDependency(depResults.skill, r.name)}
+                          className="ml-auto text-[10px] text-text-secondary/60 hover:text-primary"
+                        >
+                          忽略此依赖
+                        </button>
+                      </div>
+                      {r.error && (
+                        <div className="max-h-24 overflow-y-auto whitespace-pre-wrap break-words text-[9px] text-text-secondary/60 font-mono">
+                          {r.error}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="flex items-center gap-2 pt-1">
+                {failed.length > 0 && (
+                  <>
+                    <button
+                      onClick={() => void retryFailed()}
+                      className="px-3 py-1.5 rounded-lg text-[11px] bg-primary/15 text-primary hover:bg-primary/25"
+                    >
+                      重试失败项
+                    </button>
+                    <button
+                      onClick={() => void copyFailedInstallCommand()}
+                      className="px-3 py-1.5 rounded-lg text-[11px] border border-surface-hover text-text-secondary hover:text-text-primary"
+                    >
+                      复制安装命令
+                    </button>
+                  </>
+                )}
+                <button
+                  onClick={() => setDepResults(null)}
+                  className="ml-auto px-3 py-1.5 rounded-lg text-[11px] bg-surface-hover text-text-secondary hover:text-text-primary"
+                >
+                  关闭并继续
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </Modal>
   );
 }

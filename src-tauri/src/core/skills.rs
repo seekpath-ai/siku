@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -15,33 +15,6 @@ pub enum SkillSource {
     User,
 }
 
-/// Dependencies declared in SKILL.md frontmatter (inline bracket lists only):
-///
-/// ```yaml
-/// requires:
-///   binaries: [python3, soffice]
-///   pip: [python-pptx]
-/// ```
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SkillRequires {
-    pub binaries: Vec<String>,
-    pub pip: Vec<String>,
-    /// Optional tools (e.g. LibreOffice for visual preview). Missing optional
-    /// dependencies never block mounting or label the skill "broken".
-    pub optional_binaries: Vec<String>,
-    pub optional_pip: Vec<String>,
-}
-
-impl SkillRequires {
-    pub fn is_empty(&self) -> bool {
-        self.binaries.is_empty()
-            && self.pip.is_empty()
-            && self.optional_binaries.is_empty()
-            && self.optional_pip.is_empty()
-    }
-}
-
 /// A loaded inline skill (Kimi Code style): a `<skills_dir>/<name>/SKILL.md`
 /// with YAML-ish frontmatter (`name`, `description`, optional `requires`) and
 /// a markdown body. `dir` is the skill's own directory — auxiliary files
@@ -54,7 +27,6 @@ pub struct Skill {
     pub content: String,
     pub dir: std::path::PathBuf,
     pub source: SkillSource,
-    pub requires: SkillRequires,
     /// 适用场景标签（卡片 chips）；用户技能可为空。
     pub scenarios: Vec<String>,
     /// 模板/规范标签（详情页展示）；用户技能可为空。
@@ -66,10 +38,9 @@ pub struct Skill {
 }
 
 /// Parse `SKILL.md`: optional `---` frontmatter block with `name:` and
-/// `description:` fields, followed by the markdown body.
-fn parse_skill_md(
-    text: &str,
-) -> Option<(String, String, String, SkillRequires, Vec<String>, Vec<String>, Vec<String>)> {
+/// `description:` fields, followed by the markdown body. Runtime dependencies
+/// are the agent's job, not skill metadata.
+fn parse_skill_md(text: &str) -> Option<(String, String, String, Vec<String>, Vec<String>, Vec<String>)> {
     let body = text.strip_prefix("---")?;
     let end = body.find("---")?;
     let front = &body[..end];
@@ -77,67 +48,31 @@ fn parse_skill_md(
 
     let mut name = String::new();
     let mut description = String::new();
-    let mut requires = SkillRequires::default();
     let mut tools: Vec<String> = Vec::new();
     let mut scenarios: Vec<String> = Vec::new();
     let mut rules: Vec<String> = Vec::new();
-    let mut in_requires = false;
-    let mut in_optional = false;
     for line in front.lines() {
         let trimmed = line.trim();
+        let top_level = !line.starts_with([' ', '\t']);
+        if !top_level {
+            continue;
+        }
         if let Some(v) = trimmed.strip_prefix("name:") {
-            if !line.starts_with([' ', '\t']) {
-                in_requires = false;
-                in_optional = false;
-            }
             name = v.trim().trim_matches('"').trim_matches('\'').to_string();
         } else if let Some(v) = trimmed.strip_prefix("description:") {
             description = v.trim().trim_matches('"').trim_matches('\'').to_string();
         } else if let Some(v) = trimmed.strip_prefix("tools:") {
-            if !line.starts_with([' ', '\t']) {
-                in_requires = false;
-                in_optional = false;
-                tools = parse_inline_list(v);
-            }
+            tools = parse_inline_list(v);
         } else if let Some(v) = trimmed.strip_prefix("scenarios:") {
-            if !line.starts_with([' ', '\t']) {
-                in_requires = false;
-                in_optional = false;
-                scenarios = parse_inline_list(v);
-            }
+            scenarios = parse_inline_list(v);
         } else if let Some(v) = trimmed.strip_prefix("rules:") {
-            if !line.starts_with([' ', '\t']) {
-                in_requires = false;
-                in_optional = false;
-                rules = parse_inline_list(v);
-            }
-        } else if trimmed == "requires:" {
-            in_requires = true;
-            in_optional = false;
-        } else if trimmed == "optional:" {
-            in_optional = true;
-            in_requires = false;
-        } else if in_requires && line.starts_with([' ', '\t']) {
-            if let Some(v) = trimmed.strip_prefix("binaries:") {
-                requires.binaries = parse_inline_list(v);
-            } else if let Some(v) = trimmed.strip_prefix("pip:") {
-                requires.pip = parse_inline_list(v);
-            }
-        } else if in_optional && line.starts_with([' ', '\t']) {
-            if let Some(v) = trimmed.strip_prefix("binaries:") {
-                requires.optional_binaries = parse_inline_list(v);
-            } else if let Some(v) = trimmed.strip_prefix("pip:") {
-                requires.optional_pip = parse_inline_list(v);
-            }
-        } else if !line.starts_with([' ', '\t']) {
-            in_requires = false;
-            in_optional = false;
+            rules = parse_inline_list(v);
         }
     }
     if name.is_empty() {
         return None;
     }
-    Some((name, description, content, requires, tools, scenarios, rules))
+    Some((name, description, content, tools, scenarios, rules))
 }
 
 /// Parse an inline `[a, b, c]` list from a frontmatter value.
@@ -200,7 +135,7 @@ fn load_skill_file(md: &Path, source: SkillSource) -> Option<Skill> {
         }
     }
     let text = std::fs::read_to_string(md).ok()?;
-    let (name, description, content, requires, tools, scenarios, rules) = parse_skill_md(&text)?;
+    let (name, description, content, tools, scenarios, rules) = parse_skill_md(&text)?;
     let name = sanitize_name(&name)?;
     let skill = Skill {
         name,
@@ -208,7 +143,6 @@ fn load_skill_file(md: &Path, source: SkillSource) -> Option<Skill> {
         content,
         dir: md.parent()?.to_path_buf(),
         source,
-        requires,
         scenarios,
         rules,
         tools,
@@ -379,10 +313,6 @@ pub struct SkillInfo {
     /// Always None for built-in skills (first-party, review-exempt).
     pub review: Option<crate::core::skill_review::ReviewBadge>,
     pub source: SkillSource,
-    /// Declared dependencies (unprobed — see `probe_dependencies`).
-    pub requires: SkillRequires,
-    /// Live dependency probe for the card status/install action.
-    pub dependencies: Vec<DepStatus>,
     /// Agent tools this skill would open when mounted.
     pub tools: Vec<String>,
     /// 适用场景标签。
@@ -391,8 +321,6 @@ pub struct SkillInfo {
     pub rules: Vec<String>,
     /// 审查状态：builtin | unreviewed | stale | risk | warn | pass。
     pub review_state: String,
-    /// 依赖来源：declared | review | none | unreviewed。
-    pub dependency_source: String,
 }
 
 /// All skills (built-in + user), sorted by name. Built-ins skip both the
@@ -401,7 +329,6 @@ pub struct SkillInfo {
 /// against — and hashing big skill dirs is what made the dialog slow).
 pub async fn list_all(
     db: &SqlitePool,
-    app_data_dir: &Path,
     builtin_dir: Option<&Path>,
     user_dir: &Path,
 ) -> Vec<SkillInfo> {
@@ -429,37 +356,16 @@ pub async fn list_all(
                 Some(b) => b.verdict.clone(),
             },
         };
-        let declared = !s.requires.is_empty();
-        let dependencies = if declared {
-            probe_dependencies_cached(app_data_dir, &s.requires, &s.dir)
-        } else {
-            record
-                .as_ref()
-                .map(|rec| probe_review_dependencies(app_data_dir, rec, &s.dir))
-                .unwrap_or_default()
-        };
-        let dependency_source = if declared {
-            "declared".to_string()
-        } else if record.is_some() {
-            "review".to_string()
-        } else if s.source == SkillSource::User {
-            "unreviewed".to_string()
-        } else {
-            "none".to_string()
-        };
         out.push(SkillInfo {
             path: s.dir.to_string_lossy().to_string(),
             name: s.name,
             description: s.description,
             review,
             source: s.source,
-            dependencies,
             tools: s.tools,
             scenarios: s.scenarios,
             rules: s.rules,
-            requires: s.requires,
             review_state,
-            dependency_source,
         });
     }
     out
@@ -500,7 +406,7 @@ pub fn import_folder(
     let md = src.join("SKILL.md");
     let text = std::fs::read_to_string(&md)
         .map_err(|_| "所选文件夹中没有可读取的 SKILL.md".to_string())?;
-    let (name, _, _, requires, tools, scenarios, rules) =
+    let (name, _, _, tools, scenarios, rules) =
         parse_skill_md(&text).ok_or("SKILL.md 缺少 name 前言字段")?;
     let name = sanitize_name(&name).ok_or("技能名无法转换为合法标识")?;
     reject_builtin_conflict(builtin_dir, &name)?;
@@ -511,17 +417,14 @@ pub fn import_folder(
     copy_dir(src, &dest)?;
     Ok(SkillInfo {
         path: dest.to_string_lossy().to_string(),
-        description: parse_skill_md(&text).map(|(_, d, _, _, _, _, _)| d).unwrap_or_default(),
+        description: parse_skill_md(&text).map(|(_, d, _, _, _, _)| d).unwrap_or_default(),
         name,
         review: None,
         source: SkillSource::User,
-        dependencies: Vec::new(),
         tools,
         scenarios,
         rules,
-        requires,
         review_state: "unreviewed".to_string(),
-        dependency_source: "unreviewed".to_string(),
     })
 }
 
@@ -583,7 +486,7 @@ pub fn import_zip(
             break;
         }
     }
-    let (name, description, _, requires, tools, scenarios, rules) =
+    let (name, description, _, tools, scenarios, rules) =
         parse_skill_md(&text).ok_or("SKILL.md 缺少 name 前言字段")?;
     let name = sanitize_name(&name).ok_or("技能名无法转换为合法标识")?;
     reject_builtin_conflict(builtin_dir, &name)?;
@@ -628,13 +531,10 @@ pub fn import_zip(
         name,
         review: None,
         source: SkillSource::User,
-        dependencies: Vec::new(),
         tools,
         scenarios,
         rules,
-        requires,
         review_state: "unreviewed".to_string(),
-        dependency_source: "unreviewed".to_string(),
     })
 }
 
@@ -655,86 +555,6 @@ pub fn delete(builtin_dir: Option<&Path>, user_dir: &Path, name: &str) -> Result
         return Err(format!("技能「{name}」不存在"));
     }
     std::fs::remove_dir_all(&dir).map_err(|e| format!("删除失败：{e}"))
-}
-
-/// One dependency's probe result for the detail dialog.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DepStatus {
-    /// `binary` (system program) or `pip` (Python package).
-    pub kind: String,
-    pub name: String,
-    pub available: bool,
-    /// Optional deps (e.g. LibreOffice preview) never block mounting.
-    #[serde(default)]
-    pub optional: bool,
-    /// Locally ignored false-positive inferred dependency.
-    #[serde(default)]
-    pub ignored: bool,
-    /// 缺失时的补充指引（如 pip 依赖所在的隔离环境状态）。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hint: Option<String>,
-}
-
-/// Probe a skill's declared dependencies (process spawns — call from the
-/// detail dialog, not the list path).
-///
-/// pip 依赖探测的是隔离 conda 环境（siku-office），不是系统 Python——技能
-/// 脚本只在隔离环境里跑，系统环境装没装与可用性无关。
-pub fn probe_dependencies(app_data_dir: &Path, requires: &SkillRequires) -> Vec<DepStatus> {
-    let mut out = Vec::new();
-    if requires.is_empty() {
-        return out;
-    }
-    let mut push_binary = |name: &str, optional: bool| {
-        out.push(DepStatus {
-            kind: "binary".to_string(),
-            name: name.to_string(),
-            available: crate::core::skill_review::binary_available(name),
-            optional,
-            ignored: false,
-            hint: None,
-        });
-    };
-    for b in &requires.binaries {
-        push_binary(b, false);
-    }
-    for b in &requires.optional_binaries {
-        push_binary(b, true);
-    }
-    if !requires.pip.is_empty() || !requires.optional_pip.is_empty() {
-        let env = crate::core::skill_env::resolve(app_data_dir);
-        let missing_hint = if env.ready() {
-            None
-        } else if env.conda.is_some() {
-            Some("隔离环境 siku-office 尚未创建".to_string())
-        } else {
-            Some("隔离环境 siku-office 尚未安装（将先装 Miniconda）".to_string())
-        };
-        let mut push_pip = |p: &str, optional: bool| {
-            let module = crate::core::skill_review::pip_to_module(p);
-            let available = env
-                .python
-                .as_deref()
-                .map(|py| crate::core::skill_env::python_module_available_in(py, &module))
-                .unwrap_or(false);
-            out.push(DepStatus {
-                kind: "pip".to_string(),
-                name: p.to_string(),
-                available,
-                optional,
-                ignored: false,
-                hint: if available { None } else { missing_hint.clone() },
-            });
-        };
-        for p in &requires.pip {
-            push_pip(p, false);
-        }
-        for p in &requires.optional_pip {
-            push_pip(p, true);
-        }
-    }
-    out
 }
 
 /// Review gate shared by mount commands and per-turn registration. Returns a
@@ -758,78 +578,6 @@ pub fn review_gate_error(
     None
 }
 
-/// Probe the dependencies recorded by a review against the CURRENT machine.
-/// Review records store availability from review time; installs can happen
-/// later, so only the names/kinds are reused.
-pub fn probe_review_dependencies(
-    app_data_dir: &Path,
-    review: &crate::core::skill_review::ReviewRecord,
-    cache_key: &Path,
-) -> Vec<DepStatus> {
-    let requires = SkillRequires {
-        binaries: review
-            .dependencies
-            .iter()
-            .filter(|d| d.kind == "binary")
-            .map(|d| d.name.clone())
-            .collect(),
-        pip: review
-            .dependencies
-            .iter()
-            .filter(|d| d.kind != "binary")
-            .map(|d| d.name.clone())
-            .collect(),
-        optional_binaries: Vec::new(),
-        optional_pip: Vec::new(),
-    };
-    probe_dependencies_cached(app_data_dir, &requires, cache_key)
-}
-
-/// Cached dependency probe. Process spawning is expensive on low-end
-/// machines; a short TTL is enough to make repeated list/detail opens cheap
-/// while still noticing an install done outside the app.
-fn dependency_cache() -> &'static Mutex<std::collections::HashMap<String, (Instant, Vec<DepStatus>)>> {
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, (Instant, Vec<DepStatus>)>>> =
-        OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-}
-
-pub fn probe_dependencies_cached(
-    app_data_dir: &Path,
-    requires: &SkillRequires,
-    cache_key: &Path,
-) -> Vec<DepStatus> {
-    if requires.is_empty() {
-        return Vec::new();
-    }
-    let key = format!(
-        "{}|{:?}|{:?}|{:?}|{:?}",
-        cache_key.display(),
-        requires.binaries,
-        requires.pip,
-        requires.optional_binaries,
-        requires.optional_pip
-    );
-    if let Ok(map) = dependency_cache().lock() {
-        if let Some((at, deps)) = map.get(&key) {
-            if at.elapsed() < Duration::from_secs(300) {
-                return deps.clone();
-            }
-        }
-    }
-    let deps = probe_dependencies(app_data_dir, requires);
-    if let Ok(mut map) = dependency_cache().lock() {
-        map.insert(key, (Instant::now(), deps.clone()));
-    }
-    deps
-}
-
-pub fn clear_dependency_cache() {
-    if let Ok(mut map) = dependency_cache().lock() {
-        map.clear();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,20 +586,13 @@ mod tests {
     const SKILL_MD: &str = "---\nname: demo-skill\ndescription: 演示\n---\n\n# 正文\n";
 
     #[test]
-    fn parse_requires_inline_lists() {
-        let text = "---\nname: pptx\ndescription: 演示\nscenarios: [学术汇报, 商务提案]\nrules: [学术模板]\ntools: [bash, file_write]\nrequires:\n  binaries: [python3, soffice]\n  pip: [python-pptx]\noptional:\n  binaries: [libreoffice]\n  pip: [pypdfium2]\n---\n\n# 正文\n";
-        let (name, _, _, req, tools, scenarios, rules) = parse_skill_md(text).unwrap();
+    fn parse_frontmatter_scenarios_rules_and_tools() {
+        let text = "---\nname: pptx\ndescription: 演示\nscenarios: [学术汇报, 商务提案]\nrules: [学术模板]\ntools: [bash, file_write]\nrequires:\n  pip: [python-pptx]\n---\n\n# 正文\n";
+        let (name, _, _, tools, scenarios, rules) = parse_skill_md(text).unwrap();
         assert_eq!(name, "pptx");
-        assert_eq!(req.binaries, vec!["python3", "soffice"]);
-        assert_eq!(req.pip, vec!["python-pptx"]);
-        assert_eq!(req.optional_binaries, vec!["libreoffice"]);
-        assert_eq!(req.optional_pip, vec!["pypdfium2"]);
         assert_eq!(tools, vec!["bash", "file_write"]);
         assert_eq!(scenarios, vec!["学术汇报", "商务提案"]);
         assert_eq!(rules, vec!["学术模板"]);
-        // Frontmatter without requires parses to empty deps.
-        let (_, _, _, req2, _, _, _) = parse_skill_md(SKILL_MD).unwrap();
-        assert!(req2.is_empty());
     }
 
     #[test]
@@ -994,7 +735,6 @@ mod tests {
             llm_verdict: None,
             summary: String::new(),
             findings: Vec::new(),
-            dependencies: Vec::new(),
             content_hash: hash,
             reviewed_at: "2026-01-01T00:00:00Z".into(),
         };

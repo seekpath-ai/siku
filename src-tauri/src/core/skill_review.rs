@@ -22,22 +22,11 @@ pub struct Finding {
     pub rule: String,
 }
 
-/// A dependency the skill references and whether this machine has it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Dependency {
-    pub name: String,
-    /// "binary" | "python-module"
-    pub kind: String,
-    pub available: bool,
-}
-
-/// Static scan + dependency probe result for one skill.
+/// Static scan result for one skill.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StaticReport {
     pub findings: Vec<Finding>,
-    pub dependencies: Vec<Dependency>,
     /// Worst finding severity: "risk" | "warn" | "pass".
     pub verdict: String,
     /// SHA-256 over every scanned file (path + bytes); a review is only
@@ -165,12 +154,37 @@ fn metadata_fingerprint(dir: &Path, files: &[PathBuf]) -> u64 {
 /// SHA-256 over (relative path + NUL + content) for every file, sorted.
 /// The result is cached by a metadata fingerprint: directory traversal is
 /// still needed, but unchanged skills do not re-read every script/template.
-pub fn content_hash(dir: &Path) -> String {
+fn hash_files(dir: &Path, files: &[PathBuf]) -> String {
     use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    for f in files {
+        let Ok(bytes) = std::fs::read(f) else { continue };
+        if let Ok(rel) = f.strip_prefix(dir) {
+            hasher.update(rel.to_string_lossy().as_bytes());
+            hasher.update([0u8]);
+            hasher.update(&bytes);
+            hasher.update([0u8]);
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// SHA-256 over (relative path + NUL + content) for every file, sorted.
+/// Large directories are cached by a metadata fingerprint; small ones are
+/// re-read directly because coarse mtime/ctime resolution can otherwise make
+/// two rapid same-size edits look unchanged.
+pub fn content_hash(dir: &Path) -> String {
+    let files = collect_files(dir);
+    let total_size: u64 = files
+        .iter()
+        .filter_map(|f| std::fs::metadata(f).ok().map(|m| m.len()))
+        .sum();
+    if total_size <= 64 * 1024 {
+        return hash_files(dir, &files);
+    }
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, String)>>,
     > = std::sync::OnceLock::new();
-    let files = collect_files(dir);
     let fingerprint = metadata_fingerprint(dir, &files);
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Ok(map) = cache.lock() {
@@ -180,150 +194,11 @@ pub fn content_hash(dir: &Path) -> String {
             }
         }
     }
-    let mut hasher = sha2::Sha256::new();
-    for f in &files {
-        let Ok(bytes) = std::fs::read(f) else { continue };
-        if let Ok(rel) = f.strip_prefix(dir) {
-            hasher.update(rel.to_string_lossy().as_bytes());
-            hasher.update([0u8]);
-            hasher.update(&bytes);
-            hasher.update([0u8]);
-        }
-    }
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = hash_files(dir, &files);
     if let Ok(mut map) = cache.lock() {
         map.insert(dir.to_path_buf(), (fingerprint, hash.clone()));
     }
     hash
-}
-
-pub fn binary_available(name: &str) -> bool {
-    crate::core::process::no_window(&mut std::process::Command::new(name))
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Known CLI binaries a skill might need; probed when mentioned.
-const KNOWN_BINARIES: &[&str] = &[
-    "git", "python3", "node", "npm", "ffmpeg", "pandoc", "docker", "libreoffice", "jq", "pip3",
-];
-
-/// pip package name → importable module name (when they differ).
-pub fn pip_to_module(pkg: &str) -> String {
-    match pkg.to_ascii_lowercase().as_str() {
-        "python-pptx" => "pptx".to_string(),
-        "pillow" => "PIL".to_string(),
-        "beautifulsoup4" => "bs4".to_string(),
-        "pyyaml" => "yaml".to_string(),
-        "python-docx" => "docx".to_string(),
-        "opencv-python" => "cv2".to_string(),
-        "scikit-learn" => "sklearn".to_string(),
-        other => other.to_string(),
-    }
-}
-
-pub fn python_module_available(module: &str) -> bool {
-    crate::core::process::no_window(&mut std::process::Command::new("python3"))
-        .args(["-c", &format!("import {module}")])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Import module name → pip distribution name for common packages. Unknown
-/// modules fall back to the module name, which is correct for most pip names.
-fn module_to_pip(module: &str) -> Option<&str> {
-    match module {
-        "pptx" => Some("python-pptx"),
-        "docx" => Some("python-docx"),
-        "PIL" => Some("Pillow"),
-        "yaml" => Some("PyYAML"),
-        "cv2" => Some("opencv-python"),
-        "sklearn" => Some("scikit-learn"),
-        "bs4" => Some("beautifulsoup4"),
-        "fitz" => Some("PyMuPDF"),
-        "openpyxl" => Some("openpyxl"),
-        "pandas" => Some("pandas"),
-        "numpy" => Some("numpy"),
-        "requests" => Some("requests"),
-        "lxml" => Some("lxml"),
-        "fpdf" => Some("fpdf2"),
-        // Unknown modules are intentionally NOT treated as pip packages:
-        // names like Node's `process` are not PyPI distributions and would
-        // otherwise make a whole batch install fail. Authors can declare
-        // uncommon packages explicitly in `requires`.
-        _ => None,
-    }
-}
-
-/// Extract referenced binaries and pip packages from the skill's text.
-fn extract_dependencies(all_text: &str, python_text: &str) -> Vec<Dependency> {
-    let mut deps: Vec<Dependency> = Vec::new();
-    for bin in KNOWN_BINARIES {
-        let pat = format!(r"(?i)(?:^|[^a-z0-9-]){}(?:[^a-z0-9-]|$)", regex::escape(bin));
-        if regex::Regex::new(&pat).map(|r| r.is_match(all_text)).unwrap_or(false) {
-            deps.push(Dependency {
-                name: bin.to_string(),
-                kind: "binary".into(),
-                available: binary_available(bin),
-            });
-        }
-    }
-    // pip install <pkgs…> — stop the token list at shell separators.
-    let pip_re = regex::Regex::new(r"(?m)pip3?\s+install\s+([^\n&;|]+)").unwrap();
-    let mut seen = std::collections::HashSet::new();
-    for cap in pip_re.captures_iter(all_text) {
-        for tok in cap[1].split_whitespace() {
-            if tok.starts_with('-') {
-                continue;
-            }
-            let pkg = tok.trim_matches(|c: char| c == '\'' || c == '"');
-            if pkg.is_empty() || !seen.insert(pkg.to_string()) {
-                continue;
-            }
-            let module = pip_to_module(pkg);
-            let available = binary_available("python3") && python_module_available(&module);
-            deps.push(Dependency {
-                name: pkg.to_string(),
-                kind: "python-module".into(),
-                available,
-            });
-        }
-    }
-
-    // Python imports. User skills often omit `requires` entirely, so infer
-    // common third-party imports as a fallback. Standard library modules are
-    // filtered out; the result is still labelled "审查推断" in the UI.
-    let import_re = regex::Regex::new(
-        r"(?m)^\s*(?:from\s+([A-Za-z_][A-Za-z0-9_]*)\s+import\b|import\s+([A-Za-z_][A-Za-z0-9_]*))",
-    )
-    .unwrap();
-    let python_ok = binary_available("python3");
-    for cap in import_re.captures_iter(python_text) {
-        let module = cap
-            .get(1)
-            .or_else(|| cap.get(2))
-            .map(|m| m.as_str())
-            .unwrap_or_default();
-        let Some(pkg) = module_to_pip(module) else { continue };
-        if !seen.insert(pkg.to_string()) {
-            continue;
-        }
-        deps.push(Dependency {
-            name: pkg.to_string(),
-            kind: "python-module".into(),
-            available: python_ok && python_module_available(module),
-        });
-    }
-    deps
 }
 
 /// Run the full deterministic review: pattern scan + dependency probe +
@@ -342,7 +217,6 @@ pub fn static_scan(dir: &Path) -> StaticReport {    let rules: Vec<(Rule, regex:
     let files = collect_files(dir);
     let mut findings = Vec::new();
     let mut all_text = String::new();
-    let mut python_text = String::new();
     let mut scanned = Vec::new();
 
     for file in &files {
@@ -359,11 +233,6 @@ pub fn static_scan(dir: &Path) -> StaticReport {    let rules: Vec<(Rule, regex:
         scanned.push(rel.clone());
         all_text.push_str(&text);
         all_text.push('\n');
-        let is_python = rel.ends_with(".py") || rel.ends_with(".pyw");
-        if is_python {
-            python_text.push_str(&text);
-            python_text.push('\n');
-        }
         for (line_no, line) in text.lines().enumerate() {
             for (rule, re) in &rules {
                 if let Some(m) = re.find(line) {
@@ -392,7 +261,6 @@ pub fn static_scan(dir: &Path) -> StaticReport {    let rules: Vec<(Rule, regex:
 
     StaticReport {
         findings,
-        dependencies: extract_dependencies(&all_text, &python_text),
         verdict: verdict.into(),
         content_hash: content_hash(dir),
         scanned_files: scanned,
@@ -421,19 +289,6 @@ pub fn build_review_prompt(skill_name: &str, dir: &Path, report: &StaticReport) 
             out.push_str(&format!(
                 "- [{}][{}] {}:{} {}\n",
                 f.severity, f.category, f.file, f.line, f.excerpt
-            ));
-        }
-    }
-    if report.dependencies.is_empty() {
-        out.push_str("依赖：未检测到外部依赖\n");
-    } else {
-        out.push_str("依赖探测：\n");
-        for d in &report.dependencies {
-            out.push_str(&format!(
-                "- {}（{}）：{}\n",
-                d.name,
-                d.kind,
-                if d.available { "已安装" } else { "缺失" }
             ));
         }
     }
@@ -512,7 +367,6 @@ pub struct ReviewRecord {
     pub summary: String,
     pub findings: Vec<Finding>,
     #[serde(default)]
-    pub dependencies: Vec<Dependency>,
     pub content_hash: String,
     pub reviewed_at: String,
 }
@@ -576,29 +430,6 @@ mod tests {
     }
 
     #[test]
-    fn imports_without_requirements_are_inferred_and_stdlib_skipped() {
-        let deps = extract_dependencies("", "import os\nimport process\nimport pptx\nfrom docx import Document\n");
-        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
-        assert!(names.contains(&"python-pptx"), "{names:?}");
-        assert!(names.contains(&"python-docx"), "{names:?}");
-        assert!(!names.contains(&"os"), "{names:?}");
-        assert!(!names.contains(&"process"), "{names:?}");
-        assert!(deps
-            .iter()
-            .filter(|d| d.name == "python-pptx")
-            .all(|d| d.kind == "python-module"));
-    }
-
-    #[test]
-    fn clean_skill_passes() {
-        let tmp = skill_dir(&[("SKILL.md", "---\nname: ok\n---\n用 python3 处理文件")]);
-        let report = static_scan(tmp.path());
-        assert_eq!(report.verdict, "pass");
-        // python3 mentioned → dependency probed.
-        assert!(report.dependencies.iter().any(|d| d.name == "python3"));
-    }
-
-    #[test]
     fn prompt_injection_is_risk() {
         let tmp = skill_dir(&[(
             "SKILL.md",
@@ -631,18 +462,6 @@ mod tests {
         let h1 = content_hash(tmp.path());
         std::fs::write(tmp.path().join("SKILL.md"), "---\nname: h\n---\nv2").unwrap();
         assert_ne!(h1, content_hash(tmp.path()));
-    }
-
-    #[test]
-    fn pip_packages_extracted() {
-        let tmp = skill_dir(&[(
-            "SKILL.md",
-            "---\nname: p\n---\n先 pip3 install python-pptx requests",
-        )]);
-        let report = static_scan(tmp.path());
-        let names: Vec<&str> = report.dependencies.iter().map(|d| d.name.as_str()).collect();
-        assert!(names.contains(&"python-pptx"));
-        assert!(names.contains(&"requests"));
     }
 
     #[test]

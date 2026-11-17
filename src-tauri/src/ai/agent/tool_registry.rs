@@ -38,7 +38,7 @@ pub trait Tool: Send + Sync {
     }
 
     /// Per-tool execution timeout (seconds). Most tools fit the default;
-    /// long installers (e.g. skill_env_setup downloading Miniconda) override it.
+    /// long-running shell/install commands override it.
     fn timeout_secs(&self) -> u64 {
         320
     }
@@ -236,14 +236,13 @@ impl ToolRegistry {
         &mut self,
         skills: Vec<crate::core::skills::Skill>,
         selected: &std::collections::HashSet<String>,
-        env: Option<&crate::core::skill_env::SkillEnv>,
     ) {
         if selected.is_empty() {
             return;
         }
         for skill in skills {
             if selected.contains(&skill.name) {
-                self.register(crate::ai::agent::tools::skill::SkillTool::new(skill, env.cloned()));
+                self.register(crate::ai::agent::tools::skill::SkillTool::new(skill));
             }
         }
     }

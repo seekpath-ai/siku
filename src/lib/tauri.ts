@@ -960,19 +960,12 @@ export interface SkillReviewFinding {
   rule: string;
 }
 
-export interface SkillReviewDependency {
-  name: string;
-  kind: string;
-  available: boolean;
-}
-
 export interface SkillReviewRecord {
   verdict: 'pass' | 'warn' | 'risk';
   staticVerdict: string;
   llmVerdict: string | null;
   summary: string;
   findings: SkillReviewFinding[];
-  dependencies: SkillReviewDependency[];
   contentHash: string;
   reviewedAt: string;
 }
@@ -986,37 +979,11 @@ export interface SkillInfo {
   review?: SkillReviewBadge | null;
   /** 来源：内置（随安装包分发，免审、只读）或用户导入。 */
   source: 'builtin' | 'user';
-  /** 声明的依赖（未经探测；详情页返回探测结果）。 */
-  requires: { binaries: string[]; pip: string[] };
-  /** 列表页实时探测结果，用于卡片状态和安装按钮。 */
-  dependencies: SkillDepStatus[];
   /** 挂载后会放开的 agent 工具。 */
   tools: string[];
   scenarios: string[];
   rules: string[];
   reviewState: 'builtin' | 'unreviewed' | 'stale' | 'risk' | 'warn' | 'pass';
-  dependencySource: 'declared' | 'review' | 'none' | 'unreviewed';
-}
-
-export interface SkillDepStatus {
-  /** `binary`（系统程序）或 `pip`（Python 包，探测的是隔离环境 siku-office）。 */
-  kind: string;
-  name: string;
-  available: boolean;
-  /** 可选依赖（如 LibreOffice 视觉自检）不阻塞挂载。 */
-  optional?: boolean;
-  /** 本地忽略的误报依赖。 */
-  ignored?: boolean;
-  /** 缺失时的补充指引（隔离环境状态）。 */
-  hint?: string | null;
-}
-
-export interface SkillInstallResult {
-  name: string;
-  ok: boolean;
-  error?: string | null;
-  /** "not_found" | "network" | "failed" */
-  code?: string | null;
 }
 
 export interface SkillDetail {
@@ -1028,14 +995,11 @@ export interface SkillDetail {
   /** Latest review record; absent = never reviewed (or built-in). */
   review?: SkillReviewRecord | null;
   source: 'builtin' | 'user';
-  /** 声明依赖的实时探测结果。 */
-  dependencies: SkillDepStatus[];
   /** 技能声明的工具权限（挂载后并入会话工具白名单）。 */
   tools: string[];
   scenarios: string[];
   rules: string[];
   reviewState: 'builtin' | 'unreviewed' | 'stale' | 'risk' | 'warn' | 'pass';
-  dependencySource: 'declared' | 'review' | 'none' | 'unreviewed';
 }
 
 export async function skillsList(): Promise<SkillInfo[]> {
@@ -1047,37 +1011,9 @@ export async function skillsGet(name: string): Promise<SkillDetail> {
   return invoke<SkillDetail>('skills_get', { name });
 }
 
-/** pip install --user 一组依赖包，返回安装结果说明。 */
-/** 安装 pip 依赖到应用托管的隔离 conda 环境（siku-office）：没有环境则创建，
- *  没有 conda 则先下载 Miniconda 静默安装到应用数据目录（不碰系统 Python）。
- *  进度经 `skills:env-install` 事件推送。 */
-export async function skillsEnvInstall(packages: string[]): Promise<string> {
-  return invoke<string>('skills_env_install', { packages });
-}
-
-/** Per-package install: one bad inferred name cannot fail the whole batch. */
-export async function skillsEnvInstallMany(packages: string[]): Promise<SkillInstallResult[]> {
-  return invoke<SkillInstallResult[]>('skills_env_install_many', { packages });
-}
-
-/** Isolated Python path, used for copy/manual-install escape. */
-export async function skillsEnvPython(): Promise<string | null> {
-  return invoke<string | null>('skills_env_python');
-}
-
-/** Persist/remove a device-local ignore override for an inferred dependency. */
-export async function skillsSetDependencyIgnored(
-  skill: string,
-  dependency: string,
-  ignored: boolean,
-): Promise<void> {
-  return invoke<void>('skills_set_dependency_ignored', { skill, dependency, ignored });
-}
-
 /** Static scan report (deterministic, pre-LLM). */
 export interface SkillStaticReport {
   findings: SkillReviewFinding[];
-  dependencies: SkillReviewDependency[];
   verdict: string;
   contentHash: string;
   scannedFiles: string[];

@@ -17,10 +17,16 @@ tools: [bash, file_write, file_read]
 
 ## 运行环境（先读）
 
-技能内容末尾附有「运行环境」块，两种状态：
+本技能不附带依赖管理。运行脚本前先用 `bash` 检查本机 Python，并在工作区创建独立环境：
 
-- **已就绪**：块里给出隔离环境的 Python 解释器绝对路径。下文所有 `python` 命令都换成这个路径执行。**禁止**使用系统 python3/python，**禁止**用 pip 往系统环境安装任何包。
-- **未就绪**：调用 `skill_env_setup` 工具自动安装（Miniconda + 依赖，不改动用户系统 Python，首次约需 3-10 分钟），装完用工具返回的解释器路径继续。安装失败或被拒绝时，告知用户也可在「插件 → 技能详情」里手动安装。
+```bash
+uv venv .siku/venv
+uv pip install --python .siku/venv/bin/python  # Windows: .siku/venv/Scripts/python.exe python-pptx pypdfium2
+```
+
+没有 `uv` 时使用 `python -m venv .siku/venv` 加对应 `pip`。下文 `$PY` 表示这个工作区解释器的绝对路径。不要用 `pip install` 修改系统 Python，也不要全局安装依赖。
+
+缺少 LibreOffice（`soffice`）时，仍可生成文件，但跳过视觉自检并告知用户。
 
 ## 工作流程
 
@@ -61,7 +67,7 @@ tools: [bash, file_write, file_read]
 ### 4. 生成
 
 ```bash
-<运行环境块给出的 Python 解释器> scripts/build_deck.py deck.json
+$PY scripts/build_deck.py deck.json
 ```
 
 脚本会**校验并拒绝**违反设计规范的内容（字号低于场景下限、要点过多、字段缺失），报错信息会告诉你怎么改；修正后重跑。生成成功输出 .pptx 的绝对路径。
@@ -69,7 +75,7 @@ tools: [bash, file_write, file_read]
 ### 5. 视觉自检（有 LibreOffice 时必做）
 
 ```bash
-<运行环境块给出的 Python 解释器> scripts/render_preview.py <产出.pptx>
+$PY scripts/render_preview.py <产出.pptx>
 ```
 
 它把每页渲染成 PNG（依赖 soffice + pypdfium2）。用 read_media_file **逐页查看**，检查：

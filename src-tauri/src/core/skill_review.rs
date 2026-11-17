@@ -130,12 +130,59 @@ fn collect_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Fingerprint file metadata only (path/size/mtime), avoiding reading file
+/// bytes just to decide whether the cached hash is still valid.
+fn metadata_fingerprint(dir: &Path, files: &[PathBuf]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for f in files {
+        let rel = f.strip_prefix(dir).unwrap_or(f);
+        rel.to_string_lossy().hash(&mut h);
+        if let Ok(meta) = std::fs::metadata(f) {
+            meta.len().hash(&mut h);
+            if let Ok(modified) = meta.modified() {
+                modified.hash(&mut h);
+            }
+            // On Unix, ctime changes even when a same-size rewrite lands in
+            // the same mtime tick; without it a rapid edit can reuse a stale
+            // hash (and make a review look fresh).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                meta.ctime().hash(&mut h);
+                meta.ctime_nsec().hash(&mut h);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                meta.last_write_time().hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
 /// SHA-256 over (relative path + NUL + content) for every file, sorted.
+/// The result is cached by a metadata fingerprint: directory traversal is
+/// still needed, but unchanged skills do not re-read every script/template.
 pub fn content_hash(dir: &Path) -> String {
     use sha2::Digest;
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, (u64, String)>>,
+    > = std::sync::OnceLock::new();
+    let files = collect_files(dir);
+    let fingerprint = metadata_fingerprint(dir, &files);
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some((fp, hash)) = map.get(dir) {
+            if *fp == fingerprint {
+                return hash.clone();
+            }
+        }
+    }
     let mut hasher = sha2::Sha256::new();
-    for f in collect_files(dir) {
-        let Ok(bytes) = std::fs::read(&f) else { continue };
+    for f in &files {
+        let Ok(bytes) = std::fs::read(f) else { continue };
         if let Ok(rel) = f.strip_prefix(dir) {
             hasher.update(rel.to_string_lossy().as_bytes());
             hasher.update([0u8]);
@@ -143,7 +190,11 @@ pub fn content_hash(dir: &Path) -> String {
             hasher.update([0u8]);
         }
     }
-    format!("{:x}", hasher.finalize())
+    let hash = format!("{:x}", hasher.finalize());
+    if let Ok(mut map) = cache.lock() {
+        map.insert(dir.to_path_buf(), (fingerprint, hash.clone()));
+    }
+    hash
 }
 
 pub fn binary_available(name: &str) -> bool {
@@ -187,6 +238,42 @@ pub fn python_module_available(module: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Common Python standard-library / built-in modules that must not become
+/// inferred pip packages when a user skill has no `requires` metadata.
+const STDLIB_MODULES: &[&str] = &[
+    "os", "sys", "re", "json", "math", "time", "datetime", "pathlib", "typing",
+    "collections", "itertools", "functools", "subprocess", "shutil", "tempfile",
+    "argparse", "logging", "unittest", "dataclasses", "enum", "io", "csv", "sqlite3",
+    "hashlib", "base64", "random", "statistics", "decimal", "fractions", "glob",
+    "threading", "multiprocessing", "asyncio", "urllib", "http", "html", "xml",
+    "zipfile", "tarfile", "gzip", "struct", "socket", "ssl", "email", "uuid",
+    "textwrap", "pprint", "traceback", "warnings", "contextlib", "copy", "pickle",
+    "concurrent", "ctypes", "platform", "getpass", "webbrowser", "tkinter", "venv",
+];
+
+/// Import module name → pip distribution name for common packages. Unknown
+/// modules fall back to the module name, which is correct for most pip names.
+fn module_to_pip(module: &str) -> Option<&str> {
+    match module {
+        "pptx" => Some("python-pptx"),
+        "docx" => Some("python-docx"),
+        "PIL" => Some("Pillow"),
+        "yaml" => Some("PyYAML"),
+        "cv2" => Some("opencv-python"),
+        "sklearn" => Some("scikit-learn"),
+        "bs4" => Some("beautifulsoup4"),
+        "fitz" => Some("PyMuPDF"),
+        "openpyxl" => Some("openpyxl"),
+        "pandas" => Some("pandas"),
+        "numpy" => Some("numpy"),
+        "requests" => Some("requests"),
+        "lxml" => Some("lxml"),
+        "fpdf" => Some("fpdf2"),
+        _ if STDLIB_MODULES.contains(&module) || module.starts_with('_') => None,
+        _ => Some(module),
+    }
+}
+
 /// Extract referenced binaries and pip packages from the skill's text.
 fn extract_dependencies(all_text: &str) -> Vec<Dependency> {
     let mut deps: Vec<Dependency> = Vec::new();
@@ -220,6 +307,31 @@ fn extract_dependencies(all_text: &str) -> Vec<Dependency> {
                 available,
             });
         }
+    }
+
+    // Python imports. User skills often omit `requires` entirely, so infer
+    // common third-party imports as a fallback. Standard library modules are
+    // filtered out; the result is still labelled "审查推断" in the UI.
+    let import_re = regex::Regex::new(
+        r"(?m)^\s*(?:from\s+([A-Za-z_][A-Za-z0-9_]*)\s+import\b|import\s+([A-Za-z_][A-Za-z0-9_]*))",
+    )
+    .unwrap();
+    let python_ok = binary_available("python3");
+    for cap in import_re.captures_iter(all_text) {
+        let module = cap
+            .get(1)
+            .or_else(|| cap.get(2))
+            .map(|m| m.as_str())
+            .unwrap_or_default();
+        let Some(pkg) = module_to_pip(module) else { continue };
+        if !seen.insert(pkg.to_string()) {
+            continue;
+        }
+        deps.push(Dependency {
+            name: pkg.to_string(),
+            kind: "python-module".into(),
+            available: python_ok && python_module_available(module),
+        });
     }
     deps
 }
@@ -403,6 +515,7 @@ pub struct ReviewRecord {
     pub llm_verdict: Option<String>,
     pub summary: String,
     pub findings: Vec<Finding>,
+    #[serde(default)]
     pub dependencies: Vec<Dependency>,
     pub content_hash: String,
     pub reviewed_at: String,
@@ -464,6 +577,19 @@ mod tests {
             std::fs::write(p, content).unwrap();
         }
         tmp
+    }
+
+    #[test]
+    fn imports_without_requirements_are_inferred_and_stdlib_skipped() {
+        let deps = extract_dependencies("import os\nimport pptx\nfrom docx import Document\n");
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"python-pptx"), "{names:?}");
+        assert!(names.contains(&"python-docx"), "{names:?}");
+        assert!(!names.contains(&"os"), "{names:?}");
+        assert!(deps
+            .iter()
+            .filter(|d| d.name == "python-pptx")
+            .all(|d| d.kind == "python-module"));
     }
 
     #[test]

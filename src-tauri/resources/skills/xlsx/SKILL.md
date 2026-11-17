@@ -1,9 +1,13 @@
 ---
 name: xlsx
 description: 创建专业 Excel 工作簿（.xlsx）。内置三类规范：数据报表（标题+表头样式+冻结筛选）、登记台账（逐行登记、斑马纹）、统计分析（合计/均值等公式行+图表）。自动列宽、数字格式、对齐方式均按经验值固化。当用户要求做表格、报表、台账、统计 Excel 时使用。
+scenarios: [数据报表, 登记台账, 统计分析]
+rules: [标题与表头规范, 冻结筛选, 公式与图表]
 requires:
+  pip: [openpyxl]
+optional:
   binaries: [soffice]
-  pip: [openpyxl, pypdfium2]
+  pip: [pypdfium2]
 tools: [bash, file_write, file_read]
 ---
 

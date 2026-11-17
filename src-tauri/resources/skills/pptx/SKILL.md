@@ -1,9 +1,13 @@
 ---
 name: pptx
 description: 创建专业演示文稿（.pptx）。适合学术汇报、商务提案、讨论分享等场合。内置排版设计规范（字号、字体、行距、信息密度），产出可直接使用。当用户要求做 PPT、幻灯片、演示文稿时使用。
+scenarios: [学术汇报, 商务提案, 讨论分享]
+rules: [学术模板, 商务模板, 讨论模板]
 requires:
+  pip: [python-pptx]
+optional:
   binaries: [soffice]
-  pip: [python-pptx, pypdfium2]
+  pip: [pypdfium2]
 tools: [bash, file_write, file_read]
 ---
 

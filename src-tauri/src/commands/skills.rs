@@ -19,7 +19,13 @@ fn builtin_skills_dir(state: &AppState) -> Option<&std::path::Path> {
 #[tauri::command]
 #[instrument(skip(state))]
 pub async fn skills_list(state: State<'_, AppState>) -> Result<Vec<SkillInfo>, String> {
-    Ok(skills::list_all(&state.db, builtin_skills_dir(&state), &user_skills_dir(&state)).await)
+    Ok(skills::list_all(
+        &state.db,
+        &state.app_data_dir,
+        builtin_skills_dir(&state),
+        &user_skills_dir(&state),
+    )
+    .await)
 }
 
 /// Full skill detail (incl. SKILL.md body + review record + probed
@@ -29,21 +35,57 @@ pub async fn skills_list(state: State<'_, AppState>) -> Result<Vec<SkillInfo>, S
 pub async fn skills_get(state: State<'_, AppState>, name: String) -> Result<SkillDetail, String> {
     let (skill, path) = skills::get(builtin_skills_dir(&state), &user_skills_dir(&state), &name)
         .ok_or(format!("技能「{name}」不存在"))?;
-    let review = match skill.source {
+    let record = match skill.source {
         // 内置技能一方可信，免审查。
         SkillSource::Builtin => None,
         SkillSource::User => skill_review::get_review(&state.db, &name).await,
     };
-    let dependencies = skills::probe_dependencies(&state.app_data_dir, &skill.requires);
+    let review_badge = record.as_ref().map(|rec| {
+        let hash = skill_review::content_hash(&skill.dir);
+        skill_review::ReviewBadge {
+            verdict: rec.verdict.clone(),
+            stale: rec.content_hash != hash,
+        }
+    });
+    let review_state = match skill.source {
+        SkillSource::Builtin => "builtin".to_string(),
+        SkillSource::User => match review_badge.as_ref() {
+            None => "unreviewed".to_string(),
+            Some(b) if b.stale => "stale".to_string(),
+            Some(b) => b.verdict.clone(),
+        },
+    };
+    let declared = !skill.requires.is_empty();
+    let dependencies = if declared {
+        skills::probe_dependencies_cached(&state.app_data_dir, &skill.requires, &skill.dir)
+    } else {
+        record
+            .as_ref()
+            .map(|rec| skills::probe_review_dependencies(&state.app_data_dir, rec, &skill.dir))
+            .unwrap_or_default()
+    };
+    let dependency_source = if declared {
+        "declared".to_string()
+    } else if record.is_some() {
+        "review".to_string()
+    } else if skill.source == SkillSource::User {
+        "unreviewed".to_string()
+    } else {
+        "none".to_string()
+    };
     Ok(SkillDetail {
         name: skill.name,
         description: skill.description,
         content: skill.content,
         path,
-        review,
+        review: record,
+        review_state,
+        dependency_source,
         source: skill.source,
         dependencies,
         tools: skill.tools,
+        scenarios: skill.scenarios,
+        rules: skill.rules,
     })
 }
 
@@ -58,11 +100,15 @@ pub struct SkillDetail {
     pub path: String,
     /// Latest review record; absent = never reviewed (or built-in).
     pub review: Option<ReviewRecord>,
+    pub review_state: String,
+    pub dependency_source: String,
     pub source: SkillSource,
     /// Declared dependencies with live availability (probed on open).
     pub dependencies: Vec<DepStatus>,
     /// 技能声明的工具权限（挂载后并入会话工具白名单）。
     pub tools: Vec<String>,
+    pub scenarios: Vec<String>,
+    pub rules: Vec<String>,
 }
 
 /// Import a skill from a folder containing SKILL.md.
@@ -74,7 +120,11 @@ pub async fn skills_import_folder(
 ) -> Result<SkillInfo, String> {
     let dir = user_skills_dir(&state);
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建插件目录：{e}"))?;
-    skills::import_folder(builtin_skills_dir(&state), &dir, std::path::Path::new(&path))
+    let result = skills::import_folder(builtin_skills_dir(&state), &dir, std::path::Path::new(&path));
+    if result.is_ok() {
+        skills::clear_dependency_cache();
+    }
+    result
 }
 
 /// Import a skill from a zip archive.
@@ -86,7 +136,11 @@ pub async fn skills_import_zip(
 ) -> Result<SkillInfo, String> {
     let dir = user_skills_dir(&state);
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建插件目录：{e}"))?;
-    skills::import_zip(builtin_skills_dir(&state), &dir, std::path::Path::new(&path))
+    let result = skills::import_zip(builtin_skills_dir(&state), &dir, std::path::Path::new(&path));
+    if result.is_ok() {
+        skills::clear_dependency_cache();
+    }
+    result
 }
 
 /// Delete an installed user skill (removes its directory). Sessions that
@@ -96,6 +150,7 @@ pub async fn skills_import_zip(
 #[instrument(skip(state))]
 pub async fn skills_delete(state: State<'_, AppState>, name: String) -> Result<(), String> {
     skills::delete(builtin_skills_dir(&state), &user_skills_dir(&state), &name)?;
+    skills::clear_dependency_cache();
     // Drop any stored review alongside the skill.
     skill_review::drop_review(&state.db, &name).await?;
     Ok(())
@@ -130,6 +185,7 @@ pub async fn skills_env_install(
         let _ = app_handle.emit("skills:env-install", serde_json::json!({ "message": msg }));
     });
     let python = crate::core::skill_env::ensure_env(&state.app_data_dir, &packages, Some(&cb)).await?;
+    skills::clear_dependency_cache();
     Ok(format!(
         "隔离环境已就绪（{}）：{}",
         python.display(),

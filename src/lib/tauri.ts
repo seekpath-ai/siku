@@ -988,6 +988,14 @@ export interface SkillInfo {
   source: 'builtin' | 'user';
   /** 声明的依赖（未经探测；详情页返回探测结果）。 */
   requires: { binaries: string[]; pip: string[] };
+  /** 列表页实时探测结果，用于卡片状态和安装按钮。 */
+  dependencies: SkillDepStatus[];
+  /** 挂载后会放开的 agent 工具。 */
+  tools: string[];
+  scenarios: string[];
+  rules: string[];
+  reviewState: 'builtin' | 'unreviewed' | 'stale' | 'risk' | 'warn' | 'pass';
+  dependencySource: 'declared' | 'review' | 'none' | 'unreviewed';
 }
 
 export interface SkillDepStatus {
@@ -995,6 +1003,8 @@ export interface SkillDepStatus {
   kind: string;
   name: string;
   available: boolean;
+  /** 可选依赖（如 LibreOffice 视觉自检）不阻塞挂载。 */
+  optional?: boolean;
   /** 缺失时的补充指引（隔离环境状态）。 */
   hint?: string | null;
 }
@@ -1012,6 +1022,10 @@ export interface SkillDetail {
   dependencies: SkillDepStatus[];
   /** 技能声明的工具权限（挂载后并入会话工具白名单）。 */
   tools: string[];
+  scenarios: string[];
+  rules: string[];
+  reviewState: 'builtin' | 'unreviewed' | 'stale' | 'risk' | 'warn' | 'pass';
+  dependencySource: 'declared' | 'review' | 'none' | 'unreviewed';
 }
 
 export async function skillsList(): Promise<SkillInfo[]> {

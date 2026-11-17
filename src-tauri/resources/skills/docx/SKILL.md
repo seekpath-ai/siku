@@ -1,9 +1,13 @@
 ---
 name: docx
 description: 创建专业 Word 文档（.docx）。内置三类格式规范：党政机关公文（GB/T 9704-2012 红头格式）、学术论文（摘要/关键词/自动章节编号/GB/T 7714 参考文献）、企业内部文档（通知、报告、方案、制度）。当用户要求写公文、红头文件、论文、报告、通知等 Word 文档时使用。
+scenarios: [党政机关公文, 学术论文, 企业内部文档]
+rules: [GB/T 9704-2012, 学术论文格式, 企业文档规范]
 requires:
+  pip: [python-docx]
+optional:
   binaries: [soffice]
-  pip: [python-docx, pypdfium2]
+  pip: [pypdfium2]
 tools: [bash, file_write, file_read]
 ---
 

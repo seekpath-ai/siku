@@ -47,6 +47,56 @@ fn forbidden_working_dir_message() -> &'static str {
     "不能将会话工作目录设为思库应用数据目录、其子目录或上级目录；请选择普通项目文件夹。"
 }
 
+/// User skills must have a fresh, non-risk security review before they can be
+/// newly mounted. Built-ins are first-party and exempt.
+async fn validate_new_skill_mounts(
+    state: &AppState,
+    session_id: &str,
+    requested: &[String],
+) -> Result<(), String> {
+    let existing_json: Option<(String,)> = sqlx::query_as(
+        "SELECT selected_skills FROM chat_sessions WHERE id = ?",
+    )
+    .bind(session_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| format!("db error: {e}"))?;
+    let existing: std::collections::HashSet<String> = existing_json
+        .and_then(|(json,)| serde_json::from_str::<Vec<String>>(&json).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let builtin = state.builtin_skills_dir.as_deref();
+    let user_dir = state.app_data_dir.join("skills");
+    for name in requested {
+        if existing.contains(name) {
+            continue; // already mounted; allows legacy mounts to be removed
+        }
+        let Some((skill, _)) = crate::core::skills::get(builtin, &user_dir, name) else {
+            return Err(format!("技能「{name}」不存在"));
+        };
+        if skill.source == crate::core::skills::SkillSource::Builtin {
+            continue;
+        }
+        let record = crate::core::skill_review::get_review(&state.db, &skill.name).await;
+        if let Some(reason) = crate::core::skills::review_gate_error(&skill, record.as_ref()) {
+            return Err(format!("技能「{name}」{reason}"));
+        }
+    }
+    Ok(())
+}
+
+/// Filter already-mounted skills at turn start: legacy sessions may predate
+/// the review gate, so an unreviewed/stale/risk user skill must not reach the
+/// model even if its name is still in selected_skills.
+async fn review_allows_mount(state: &AppState, skill: &crate::core::skills::Skill) -> bool {
+    if skill.source == crate::core::skills::SkillSource::Builtin {
+        return true;
+    }
+    let record = crate::core::skill_review::get_review(&state.db, &skill.name).await;
+    crate::core::skills::review_gate_error(skill, record.as_ref()).is_none()
+}
+
 /// Per-session turn mutex. cancel_tokens / approval_senders / ask_senders
 /// are all single-slot per session_id, so a second concurrent turn for the
 /// same session would clobber the first turn's channels, and the first
@@ -588,6 +638,9 @@ pub async fn agent_update_session(
         .as_ref()
         .map(|v| serde_json::to_string(v).map_err(|e| format!("json: {e}")))
         .transpose()?;
+    if let Some(skills) = input.selected_skills.as_ref() {
+        validate_new_skill_mounts(&state, &session_id, skills).await?;
+    }
 
     if let Some(wd) = input.working_dir.as_deref() {
         if is_forbidden_working_dir(Path::new(wd), &state.app_data_dir) {
@@ -830,6 +883,7 @@ pub async fn agent_set_session_skills(
     session_id: String,
     skills: Vec<String>,
 ) -> Result<(), String> {
+    validate_new_skill_mounts(&state, &session_id, &skills).await?;
     let json = serde_json::to_string(&skills).map_err(|e| format!("json: {e}"))?;
     sqlx::query("UPDATE chat_sessions SET selected_skills = ?, updated_at = ? WHERE id = ?")
         .bind(&json)
@@ -1322,8 +1376,28 @@ pub(crate) async fn run_agent_turn(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    let all_skills =
-        crate::core::skills::scan_all(state.builtin_skills_dir.as_deref(), &skills_dir);
+    // No mounted skills means no skill work at all: do not scan the library
+    // on every turn. With mounts, load only those directories directly.
+    let all_skills = if selected_skills.is_empty() {
+        Vec::new()
+    } else {
+        crate::core::skills::load_selected(
+            state.builtin_skills_dir.as_deref(),
+            &skills_dir,
+            &selected_skills,
+        )
+    };
+    // Legacy sessions may still name unreviewed/stale/risk user skills. Never
+    // register those tools; unmounting is still possible through the UI.
+    let mut allowed = Vec::with_capacity(all_skills.len());
+    for skill in all_skills {
+        if review_allows_mount(&state, &skill).await {
+            allowed.push(skill);
+        } else {
+            warn!(skill = %skill.name, session_id=%session_id, "skill mount blocked by review gate");
+        }
+    }
+    let all_skills = allowed;
 
     // 挂载即授权：技能前言 `tools:` 声明的工具并入会话白名单（每轮重算，
     // 卸载即回收）。领域智能体的窄白名单（如文献分析无 bash）因此可以

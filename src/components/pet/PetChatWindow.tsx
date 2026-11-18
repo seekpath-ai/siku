@@ -16,6 +16,8 @@ export function PetChatWindow() {
   const store = usePetStore();
   const [context, setContext] = useState<PetContext | null>(null);
   const [paramError, setParamError] = useState<string | null>(null);
+  const [reviewStatus, setReviewStatus] = useState<string | null>(null);
+  const [reviewError, setReviewError] = useState<string | null>(null);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -33,6 +35,27 @@ export function PetChatWindow() {
       return;
     }
     usePetStore.getState().attach(sessionId);
+  }, []);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const sessionId = params.get('petSession');
+    if (!sessionId) return;
+    let unProgress: (() => void) | undefined;
+    let unError: (() => void) | undefined;
+    listen<{ sessionId: string; message: string }>('skills:review-progress', (event) => {
+      if (event.payload.sessionId === sessionId) setReviewStatus(event.payload.message);
+    }).then((u) => { unProgress = u; });
+    listen<{ sessionId: string; message: string }>('skills:review-error', (event) => {
+      if (event.payload.sessionId === sessionId) {
+        setReviewStatus(null);
+        setReviewError(event.payload.message);
+      }
+    }).then((u) => { unError = u; });
+    return () => {
+      unProgress?.();
+      unError?.();
+    };
   }, []);
 
   // The session was cleared from another window: nothing left to show.
@@ -80,7 +103,19 @@ export function PetChatWindow() {
           {paramError}
         </div>
       ) : (
-        <PetConversation context={context} liveSelection={false} />
+        <>
+          {reviewStatus && (
+            <div className="mx-3 mt-2 rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-[11px] text-primary">
+              {reviewStatus}
+            </div>
+          )}
+          {reviewError && (
+            <div className="mx-3 mt-2 rounded-lg border border-red-500/20 bg-red-500/5 px-3 py-2 text-[11px] text-red-400">
+              审查失败：{reviewError}
+            </div>
+          )}
+          <PetConversation context={context} liveSelection={false} />
+        </>
       )}
     </div>
   );

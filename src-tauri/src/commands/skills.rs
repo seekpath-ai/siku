@@ -1,7 +1,7 @@
-use tauri::State;
+use tauri::{Emitter, State};
 use tracing::instrument;
 
-use crate::core::skill_review::{self, ReviewRecord, StaticReport};
+use crate::core::skill_review::{self, ReviewRecord};
 use crate::core::skills::{self, SkillInfo, SkillSource};
 use crate::AppState;
 
@@ -124,31 +124,30 @@ pub async fn skills_delete(state: State<'_, AppState>, name: String) -> Result<(
     Ok(())
 }
 
-/// Result of `skills_review_start`: the reviewer session to display plus the
-/// deterministic scan report (shown in the detail dialog immediately).
+/// Result of `skills_review_start`: the reviewer session to open immediately.
+/// The static scan happens in `skills_review_run`, so a large skill directory
+/// cannot block the window from opening.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillReviewStart {
     pub session_id: String,
-    pub report: StaticReport,
 }
 
-/// Start an AI review for a skill: run the deterministic static scan, create
-/// a no-tool 安全审查 domain session, and fire the review turn. The frontend
-/// displays the session in a pet-chat window and calls
-/// `skills_review_collect` when the turn completes.
+/// Prepare an AI review: create a no-tool 安全审查 domain session. The
+/// frontend opens the pet-chat window immediately, then calls
+/// `skills_review_run` (without awaiting it), which runs the deterministic
+/// scan and starts the reviewer turn. `skills_review_collect` persists the
+/// verdict when the turn completes.
 #[tauri::command]
-#[instrument(skip(state, app_handle))]
+#[instrument(skip(state))]
 pub async fn skills_review_start(
     state: State<'_, AppState>,
-    app_handle: tauri::AppHandle,
     name: String,
 ) -> Result<SkillReviewStart, String> {
     let dir = user_skills_dir(&state).join(&name);
     if !dir.is_dir() {
         return Err(format!("技能「{name}」不存在"));
     }
-    let report = skill_review::static_scan(&dir);
 
     // Reviewer session: domain agent with NO tools — content under review
     // must never be executable by the reviewer itself.
@@ -164,11 +163,57 @@ pub async fn skills_review_start(
         .ok_or("创建审查会话失败")?
         .to_string();
 
-    let prompt = skill_review::build_review_prompt(&name, &dir, &report);
-    crate::commands::agent::run_agent_turn(&state, &app_handle, session_id.clone(), prompt, None, None, None)
-        .await?;
+    Ok(SkillReviewStart { session_id })
+}
 
-    Ok(SkillReviewStart { session_id, report })
+/// Fire the reviewer turn for a session created by `skills_review_start`.
+/// Frontend invokes this WITHOUT awaiting, then opens the pet window: the
+/// command keeps running after the button handler returns, so the window
+/// appears immediately instead of waiting for the whole LLM review.
+#[tauri::command]
+#[instrument(skip(state, app_handle))]
+pub async fn skills_review_run(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    session_id: String,
+    name: String,
+) -> Result<(), String> {
+    let dir = user_skills_dir(&state).join(&name);
+    if !dir.is_dir() {
+        return Err(format!("技能「{name}」不存在"));
+    }
+    let _ = app_handle.emit(
+        "skills:review-progress",
+        serde_json::json!({ "sessionId": session_id, "message": "正在扫描技能内容…" }),
+    );
+    let report = skill_review::static_scan(&dir);
+    let prompt = skill_review::build_review_prompt(&name, &dir, &report);
+    let _ = app_handle.emit(
+        "skills:review-progress",
+        serde_json::json!({ "sessionId": session_id, "message": "正在启动审查模型…" }),
+    );
+    if let Err(error) = crate::commands::agent::run_agent_turn(
+        &state,
+        &app_handle,
+        session_id.clone(),
+        prompt,
+        None,
+        None,
+        None,
+    )
+    .await
+    {
+        let _ = app_handle.emit(
+            "skills:review-error",
+            serde_json::json!({ "sessionId": session_id, "message": error.clone() }),
+        );
+        return Err(error);
+    }
+    let _ = app_handle.emit(
+        "skills:review-progress",
+        serde_json::json!({ "sessionId": session_id, "message": "审查回合已结束，正在保存结果…" }),
+    );
+    Ok(())
 }
 
 /// Collect the verdict after the review turn completes: parse the reviewer

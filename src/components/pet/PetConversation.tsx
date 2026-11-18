@@ -263,6 +263,7 @@ export const DOMAIN_ID_NAMES: Record<string, string> = {
   research_tracker: '科研追踪',
   knowledge_curator: '知识库整理',
   chat_summarizer: '对话总结',
+  skill_reviewer: '安全审查',
 };
 
 // Keyed by page type (context.page) — fallback when no session yet.

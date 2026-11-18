@@ -1,0 +1,23 @@
+{
+  "output_dir": "/absolute/path/to/figure",
+  "meta": {
+    "title": "Toy comparison",
+    "data_source": "example-data.csv（请替换为真实数据）",
+    "venue": "example"
+  },
+  "figure": {
+    "width_in": 3.5,
+    "height_in": 2.4,
+    "font_size": 8
+  },
+  "panels": [
+    {
+      "kind": "bar",
+      "ylabel": "Score",
+      "categories": ["Baseline", "Ours"],
+      "series": [
+        { "name": "Accuracy", "values": [70.1, 78.4] }
+      ]
+    }
+  ]
+}

@@ -596,6 +596,21 @@ mod tests {
     }
 
     #[test]
+    fn bundled_paper_skills_have_expected_frontmatter() {
+        for (text, name) in [
+            (include_str!("../../resources/skills/paper-figure/SKILL.md"), "paper-figure"),
+            (include_str!("../../resources/skills/paper-diagram/SKILL.md"), "paper-diagram"),
+            (include_str!("../../resources/skills/paper-assets/SKILL.md"), "paper-assets"),
+        ] {
+            let (parsed, _, _, tools, scenarios, rules) = parse_skill_md(text).unwrap();
+            assert_eq!(parsed, name);
+            assert!(tools.contains(&"bash".to_string()));
+            assert!(!scenarios.is_empty());
+            assert!(!rules.is_empty());
+        }
+    }
+
+    #[test]
     fn sanitize_name_produces_legal_tool_names() {
         assert_eq!(sanitize_name("pdf-tools").as_deref(), Some("pdf-tools"));
         assert_eq!(sanitize_name("My Skill").as_deref(), Some("my-skill"));

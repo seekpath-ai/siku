@@ -70,6 +70,15 @@ const WARN_RULES: &[Rule] = &[
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 /// Safety cap on scanned file count.
 const MAX_FILES: usize = 200;
+/// Hard cap on directory entries visited, independent of how many files are
+/// accepted. A skill bundle that accidentally contains a venv/node_modules
+/// could otherwise make review spend minutes traversing empty directories.
+const MAX_ENTRIES: usize = 5000;
+/// Directories that are never part of a skill bundle's review surface.
+const SKIP_DIRS: &[&str] = &[
+    "node_modules", ".git", "venv", ".venv", "__pycache__", "site-packages",
+    "dist", "build", ".siku", ".next", "target",
+];
 /// Excerpt window around a match.
 const EXCERPT_RADIUS: usize = 40;
 
@@ -89,19 +98,28 @@ fn is_probably_text(path: &Path) -> bool {
 fn collect_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
+    let mut visited = 0usize;
     while let Some(d) = stack.pop() {
-        if out.len() >= MAX_FILES {
+        if out.len() >= MAX_FILES || visited >= MAX_ENTRIES {
             break;
         }
         let Ok(entries) = std::fs::read_dir(&d) else { continue };
         for entry in entries.flatten() {
+            visited += 1;
+            if visited >= MAX_ENTRIES || out.len() >= MAX_FILES {
+                break;
+            }
             let p = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with('.') {
                 continue;
             }
             match entry.file_type() {
-                Ok(t) if t.is_dir() => stack.push(p),
+                Ok(t) if t.is_dir() => {
+                    if !SKIP_DIRS.contains(&name.as_str()) {
+                        stack.push(p);
+                    }
+                }
                 Ok(t) if t.is_file() => {
                     let small = entry
                         .metadata()

@@ -1011,24 +1011,23 @@ export async function skillsGet(name: string): Promise<SkillDetail> {
   return invoke<SkillDetail>('skills_get', { name });
 }
 
-/** Static scan report (deterministic, pre-LLM). */
-export interface SkillStaticReport {
-  findings: SkillReviewFinding[];
-  verdict: string;
-  contentHash: string;
-  scannedFiles: string[];
-}
-
-/** Start an AI review (static scan + no-tool reviewer session). */
+/** Create the reviewer session; the scan + turn run in `skillsReviewRun`. */
 export async function skillsReviewStart(
   name: string
-): Promise<{ sessionId: string; report: SkillStaticReport }> {
+): Promise<{ sessionId: string }> {
   return invoke('skills_review_start', { name });
 }
 
 /** Collect + persist the verdict after the review turn completes. */
 export async function skillsReviewCollect(sessionId: string): Promise<SkillReviewRecord> {
   return invoke<SkillReviewRecord>('skills_review_collect', { sessionId });
+}
+
+/** Fire the actual reviewer turn after `skills_review_start` has returned.
+ *  Callers should invoke this without awaiting so the review window opens
+ *  immediately. */
+export async function skillsReviewRun(sessionId: string, name: string): Promise<void> {
+  return invoke<void>('skills_review_run', { sessionId, name });
 }
 
 /** Import a skill from a folder containing SKILL.md. */

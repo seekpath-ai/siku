@@ -1,0 +1,3 @@
+method,accuracy,latency
+Baseline,70.1,12.4
+Ours,78.4,9.8

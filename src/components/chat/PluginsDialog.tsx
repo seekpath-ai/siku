@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   Puzzle, X, RefreshCw, Search, FolderOpen, FolderInput, FileArchive, Trash2, Loader2,
-  ShieldCheck,
+  ShieldCheck, ChevronRight,
 } from 'lucide-react';
 import {
   skillsList, skillsGet, skillsImportFolder, skillsImportZip, skillsDelete,
-  skillsOpenDirectory, agentSetSessionSkills, skillsReviewStart, skillsReviewCollect,
+  skillsOpenDirectory, agentSetSessionSkills, skillsReviewStart, skillsReviewRun, skillsReviewCollect,
   type SkillInfo, type SkillDetail,
 } from '@/lib/tauri';
 import type { AgentStreamEvent } from '@/lib/types';
@@ -14,6 +14,7 @@ import { useDialog } from '@/hooks/useDialog';
 import { notify } from '@/lib/notify';
 import { Modal } from '@/components/ui/Modal';
 import { SkillIcon } from './SkillIcon';
+import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
 
 /** Small module-level cache so reopening the dialog is instant; every mutating
  *  action invalidates it explicitly. */
@@ -38,6 +39,7 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   /** skill name → reviewer session id for in-flight AI reviews. */
   const [reviewing, setReviewing] = useState<Map<string, string>>(new Map());
+  const [reviewStarting, setReviewStarting] = useState<string | null>(null);
   const { sessions, activeSessionId, setSessions } = useChatStore();
   const { confirm } = useDialog();
 
@@ -67,11 +69,17 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
    * user can watch the process. */
   const startReview = async (name: string) => {
     setError(null);
+    setReviewStarting(name);
+    notify('正在创建审查会话…', 'info');
     try {
-      const { sessionId } = await skillsReviewStart(name);
+      const { sessionId } = await Promise.race([
+        skillsReviewStart(name),
+        new Promise<never>((_, reject) =>
+          window.setTimeout(() => reject(new Error('创建审查会话超时，请重启应用后重试')), 20000)
+        ),
+      ]);
       setReviewing((m) => new Map(m).set(name, sessionId));
-      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
-      new WebviewWindow(`pet-chat-${Date.now()}`, {
+      const win = new WebviewWindow(`pet-chat-${Date.now()}`, {
         url: `index.html?petSession=${sessionId}`,
         title: '技能安全审查 - 思库',
         width: 440,
@@ -83,8 +91,36 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
         transparent: true,
         shadow: false,
       });
+      win.once('tauri://error', (event) => {
+        const message = String((event as { payload?: unknown }).payload ?? '无法打开审查窗口');
+        setError(message);
+        notify(message, 'error');
+      });
+      notify('审查窗口已打开，正在等待模型…', 'info');
+      // Fire-and-forget: the backend keeps running this turn while the
+      // window is already visible. Awaiting it here was what made the
+      // button appear to do nothing during a slow LLM review.
+      void skillsReviewRun(sessionId, name).catch((err) => {
+        const message = String(err);
+        setError(message);
+        notify(message, 'error');
+        setReviewing((m) => {
+          const next = new Map(m);
+          next.delete(name);
+          return next;
+        });
+      });
     } catch (err) {
-      setError(String(err));
+      const message = String(err);
+      setError(message);
+      notify(message, 'error');
+      setReviewing((m) => {
+        const next = new Map(m);
+        next.delete(name);
+        return next;
+      });
+    } finally {
+      setReviewStarting(null);
     }
   };
 
@@ -109,6 +145,8 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
               } catch (err) {
                 setError(String(err));
               }
+            } else if (ev.type === 'error') {
+              setError(ev.content ? String(ev.content) : '技能审查失败');
             }
             setReviewing((m) => {
               const n = new Map(m);
@@ -210,13 +248,13 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
           return;
         }
         if (state === 'risk') {
-          notify('该技能审查结果为风险，禁止挂载', 'error');
+          notify('该技能审查结果为高风险，禁止挂载', 'error');
           return;
         }
         if (state === 'warn') {
           const ok = await confirm(
-            '该技能审查结果为「注意」，可能包含需要人工确认的权限或模式。仍要挂载吗？',
-            { title: '挂载审查注意的技能' },
+            '该技能审查结果为中风险，可能包含需要人工确认的权限或模式。仍要挂载吗？',
+            { title: '挂载中风险的技能' },
           );
           if (!ok) return;
         }
@@ -272,19 +310,34 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
   const builtinSkills = filtered.filter((s) => s.source === 'builtin');
   const userSkills = filtered.filter((s) => s.source !== 'builtin');
 
-  /** Review state badge: 绿=通过 / 黄=注意 / 红=风险；stale（审查后内容变更）按待复审显示。 */
+  /** Review state badge: 绿=低风险 / 黄=中风险 / 红=高风险；stale（审查后内容变更）按待复审显示。 */
   const reviewBadge = (s: SkillInfo) => {
     const r = s.review;
     if (!r) return null;
     if (r.stale) return null; // top-right status already shows 待复审
-    const styles: Record<string, [string, string]> = {
-      pass: ['审查通过', 'border-emerald-400/30 text-emerald-400 bg-emerald-400/10'],
-      warn: ['审查注意', 'border-amber-400/30 text-amber-400 bg-amber-400/10'],
-      risk: ['存在风险', 'border-red-400/30 text-red-400 bg-red-400/10'],
+    const styles: Record<string, [string, string, string]> = {
+      pass: [
+        '低风险',
+        'border-emerald-400/30 text-emerald-400 bg-emerald-400/10',
+        'AI 审查未发现明显风险',
+      ],
+      warn: [
+        '中风险',
+        'border-amber-400/30 text-amber-400 bg-amber-400/10',
+        'AI 审查发现需人工确认的风险项，挂载前会再次确认',
+      ],
+      risk: [
+        '高风险',
+        'border-red-400/30 text-red-400 bg-red-400/10',
+        'AI 审查发现高风险内容，禁止挂载',
+      ],
     };
-    const [label, cls] = styles[r.verdict] ?? styles.warn;
+    const [label, cls, hint] = styles[r.verdict] ?? styles.warn;
     return (
-      <span className={`shrink-0 text-[10px] px-1.5 py-px rounded-full border ${cls}`}>
+      <span
+        className={`shrink-0 rounded-full border px-1.5 py-px text-[10px] ${cls}`}
+        title={hint}
+      >
         {label}
       </span>
     );
@@ -308,7 +361,7 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
       onClose={onClose}
       backdropClassName="bg-black/50 backdrop-blur-sm"
     >
-      <div className="relative w-[680px] max-w-[94vw] h-[580px] max-h-[88vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
+      <div className="relative w-[680px] max-w-[94vw] h-[620px] max-h-[88vh] flex flex-col bg-surface border border-surface-hover rounded-xl shadow-2xl overflow-hidden">
         {/* Header */}
         <div className="flex items-center gap-2 px-4 py-3 border-b border-surface-hover">
           <Puzzle size={16} className="text-primary" />
@@ -393,8 +446,7 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
         <div className="flex-1 overflow-y-auto px-4 py-3">
           {error && <div className="mb-3 text-xs text-red-400">{error}</div>}
           <p className="mb-3 text-[11px] text-text-secondary/60 leading-relaxed">
-            插件（技能）按会话挂载：未挂载的插件不会出现在对话中，其描述也不占用上下文。
-            点击卡片查看详情并挂载到当前会话。
+            插件按会话挂载，未挂载不会进入对话。审查结果：低风险可直接挂载，中风险需确认，高风险禁止挂载。
           </p>
           {loading && skills.length === 0 ? (
             <div className="flex items-center justify-center py-12 text-text-secondary/60">
@@ -420,6 +472,7 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
                       )}
                       <div className="grid grid-cols-2 gap-2.5">
                         {group.items.map((s) => {
+                          const isMounted = mounted.has(s.name);
                           return (
                             <div
                               key={s.name}
@@ -427,78 +480,91 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
                               tabIndex={0}
                               onClick={() => openDetail(s.name)}
                               onKeyDown={(e) => e.key === 'Enter' && openDetail(s.name)}
-                              className="group relative flex min-h-[190px] text-left flex-col rounded-xl border border-surface-hover bg-background/40 p-3 hover:border-primary/40 transition-colors cursor-pointer"
+                              className={`group relative flex h-full cursor-pointer flex-col rounded-xl border p-3 text-left transition-colors ${
+                                isMounted
+                                  ? 'border-primary/35 bg-primary/[0.04] hover:border-primary/55'
+                                  : 'border-surface-hover bg-background/40 hover:border-primary/40 hover:bg-background/60'
+                              }`}
                             >
-                              <div className="flex items-start gap-2 pr-20">
-                                <SkillIcon name={s.name} size={16} />
-                                <div className="min-w-0 flex-1">
-                                  <div className="flex flex-wrap items-center gap-1.5">
-                                    <span className="text-[13px] font-medium text-text-primary font-mono truncate">
-                                      {s.name}
+                              <div className="flex items-center gap-2">
+                                <SkillIcon name={s.name} size={20} />
+                                <span
+                                  className="min-w-0 flex-1 truncate font-mono text-[13px] font-medium text-text-primary"
+                                  title={s.name}
+                                >
+                                  {s.name}
+                                </span>
+                                <div className="flex shrink-0 items-center gap-1">
+                                  {isMounted && (
+                                    <span className="rounded-full border border-primary/30 bg-primary/10 px-1.5 py-px text-[10px] text-primary">
+                                      已挂载
                                     </span>
-                                    {mounted.has(s.name) && (
-                                      <span className="shrink-0 text-[10px] px-1.5 py-px rounded-full border border-primary/30 text-primary bg-primary/10">
-                                        已挂载
-                                      </span>
-                                    )}
-                                    {s.source === 'builtin' ? (
-                                      <span className="shrink-0 text-[10px] px-1.5 py-px rounded-full border border-sky-400/30 text-sky-400 bg-sky-400/10">
-                                        内置
-                                      </span>
-                                    ) : (
-                                      reviewBadge(s)
-                                    )}
-                                    {detailLoading === s.name && (
-                                      <Loader2 size={11} className="animate-spin text-text-secondary/40" />
-                                    )}
-                                  </div>
-                                  <p className="mt-1.5 text-[11px] text-text-secondary leading-relaxed line-clamp-3">
-                                    {s.description || '（无描述）'}
-                                  </p>
-                                  {s.scenarios.length > 0 && (
-                                    <div className="mt-1.5 flex flex-wrap gap-1">
-                                      {s.scenarios.slice(0, 3).map((scenario) => (
+                                  )}
+                                  {s.source === 'builtin' ? (
+                                    <span className="rounded-full border border-sky-400/30 bg-sky-400/10 px-1.5 py-px text-[10px] text-sky-400">
+                                      内置
+                                    </span>
+                                  ) : (
+                                    <>
+                                      {reviewBadge(s)}
+                                      {s.reviewState === 'unreviewed' && (
                                         <span
-                                          key={scenario}
-                                          className="rounded-full border border-surface-hover bg-surface-hover/40 px-1.5 py-px text-[9px] text-text-secondary"
+                                          className="rounded-full border border-surface-hover bg-surface-hover/40 px-1.5 py-px text-[10px] text-text-secondary"
+                                          title="尚未进行 AI 安全审查，审查后才能挂载"
                                         >
-                                          {scenario}
-                                        </span>
-                                      ))}
-                                      {s.scenarios.length > 3 && (
-                                        <span className="text-[9px] text-text-secondary/50">
-                                          +{s.scenarios.length - 3}
+                                          待审查
                                         </span>
                                       )}
-                                    </div>
+                                      {s.reviewState === 'stale' && (
+                                        <span
+                                          className="rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-px text-[10px] text-amber-400"
+                                          title="审查后技能内容已变更，需要重新审查"
+                                        >
+                                          待复审
+                                        </span>
+                                      )}
+                                    </>
+                                  )}
+                                  {detailLoading === s.name && (
+                                    <Loader2 size={11} className="animate-spin text-text-secondary/40" />
                                   )}
                                 </div>
                               </div>
+                              <p className="mt-1.5 line-clamp-2 text-[11px] leading-relaxed text-text-secondary">
+                                {s.description || '（无描述）'}
+                              </p>
 
-                              <div className="absolute right-2 top-2 flex items-center gap-1">
-                                {s.source !== 'builtin' && s.reviewState === 'unreviewed' ? (
-                                  <span className="rounded-md bg-amber-500/10 px-2 py-1 text-[10px] text-amber-300">
-                                    待审查
-                                  </span>
-                                ) : s.source !== 'builtin' && s.reviewState === 'stale' ? (
-                                  <span className="rounded-md bg-amber-500/10 px-2 py-1 text-[10px] text-amber-300">
-                                    待复审
-                                  </span>
-                                ) : s.source !== 'builtin' && s.reviewState === 'risk' ? (
-                                  <span className="rounded-md bg-red-500/10 px-2 py-1 text-[10px] text-red-300">
-                                    存在风险
-                                  </span>
-                                ) : null}
-                              </div>
-
-                              <div className="mt-auto pt-3">
-                                <div className="truncate text-[10px] text-text-secondary/70" title={s.tools.join(', ')}>
-                                  工具：{s.tools.length > 0 ? s.tools.join(' / ') : '继承会话'}
+                              {s.scenarios.length > 0 && (
+                                <div className="mt-1.5 flex flex-wrap gap-1">
+                                  {s.scenarios.slice(0, 3).map((scenario) => (
+                                    <span
+                                      key={scenario}
+                                      className="rounded-full border border-surface-hover bg-surface-hover/40 px-1.5 py-px text-[9px] text-text-secondary"
+                                    >
+                                      {scenario}
+                                    </span>
+                                  ))}
+                                  {s.scenarios.length > 3 && (
+                                    <span className="text-[9px] text-text-secondary/50">
+                                      +{s.scenarios.length - 3}
+                                    </span>
+                                  )}
                                 </div>
-                              </div>
+                              )}
 
-                              <div className="flex items-center justify-between pt-2">
-                                <span className="text-[10px] text-text-secondary/40">点击查看详情</span>
+                              <div className="mt-auto flex items-center gap-2 border-t border-surface-hover/60 pt-2">
+                                <span
+                                  className="min-w-0 flex-1 truncate text-[10px] text-text-secondary/70"
+                                  title={s.tools.join(', ')}
+                                >
+                                  工具：{s.tools.length > 0 ? s.tools.join(' / ') : '继承会话'}
+                                </span>
+                                {s.source === 'builtin' && (
+                                  <ChevronRight
+                                    size={13}
+                                    className="shrink-0 text-text-secondary/25 transition-colors group-hover:text-primary/70"
+                                  />
+                                )}
                                 {s.source !== 'builtin' && (
                                   <button
                                     type="button"
@@ -506,15 +572,15 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
                                       e.stopPropagation();
                                       void startReview(s.name);
                                     }}
-                                    disabled={reviewing.has(s.name)}
+                                    disabled={reviewing.has(s.name) || reviewStarting === s.name}
                                     title="AI 审查（提示词/脚本安全）"
                                     className={
                                       s.reviewState === 'unreviewed' || s.reviewState === 'stale'
-                                        ? 'flex items-center gap-1 rounded-md bg-amber-500/10 px-2 py-1 text-[10px] text-amber-300 hover:bg-amber-500/20 disabled:opacity-50'
-                                        : 'rounded p-1 text-text-secondary/50 opacity-100 hover:text-primary hover:bg-surface-hover transition-colors disabled:opacity-50'
+                                        ? 'flex shrink-0 items-center gap-1 rounded-md bg-amber-500/10 px-2 py-1 text-[10px] text-amber-300 hover:bg-amber-500/20 disabled:opacity-50'
+                                        : 'shrink-0 rounded p-1 text-text-secondary/50 transition-colors hover:bg-surface-hover hover:text-primary disabled:opacity-50'
                                     }
                                   >
-                                    {reviewing.has(s.name) ? (
+                                    {reviewing.has(s.name) || reviewStarting === s.name ? (
                                       <Loader2 size={12} className="animate-spin" />
                                     ) : s.reviewState === 'unreviewed' || s.reviewState === 'stale' ? (
                                       <>
@@ -632,10 +698,10 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
                       }`}
                     >
                       {detail.review.verdict === 'pass'
-                        ? '通过'
+                        ? '低风险'
                         : detail.review.verdict === 'warn'
-                          ? '注意'
-                          : '风险'}
+                          ? '中风险'
+                          : '高风险'}
                     </span>
                     <span className="text-[10px] text-text-secondary/50">
                       {detail.review.reviewedAt.slice(0, 19).replace('T', ' ')}
@@ -668,15 +734,21 @@ export function PluginsDialog({ onClose }: { onClose: () => void }) {
               {detail.source !== 'builtin' && (
                 <button
                   onClick={() => void startReview(detail.name)}
-                  disabled={reviewing.has(detail.name)}
+                  disabled={reviewing.has(detail.name) || reviewStarting === detail.name}
                   className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-[12px] border border-surface-hover text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors disabled:opacity-50"
                 >
-                  {reviewing.has(detail.name) ? (
+                  {reviewing.has(detail.name) || reviewStarting === detail.name ? (
                     <Loader2 size={12} className="animate-spin" />
                   ) : (
                     <ShieldCheck size={12} />
                   )}
-                  {detail.review ? '重新审查' : 'AI 审查'}
+                  {reviewStarting === detail.name
+                    ? '准备中…'
+                    : reviewing.has(detail.name)
+                      ? '审查中…'
+                      : detail.review
+                        ? '重新审查'
+                        : 'AI 审查'}
                 </button>
               )}
               <button

@@ -78,7 +78,6 @@ async fn run(
             app: app.clone(),
             sink: sink.clone(),
             bot_open_id: bot.open_id.clone(),
-            cfg: cfg.clone(),
             instance_channel: format!("feishu:{}", cfg.app_id),
         }))
         .await;
@@ -186,7 +185,6 @@ struct FeishuMessageHandler {
     app: AppHandle,
     sink: Arc<dyn ReplySink>,
     bot_open_id: String,
-    cfg: FeishuBotConfig,
     /// "feishu:<app_id>" — instance-scoped channel key for routing/pairing.
     instance_channel: String,
 }
@@ -209,47 +207,10 @@ impl EventHandler for FeishuMessageHandler {
                 "feishu message event"
             );
             match parse_inbound(&payload, &self.bot_open_id, &self.instance_channel) {
-                Ok(Some(mut inbound)) => {
-                    // Image messages: fetch the attachment now so the agent
-                    // turn gets real pixels. Files stay as references — the
-                    // router answers them with guidance instead.
-                    let is_image = inbound
-                        .media
-                        .as_ref()
-                        .map(|m| m.kind == "image")
-                        .unwrap_or(false);
-                    if is_image {
-                        let m = inbound.media.clone().unwrap();
-                        let mut keys = vec![m.file_key.clone()];
-                        keys.extend(m.extra_image_keys.iter().cloned());
-                        let mut download_failed = false;
-                        for key in &keys {
-                            match download_resource(&self.cfg, &m.message_id, key, "image").await {
-                                Ok((bytes, mime)) => {
-                                    inbound.images.push(crate::ai::llm::ImageAttachment {
-                                        mime: if mime.starts_with("image/") { mime } else { "image/jpeg".to_string() },
-                                        base64: base64::Engine::encode(
-                                            &base64::engine::general_purpose::STANDARD,
-                                            &bytes,
-                                        ),
-                                        name: None,
-                                    });
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "feishu image download failed");
-                                    download_failed = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if download_failed {
-                            let _ = self
-                                .sink
-                                .send_text(&inbound.chat_id, "图片下载失败，请重发一次。")
-                                .await;
-                            return Ok(None);
-                        }
-                    }
+                Ok(Some(inbound)) => {
+                    // Media stays a reference here: the debounce batch owns
+                    // downloading/decrypting, so a slow image can never be
+                    // split from the caption typed right after it.
                     router::enqueue(self.app.clone(), inbound, self.sink.clone()).await;
                 }
                 Ok(None) => {
@@ -408,25 +369,26 @@ fn parse_inbound(
             msg_id: msg_id.clone(),
             sent_at_ms: message_sent_at_ms(message),
             text,
-            images: Vec::new(),
             media: if first_key.is_empty() {
-                None
+                Vec::new()
             } else {
-                Some(crate::remote::router::MediaRef {
-                    kind: "image".to_string(),
+                vec![crate::remote::router::MediaRef {
+                    kind: crate::remote::router::MediaKind::Image,
                     name: "图片".to_string(),
-                    message_id: msg_id,
-                    file_key: first_key,
-                    extra_image_keys: extra_keys,
-                })
+                    locator: crate::remote::router::MediaLocator::Feishu {
+                        message_id: msg_id,
+                        file_key: first_key,
+                        extra_image_keys: extra_keys,
+                    },
+                }]
             },
         }));
     }
 
     if msg_type != "text" {
-        // Media messages carry no text; the file_key/image_key locates the
-        // attachment for the handler to download (images) or for the group
-        // files dialog to fetch later (files).
+        // Media messages carry no text; the file_key/image_key stays a raw
+        // locator for the batch resolver (images are downloaded there, and
+        // files are materialized when the batch reaches process_batch).
         let content = message
             .get("content")
             .and_then(|v| v.as_str())
@@ -459,14 +421,19 @@ fn parse_inbound(
             msg_id: msg_id.clone(),
             sent_at_ms: message_sent_at_ms(message),
             text: String::new(),
-            images: Vec::new(),
-            media: Some(crate::remote::router::MediaRef {
-                kind: msg_type.to_string(),
+            media: vec![crate::remote::router::MediaRef {
+                kind: if msg_type == "image" {
+                    crate::remote::router::MediaKind::Image
+                } else {
+                    crate::remote::router::MediaKind::File
+                },
                 name,
-                message_id: msg_id,
-                file_key: key.to_string(),
-                extra_image_keys: Vec::new(),
-            }),
+                locator: crate::remote::router::MediaLocator::Feishu {
+                    message_id: msg_id,
+                    file_key: key.to_string(),
+                    extra_image_keys: Vec::new(),
+                },
+            }],
         }));
     }
 
@@ -495,8 +462,7 @@ fn parse_inbound(
         msg_id,
         sent_at_ms: message_sent_at_ms(message),
         text,
-        images: Vec::new(),
-        media: None,
+        media: Vec::new(),
     }))
 }
 
@@ -672,8 +638,7 @@ impl FeishuCardActionHandler {
                 msg_id: String::new(), // synthetic click: no dedup entry
                 sent_at_ms: None,      // fresh user intent: no stale guard
                 text: state.prompt.clone(),
-                images: Vec::new(),
-                media: None,
+                media: Vec::new(),
             };
             (final_card(state), inbound)
         };
@@ -1024,12 +989,52 @@ impl ReplySink for FeishuSink {
         Ok(())
     }
 
+    async fn resolve_image_media(
+        &self,
+        media: &crate::remote::router::MediaRef,
+    ) -> Result<Vec<crate::ai::llm::ImageAttachment>, String> {
+        let (message_id, first, extra) = match &media.locator {
+            crate::remote::router::MediaLocator::Feishu {
+                message_id,
+                file_key,
+                extra_image_keys,
+            } => (message_id, file_key, extra_image_keys),
+            _ => return Err("飞书图片定位符无效".to_string()),
+        };
+        let mut keys = vec![first.clone()];
+        keys.extend(extra.iter().cloned());
+        let mut images = Vec::new();
+        for key in keys {
+            let (bytes, mime) = download_resource(&self.cfg, message_id, &key, "image").await?;
+            images.push(crate::ai::llm::ImageAttachment {
+                mime: if mime.starts_with("image/") {
+                    mime
+                } else {
+                    "image/jpeg".to_string()
+                },
+                base64: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &bytes,
+                ),
+                name: None,
+            });
+        }
+        Ok(images)
+    }
+
     async fn resolve_file_media(
         &self,
         media: &crate::remote::router::MediaRef,
     ) -> Result<std::path::PathBuf, String> {
-        let (bytes, _mime) =
-            download_resource(&self.cfg, &media.message_id, &media.file_key, "file").await?;
+        let (message_id, file_key) = match &media.locator {
+            crate::remote::router::MediaLocator::Feishu {
+                message_id,
+                file_key,
+                ..
+            } => (message_id, file_key),
+            _ => return Err("飞书文件定位符无效".to_string()),
+        };
+        let (bytes, _mime) = download_resource(&self.cfg, message_id, file_key, "file").await?;
         let dir = std::env::temp_dir().join("siku_remote_files");
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
         let path = dir.join(format!("{}_{}", uuid::Uuid::new_v4(), media.name));

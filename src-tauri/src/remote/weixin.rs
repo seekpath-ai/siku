@@ -146,11 +146,16 @@ async fn run_monitor(
     } else {
         cfg.baseurl.clone()
     };
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("无法获取应用数据目录: {e}"))?;
     let sink: Arc<dyn ReplySink> = Arc::new(WeixinSink {
         http: http.clone(),
         base_url: base_url.clone(),
         token: cfg.bot_token.clone(),
         db: db.clone(),
+        app_data_dir,
         typing: Arc::new(std::sync::Mutex::new(TypingCache::default())),
         typing_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
@@ -419,8 +424,7 @@ async fn handle_inbound(
         }
     }
     let mut text = String::new();
-    let mut images: Vec<crate::ai::llm::ImageAttachment> = Vec::new();
-    let mut media: Option<crate::remote::router::MediaRef> = None;
+    let mut medias: Vec<crate::remote::router::MediaRef> = Vec::new();
     let mut voice_without_text = false;
     if let Some(items) = msg.get("item_list").and_then(|v| v.as_array()) {
         for item in items {
@@ -447,32 +451,27 @@ async fn handle_inbound(
                         _ => voice_without_text = true,
                     }
                 }
-                // IMAGE: download + AES-128-ECB decrypt, feed the vision turn.
+                // IMAGE: keep only the CDN locator. The batch resolves it
+                // after debounce, so a slow download can't split the caption.
                 Some(2) => {
                     let media_ref = item.get("image_item").and_then(|i| i.get("media"));
                     let aeskey = item
                         .pointer("/image_item/aeskey")
-                        .and_then(|v| v.as_str());
+                        .and_then(|v| v.as_str())
+                        .map(|v| v.to_string());
                     if let Some(m) = media_ref {
-                        match cdn_download(m, aeskey).await {
-                            Ok(bytes) => images.push(crate::ai::llm::ImageAttachment {
-                                mime: sniff_image_mime(&bytes).to_string(),
-                                base64: base64::Engine::encode(
-                                    &base64::engine::general_purpose::STANDARD,
-                                    &bytes,
-                                ),
-                                name: None,
-                            }),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "weixin image download failed");
-                            }
-                        }
+                        medias.push(crate::remote::router::MediaRef {
+                            kind: crate::remote::router::MediaKind::Image,
+                            name: "图片".to_string(),
+                            locator: crate::remote::router::MediaLocator::Weixin {
+                                media: m.clone(),
+                                aeskey,
+                            },
+                        });
                     }
                 }
-                // FILE: download + decrypt, stash under remote_downloads;
-                // the router auto-imports PDFs into the library (the saved
-                // path rides in MediaRef.file_key) and answers other types
-                // with manual-handling guidance.
+                // FILE: same locator strategy. Downloading/decrypting and
+                // saving under remote_downloads happen in the batch resolver.
                 Some(4) => {
                     let media_ref = item.get("file_item").and_then(|i| i.get("media"));
                     let name = item
@@ -481,30 +480,14 @@ async fn handle_inbound(
                         .unwrap_or("文件")
                         .to_string();
                     if let Some(m) = media_ref {
-                        match cdn_download(m, None).await {
-                            Ok(bytes) => {
-                                let dir = app.state::<crate::AppState>().app_data_dir.join("remote_downloads");
-                                let mut saved_path = String::new();
-                                if std::fs::create_dir_all(&dir).is_ok() {
-                                    let path = dir.join(format!("{}_{}", uuid::Uuid::new_v4(), name));
-                                    if let Err(e) = std::fs::write(&path, &bytes) {
-                                        tracing::warn!(error = %e, "weixin file save failed");
-                                    } else {
-                                        saved_path = path.to_string_lossy().to_string();
-                                    }
-                                }
-                                media = Some(crate::remote::router::MediaRef {
-                                    kind: "file".to_string(),
-                                    name: name.clone(),
-                                    message_id: String::new(),
-                                    file_key: saved_path,
-                                    extra_image_keys: Vec::new(),
-                                });
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "weixin file download failed");
-                            }
-                        }
+                        medias.push(crate::remote::router::MediaRef {
+                            kind: crate::remote::router::MediaKind::File,
+                            name,
+                            locator: crate::remote::router::MediaLocator::Weixin {
+                                media: m.clone(),
+                                aeskey: None,
+                            },
+                        });
                     }
                 }
                 _ => {}
@@ -512,7 +495,7 @@ async fn handle_inbound(
         }
     }
     let text = text.trim().to_string();
-    if text.is_empty() && images.is_empty() && media.is_none() {
+    if text.is_empty() && medias.is_empty() {
         if voice_without_text {
             let _ = sink
                 .send_text(from, "收到了你的语音，但这条没有转文字结果，我这边无法识别，麻烦再发一次文字～")
@@ -555,8 +538,7 @@ async fn handle_inbound(
             msg_id,
             sent_at_ms,
             text,
-            images,
-            media,
+            media: medias,
         },
         sink.clone(),
     )
@@ -600,6 +582,8 @@ struct WeixinSink {
     base_url: String,
     token: String,
     db: sqlx::SqlitePool,
+    /// Inbound files are saved under this app-data root.
+    app_data_dir: std::path::PathBuf,
     /// Per-chat typing tickets (in memory only — see `TypingCache`).
     typing: Arc<std::sync::Mutex<TypingCache>>,
     /// Running typing heartbeats, one per chat, aborted when the turn settles.
@@ -621,16 +605,36 @@ impl ReplySink for WeixinSink {
         send_file(&self.http, &self.base_url, &self.token, &self.db, chat_id, file).await
     }
 
+    async fn resolve_image_media(
+        &self,
+        media: &crate::remote::router::MediaRef,
+    ) -> Result<Vec<crate::ai::llm::ImageAttachment>, String> {
+        let (cdn_media, aeskey) = match &media.locator {
+            crate::remote::router::MediaLocator::Weixin { media, aeskey } => (media, aeskey),
+            _ => return Err("微信图片定位符无效".to_string()),
+        };
+        let bytes = cdn_download(cdn_media, aeskey.as_deref()).await?;
+        Ok(vec![crate::ai::llm::ImageAttachment {
+            mime: sniff_image_mime(&bytes).to_string(),
+            base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
+            name: None,
+        }])
+    }
+
     async fn resolve_file_media(
         &self,
         media: &crate::remote::router::MediaRef,
     ) -> Result<std::path::PathBuf, String> {
-        // Inbound files are written to remote_downloads at receive time;
-        // the path rides in file_key.
-        if media.file_key.is_empty() {
-            return Err("文件保存失败，请重发一次".to_string());
-        }
-        Ok(std::path::PathBuf::from(&media.file_key))
+        let (cdn_media, aeskey) = match &media.locator {
+            crate::remote::router::MediaLocator::Weixin { media, aeskey } => (media, aeskey),
+            _ => return Err("微信文件定位符无效".to_string()),
+        };
+        let bytes = cdn_download(cdn_media, aeskey.as_deref()).await?;
+        let dir = self.app_data_dir.join("remote_downloads");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建下载目录失败: {e}"))?;
+        let path = dir.join(format!("{}_{}", uuid::Uuid::new_v4(), media.name));
+        std::fs::write(&path, &bytes).map_err(|e| format!("保存文件失败: {e}"))?;
+        Ok(path)
     }
 
     /// WeChat has no message-editing surface, so "the bot is working" is

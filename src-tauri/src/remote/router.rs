@@ -38,6 +38,9 @@ pub const GRANT_FULL: &str = "full";
 pub const GRANT_READONLY: &str = "readonly";
 
 const DEBOUNCE_MS: u64 = 600;
+/// Image/file-only batches wait a little longer for the user to type the
+/// caption/question. Once text exists, the normal debounce is enough.
+const MEDIA_DEBOUNCE_MS: u64 = 2_000;
 const RATE_LIMIT_PER_MIN: usize = 10;
 const SEEN_CAP: usize = 2048;
 const SEEN_TTL_SECS: i64 = 24 * 3600;
@@ -66,16 +69,45 @@ pub enum ChatKind {
     Group,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    File,
+}
+
+impl MediaKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::File => "file",
+        }
+    }
+}
+
+/// Channel-specific locator for one inbound image/file. Downloading and
+/// decrypting happen later, in the batch's resolve stage, so the debounce
+/// window never depends on network timing.
+#[derive(Clone, Debug)]
+pub enum MediaLocator {
+    Feishu {
+        message_id: String,
+        file_key: String,
+        /// Extra image keys of a Feishu post message (`file_key` is the first).
+        extra_image_keys: Vec<String>,
+    },
+    Weixin {
+        /// The `image_item.media` / `file_item.media` object.
+        media: serde_json::Value,
+        /// `image_item.aeskey` (hex), when present.
+        aeskey: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub struct MediaRef {
-    /// "image" | "file" (images are additionally materialized into `images`).
-    pub kind: String,
+    pub kind: MediaKind,
     pub name: String,
-    /// Channel-specific attachment locators (feishu message_id + file_key).
-    pub message_id: String,
-    pub file_key: String,
-    /// Extra image keys of a feishu post message (file_key holds the first).
-    pub extra_image_keys: Vec<String>,
+    pub locator: MediaLocator,
 }
 
 #[derive(Clone)]
@@ -94,9 +126,9 @@ pub struct InboundMessage {
     /// for that message (synthetic turns, channels without timestamps).
     pub sent_at_ms: Option<i64>,
     pub text: String,
-    /// Downloaded image attachments ready for the agent turn.
-    pub images: Vec<crate::ai::llm::ImageAttachment>,
-    pub media: Option<MediaRef>,
+    /// Raw image/file references. The batch resolves them after debounce, so
+    /// a slow download can never split a caption from its image.
+    pub media: Vec<MediaRef>,
 }
 
 /// A file the agent asked to send back to the remote user's chat app.
@@ -256,6 +288,15 @@ pub trait ReplySink: Send + Sync {
         _kind: ChatKind,
     ) -> (Option<String>, Option<String>) {
         (None, None)
+    }
+    /// Download/decrypt an inbound image into vision attachments. Called once
+    /// per batch and only after the debounce window has settled, so network
+    /// latency cannot separate an image from its caption.
+    async fn resolve_image_media(
+        &self,
+        _media: &MediaRef,
+    ) -> Result<Vec<crate::ai::llm::ImageAttachment>, String> {
+        Err("渠道不支持图片解析".to_string())
     }
     /// Materialize a file attachment to a local path for import. Channels
     /// that already store inbound files locally (weixin) return their path;
@@ -521,21 +562,49 @@ fn inbound_fingerprint(msg: &InboundMessage) -> Option<String> {
         hash.update([0u8]);
     }
     hash.update(sent_at_ms.to_le_bytes());
-    for image in &msg.images {
-        hash.update(image.mime.as_bytes());
+    for media in &msg.media {
+        hash.update(media.kind.as_str().as_bytes());
         hash.update([0u8]);
-        hash.update(image.base64.as_bytes());
+        hash.update(media.name.as_bytes());
         hash.update([0u8]);
-    }
-    if let Some(media) = &msg.media {
-        for part in [
-            media.kind.as_str(),
-            media.name.as_str(),
-            media.message_id.as_str(),
-            media.file_key.as_str(),
-        ] {
-            hash.update(part.as_bytes());
-            hash.update([0u8]);
+        match &media.locator {
+            MediaLocator::Feishu {
+                message_id,
+                file_key,
+                extra_image_keys,
+            } => {
+                hash.update(b"feishu");
+                hash.update([0u8]);
+                hash.update(message_id.as_bytes());
+                hash.update([0u8]);
+                hash.update(file_key.as_bytes());
+                hash.update([0u8]);
+                for key in extra_image_keys {
+                    hash.update(key.as_bytes());
+                    hash.update([0u8]);
+                }
+            }
+            MediaLocator::Weixin { media, aeskey } => {
+                hash.update(b"weixin");
+                hash.update([0u8]);
+                // The signed `full_url` changes between redeliveries; the
+                // encrypted query param is the stable locator.
+                let stable = media
+                    .get("encrypt_query_param")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| media.get("full_url").and_then(|v| v.as_str()))
+                    .unwrap_or_default();
+                hash.update(stable.as_bytes());
+                hash.update([0u8]);
+                if let Some(key) = media.get("aes_key").and_then(|v| v.as_str()) {
+                    hash.update(key.as_bytes());
+                    hash.update([0u8]);
+                }
+                if let Some(key) = aeskey {
+                    hash.update(key.as_bytes());
+                    hash.update([0u8]);
+                }
+            }
         }
     }
     Some(format!("{:x}", hash.finalize()))
@@ -583,13 +652,23 @@ async fn rate_limited(user_key: &str) -> bool {
 struct PendingBatch {
     generation: u64,
     texts: Vec<String>,
-    images: Vec<crate::ai::llm::ImageAttachment>,
+    medias: Vec<MediaRef>,
     meta: Option<InboundMessage>,
     sink: Arc<dyn ReplySink>,
 }
 
 static PENDING: Lazy<Mutex<HashMap<String, PendingBatch>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Quiet-window for one pending batch. Media-only waits for a possible
+/// caption; any real text (with or without media) uses the normal window.
+fn batch_delay(has_text: bool, has_media: bool) -> u64 {
+    if !has_media || has_text {
+        DEBOUNCE_MS
+    } else {
+        MEDIA_DEBOUNCE_MS
+    }
+}
 
 /// Entry point called by channel adapters for every inbound message.
 pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySink>) {
@@ -618,8 +697,7 @@ pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySin
         cursor_len,
         relay_connected = crate::sync::engine::relay_connected(),
         initial_sync_ready = crate::sync::engine::initial_sync_ready(),
-        images = msg.images.len(),
-        has_media = msg.media.is_some(),
+        media = msg.media.len(),
         "remote inbound message"
     );
 
@@ -676,41 +754,47 @@ pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySin
         }
     }
 
-    let key = format!("{}:{}", msg.channel, msg.chat_id);
-    let generation = {
+    // Include the sender: a group's A-image must not be merged into B's text.
+    let key = format!("{}:{}:{}", msg.channel, msg.chat_id, msg.user_id);
+    let (generation, delay) = {
         let mut map = PENDING.lock().await;
         let entry = map.entry(key.clone()).or_insert_with(|| PendingBatch {
             generation: 0,
             texts: Vec::new(),
-            images: Vec::new(),
+            medias: Vec::new(),
             meta: None,
             sink: sink.clone(),
         });
         entry.generation += 1;
         entry.texts.push(msg.text.clone());
-        entry.images.extend(msg.images.clone());
+        entry.medias.extend(msg.media.clone());
         entry.meta = Some(msg);
         entry.sink = sink;
-        entry.generation
+        // Media-only waits for a possible caption; text (with or without
+        // media) uses the normal quiet window. Empty text entries from media
+        // messages must not count as a caption.
+        let has_text = entry.texts.iter().any(|t| !t.trim().is_empty());
+        let delay = batch_delay(has_text, !entry.medias.is_empty());
+        (entry.generation, delay)
     };
 
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
+        tokio::time::sleep(Duration::from_millis(delay)).await;
         let ready = {
             let mut map = PENDING.lock().await;
             map.get_mut(&key).and_then(|entry| {
                 if entry.generation == generation {
                     let texts = std::mem::take(&mut entry.texts);
-                    let images = std::mem::take(&mut entry.images);
+                    let medias = std::mem::take(&mut entry.medias);
                     let meta = entry.meta.clone();
-                    meta.map(|m| (m, texts, images, entry.sink.clone()))
+                    meta.map(|m| (m, texts, medias, entry.sink.clone()))
                 } else {
                     None
                 }
             })
         };
-        if let Some((meta, texts, images, sink)) = ready {
-            process_batch(app, meta, texts, images, sink).await;
+        if let Some((meta, texts, medias, sink)) = ready {
+            process_batch(app, meta, texts, medias, sink).await;
         }
     });
 }
@@ -736,14 +820,16 @@ async fn process_batch(
     app: AppHandle,
     meta: InboundMessage,
     texts: Vec<String>,
-    images: Vec<crate::ai::llm::ImageAttachment>,
+    medias: Vec<MediaRef>,
     sink: Arc<dyn ReplySink>,
 ) {
-    let mut text = texts.join("\n");
-    if text.trim().is_empty() && !images.is_empty() {
-        text = "[图片]".to_string();
-    }
-    if text.trim().is_empty() && images.is_empty() && meta.media.is_none() {
+    let mut text = texts
+        .iter()
+        .filter(|t| !t.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() && medias.is_empty() {
         return;
     }
     let state = app.state::<AppState>();
@@ -785,18 +871,28 @@ async fn process_batch(
         }
     };
 
-    // File messages: save the attachment, extract its text with the same
-    // document pipeline chat attachments use, and hand both path and content
-    // to a normal agent turn. No auto-import — the agent decides (e.g.
-    // paper_import when the user asks to add a PDF to the library).
-    if let Some(media) = &meta.media {
-        if media.kind == "file" {
-            match sink.resolve_file_media(media).await {
+    // Resolve media AFTER the debounce window: the download/decrypt cost no
+    // longer influences whether a caption joins its image/file. Both image
+    // and file refs go through this loop; a failure is reported alongside the
+    // rest of the batch instead of dropping a perfectly good text prompt.
+    let mut images = Vec::new();
+    let mut file_notes: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    let downloads = state.app_data_dir.join("remote_downloads");
+    let caption = text.trim().to_string();
+
+    for media in &medias {
+        match media.kind {
+            MediaKind::Image => match sink.resolve_image_media(media).await {
+                Ok(mut resolved) if !resolved.is_empty() => images.append(&mut resolved),
+                Ok(_) => failures.push(format!("（图片《{}》内容为空，已跳过）", media.name)),
+                Err(e) => failures.push(format!("（图片《{}》下载失败：{e}）", media.name)),
+            },
+            MediaKind::File => match sink.resolve_file_media(media).await {
                 Ok(path) => {
                     // Keep every inbound file under remote_downloads so the
                     // agent can come back to it in later turns (feishu
                     // resolves into a volatile temp dir).
-                    let downloads = state.app_data_dir.join("remote_downloads");
                     let path = if path.starts_with(&downloads) {
                         path
                     } else {
@@ -820,7 +916,6 @@ async fn process_batch(
                     .await
                     .map_err(|e| format!("task join: {e}"))
                     .and_then(|r| r);
-                    let user_note = text.trim().to_string();
                     let body = match extracted {
                         Ok(content) => format!("文件内容提取如下：\n{content}"),
                         Err(e) => format!(
@@ -828,20 +923,45 @@ async fn process_batch(
                              若用户要求入库且是文献 PDF，可用 paper_import 导入该路径。"
                         ),
                     };
-                    text = if user_note.is_empty() {
+                    file_notes.push(if caption.is_empty() {
                         format!("（用户发来文件《{}》，已保存到本机：{}。{body}）", media.name, path.display())
                     } else {
-                        format!("{user_note}\n\n（附件《{}》已保存到本机：{}。{body}）", media.name, path.display())
-                    };
+                        format!("（附件《{}》已保存到本机：{}。{body}）", media.name, path.display())
+                    });
                 }
-                Err(_) => {
-                    let _ = sink
-                        .send_text(&meta.chat_id, &file_fallback_text(&meta, &media.name))
-                        .await;
-                    return;
+                Err(e) => {
+                    tracing::warn!(error = %e, file = %media.name, "remote file download failed");
+                    failures.push(format!(
+                        "（{}：{e}）",
+                        file_fallback_text(&meta, &media.name)
+                    ));
                 }
-            }
+            },
         }
+    }
+
+    if !file_notes.is_empty() {
+        let base = text.trim();
+        text = if base.is_empty() {
+            file_notes.join("\n\n")
+        } else {
+            format!("{base}\n\n{}", file_notes.join("\n\n"))
+        };
+    }
+    if text.trim().is_empty() && !images.is_empty() {
+        text = "[图片]".to_string();
+    }
+    if text.trim().is_empty() && images.is_empty() {
+        let note = if failures.is_empty() {
+            "没有可处理的媒体内容，请重发一次。".to_string()
+        } else {
+            failures.join("\n")
+        };
+        let _ = sink.send_text(&meta.chat_id, &note).await;
+        return;
+    }
+    if !failures.is_empty() {
+        text = format!("{}\n\n{}", text.trim(), failures.join("\n"));
     }
 
     let channel_label = channel_label(&meta.channel);
@@ -1576,9 +1696,36 @@ mod tests {
             msg_id: msg_id.to_string(),
             sent_at_ms,
             text: text.to_string(),
-            images: Vec::new(),
-            media: None,
+            media: Vec::new(),
         }
+    }
+
+    #[test]
+    fn media_only_waits_for_a_caption_but_text_does_not() {
+        assert_eq!(batch_delay(false, false), DEBOUNCE_MS);
+        assert_eq!(batch_delay(true, false), DEBOUNCE_MS);
+        assert_eq!(batch_delay(true, true), DEBOUNCE_MS);
+        assert_eq!(batch_delay(false, true), MEDIA_DEBOUNCE_MS);
+    }
+
+    #[test]
+    fn fingerprint_includes_media_locator() {
+        let mut msg = sample_inbound("m1", Some(1_700_000_000_000), "");
+        msg.media.push(MediaRef {
+            kind: MediaKind::Image,
+            name: "图片".into(),
+            locator: MediaLocator::Feishu {
+                message_id: "m1".into(),
+                file_key: "img-1".into(),
+                extra_image_keys: vec![],
+            },
+        });
+        let first = inbound_fingerprint(&msg).expect("fingerprint");
+        if let MediaLocator::Feishu { file_key, .. } = &mut msg.media[0].locator {
+            *file_key = "img-2".into();
+        }
+        let second = inbound_fingerprint(&msg).expect("fingerprint");
+        assert_ne!(first, second);
     }
 
     #[tokio::test]

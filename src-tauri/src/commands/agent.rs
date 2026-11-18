@@ -7,6 +7,7 @@ use tracing::{error, info, instrument, warn};
 use crate::AppState;
 use crate::ai::agent::config::{AgentConfig, ApprovalConfig, LlmConfigBlock};
 use crate::ai::agent::engine::{AgentEngine, AgentEvent, ApprovalDecision, ApprovalResponse};
+use crate::ai::agent::live_state::AgentLiveState;
 use crate::ai::agent::memory_store::MemoryStore;
 use crate::ai::agent::tool_registry::ToolRegistry;
 use crate::ai::llm::{self, ChatMessage};
@@ -917,6 +918,22 @@ pub async fn agent_cancel(state: State<'_, AppState>, session_id: String) -> Res
 #[instrument(skip(state))]
 pub async fn agent_is_running(state: State<'_, AppState>, session_id: String) -> Result<bool, String> {
     Ok(state.cancel_tokens.lock().await.contains_key(&session_id))
+}
+
+/// Snapshot of the live turn running for `session_id`, if any.
+///
+/// Used when the user switches back to a conversation that kept running in the
+/// background: the frontend restores reasoning steps, streamed text, pending
+/// approval and pending AskUserQuestion from here instead of showing a bare
+/// "thinking" placeholder.
+#[tauri::command]
+#[instrument(skip(state))]
+pub async fn agent_get_live_state(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<AgentLiveState>, String> {
+    let map = state.live_states.lock().await;
+    Ok(map.get(&session_id).filter(|live| live.running).cloned())
 }
 
 /// Rename a session (title only — avoids clobbering the agent config).
@@ -2037,42 +2054,126 @@ pub(crate) async fn run_agent_turn(
     });
 
     // Forward events to the frontend. Also track pending approvals so
-    // agent_approve_tool can resolve the tool_call id from context.
+    // agent_approve_tool can resolve the tool_call id from context, and keep
+    // the backend live snapshot current for session-switch hydration.
     let app_clone2 = app_handle.clone();
     let fwd_sid = session_id.clone();
     // pet_link was resolved above (before `content` moved): linked sessions
     // feed the pet activity aggregator on meaningful transitions only —
     // Delta/Reasoning heartbeats are far too chatty to re-report.
     let pet_fwd = pet_link;
+    let pet_open_target = if is_domain_session { "pet" } else { "chat" };
+    let live_states = state.live_states.clone();
+    let live_turn_id = uuid::Uuid::new_v4().to_string();
+    let live_turn_id_cleanup = live_turn_id.clone();
+    live_states.lock().await.insert(
+        fwd_sid.clone(),
+        AgentLiveState::start(live_turn_id),
+    );
     tokio::spawn(async move {
+        // The status card should stop saying "waiting" as soon as the turn
+        // resumes after an approval/answer. Only the transition is reported,
+        // so token-level Delta events do not spam pet:state.
+        let mut pet_waiting = false;
         while let Some(event) = event_rx.recv().await {
             if let AgentEvent::ToolApprovalRequired { tool_call_id, .. } = &event {
                 if let Ok(mut m) = pending_approvals().lock() {
                     m.insert(fwd_sid.clone(), tool_call_id.clone());
                 }
             }
+            // Update the snapshot BEFORE emitting: a switch that races the
+            // event always sees at least the event's effect.
+            if let Some(live) = live_states.lock().await.get_mut(&fwd_sid) {
+                live.apply(&event);
+            }
             if let Some((src, title)) = &pet_fwd {
                 let label = format!("对话 · {title}");
-                let report: Option<(&str, Option<String>)> = match &event {
-                    AgentEvent::ToolCall { tool_name, .. } => {
-                        Some(("running", Some(format!("工具：{tool_name}"))))
+                match &event {
+                    AgentEvent::ToolApprovalRequired {
+                        tool_call_id,
+                        tool_name,
+                        ..
+                    } => {
+                        pet_waiting = true;
+                        crate::commands::pet::pet_report_pending(
+                            &app_clone2,
+                            src,
+                            &label,
+                            "waiting",
+                            Some(format!("审批：{tool_name}")),
+                            "approval",
+                            Some(tool_call_id.clone()),
+                            Some(pet_open_target.to_string()),
+                        );
                     }
-                    AgentEvent::ToolApprovalRequired { tool_name, .. } => {
-                        Some(("waiting", Some(format!("审批：{tool_name}"))))
+                    AgentEvent::AskUser { .. } => {
+                        pet_waiting = true;
+                        crate::commands::pet::pet_report_pending(
+                            &app_clone2,
+                            src,
+                            &label,
+                            "waiting",
+                            Some("需要你回答问题".to_string()),
+                            "question",
+                            None,
+                            Some(pet_open_target.to_string()),
+                        );
                     }
-                    AgentEvent::AskUser { .. } => Some(("waiting", Some("提问".to_string()))),
-                    AgentEvent::Done { .. } => Some(("done", None)),
-                    AgentEvent::Cancelled { .. } => Some(("idle", None)),
-                    AgentEvent::Error { content, .. } => {
-                        Some(("failed", Some(content.chars().take(60).collect())))
+                    AgentEvent::Thinking { .. }
+                    | AgentEvent::Reasoning { .. }
+                    | AgentEvent::Delta { .. }
+                    | AgentEvent::StepComplete { .. } => {
+                        if pet_waiting {
+                            pet_waiting = false;
+                            crate::commands::pet::pet_report(
+                                &app_clone2,
+                                src,
+                                &label,
+                                "running",
+                                Some("已回复，继续处理".to_string()),
+                            );
+                        }
                     }
-                    _ => None,
-                };
-                if let Some((s, detail)) = report {
-                    crate::commands::pet::pet_report(&app_clone2, src, &label, s, detail);
+                    _ => {
+                        let report: Option<(&str, Option<String>)> = match &event {
+                            AgentEvent::ToolCall { tool_name, .. } => {
+                                pet_waiting = false;
+                                Some(("running", Some(format!("工具：{tool_name}"))))
+                            }
+                            AgentEvent::ToolResult { tool_name, .. } => {
+                                pet_waiting = false;
+                                Some(("running", Some(format!("工具：{tool_name}"))))
+                            }
+                            AgentEvent::Done { .. } => {
+                                pet_waiting = false;
+                                Some(("done", None))
+                            }
+                            AgentEvent::Cancelled { .. } => {
+                                pet_waiting = false;
+                                Some(("idle", None))
+                            }
+                            AgentEvent::Error { content, .. } => {
+                                pet_waiting = false;
+                                Some(("failed", Some(content.chars().take(60).collect())))
+                            }
+                            _ => None,
+                        };
+                        if let Some((s, detail)) = report {
+                            crate::commands::pet::pet_report(&app_clone2, src, &label, s, detail);
+                        }
+                    }
                 }
             }
             let _ = app_clone2.emit("agent:event", &event);
+        }
+        // Only remove the snapshot if it is still ours: a fast follow-up turn
+        // may already have replaced it under the same session id.
+        let mut map = live_states.lock().await;
+        if map
+            .get(&fwd_sid)
+            .is_some_and(|live| live.turn_id == live_turn_id_cleanup)
+        {
+            map.remove(&fwd_sid);
         }
     });
 
@@ -2113,6 +2214,10 @@ pub async fn agent_answer_user(
     if let Some(tx) = senders.get(&session_id) {
         let note = note.unwrap_or_default();
         let _ = tx.send(serde_json::json!({ "answers": answers, "note": note }));
+        drop(senders);
+        if let Some(live) = state.live_states.lock().await.get_mut(&session_id) {
+            live.clear_pending();
+        }
         Ok(())
     } else {
         Err("no pending question for this session".to_string())
@@ -2497,6 +2602,10 @@ pub async fn agent_approve_tool(
 
     tx.send(response)
         .map_err(|e| format!("approval channel closed: {e}"))?;
+    drop(senders);
+    if let Some(live) = state.live_states.lock().await.get_mut(&session_id) {
+        live.mark_approval_submitted();
+    }
     Ok(())
 }
 
@@ -2538,9 +2647,16 @@ pub async fn settings_app_save(
     state: State<'_, AppState>,
     settings: crate::core::models::AppSettings,
 ) -> Result<(), String> {
+    let previous = settings_service::load_app_settings(&state.db).await?;
     settings_service::save_app_settings(&state.db, &settings).await?;
 
-    // Sync the pet window visibility with the setting.
+    // Sync the pet window visibility with the setting. Hiding the ball must
+    // also close its overlay windows: a hidden WebView keeps running, so a
+    // running turn would otherwise keep creating `pet-status` next to a ball
+    // the user explicitly hid.
+    if previous.show_pet != settings.show_pet {
+        crate::commands::pet::close_pet_overlays(&app);
+    }
     if settings.show_pet {
         match app.get_webview_window("pet") {
             Some(pet) => {

@@ -12,6 +12,7 @@ const STREAMING_START_TYPES = new Set<AgentStreamEvent['type']>([
   'reasoning',
   'tool_call',
   'tool_approval_required',
+  'ask_user',
 ]);
 
 export function useStreamingChat() {
@@ -264,6 +265,7 @@ export function useStreamingChat() {
 
       case 'ask_user': {
         // The agent is waiting for structured answers (AskUserQuestion).
+        markTurnStreaming(e.session_id);
         try {
           const raw = e.content ? JSON.parse(e.content) : null;
           const parsed = Array.isArray(raw) ? raw : raw?.questions;

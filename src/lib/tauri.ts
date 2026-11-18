@@ -7,7 +7,7 @@ import type {
   KnowledgeDomain, KnowledgeItem,
   ResearchTopic, ResearchSource, Note,
   FileEntry, FileItem, TextPreview, SystemInfo, TimelineItem,
-  Collection, Tag, LlmProvider, Vault, NoteVersion, Bookmark,
+  Collection, Tag, LlmProvider, Vault, NoteVersion, Bookmark, AskQuestion,
 } from './types';
 
 /**
@@ -344,6 +344,12 @@ export interface PetActivity {
   detail: string | null;
   /** Present for chat-sourced activities — the session to approve/decline in. */
   sessionId?: string;
+  /** "approval" | "question" when this waiting activity is interactive. */
+  waitingKind?: 'approval' | 'question';
+  /** Tool call behind an approval wait. */
+  toolCallId?: string;
+  /** "chat" | "pet" — where the answer button should open. */
+  openTarget?: 'chat' | 'pet';
 }
 
 export interface PetStatusInfo {
@@ -356,6 +362,58 @@ export interface PetStatusInfo {
 
 export async function petCurrentStatus(): Promise<PetStatusInfo | null> {
   return invoke<PetStatusInfo | null>('pet_current_status');
+}
+
+/** A tool call inside a live agent turn. Mirrors the frontend ToolCallInfo. */
+export interface LiveToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  result?: string;
+  status: 'pending' | 'running' | 'completed' | 'error' | 'timeout';
+  duration_ms?: number;
+  outside_write_base: boolean;
+}
+
+/** A ReAct step inside a live agent turn. Mirrors StreamingStep. */
+export interface LiveStep {
+  step_index: number;
+  reasoning_content: string;
+  tool_calls: LiveToolCall[];
+  narration?: string;
+  status: 'streaming' | 'completed';
+}
+
+/** Interaction a live turn is currently blocked on. */
+export type LivePending =
+  | {
+      kind: 'approval';
+      tool_call_id: string;
+      tool_name: string;
+      tool_args: Record<string, unknown>;
+      outside_write_base: boolean;
+    }
+  | {
+      kind: 'question';
+      questions: AskQuestion[];
+    };
+
+/** Backend snapshot of a running turn. Completed turns come from the DB. */
+export interface AgentLiveState {
+  running: boolean;
+  revision: number;
+  stream_content: string;
+  stream_text_step: number | null;
+  steps: LiveStep[];
+  current_step: LiveStep | null;
+  pending: LivePending | null;
+  updated_at: string;
+}
+
+export async function agentGetLiveState(
+  sessionId: string,
+): Promise<AgentLiveState | null> {
+  return invoke<AgentLiveState | null>('agent_get_live_state', { sessionId });
 }
 
 export const petGetChatLinked = () => invoke<boolean>('pet_get_chat_linked');

@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import type { AgentSession, AgentStep, ChatMessage, StreamingStep, ToolCallInfo, AskQuestion } from '@/lib/types';
+import type { AgentLiveState } from '@/lib/tauri';
 
 /** Messages per history page (initial load and each scroll-up fetch). */
 export const MESSAGE_PAGE_SIZE = 50;
@@ -71,6 +72,11 @@ interface ChatState {
   clearStreamingSteps: () => void;
   removeSession: (id: string) => void;
   setPendingQuestions: (q: AskQuestion[] | null, sessionId?: string | null) => void;
+  /** Restore a running turn from the backend's live snapshot after a session
+   *  switch. Only applies to the currently active session. */
+  hydrateLiveState: (sessionId: string, live: AgentLiveState) => void;
+  /** Drop the live slice when a session has no running turn. */
+  clearLiveState: (sessionId: string) => void;
   setPendingFirst: (p: { sessionId: string; text: string } | null) => void;
   setJumpTarget: (messageId: string | null) => void;
 }
@@ -112,8 +118,10 @@ export const useChatStore = create<ChatState>((set) => ({
         // is only disabled while THAT session is actually generating.
         isStreaming: id ? !!s.streamingById[id] : false,
         isLoading: id ? !!s.loadingById[id] : false,
-        // pendingQuestions intentionally kept: they belong to their origin
-        // session (pendingQuestionsSessionId) and re-appear on switch-back.
+        // Clear the active-only question slot; a switch-back restores the
+        // question from the backend live snapshot (agent_get_live_state).
+        pendingQuestions: null,
+        pendingQuestionsSessionId: null,
       };
     }),
   setMessages: (messages) => set({ messages }),
@@ -293,6 +301,84 @@ export const useChatStore = create<ChatState>((set) => ({
         ? { pendingQuestions: q, pendingQuestionsSessionId: sessionId ?? s.activeSessionId }
         : { pendingQuestions: null, pendingQuestionsSessionId: null }
     ),
+
+  hydrateLiveState: (sessionId, live) =>
+    set((s) => {
+      // A stale snapshot for a session the user already switched away from
+      // must never overwrite the active pane.
+      if (s.activeSessionId !== sessionId) return s;
+      const questions =
+        live.pending?.kind === 'question' && Array.isArray(live.pending.questions)
+          ? live.pending.questions
+          : null;
+      const steps: StreamingStep[] = live.steps.map((step) => ({
+        step_index: step.step_index,
+        reasoning_content: step.reasoning_content,
+        tool_calls: step.tool_calls.map((call) => ({
+          id: call.id,
+          name: call.name,
+          arguments: call.arguments,
+          result: call.result,
+          status: call.status,
+          duration_ms: call.duration_ms,
+          outside_write_base: call.outside_write_base,
+        })),
+        narration: step.narration,
+        status: step.status,
+      }));
+      const current: StreamingStep | null = live.current_step
+        ? {
+            step_index: live.current_step.step_index,
+            reasoning_content: live.current_step.reasoning_content,
+            tool_calls: live.current_step.tool_calls.map((call) => ({
+              id: call.id,
+              name: call.name,
+              arguments: call.arguments,
+              result: call.result,
+              status: call.status,
+              duration_ms: call.duration_ms,
+              outside_write_base: call.outside_write_base,
+            })),
+            narration: live.current_step.narration,
+            status: live.current_step.status,
+          }
+        : null;
+      return {
+        streamingById: { ...s.streamingById, [sessionId]: true },
+        loadingById: { ...s.loadingById, [sessionId]: false },
+        isStreaming: true,
+        isLoading: false,
+        streamContent: live.stream_content,
+        streamTextStep: live.stream_text_step,
+        streamingSteps: steps,
+        currentStreamingStep: current,
+        pendingQuestions: questions,
+        pendingQuestionsSessionId: questions ? sessionId : null,
+      };
+    }),
+
+  clearLiveState: (sessionId) =>
+    set((s) => {
+      const streamingById = { ...s.streamingById, [sessionId]: false };
+      const loadingById = { ...s.loadingById, [sessionId]: false };
+      if (s.activeSessionId !== sessionId) {
+        return { streamingById, loadingById };
+      }
+      return {
+        streamingById,
+        loadingById,
+        isStreaming: false,
+        isLoading: false,
+        streamContent: '',
+        streamTextStep: null,
+        streamingSteps: [],
+        currentStreamingStep: null,
+        pendingQuestions:
+          s.pendingQuestionsSessionId === sessionId ? null : s.pendingQuestions,
+        pendingQuestionsSessionId:
+          s.pendingQuestionsSessionId === sessionId ? null : s.pendingQuestionsSessionId,
+      };
+    }),
 
   setPendingFirst: (p) => set({ pendingFirst: p }),
   setJumpTarget: (messageId) =>

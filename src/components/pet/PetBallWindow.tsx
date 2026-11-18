@@ -3,6 +3,7 @@ import { emit, listen } from '@/lib/events';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { PetSprite } from './PetSprite';
 import type { PetSkinDetail } from '@/lib/tauri';
+import { settingsAppGet } from '@/lib/tauri';
 import './pet-window.css';
 
 /** Root component for the always-on-top pet window. Dragging the ball starts an
@@ -87,7 +88,7 @@ export function PetBallWindow() {
     let unlisten: (() => void) | undefined;
     const setup = async () => {
       unlisten = await listen<string>('pet:bubble', (event) => {
-        showBubble(event.payload);
+        if (petVisibleRef.current) showBubble(event.payload);
       });
     };
     setup();
@@ -108,6 +109,10 @@ export function PetBallWindow() {
   const handleSpriteError = useCallback(() => setSkin(null), []);
   // Ball edge length in px (device setting `pet.size`, default 48).
   const [ballSize, setBallSize] = useState(48);
+  // Visibility mirror of `show_pet`. A hidden ball keeps its WebView alive,
+  // so its `pet:state` listener would otherwise keep creating `pet-status`.
+  const [petVisible, setPetVisible] = useState(true);
+  const petVisibleRef = useRef(true);
   // Readiness gates for revealing the (initially hidden) window: both the
   // size and the skin load must have settled — success or fallback — before
   // show(), so a configured sprite never flashes as the default ball first.
@@ -195,6 +200,49 @@ export function PetBallWindow() {
     getCurrentWindow().show().catch(() => {});
   }, [sizeReady, skinReady]);
 
+  // Keep the status-card lifecycle in sync with `show_pet`. The backend also
+  // closes overlays on the transition; this guard stops the hidden ball's
+  // event listener from creating a new one afterwards.
+  useEffect(() => {
+    petVisibleRef.current = petVisible;
+  }, [petVisible]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    const load = async () => {
+      const settings = await settingsAppGet().catch(() => null);
+      if (!cancelled) setPetVisible(settings?.show_pet ?? true);
+    };
+    load();
+    listen('app:settings_changed', () => void load()).then((u) => {
+      unlisten = u;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // Re-showing the ball during a turn: no new `pet:state` may arrive, so ask
+  // for the current aggregate once and let the lifecycle effect recreate the
+  // status card if it is still running/waiting.
+  useEffect(() => {
+    if (!petVisible) return;
+    let cancelled = false;
+    import('@/lib/tauri')
+      .then(({ petCurrentStatus }) => petCurrentStatus())
+      .then((status) => {
+        if (!cancelled && status && (status.state === 'running' || status.state === 'waiting')) {
+          setAgentState(status.state);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [petVisible]);
+
   // Status card lifecycle (Codex-style): while the aggregate agent state is
   // running/waiting, the interactive status card floats next to the ball;
   // done/failed keep it up until the decay below flips back to idle, which
@@ -204,13 +252,17 @@ export function PetBallWindow() {
     (async () => {
       const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const existing = await WebviewWindow.getByLabel('pet-status');
+      if (!petVisible) {
+        if (existing) await existing.close().catch(() => {});
+        return;
+      }
       if (agentState === 'running' || agentState === 'waiting') {
         if (existing || cancelled) return;
         new WebviewWindow('pet-status', {
           url: 'index.html?petStatus=1',
           title: '',
           width: 280,
-          height: 150,
+          height: 180,
           decorations: false,
           transparent: true,
           shadow: false,
@@ -227,7 +279,7 @@ export function PetBallWindow() {
     return () => {
       cancelled = true;
     };
-  }, [agentState]);
+  }, [agentState, petVisible]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;

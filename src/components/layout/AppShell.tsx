@@ -1,5 +1,6 @@
 import { useCallback, useState, useEffect, useRef } from 'react';
 import { useRouterState, useNavigate } from '@tanstack/react-router';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Sidebar } from './Sidebar';
 import { TitleBar } from './TitleBar';
 import { TabSwitcher } from './TabSwitcher';
@@ -19,6 +20,8 @@ import { useImportPaper } from '@/hooks/useLibrary';
 import { useShellStore } from '@/stores/shellStore';
 import { useTabStore } from '@/stores/tabStore';
 import { useResearchStore } from '@/stores/researchStore';
+import { useChatStore } from '@/stores/chatStore';
+import { usePetStore } from '@/stores/petStore';
 import { notesCreate, bookmarksCreate, settingsAppGet, settingsAppSave, screenshotHotkeySync, screenshotStart } from '@/lib/tauri';
 import { openNoteTab } from '@/lib/openNote';
 import { listen } from '@/lib/events';
@@ -52,6 +55,48 @@ export function AppShell({ children }: AppShellProps) {
   const zoomRef = useRef(1);
   const creatingNoteRef = useRef(false);
 
+
+  // Status-card "回答" buttons have no direct approval channel: they ask the
+  // main window to open the session that owns the AskUserQuestion. The chat
+  // panel then hydrates the pending question from the backend live snapshot.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    listen<{ sessionId: string; target?: 'chat' | 'pet' }>(
+      'pet:open-session',
+      async (event) => {
+        if (cancelled) return;
+        const win = getCurrentWindow();
+        if (win.label !== 'main') return;
+        const minimized = await win.isMinimized().catch(() => false);
+        if (minimized) await win.unminimize().catch(() => {});
+        const visible = await win.isVisible().catch(() => true);
+        if (!visible) await win.show().catch(() => {});
+        await win.setFocus().catch(() => {});
+        const { sessionId, target } = event.payload;
+        if (target === 'pet') {
+          const pet = usePetStore.getState();
+          try {
+            await pet.attach(sessionId);
+            pet.setOpen(true);
+          } catch (err) {
+            console.error('open pet session:', err);
+            useChatStore.getState().setActiveSession(sessionId);
+            navigate({ to: '/chat' });
+          }
+        } else {
+          useChatStore.getState().setActiveSession(sessionId);
+          navigate({ to: '/chat' });
+        }
+      },
+    ).then((u) => {
+      unlisten = u;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [navigate]);
 
   // Skeleton screen — shows briefly on first mount to bridge the gap
   // between the splash fade-out and the real content rendering.

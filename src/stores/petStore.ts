@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { AgentSession, AgentStep, ChatAttachment, ChatMessage, StreamingStep, ToolCallInfo, AskQuestion } from '@/lib/types';
-import { petCreateSession, getChatMessages, getAgentSteps, agentGetSession, agentSendMessage, agentListSessions, agentSetSessionModel, agentDeleteSession } from '@/lib/tauri';
+import type { AgentLiveState } from '@/lib/tauri';
+import { petCreateSession, getChatMessages, getAgentSteps, agentGetSession, agentGetLiveState, agentSendMessage, agentListSessions, agentSetSessionModel, agentDeleteSession } from '@/lib/tauri';
 import type { PetContext } from './petContextStore';
 
 /** Map a page type to its built-in pet domain agent. */
@@ -98,6 +99,74 @@ interface PetState {
   reset: () => void;
 }
 
+/** Map the backend live snapshot onto the pet store's streaming slice. */
+function liveToPetState(live: AgentLiveState | null) {
+  if (!live?.running) {
+    return {
+      streaming: false,
+      streamContent: '',
+      streamTextStep: null,
+      streamingSteps: [] as StreamingStep[],
+      currentStreamingStep: null as StreamingStep | null,
+      pendingApproval: null,
+      pendingQuestions: null,
+    };
+  }
+  const steps: StreamingStep[] = live.steps.map((step) => ({
+    step_index: step.step_index,
+    reasoning_content: step.reasoning_content,
+    tool_calls: step.tool_calls.map((call) => ({
+      id: call.id,
+      name: call.name,
+      arguments: call.arguments,
+      result: call.result,
+      status: call.status,
+      duration_ms: call.duration_ms,
+      outside_write_base: call.outside_write_base,
+    })),
+    narration: step.narration,
+    status: step.status,
+  }));
+  const current: StreamingStep | null = live.current_step
+    ? {
+        step_index: live.current_step.step_index,
+        reasoning_content: live.current_step.reasoning_content,
+        tool_calls: live.current_step.tool_calls.map((call) => ({
+          id: call.id,
+          name: call.name,
+          arguments: call.arguments,
+          result: call.result,
+          status: call.status,
+          duration_ms: call.duration_ms,
+          outside_write_base: call.outside_write_base,
+        })),
+        narration: live.current_step.narration,
+        status: live.current_step.status,
+      }
+    : null;
+  return {
+    streaming: true,
+    streamContent: live.stream_content,
+    streamTextStep: live.stream_text_step,
+    streamingSteps: steps,
+    currentStreamingStep: current,
+    pendingApproval:
+      live.pending?.kind === 'approval'
+        ? {
+            toolCallId: live.pending.tool_call_id,
+            toolName: live.pending.tool_name,
+            args: JSON.stringify(live.pending.tool_args, null, 1),
+            stepIndex: current?.step_index ?? steps[steps.length - 1]?.step_index,
+            outsideWriteBase: live.pending.outside_write_base,
+          }
+        : null,
+    pendingQuestions:
+      live.pending?.kind === 'question' && Array.isArray(live.pending.questions)
+        ? live.pending.questions
+        : null,
+  };
+}
+
 const initial = {
   open: false,
   session: null,
@@ -126,6 +195,10 @@ export const usePetStore = create<PetState>((set, get) => ({
     const current = get().session;
     if (current && sessionMatchesContext(current, domain, ctx)) {
       set({ open: true });
+      // The panel may have been unmounted while a background turn kept
+      // running; refresh the live slice instead of showing a stale/empty pane.
+      const live = await agentGetLiveState(current.id).catch(() => null);
+      set(liveToPetState(live));
       return;
     }
     set({
@@ -155,16 +228,20 @@ export const usePetStore = create<PetState>((set, get) => ({
           title: ctx.title,
         });
       }
-      const [msgPage, agentSteps] = await Promise.all([
+      const [msgPage, agentSteps, live] = await Promise.all([
         getChatMessages(session.id),
         // 步骤查询失败只丢推理过程卡，不能拖垮消息本体。
         getAgentSteps(session.id).catch((err) => {
           console.error('pet start steps:', err);
           return [];
         }),
+        agentGetLiveState(session.id).catch((err) => {
+          console.error('pet start live state:', err);
+          return null;
+        }),
       ]);
       const messages = msgPage.messages;
-      set({ session, messages, agentSteps, loading: false });
+      set({ session, messages, agentSteps, loading: false, ...liveToPetState(live) });
     } catch (err) {
       console.error('pet start:', err);
       set({ loading: false, session: null, error: err instanceof Error ? err.message : String(err) });
@@ -180,16 +257,26 @@ export const usePetStore = create<PetState>((set, get) => ({
     });
     try {
       const session = await agentGetSession(sessionId);
-      const [msgPage, agentSteps] = await Promise.all([
+      const [msgPage, agentSteps, live] = await Promise.all([
         getChatMessages(sessionId),
         // 步骤查询失败只丢推理过程卡，不能拖垮消息本体。
         getAgentSteps(sessionId).catch((err) => {
           console.error('pet attach steps:', err);
           return [];
         }),
+        agentGetLiveState(sessionId).catch((err) => {
+          console.error('pet attach live state:', err);
+          return null;
+        }),
       ]);
       const messages = msgPage.messages;
-      set({ session, messages, agentSteps, loading: false });
+      set({
+        session,
+        messages,
+        agentSteps,
+        loading: false,
+        ...liveToPetState(live),
+      });
     } catch (err) {
       console.error('pet attach:', err);
       set({ loading: false, session: null, error: err instanceof Error ? err.message : String(err) });

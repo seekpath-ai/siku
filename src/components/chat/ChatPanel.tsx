@@ -12,7 +12,7 @@ import { mergeMessages } from '@/lib/chatMerge';
 import { useProjectStore } from '@/stores/projectStore';
 import { usePetContextStore } from '@/stores/petContextStore';
 import { useStreamingChat } from '@/hooks/useStreamingChat';
-import { getChatMessages, getAgentSteps, agentRenameSession, agentSetSessionModel, agentIsRunning, agentCreateSession, agentSendMessage, getDeviceId, agentSetSessionWorkingDir, agentSessionWorkspace } from '@/lib/tauri';
+import { getChatMessages, getAgentSteps, agentRenameSession, agentSetSessionModel, agentIsRunning, agentGetLiveState, agentCreateSession, agentSendMessage, getDeviceId, agentSetSessionWorkingDir, agentSessionWorkspace } from '@/lib/tauri';
 import { pickDirectory } from '@/lib/pickDirectory';
 import { useDialogStore } from '@/stores/dialogStore';
 import { useSyncTick } from '@/stores/syncTickStore';
@@ -299,19 +299,11 @@ export function ChatPanel() {
     let cancelled = false;
     setLoadingMessages(true);
 
-    // Heal stale streaming/loading flags: the agent:event listener unmounts
-    // with the chat route, so a turn that finished while the user was on
-    // another module leaves streamingById stuck at true — with the cancel
-    // token long gone, the stop button becomes a no-op. Ask the backend.
-    agentIsRunning(activeSessionId)
-      .then((running) => {
-        if (cancelled || running) return;
-        const st = useChatStore.getState();
-        st.setSessionStreaming(activeSessionId, false);
-        st.setSessionLoading(activeSessionId, false);
-      })
-      .catch(() => {});
-
+    // Load persisted history, persisted steps, and the backend live snapshot
+    // together. A running turn has no agent_steps row yet (they are inserted
+    // when the turn finishes), so the live snapshot is the only way to restore
+    // the current reasoning round / pending approval / pending question when
+    // switching back to a conversation that kept running in the background.
     Promise.all([
       getChatMessages(activeSessionId, { limit: MESSAGE_PAGE_SIZE }),
       // 步骤查询失败只丢推理过程卡，不能拖垮消息本体（曾因此整页历史空白）。
@@ -319,12 +311,32 @@ export function ChatPanel() {
         console.error('Failed to load agent steps:', err);
         return [];
       }),
+      agentGetLiveState(activeSessionId).catch((err) => {
+        console.error('Failed to load live agent state:', err);
+        return null;
+      }),
     ])
-      .then(([page, steps]) => {
-        if (!cancelled) {
-          setMessages(page.messages);
-          useChatStore.getState().setHasMoreMessages(page.hasMore);
-          setAgentSteps(steps);
+      .then(async ([page, steps, live]) => {
+        if (cancelled) return;
+        setMessages(page.messages);
+        useChatStore.getState().setHasMoreMessages(page.hasMore);
+        setAgentSteps(steps);
+
+        if (live?.running) {
+          useChatStore.getState().hydrateLiveState(activeSessionId, live);
+          return;
+        }
+
+        // No live snapshot: a finished turn is fully represented by the DB.
+        // Fall back to agent_is_running for a backend that predates
+        // agent_get_live_state, and heal flags left over from an unmounted
+        // listener.
+        const running = await agentIsRunning(activeSessionId).catch(() => false);
+        if (cancelled) return;
+        if (running) {
+          useChatStore.getState().setSessionStreaming(activeSessionId, true);
+        } else {
+          useChatStore.getState().clearLiveState(activeSessionId);
         }
       })
       .catch((err) => {
@@ -333,6 +345,7 @@ export function ChatPanel() {
           setMessages([]);
           useChatStore.getState().setHasMoreMessages(false);
           setAgentSteps([]);
+          useChatStore.getState().clearLiveState(activeSessionId);
         }
       })
       .finally(() => {

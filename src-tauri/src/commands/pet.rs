@@ -333,6 +333,17 @@ pub struct PetActivity {
     /// approve/decline a pending tool approval without opening the panel.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// "approval" | "question" for a waiting chat activity. The status card
+    /// must not offer 批准/拒绝 for an AskUserQuestion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_kind: Option<String>,
+    /// Tool call behind an approval wait, so the status card can submit
+    /// directly instead of relying only on the backend's pending map.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// "chat" | "pet" — where the status card's 回答 button should open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -433,11 +444,52 @@ pub fn pet_report(
     state: &str,
     detail: Option<String>,
 ) {
+    report_activity(app_handle, source, label, state, detail, None, None, None);
+}
+
+/// Report a waiting activity together with the kind of interaction it is
+/// blocked on. `waiting_kind` is "approval" or "question"; only an approval is
+/// actionable by `agent_approve_tool`.
+pub fn pet_report_pending(
+    app_handle: &tauri::AppHandle,
+    source: &str,
+    label: &str,
+    state: &str,
+    detail: Option<String>,
+    waiting_kind: &str,
+    tool_call_id: Option<String>,
+    open_target: Option<String>,
+) {
+    report_activity(
+        app_handle,
+        source,
+        label,
+        state,
+        detail,
+        Some(waiting_kind.to_string()),
+        tool_call_id,
+        open_target,
+    );
+}
+
+fn report_activity(
+    app_handle: &tauri::AppHandle,
+    source: &str,
+    label: &str,
+    state: &str,
+    detail: Option<String>,
+    waiting_kind: Option<String>,
+    tool_call_id: Option<String>,
+    open_target: Option<String>,
+) {
     let activity = PetActivity {
         label: label.to_string(),
         state: state.to_string(),
         detail,
         session_id: source.strip_prefix("chat:").map(|s| s.to_string()),
+        waiting_kind,
+        tool_call_id,
+        open_target,
     };
     match state {
         "done" | "failed" => {
@@ -462,6 +514,17 @@ pub fn pet_report(
         }
     }
     aggregate_and_emit(app_handle);
+}
+
+/// Close every pet overlay window. Called when the pet is hidden: hiding only
+/// the ball leaves `pet-status` (and friends) alive and visible, because a
+/// hidden WebView keeps running its event listeners.
+pub fn close_pet_overlays(app: &tauri::AppHandle) {
+    for label in ["pet-status", "pet-detail", "pet-bubble", "pet-menu"] {
+        if let Some(win) = app.get_webview_window(label) {
+            let _ = win.close();
+        }
+    }
 }
 
 /// Hover detail card data (null when nothing has run this app launch).

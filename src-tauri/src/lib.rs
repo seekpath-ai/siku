@@ -27,6 +27,17 @@ pub struct AppState {
             std::collections::HashMap<String, tokio_util::sync::CancellationToken>,
         >,
     >,
+    /// Live snapshot of every running agent turn. Written by the event
+    /// forwarder and read by `agent_get_live_state` when the frontend switches
+    /// back to a conversation that kept running in the background.
+    pub live_states: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                crate::ai::agent::live_state::AgentLiveState,
+            >,
+        >,
+    >,
     /// Background tasks (bash run_in_background).
     pub tasks: crate::core::tasks::TaskStore,
     /// AskUserQuestion answer channels per session.
@@ -589,6 +600,9 @@ pub fn run() {
                     cancel_tokens: std::sync::Arc::new(tokio::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),
+                    live_states: std::sync::Arc::new(tokio::sync::Mutex::new(
+                        std::collections::HashMap::new(),
+                    )),
                     tasks: crate::core::tasks::new_task_store(),
                     ask_senders: std::sync::Arc::new(tokio::sync::Mutex::new(
                         std::collections::HashMap::new(),
@@ -956,6 +970,7 @@ pub fn run() {
             commands::agent::agent_set_session_skills,
             commands::agent::agent_cancel,
             commands::agent::agent_is_running,
+            commands::agent::agent_get_live_state,
             commands::agent::agent_rename_session,
             commands::agent::agent_answer_user,
             commands::agent::agent_session_workspace,

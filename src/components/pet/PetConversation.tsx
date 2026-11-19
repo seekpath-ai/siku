@@ -210,7 +210,7 @@ function PetMessage({ msg, onCitation, onSaveNote, saving }: {
             gradientFrom="from-surface"
             buttonClassName="mt-1 inline-flex items-center gap-0.5 text-[11px] text-text-secondary/60 hover:text-primary transition-colors"
           >
-            <span className="whitespace-pre-wrap">{msg.content}</span>
+            <span className="whitespace-pre-wrap">{msg.display_content ?? msg.content}</span>
           </CollapsibleText>
           {images.length > 0 && (
             <div className="flex flex-wrap gap-1.5 mt-1.5">

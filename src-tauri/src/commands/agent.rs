@@ -1125,6 +1125,121 @@ pub(crate) async fn run_agent_turn(
     // optimistic bubble to the authoritative id as soon as the call
     // returns, so later DB alignment matches rows by id, not content.
 ) -> Result<String, String> {
+    run_agent_turn_inner(
+        state, app_handle, session_id, content, None, None, None, attachments, tools_override, outbound,
+    )
+    .await
+}
+
+/// Remote-channel variant: `content` is the full agent prompt (including the
+/// local file path/extracted text), while `display_content` is the compact
+/// human-facing body persisted for the conversation UI and sync.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_agent_turn_with_display(
+    state: &AppState,
+    app_handle: &AppHandle,
+    session_id: String,
+    content: String,
+    display_content: Option<String>,
+    prompt_content: Option<String>,
+    file_attachments: Option<Vec<serde_json::Value>>,
+    attachments: Option<Vec<crate::ai::llm::ImageAttachment>>,
+    tools_override: Option<Vec<String>>,
+    outbound: Option<crate::remote::router::OutboundQueue>,
+) -> Result<String, String> {
+    run_agent_turn_inner(
+        state,
+        app_handle,
+        session_id,
+        content,
+        display_content,
+        prompt_content,
+        file_attachments,
+        attachments,
+        tools_override,
+        outbound,
+    )
+    .await
+}
+
+/// Expand compact `siku://artifact/...` references in a historical user
+/// message into the extracted text and local blob path for the model only.
+/// The persisted chat content stays compact; this is where a synced artifact
+/// becomes usable on a second device.
+async fn expand_remote_artifact_context(
+    db: &sqlx::SqlitePool,
+    app_data_dir: &std::path::Path,
+    content: &str,
+) -> String {
+    if !content.contains(crate::core::artifact_service::ARTIFACT_SCHEME) {
+        return content.to_string();
+    }
+    let mut uris: Vec<String> = Vec::new();
+    let scheme = crate::core::artifact_service::ARTIFACT_SCHEME;
+    let mut rest = content;
+    while let Some(start) = rest.find(scheme) {
+        let tail = &rest[start..];
+        let end = tail
+            .char_indices()
+            .find(|(_, c)| {
+                c.is_whitespace() || matches!(c, '）' | '，' | ',' | '。' | '；' | ';' | ')')
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(tail.len());
+        let token = &tail[..end];
+        if crate::core::artifact_service::parse_artifact_uri(token).is_some()
+            && !uris.iter().any(|u| u == token)
+        {
+            uris.push(token.to_string());
+        }
+        rest = &tail[end..];
+    }
+    if uris.is_empty() {
+        return content.to_string();
+    }
+    let mut expanded = content.to_string();
+    for uri in uris {
+        let row: Option<(String, String, String, String)> = sqlx::query_as(
+            "SELECT name, hash, ext, extracted_text FROM remote_artifacts WHERE artifact_id = ?",
+        )
+        .bind(&uri)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+        let Some((name, hash, ext, text)) = row else {
+            continue;
+        };
+        let path = crate::file_store::blob_path(app_data_dir, &hash, &ext);
+        let local = if path.exists() {
+            format!("本机文件：{}。", path.display())
+        } else {
+            String::new()
+        };
+        if !text.trim().is_empty() {
+            expanded.push_str(&format!(
+                "\n\n（附件《{name}》{local}文件内容提取如下：\n{text}）"
+            ));
+        }
+    }
+    expanded
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_turn_inner(
+    state: &AppState,
+    app_handle: &AppHandle,
+    session_id: String,
+    content: String,
+    display_content: Option<String>,
+    prompt_content: Option<String>,
+    file_attachments: Option<Vec<serde_json::Value>>,
+    attachments: Option<Vec<crate::ai::llm::ImageAttachment>>,
+    tools_override: Option<Vec<String>>,
+    outbound: Option<crate::remote::router::OutboundQueue>,
+) -> Result<String, String> {
+    let model_prompt = prompt_content.unwrap_or_else(|| content.clone());
+
     // Reject a second concurrent turn for the same session (user double-send,
     // cron firing mid-turn, pet windows). The guard lives until the spawned
     // task's cleanup completes, so channel cleanup below is ownership-safe.
@@ -1492,7 +1607,24 @@ pub(crate) async fn run_agent_turn(
     );
     let memory = MemoryStore::new(memory_path.clone());
 
-    let attachments_json = attachments.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()).filter(|s| !s.is_empty());
+    let attachments_json = {
+        let mut values: Vec<serde_json::Value> = Vec::new();
+        if let Some(images) = attachments.as_ref() {
+            for image in images {
+                if let Ok(value) = serde_json::to_value(image) {
+                    values.push(value);
+                }
+            }
+        }
+        if let Some(files) = file_attachments {
+            values.extend(files);
+        }
+        if values.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&values).unwrap_or_default())
+        }
+    };
 
     // History comes from the synced DB (chat_messages + agent_steps), not the
     // local JSONL cache: a second device that receives the conversation has no
@@ -1508,12 +1640,16 @@ pub(crate) async fn run_agent_turn(
     info!(session_id=%session_id, records=loaded_history.entries.len(), "loading agent history from chat_messages");
     // Parallel timestamps for the turn-context snapshot (ChatMessage drops them).
     let history_times: Vec<String> = loaded_history.entries.iter().map(|e| e.created_at.clone()).collect();
-    let mut history: Vec<ChatMessage> = loaded_history
-        .entries
-        .iter()
-        .map(|e| ChatMessage {
+    let mut history: Vec<ChatMessage> = Vec::with_capacity(loaded_history.entries.len());
+    for e in &loaded_history.entries {
+        let content = if e.role == "user" {
+            expand_remote_artifact_context(&state.db, &state.app_data_dir, &e.content).await
+        } else {
+            e.content.clone()
+        };
+        history.push(ChatMessage {
             role: e.role.clone(),
-            content: e.content.clone(),
+            content,
             attachments: e.attachments.clone(),
             tool_calls: None,
             tool_call_id: None,
@@ -1521,8 +1657,8 @@ pub(crate) async fn run_agent_turn(
             // Replayed so the model can continue its earlier reasoning (and so
             // DeepSeek's thinking models do not 400 on a tools request).
             reasoning_content: e.reasoning_content.clone(),
-        })
-        .collect();
+        });
+    }
     // Attachments are base64 blobs; keeping them on every historical message
     // resends every past image on every turn. Keep them only on the most
     // recent message that carried any — older turns' images have already
@@ -1538,7 +1674,24 @@ pub(crate) async fn run_agent_turn(
 
     // Save user message to DB (after the history load so it is not duplicated
     // in the prompt). The origin snapshot is written as a follow-up UPDATE.
-    let user_message_id = chat::save_chat_message(&state.db, &session_id, "user", &content, None, None, None, None, None, None, None, None, None, attachments_json.as_deref()).await?;
+    let user_message_id = chat::save_chat_message_with_display(
+        &state.db,
+        &session_id,
+        "user",
+        &content,
+        display_content.as_deref(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        attachments_json.as_deref(),
+    )
+    .await?;
     chat::set_message_origin(
         &state.db,
         &user_message_id,
@@ -1807,7 +1960,7 @@ pub(crate) async fn run_agent_turn(
         let _turn_guard = turn_guard;
         let engine_ref = Arc::new(engine);
         let result = engine_ref
-            .process_message(&content, attachments_json.as_deref(), &history, event_tx, &mut approval_rx, &mut ask_rx, &user_message_id, &history_times)
+            .process_message(&model_prompt, attachments_json.as_deref(), &history, event_tx, &mut approval_rx, &mut ask_rx, &user_message_id, &history_times)
             .await;
 
         // Only remove registrations that belong to this turn. The turn guard
@@ -2885,5 +3038,67 @@ mod workspace_guard_tests {
         std::fs::create_dir_all(&auto).unwrap();
         assert!(!is_forbidden_working_dir(&auto, &app_data));
         assert!(!is_forbidden_working_dir(&project, &app_data));
+    }
+}
+
+#[cfg(test)]
+mod artifact_context_tests {
+    use super::expand_remote_artifact_context;
+
+    #[tokio::test]
+    async fn compact_artifact_reference_expands_with_text_and_local_blob() {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("artifact-context-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE remote_artifacts (
+                artifact_id TEXT PRIMARY KEY NOT NULL DEFAULT '',
+                session_id TEXT NOT NULL DEFAULT '',
+                channel TEXT NOT NULL DEFAULT '',
+                chat_id TEXT NOT NULL DEFAULT '',
+                msg_id TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                mime TEXT NOT NULL DEFAULT '',
+                size INTEGER NOT NULL DEFAULT 0,
+                hash TEXT NOT NULL DEFAULT '',
+                ext TEXT NOT NULL DEFAULT '',
+                extracted_text TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let bytes = b"hello artifact";
+        let hash = crate::file_store::sha256_hex(bytes);
+        let rel = crate::file_store::write_blob(&dir, bytes, "pdf").unwrap();
+        assert!(rel.ends_with(".pdf"));
+        let uri = crate::core::artifact_service::artifact_uri(&hash, "pdf");
+        sqlx::query(
+            "INSERT INTO remote_artifacts (artifact_id, name, hash, ext, extracted_text)
+             VALUES (?, 'a.pdf', ?, 'pdf', '文件正文')",
+        )
+        .bind(&uri)
+        .bind(&hash)
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let expanded = expand_remote_artifact_context(
+            &db,
+            &dir,
+            &format!("请总结（附件《a.pdf》，引用：{uri}）"),
+        )
+        .await;
+        assert!(expanded.contains("文件正文"));
+        assert!(expanded.contains("本机文件"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

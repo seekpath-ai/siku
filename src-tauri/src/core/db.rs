@@ -86,6 +86,10 @@ pub(crate) const OPTIONAL_SYNC_TABLES: &[&str] = &[
     "settings",
     "remote_chats",
     "remote_msg_ids",
+    "remote_inbound",
+    "remote_turns",
+    "remote_channel_lease",
+    "remote_artifacts",
     // 译文缓存：可再生的派生数据，同步只为跨设备复用、省重复翻译的额度。
     // id 是确定性内容寻址（source_hash:model，见下方迁移与 cache::store），
     // 两台设备各自翻译同一段文字产生同一主键，CRDT 按行合并无唯一索引冲突。
@@ -767,6 +771,13 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
         .await
         .map_err(|e| anyhow::anyhow!("migration failed for chat_messages.tokens_out: {}", e))?;
 
+    // Migration: human-facing body for a message whose model-facing content
+    // carries hidden context (remote file paths/extracted text). NULL = use
+    // `content` (the historical default).
+    add_column_if_missing(&db, "chat_messages", "display_content", "TEXT")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for chat_messages.display_content: {}", e))?;
+
     // Migration: image attachments on chat messages (added 2026-08-25)
     add_column_if_missing(&db, "chat_messages", "attachments", "TEXT")
         .await
@@ -1439,6 +1450,92 @@ pub async fn init(app_handle: &tauri::AppHandle) -> anyhow::Result<Db> {
             id TEXT NOT NULL DEFAULT '',
             ts TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (id)
+        )"
+    )
+    .execute(&db)
+    .await?;
+
+    // Durable inbound ledger. `remote_msg_ids` prevents re-processing a
+    // message id; this table additionally records the claimed/running/done
+    // state of a turn so a crash or a redelivery cannot start it twice.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS remote_inbound (
+            id TEXT NOT NULL DEFAULT '',
+            channel TEXT NOT NULL DEFAULT '',
+            chat_id TEXT NOT NULL DEFAULT '',
+            user_id TEXT NOT NULL DEFAULT '',
+            msg_id TEXT NOT NULL DEFAULT '',
+            sent_at_ms INTEGER,
+            state TEXT NOT NULL DEFAULT 'pending',
+            turn_key TEXT NOT NULL DEFAULT '',
+            claimed_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (id)
+        )"
+    )
+    .execute(&db)
+    .await?;
+    add_column_if_missing(&db, "remote_inbound", "turn_key", "TEXT NOT NULL DEFAULT ''")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for remote_inbound.turn_key: {}", e))?;
+
+    // One durable turn per batch, keyed by the sorted inbound ledger ids.
+    // The per-message ledger stops duplicate messages; this stops the same
+    // message set from starting two turns while the first is still running.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS remote_turns (
+            turn_key TEXT NOT NULL DEFAULT '',
+            channel TEXT NOT NULL DEFAULT '',
+            chat_id TEXT NOT NULL DEFAULT '',
+            msg_ids TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT 'running',
+            claimed_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (turn_key)
+        )"
+    )
+    .execute(&db)
+    .await?;
+
+    // Single-writer lease per remote channel. The active device renews it;
+    // a takeover uses the cursor recorded in the lease, not its own stale
+    // local copy.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS remote_channel_lease (
+            channel TEXT NOT NULL DEFAULT '',
+            owner_device_id TEXT NOT NULL DEFAULT '',
+            owner_name TEXT NOT NULL DEFAULT '',
+            epoch INTEGER NOT NULL DEFAULT 0,
+            cursor TEXT NOT NULL DEFAULT '',
+            state_epoch INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT '',
+            expires_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (channel)
+        )"
+    )
+    .execute(&db)
+    .await?;
+    add_column_if_missing(&db, "remote_channel_lease", "state_epoch", "INTEGER NOT NULL DEFAULT 0")
+        .await
+        .map_err(|e| anyhow::anyhow!("migration failed for remote_channel_lease.state_epoch: {}", e))?;
+
+    // Inbound file artifacts: bytes live in the shared blob store, this row
+    // is the synced, device-independent reference plus extracted text.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS remote_artifacts (
+            artifact_id TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL DEFAULT '',
+            channel TEXT NOT NULL DEFAULT '',
+            chat_id TEXT NOT NULL DEFAULT '',
+            msg_id TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL DEFAULT '',
+            mime TEXT NOT NULL DEFAULT '',
+            size INTEGER NOT NULL DEFAULT 0,
+            hash TEXT NOT NULL DEFAULT '',
+            ext TEXT NOT NULL DEFAULT '',
+            extracted_text TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (artifact_id)
         )"
     )
     .execute(&db)

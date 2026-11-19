@@ -37,10 +37,26 @@ const READONLY_TOOLS_JSON: &str = r#"["paper_search","paper_read","search_librar
 pub const GRANT_FULL: &str = "full";
 pub const GRANT_READONLY: &str = "readonly";
 
-const DEBOUNCE_MS: u64 = 600;
+const DEBOUNCE_MS: u64 = 1_500;
+/// Text-only messages wait for a possible attachment. On WeChat the user
+/// often sends the question first and the image a few seconds later; without
+/// this window the text turn starts before the image arrives.
+const TEXT_DEBOUNCE_MS: u64 = 2_000;
 /// Image/file-only batches wait a little longer for the user to type the
-/// caption/question. Once text exists, the normal debounce is enough.
-const MEDIA_DEBOUNCE_MS: u64 = 2_000;
+/// caption/question. Once text exists, the pair window is enough.
+const MEDIA_DEBOUNCE_MS: u64 = 3_000;
+/// A file transfer + its caption/question can take longer than an image.
+/// Wait for the accompanying text before starting a file-only turn.
+const FILE_DEBOUNCE_MS: u64 = 15_000;
+/// A batch may not span arbitrarily distant messages. This also stops a
+/// startup backlog (three old messages delivered together) from becoming one
+/// giant user turn.
+const BATCH_MAX_GAP_MS: i64 = 5_000;
+/// During the startup window, a remote backlog can be redelivered before the
+/// synced session watermark has caught up. Messages this old are replay, not
+/// something the user just sent.
+const STARTUP_REPLAY_WINDOW: Duration = Duration::from_secs(120);
+const STARTUP_MAX_AGE_MS: i64 = 2 * 60 * 60 * 1000;
 const RATE_LIMIT_PER_MIN: usize = 10;
 const SEEN_CAP: usize = 2048;
 const SEEN_TTL_SECS: i64 = 24 * 3600;
@@ -435,6 +451,7 @@ impl SeenStore {
 static SEEN: Lazy<Mutex<Option<SeenStore>>> = Lazy::new(|| Mutex::new(None));
 
 /// Returns true when the message id was already processed (duplicate).
+#[allow(dead_code)]
 async fn seen_check_and_mark(app_data_dir: &std::path::Path, id: &str) -> bool {
     let mut guard = SEEN.lock().await;
     let store = guard.get_or_insert_with(|| SeenStore::load(app_data_dir.join("remote_seen.json")));
@@ -610,6 +627,172 @@ fn inbound_fingerprint(msg: &InboundMessage) -> Option<String> {
     Some(format!("{:x}", hash.finalize()))
 }
 
+/// Claim one inbound message for this device/turn. Returns false when the
+/// ledger already has it running or done. A stale `running` claim (crashed
+/// turn) is reclaimable after the TTL.
+async fn claim_inbound(db: &SqlitePool, msg: &InboundMessage) -> Option<String> {
+    if msg.msg_id.is_empty() {
+        return Some(String::new());
+    }
+    let id = format!("{}:{}:{}:{}", msg.channel, msg.chat_id, msg.user_id, msg.msg_id);
+    let now = crate::core::time::now_iso();
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO remote_inbound
+         (id, channel, chat_id, user_id, msg_id, sent_at_ms, state, claimed_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)",
+    )
+    .bind(&id)
+    .bind(&msg.channel)
+    .bind(&msg.chat_id)
+    .bind(&msg.user_id)
+    .bind(&msg.msg_id)
+    .bind(msg.sent_at_ms)
+    .bind(&now)
+    .bind(&now)
+    .execute(db)
+    .await
+    .map(|r| r.rows_affected() == 1)
+    .unwrap_or(false);
+    if inserted {
+        return Some(id);
+    }
+
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT state, updated_at FROM remote_inbound WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let Some((state, updated_at)) = row else {
+        return None;
+    };
+    let stale = chrono::DateTime::parse_from_rfc3339(&updated_at)
+        .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds() > 900)
+        .unwrap_or(true);
+    if state == "done" || (state == "running" && !stale) {
+        return None;
+    }
+    sqlx::query(
+        "UPDATE remote_inbound SET state = 'running', claimed_at = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&id)
+    .execute(db)
+    .await
+    .ok()
+    .map(|_| id)
+}
+
+fn turn_key_for(ledger_ids: &[String]) -> Option<String> {
+    let mut ids: Vec<&str> = ledger_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return None;
+    }
+    ids.sort_unstable();
+    let mut hash = Sha256::new();
+    for id in ids {
+        hash.update(id.as_bytes());
+        hash.update([0u8]);
+    }
+    Some(format!("{:x}", hash.finalize()))
+}
+
+async fn claim_turn(
+    db: &SqlitePool,
+    turn_key: &str,
+    meta: &InboundMessage,
+    ledger_ids: &[String],
+) -> bool {
+    let now = crate::core::time::now_iso();
+    let msg_ids = ledger_ids
+        .iter()
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO remote_turns
+         (turn_key, channel, chat_id, msg_ids, state, claimed_at, updated_at)
+         VALUES (?, ?, ?, ?, 'running', ?, ?)",
+    )
+    .bind(turn_key)
+    .bind(&meta.channel)
+    .bind(&meta.chat_id)
+    .bind(&msg_ids)
+    .bind(&now)
+    .bind(&now)
+    .execute(db)
+    .await
+    .map(|r| r.rows_affected() == 1)
+    .unwrap_or(false);
+    if inserted {
+        for id in ledger_ids.iter().filter(|id| !id.is_empty()) {
+            let _ = sqlx::query("UPDATE remote_inbound SET turn_key = ? WHERE id = ?")
+                .bind(turn_key)
+                .bind(id)
+                .execute(db)
+                .await;
+        }
+        return true;
+    }
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT state, updated_at FROM remote_turns WHERE turn_key = ?")
+            .bind(turn_key)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let Some((state, updated_at)) = row else {
+        return false;
+    };
+    let stale = chrono::DateTime::parse_from_rfc3339(&updated_at)
+        .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds() > 900)
+        .unwrap_or(true);
+    if state == "done" || (state == "running" && !stale) {
+        return false;
+    }
+    sqlx::query(
+        "UPDATE remote_turns SET state = 'running', claimed_at = ?, updated_at = ? WHERE turn_key = ?",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(turn_key)
+    .execute(db)
+    .await
+    .is_ok()
+}
+
+async fn finish_turn(db: &SqlitePool, turn_key: &str, state: &str) {
+    let now = crate::core::time::now_iso();
+    let _ = sqlx::query("UPDATE remote_turns SET state = ?, updated_at = ? WHERE turn_key = ?")
+        .bind(state)
+        .bind(&now)
+        .bind(turn_key)
+        .execute(db)
+        .await;
+}
+
+async fn finish_inbound(db: &SqlitePool, ledger_ids: &[String], state: &str) {
+    let now = crate::core::time::now_iso();
+    for id in ledger_ids {
+        if id.is_empty() {
+            continue;
+        }
+        let _ = sqlx::query("UPDATE remote_inbound SET state = ?, updated_at = ? WHERE id = ?")
+            .bind(state)
+            .bind(&now)
+            .bind(id)
+            .execute(db)
+            .await;
+    }
+}
+
 /// Deletes are sync traffic, so pruning runs only when the table clearly
 /// exceeds the cap, then removes the oldest overflow in one statement.
 async fn prune_remote_msg_ids(db: &SqlitePool) {
@@ -649,24 +832,65 @@ async fn rate_limited(user_key: &str) -> bool {
 
 // ---------------------------------------------------------------- debounce
 
+enum BatchPart {
+    Text(String),
+    Media(MediaRef),
+}
+
 struct PendingBatch {
     generation: u64,
-    texts: Vec<String>,
-    medias: Vec<MediaRef>,
+    /// Original arrival order of text/media (a Feishu post is one Text plus
+    /// its images, but separate WeChat messages interleave freely).
+    parts: Vec<BatchPart>,
+    /// `remote_inbound.id` rows claimed by this batch (empty for synthetic
+    /// messages without a channel msg_id).
+    ledger_ids: Vec<String>,
     meta: Option<InboundMessage>,
+    last_sent_at: Option<i64>,
     sink: Arc<dyn ReplySink>,
+}
+
+/// Remove the accumulated payload from a batch. The caller either dispatches
+/// it immediately (a timestamp gap) or schedules the normal debounce.
+fn take_pending(
+    entry: &mut PendingBatch,
+) -> Option<(InboundMessage, Vec<BatchPart>, Vec<String>, Arc<dyn ReplySink>)> {
+    if entry.parts.is_empty() {
+        return None;
+    }
+    let parts = std::mem::take(&mut entry.parts);
+    let ledger_ids = std::mem::take(&mut entry.ledger_ids);
+    let meta = entry.meta.take();
+    entry.last_sent_at = None;
+    meta.map(|m| (m, parts, ledger_ids, entry.sink.clone()))
 }
 
 static PENDING: Lazy<Mutex<HashMap<String, PendingBatch>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+fn batch_gap_exceeded(current: Option<i64>, previous: Option<i64>) -> bool {
+    current
+        .zip(previous)
+        .is_some_and(|(current, previous)| (current - previous).abs() > BATCH_MAX_GAP_MS)
+}
+
+fn startup_replay(age_ms: Option<i64>, elapsed: Duration) -> bool {
+    age_ms.is_some_and(|age| age > STARTUP_MAX_AGE_MS && elapsed < STARTUP_REPLAY_WINDOW)
+}
+
 /// Quiet-window for one pending batch. Media-only waits for a possible
 /// caption; any real text (with or without media) uses the normal window.
-fn batch_delay(has_text: bool, has_media: bool) -> u64 {
-    if !has_media || has_text {
+fn batch_delay(has_text: bool, has_image: bool, has_file: bool) -> u64 {
+    if has_text && (has_image || has_file) {
+        // Pair already assembled: dispatch shortly after the last part.
         DEBOUNCE_MS
-    } else {
+    } else if has_file {
+        FILE_DEBOUNCE_MS
+    } else if has_image {
         MEDIA_DEBOUNCE_MS
+    } else {
+        // Text-only: leave a window for the image/file the user is sending.
+        TEXT_DEBOUNCE_MS
     }
 }
 
@@ -674,7 +898,6 @@ fn batch_delay(has_text: bool, has_media: bool) -> u64 {
 pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySink>) {
     let state = app.state::<AppState>();
     let db = state.db.clone();
-    let app_data_dir = state.app_data_dir.clone();
     let role = state.remote.role_label().await;
     let cursor_len = if msg.channel == "weixin" {
         crate::core::settings_service::load_weixin_state(&db)
@@ -701,26 +924,20 @@ pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySin
         "remote inbound message"
     );
 
-    if !msg.msg_id.is_empty() {
-        if seen_check_and_mark(&app_data_dir, &msg.msg_id).await {
-            tracing::info!(channel = %msg.channel, msg_id = %msg.msg_id, "dropping duplicate remote message (local seen)");
-            return;
-        }
-        if db_seen_check_and_mark(&db, &msg.channel, &msg.msg_id).await {
-            tracing::info!(channel = %msg.channel, msg_id = %msg.msg_id, "dropping duplicate remote message (synced msg_id)");
-            return;
-        }
-    }
-
-    // Fingerprint dedup: survives an empty or changed channel message id.
-    if let Some(fingerprint) = inbound_fingerprint(&msg) {
-        let key = format!("fp:{fingerprint}");
-        if db_seen_check_and_mark(&db, &msg.channel, &key).await {
-            tracing::info!(
-                channel = %msg.channel, msg_id = %msg.msg_id, chat_id = %msg.chat_id,
-                "dropping redelivered remote message (fingerprint)"
-            );
-            return;
+    // Message-id dedup is the durable `remote_inbound` claim below. The old
+    // `remote_msg_ids` insert happened before that claim, so a `failed` turn
+    // could never be retried: the id was already marked seen. Keep
+    // `remote_msg_ids` only for the no-msg-id fingerprint path.
+    if msg.msg_id.is_empty() {
+        if let Some(fingerprint) = inbound_fingerprint(&msg) {
+            let key = format!("fp:{fingerprint}");
+            if db_seen_check_and_mark(&db, &msg.channel, &key).await {
+                tracing::info!(
+                    channel = %msg.channel, msg_id = %msg.msg_id, chat_id = %msg.chat_id,
+                    "dropping redelivered remote message (fingerprint)"
+                );
+                return;
+            }
         }
     }
 
@@ -734,6 +951,17 @@ pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySin
             channel = %msg.channel, msg_id = %msg.msg_id, chat_id = %msg.chat_id,
             sent_at_ms = ?msg.sent_at_ms, latest_user_ms = ?latest,
             "dropping replayed remote message (session watermark)"
+        );
+        return;
+    }
+
+    // Startup backlog: the account sync may still be applying changes, so a
+    // stale watermark can label yesterday's messages as "Newer". During the
+    // first two minutes, do not let a multi-hour-old backlog into a turn.
+    if startup_replay(age_ms, state.started_at.elapsed()) {
+        tracing::info!(
+            channel = %msg.channel, msg_id = %msg.msg_id, age_ms = age_ms,
+            "dropping startup replay backlog"
         );
         return;
     }
@@ -754,29 +982,94 @@ pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySin
         }
     }
 
+    // Durable claim BEFORE the batch. A redelivered/crashed message id is
+    // ignored even if the channel/watermark path missed it; the claim is
+    // released as done/failed when the turn settles.
+    let Some(ledger_id) = claim_inbound(&db, &msg).await else {
+        tracing::info!(
+            channel = %msg.channel, msg_id = %msg.msg_id,
+            "dropping inbound already claimed by the durable ledger"
+        );
+        return;
+    };
+
     // Include the sender: a group's A-image must not be merged into B's text.
     let key = format!("{}:{}:{}", msg.channel, msg.chat_id, msg.user_id);
+    let app_for_flush = app.clone();
+    let mut flushed = None;
+    let mut generation_floor = 0u64;
     let (generation, delay) = {
         let mut map = PENDING.lock().await;
+        // A redelivered backlog can arrive in one burst but carry timestamps
+        // minutes/hours apart. Only apply the sender-timestamp split to old
+        // (replayed) messages: a live file upload may carry a timestamp
+        // several seconds older than the caption typed after it, and must
+        // still merge with that caption.
+        // Timestamp-gap splitting exists only to break up a startup replay
+        // burst. WeChat can deliver one "send together" text+image action as
+        // two messages with independent create_time values; after startup
+        // those must never be split by their sender timestamps.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let current_old = age_ms.is_some_and(|age| age > STALE_MESSAGE_MS);
+        let previous_old = map
+            .get(&key)
+            .and_then(|entry| entry.last_sent_at)
+            .is_some_and(|sent| now_ms - sent > STALE_MESSAGE_MS);
+        let startup_backlog = state.started_at.elapsed() < STARTUP_REPLAY_WINDOW;
+        let gap = startup_backlog
+            && current_old
+            && previous_old
+            && batch_gap_exceeded(
+                msg.sent_at_ms,
+                map.get(&key).and_then(|entry| entry.last_sent_at),
+            );
+        if gap {
+            if let Some(mut old) = map.remove(&key) {
+                generation_floor = old.generation;
+                flushed = take_pending(&mut old);
+            }
+        }
         let entry = map.entry(key.clone()).or_insert_with(|| PendingBatch {
             generation: 0,
-            texts: Vec::new(),
-            medias: Vec::new(),
+            parts: Vec::new(),
+            ledger_ids: Vec::new(),
             meta: None,
+            last_sent_at: None,
             sink: sink.clone(),
         });
-        entry.generation += 1;
-        entry.texts.push(msg.text.clone());
-        entry.medias.extend(msg.media.clone());
+        // Never reuse the removed entry's generation: its timer is still in
+        // flight and must not consume the new segment.
+        entry.generation = entry.generation.max(generation_floor) + 1;
+        entry.parts.push(BatchPart::Text(msg.text.clone()));
+        for media in msg.media.clone() {
+            entry.parts.push(BatchPart::Media(media));
+        }
+        if !ledger_id.is_empty() {
+            entry.ledger_ids.push(ledger_id);
+        }
         entry.meta = Some(msg);
+        entry.last_sent_at = entry.meta.as_ref().and_then(|m| m.sent_at_ms);
         entry.sink = sink;
         // Media-only waits for a possible caption; text (with or without
         // media) uses the normal quiet window. Empty text entries from media
         // messages must not count as a caption.
-        let has_text = entry.texts.iter().any(|t| !t.trim().is_empty());
-        let delay = batch_delay(has_text, !entry.medias.is_empty());
-        (entry.generation, delay)
+        let has_text = entry.parts.iter().any(|part| {
+            matches!(part, BatchPart::Text(text) if !text.trim().is_empty())
+        });
+        let has_image = entry.parts.iter().any(|part| {
+            matches!(part, BatchPart::Media(MediaRef { kind: MediaKind::Image, .. }))
+        });
+        let has_file = entry.parts.iter().any(|part| {
+            matches!(part, BatchPart::Media(MediaRef { kind: MediaKind::File, .. }))
+        });
+        (entry.generation, batch_delay(has_text, has_image, has_file))
     };
+
+    if let Some((meta, parts, ledger_ids, sink)) = flushed {
+        tokio::spawn(async move {
+            process_batch(app_for_flush, meta, parts, ledger_ids, sink).await;
+        });
+    }
 
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -784,17 +1077,17 @@ pub async fn enqueue(app: AppHandle, msg: InboundMessage, sink: Arc<dyn ReplySin
             let mut map = PENDING.lock().await;
             map.get_mut(&key).and_then(|entry| {
                 if entry.generation == generation {
-                    let texts = std::mem::take(&mut entry.texts);
-                    let medias = std::mem::take(&mut entry.medias);
+                    let parts = std::mem::take(&mut entry.parts);
+                    let ledger_ids = std::mem::take(&mut entry.ledger_ids);
                     let meta = entry.meta.clone();
-                    meta.map(|m| (m, texts, medias, entry.sink.clone()))
+                    meta.map(|m| (m, parts, ledger_ids, entry.sink.clone()))
                 } else {
                     None
                 }
             })
         };
-        if let Some((meta, texts, medias, sink)) = ready {
-            process_batch(app, meta, texts, medias, sink).await;
+        if let Some((meta, parts, ledger_ids, sink)) = ready {
+            process_batch(app, meta, parts, ledger_ids, sink).await;
         }
     });
 }
@@ -816,20 +1109,24 @@ async fn chat_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+fn push_block(target: &mut String, block: &str) {
+    if block.trim().is_empty() {
+        return;
+    }
+    if !target.trim().is_empty() {
+        target.push_str("\n\n");
+    }
+    target.push_str(block.trim());
+}
+
 async fn process_batch(
     app: AppHandle,
     meta: InboundMessage,
-    texts: Vec<String>,
-    medias: Vec<MediaRef>,
+    parts: Vec<BatchPart>,
+    ledger_ids: Vec<String>,
     sink: Arc<dyn ReplySink>,
 ) {
-    let mut text = texts
-        .iter()
-        .filter(|t| !t.trim().is_empty())
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.trim().is_empty() && medias.is_empty() {
+    if parts.is_empty() {
         return;
     }
     let state = app.state::<AppState>();
@@ -839,6 +1136,7 @@ async fn process_batch(
         let _ = sink
             .send_text(&meta.chat_id, "消息太频繁了，请稍后再试。")
             .await;
+        finish_inbound(&db, &ledger_ids, "done").await;
         return;
     }
 
@@ -846,9 +1144,14 @@ async fn process_batch(
     // immediately instead of waiting behind a running turn.
     let (session_id, grant) = match ensure_paired(&db, &app, &meta, &sink).await {
         Ok(Some(pair)) => pair,
-        Ok(None) => return, // pairing notice already handled
+        Ok(None) => {
+            // Pairing notice already handled; the message is consumed.
+            finish_inbound(&db, &ledger_ids, "done").await;
+            return;
+        }
         Err(e) => {
             tracing::error!(error = %e, "remote pairing check failed");
+            finish_inbound(&db, &ledger_ids, "failed").await;
             return;
         }
     };
@@ -859,6 +1162,17 @@ async fn process_batch(
     } else {
         None
     };
+
+    // One turn per message set. The per-message ledger already claimed each
+    // id; this closes the window where two batches with the same ids race.
+    let turn_key = turn_key_for(&ledger_ids);
+    if let Some(key) = &turn_key {
+        if !claim_turn(&db, key, &meta, &ledger_ids).await {
+            tracing::info!(turn_key = %key, "dropping already-claimed remote turn");
+            finish_inbound(&db, &ledger_ids, "done").await;
+            return;
+        }
+    }
 
     let lock = chat_lock(&format!("{}:{}", meta.channel, meta.chat_id)).await;
     let _guard = match lock.clone().try_lock_owned() {
@@ -871,101 +1185,197 @@ async fn process_batch(
         }
     };
 
-    // Resolve media AFTER the debounce window: the download/decrypt cost no
-    // longer influences whether a caption joins its image/file. Both image
-    // and file refs go through this loop; a failure is reported alongside the
-    // rest of the batch instead of dropping a perfectly good text prompt.
+    // Resolve media AFTER the debounce window, in the original arrival order.
+    // `agent_text` keeps the local path + extracted document body for the
+    // model; `display_text` is the compact body persisted for the UI and
+    // sync, so a machine-local path never appears in a user bubble.
     let mut images = Vec::new();
-    let mut file_notes: Vec<String> = Vec::new();
-    let mut failures: Vec<String> = Vec::new();
+    let mut file_attachments: Vec<serde_json::Value> = Vec::new();
+    let mut agent_text = String::new();
+    let mut display_text = String::new();
+    let mut prompt_text = String::new();
+    let mut useful = false;
     let downloads = state.app_data_dir.join("remote_downloads");
-    let caption = text.trim().to_string();
 
-    for media in &medias {
-        match media.kind {
-            MediaKind::Image => match sink.resolve_image_media(media).await {
-                Ok(mut resolved) if !resolved.is_empty() => images.append(&mut resolved),
-                Ok(_) => failures.push(format!("（图片《{}》内容为空，已跳过）", media.name)),
-                Err(e) => failures.push(format!("（图片《{}》下载失败：{e}）", media.name)),
-            },
-            MediaKind::File => match sink.resolve_file_media(media).await {
-                Ok(path) => {
-                    // Keep every inbound file under remote_downloads so the
-                    // agent can come back to it in later turns (feishu
-                    // resolves into a volatile temp dir).
-                    let path = if path.starts_with(&downloads) {
-                        path
-                    } else {
-                        let target =
-                            downloads.join(format!("{}_{}", uuid::Uuid::new_v4(), media.name));
-                        match std::fs::create_dir_all(&downloads)
-                            .and_then(|_| std::fs::copy(&path, &target).map(|_| ()))
-                        {
-                            Ok(()) => {
-                                let _ = std::fs::remove_file(&path);
-                                target
+    for part in parts {
+        match part {
+            BatchPart::Text(text) => {
+                if !text.trim().is_empty() {
+                    useful = true;
+                    push_block(&mut agent_text, text.trim());
+                    push_block(&mut display_text, text.trim());
+                    push_block(&mut prompt_text, text.trim());
+                }
+            }
+            BatchPart::Media(media) => match media.kind {
+                MediaKind::Image => match sink.resolve_image_media(&media).await {
+                    Ok(mut resolved) if !resolved.is_empty() => {
+                        useful = true;
+                        images.append(&mut resolved);
+                    }
+                    Ok(_) => {
+                        let note = format!("（图片《{}》内容为空，已跳过）", media.name);
+                        push_block(&mut agent_text, &note);
+                        push_block(&mut prompt_text, &note);
+                        push_block(&mut display_text, "（一张图片内容为空，已跳过）");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, image = %media.name, "remote image resolve failed");
+                        let note = format!("（图片《{}》下载失败：{e}）", media.name);
+                        push_block(&mut agent_text, &note);
+                        push_block(&mut prompt_text, &note);
+                        push_block(&mut display_text, "（一张图片下载失败，已跳过）");
+                    }
+                },
+                MediaKind::File => match sink.resolve_file_media(&media).await {
+                    Ok(path) => {
+                        // Keep every inbound file under remote_downloads so the
+                        // agent can come back to it in later turns (feishu
+                        // resolves into a volatile temp dir).
+                        let path = if path.starts_with(&downloads) {
+                            path
+                        } else {
+                            let target = downloads
+                                .join(format!("{}_{}", uuid::Uuid::new_v4(), media.name));
+                            match std::fs::create_dir_all(&downloads)
+                                .and_then(|_| std::fs::copy(&path, &target).map(|_| ()))
+                            {
+                                Ok(()) => {
+                                    let _ = std::fs::remove_file(&path);
+                                    target
+                                }
+                                Err(_) => path,
                             }
-                            Err(_) => path,
+                        };
+                        let cache_dir = downloads.join(".siku-cache");
+                        let read_path = path.clone();
+                        let extracted = tokio::task::spawn_blocking(move || {
+                            crate::core::document_text::read_document_text(&read_path, &cache_dir)
+                        })
+                        .await
+                        .map_err(|e| format!("task join: {e}"))
+                        .and_then(|r| r);
+                        let extracted_text = match &extracted {
+                            Ok(content) => content.clone(),
+                            Err(_) => String::new(),
+                        };
+                        let body = match &extracted {
+                            Ok(content) => format!("文件内容提取如下：\n{content}"),
+                            Err(e) => format!(
+                                "文件内容提取失败（{e}）。可建议用户在思库应用内处理；\
+                                 若用户要求入库且是文献 PDF，可用 paper_import 导入该路径。"
+                            ),
+                        };
+                        // Content-addressed artifact: the synced message only
+                        // carries a device-independent URI; the blob itself is
+                        // transferred by the existing blob sync channel.
+                        let mut artifact_uri = None;
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            let ext = path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("bin")
+                                .to_ascii_lowercase();
+                            let hash = crate::file_store::sha256_hex(&bytes);
+                            if crate::file_store::write_blob(&state.app_data_dir, &bytes, &ext)
+                                .is_ok()
+                            {
+                                let uri =
+                                    crate::core::artifact_service::artifact_uri(&hash, &ext);
+                                let _ = sqlx::query(
+                                    "INSERT OR IGNORE INTO remote_artifacts
+                                     (artifact_id, session_id, channel, chat_id, msg_id, name, mime,
+                                      size, hash, ext, extracted_text, created_at)
+                                     VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)",
+                                )
+                                .bind(&uri)
+                                .bind(&session_id)
+                                .bind(&meta.channel)
+                                .bind(&meta.chat_id)
+                                .bind(&meta.msg_id)
+                                .bind(&media.name)
+                                .bind(bytes.len() as i64)
+                                .bind(&hash)
+                                .bind(&ext)
+                                .bind(&extracted_text)
+                                .bind(crate::core::time::now_iso())
+                                .execute(&db)
+                                .await;
+                                artifact_uri = Some(uri.clone());
+                                file_attachments.push(serde_json::json!({
+                                    "kind": "file",
+                                    "name": media.name,
+                                    "mime": crate::core::file_service::mime_guess(&media.name)
+                                        .unwrap_or_else(|| format!("application/{ext}")),
+                                    "size": bytes.len(),
+                                    "artifact_id": uri,
+                                    "sha256": hash,
+                                    "status": "ok",
+                                }));
+                            }
                         }
-                    };
-                    let cache_dir = downloads.join(".siku-cache");
-                    let read_path = path.clone();
-                    let extracted = tokio::task::spawn_blocking(move || {
-                        crate::core::document_text::read_document_text(&read_path, &cache_dir)
-                    })
-                    .await
-                    .map_err(|e| format!("task join: {e}"))
-                    .and_then(|r| r);
-                    let body = match extracted {
-                        Ok(content) => format!("文件内容提取如下：\n{content}"),
-                        Err(e) => format!(
-                            "文件内容提取失败（{e}）。可建议用户在思库应用内处理；\
-                             若用户要求入库且是文献 PDF，可用 paper_import 导入该路径。"
-                        ),
-                    };
-                    file_notes.push(if caption.is_empty() {
-                        format!("（用户发来文件《{}》，已保存到本机：{}。{body}）", media.name, path.display())
-                    } else {
-                        format!("（附件《{}》已保存到本机：{}。{body}）", media.name, path.display())
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, file = %media.name, "remote file download failed");
-                    failures.push(format!(
-                        "（{}：{e}）",
-                        file_fallback_text(&meta, &media.name)
-                    ));
-                }
+                        let has_text = !agent_text.trim().is_empty();
+                        let stored_note = match &artifact_uri {
+                            Some(uri) => format!("（附件《{}》，引用：{uri}）", media.name),
+                            None => format!("（附件《{}》）", media.name),
+                        };
+                        let prompt_note = match &artifact_uri {
+                            Some(uri) => format!(
+                                "（用户发来文件《{}》，已保存为 {uri}；本机路径：{}。{body}）",
+                                media.name,
+                                path.display()
+                            ),
+                            None => format!(
+                                "（用户发来文件《{}》，已保存到本机：{}。{body}）",
+                                media.name,
+                                path.display()
+                            ),
+                        };
+                        let prompt_note = if has_text {
+                            prompt_note.replace("（用户发来文件", "（附件")
+                        } else {
+                            prompt_note
+                        };
+                        useful = true;
+                        push_block(&mut agent_text, &stored_note);
+                        push_block(&mut prompt_text, &prompt_note);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, file = %media.name, "remote file download failed");
+                        let note = format!("（{}：{e}）", file_fallback_text(&meta, &media.name));
+                        push_block(&mut agent_text, &note);
+                        push_block(&mut prompt_text, &note);
+                        push_block(
+                            &mut display_text,
+                            &format!("（附件《{}》处理失败）", media.name),
+                        );
+                    }
+                },
             },
         }
     }
 
-    if !file_notes.is_empty() {
-        let base = text.trim();
-        text = if base.is_empty() {
-            file_notes.join("\n\n")
-        } else {
-            format!("{base}\n\n{}", file_notes.join("\n\n"))
-        };
-    }
-    if text.trim().is_empty() && !images.is_empty() {
-        text = "[图片]".to_string();
-    }
-    if text.trim().is_empty() && images.is_empty() {
-        let note = if failures.is_empty() {
+    if !useful {
+        let note = if display_text.trim().is_empty() {
             "没有可处理的媒体内容，请重发一次。".to_string()
         } else {
-            failures.join("\n")
+            display_text.trim().to_string()
         };
         let _ = sink.send_text(&meta.chat_id, &note).await;
+        if let Some(key) = &turn_key {
+            finish_turn(&db, key, "done").await;
+        }
+        finish_inbound(&db, &ledger_ids, "done").await;
         return;
     }
-    if !failures.is_empty() {
-        text = format!("{}\n\n{}", text.trim(), failures.join("\n"));
+    if agent_text.trim().is_empty() && !images.is_empty() {
+        agent_text = "[图片]".to_string();
+        display_text = "[图片]".to_string();
+        prompt_text = "[图片]".to_string();
     }
 
     let channel_label = channel_label(&meta.channel);
-    let preview: String = text.chars().take(50).collect();
+    let preview: String = display_text.chars().take(50).collect();
     crate::commands::pet::pet_report(
         &app,
         "remote",
@@ -977,7 +1387,9 @@ async fn process_batch(
     // Live progress surface (feishu card / weixin delayed ack): created
     // before the turn starts so early events are not missed.
     let _ = sink
-        .progress_start(&meta.chat_id, &preview, &session_id, &text, meta.kind)
+        // `preview` is human-facing; `prompt` must stay the full agent prompt
+        // so a Feishu card retry does not lose hidden file context.
+        .progress_start(&meta.chat_id, &preview, &session_id, &prompt_text, meta.kind)
         .await;
     let driver = spawn_progress_driver(&app, &session_id, &meta.chat_id, sink.clone());
 
@@ -996,16 +1408,24 @@ async fn process_batch(
     // Files the agent registers during this turn land here; the engine writes
     // them into the assistant row and we upload them after the reply goes out.
     let outbound = new_outbound_queue();
-    let result = crate::commands::agent::run_agent_turn(
+    let result = crate::commands::agent::run_agent_turn_with_display(
         &state,
         &app,
         session_id.clone(),
-        text.clone(),
+        agent_text.clone(),
+        Some(display_text.clone()),
+        Some(prompt_text.clone()),
+        if file_attachments.is_empty() { None } else { Some(file_attachments) },
         if images.is_empty() { None } else { Some(images) },
         tools_override,
         Some(outbound.clone()),
     )
     .await;
+    let turn_state = if result.is_ok() { "done" } else { "failed" };
+    if let Some(key) = &turn_key {
+        finish_turn(&db, key, turn_state).await;
+    }
+    finish_inbound(&db, &ledger_ids, turn_state).await;
 
     let mut reply_row: Option<ReplyRow> = None;
     let reply = match result {
@@ -1683,6 +2103,39 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
+        sqlx::query(
+            "CREATE TABLE remote_inbound (
+                id TEXT NOT NULL DEFAULT '',
+                channel TEXT NOT NULL DEFAULT '',
+                chat_id TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT '',
+                msg_id TEXT NOT NULL DEFAULT '',
+                sent_at_ms INTEGER,
+                state TEXT NOT NULL DEFAULT 'pending',
+                turn_key TEXT NOT NULL DEFAULT '',
+                claimed_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (id)
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE remote_turns (
+                turn_key TEXT NOT NULL DEFAULT '',
+                channel TEXT NOT NULL DEFAULT '',
+                chat_id TEXT NOT NULL DEFAULT '',
+                msg_ids TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'running',
+                claimed_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (turn_key)
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
         db
     }
 
@@ -1702,10 +2155,30 @@ mod tests {
 
     #[test]
     fn media_only_waits_for_a_caption_but_text_does_not() {
-        assert_eq!(batch_delay(false, false), DEBOUNCE_MS);
-        assert_eq!(batch_delay(true, false), DEBOUNCE_MS);
-        assert_eq!(batch_delay(true, true), DEBOUNCE_MS);
-        assert_eq!(batch_delay(false, true), MEDIA_DEBOUNCE_MS);
+        assert_eq!(batch_delay(false, false, false), TEXT_DEBOUNCE_MS);
+        assert_eq!(batch_delay(true, false, false), TEXT_DEBOUNCE_MS);
+        assert_eq!(batch_delay(true, true, true), DEBOUNCE_MS);
+        assert_eq!(batch_delay(false, true, false), MEDIA_DEBOUNCE_MS);
+        assert_eq!(batch_delay(false, false, true), FILE_DEBOUNCE_MS);
+        assert_eq!(batch_delay(false, true, true), FILE_DEBOUNCE_MS);
+    }
+
+    #[test]
+    fn batch_splits_on_sender_timestamp_gap() {
+        assert!(!batch_gap_exceeded(Some(1_000), Some(1_060)));
+        assert!(!batch_gap_exceeded(Some(1_060), Some(1_000)));
+        assert!(batch_gap_exceeded(Some(1_000), Some(361_000)));
+        assert!(!batch_gap_exceeded(None, Some(1_000)));
+    }
+
+    #[test]
+    fn startup_backlog_is_dropped_only_during_the_guard_window() {
+        let old = Some(STARTUP_MAX_AGE_MS + 1);
+        let fresh = Some(1_000);
+        assert!(startup_replay(old, Duration::from_secs(1)));
+        assert!(!startup_replay(old, STARTUP_REPLAY_WINDOW));
+        assert!(!startup_replay(fresh, Duration::from_secs(1)));
+        assert!(!startup_replay(None, Duration::from_secs(1)));
     }
 
     #[test]
@@ -1726,6 +2199,31 @@ mod tests {
         }
         let second = inbound_fingerprint(&msg).expect("fingerprint");
         assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn inbound_ledger_claims_once_and_releases_done() {
+        let db = test_db().await;
+        let msg = sample_inbound("ledger-1", Some(1), "hi");
+        let first = claim_inbound(&db, &msg).await.expect("first claim");
+        assert!(!first.is_empty());
+        assert!(claim_inbound(&db, &msg).await.is_none());
+        finish_inbound(&db, &[first], "done").await;
+        assert!(claim_inbound(&db, &msg).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_key_is_order_independent_and_claims_once() {
+        let ids = vec!["a".to_string(), "b".to_string()];
+        let reversed = vec!["b".to_string(), "a".to_string()];
+        let key = turn_key_for(&ids).expect("key");
+        assert_eq!(Some(key.clone()), turn_key_for(&reversed));
+        let db = test_db().await;
+        let msg = sample_inbound("turn-1", Some(1), "hi");
+        assert!(claim_turn(&db, &key, &msg, &ids).await);
+        assert!(!claim_turn(&db, &key, &msg, &ids).await);
+        finish_turn(&db, &key, "done").await;
+        assert!(!claim_turn(&db, &key, &msg, &ids).await);
     }
 
     #[tokio::test]

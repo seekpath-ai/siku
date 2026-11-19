@@ -315,6 +315,8 @@ export interface ChatAttachment {
   size?: number;
   /** Outbound file: absolute path on the device that sent it. */
   path?: string;
+  /** Inbound remote file: device-independent blob reference. */
+  artifact_id?: string;
   sha256?: string;
   /** Outbound delivery state: pending → ok / failed. */
   status?: 'pending' | 'ok' | 'failed';
@@ -326,6 +328,9 @@ export interface ChatMessage {
   session_id: string;
   role: 'user' | 'assistant' | 'system' | 'tool';
   content: string;
+  /** Human-facing body when `content` carries hidden agent context (remote
+   *  files). Absent/null = render `content`. */
+  display_content?: string | null;
   reasoning_content: string | null;
   tool_calls: string | null;
   citations: string | null;

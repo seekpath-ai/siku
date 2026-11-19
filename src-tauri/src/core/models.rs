@@ -212,6 +212,9 @@ pub struct ChatMessage {
     pub session_id: String,
     pub role: String,
     pub content: String,
+    /// Human-facing body when `content` carries hidden agent context.
+    /// NULL means the UI should render `content` (all historical rows).
+    pub display_content: Option<String>,
     pub reasoning_content: Option<String>,
     pub tool_calls: Option<String>,
     pub tool_call_id: Option<String>,

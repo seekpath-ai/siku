@@ -226,7 +226,7 @@ pub async fn get_chat_messages(
     after_id: Option<String>,
     limit: Option<i64>,
 ) -> Result<ChatMessagePage, String> {
-    const COLS: &str = "id, session_id, role, content, reasoning_content, tool_calls, tool_call_id, tool_name, citations, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, attachments, user_tag, origin_device_id, origin_device_name, origin_working_dir, created_at";
+    const COLS: &str = "id, session_id, role, content, display_content, reasoning_content, tool_calls, tool_call_id, tool_name, citations, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, attachments, user_tag, origin_device_id, origin_device_name, origin_working_dir, created_at";
 
     if let (Some(ts), Some(id)) = (after_created_at, after_id) {
         let messages = sqlx::query_as::<_, ChatMessage>(&format!(
@@ -387,7 +387,7 @@ pub async fn chat_message_tag(
     message_id: String,
     tag: Option<String>,
 ) -> Result<ChatMessage, String> {
-    const COLS: &str = "id, session_id, role, content, reasoning_content, tool_calls, tool_call_id, tool_name, citations, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, attachments, user_tag, origin_device_id, origin_device_name, origin_working_dir, created_at";
+    const COLS: &str = "id, session_id, role, content, display_content, reasoning_content, tool_calls, tool_call_id, tool_name, citations, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, attachments, user_tag, origin_device_id, origin_device_name, origin_working_dir, created_at";
     let msg = sqlx::query_as::<_, ChatMessage>(&format!("SELECT {COLS} FROM chat_messages WHERE id = ?"))
         .bind(&message_id)
         .fetch_optional(&state.db)
@@ -476,17 +476,46 @@ pub async fn save_chat_message(
     reasoning_content: Option<&str>,
     attachments: Option<&str>,
 ) -> Result<String, String> {
+    save_chat_message_with_display(
+        db, session_id, role, content, None, model, tokens_used, tokens_in, tokens_in_hit,
+        tokens_out, tool_calls, tool_call_id, tool_name, reasoning_content, attachments,
+    )
+    .await
+}
+
+/// Same as [`save_chat_message`], but also stores the human-facing body.
+/// `content` remains the full agent prompt (including hidden file context);
+/// `display_content` is what the UI renders and exports.
+#[allow(clippy::too_many_arguments)]
+pub async fn save_chat_message_with_display(
+    db: &sqlx::SqlitePool,
+    session_id: &str,
+    role: &str,
+    content: &str,
+    display_content: Option<&str>,
+    model: Option<&str>,
+    tokens_used: Option<i32>,
+    tokens_in: Option<i32>,
+    tokens_in_hit: Option<i32>,
+    tokens_out: Option<i32>,
+    tool_calls: Option<&str>,
+    tool_call_id: Option<&str>,
+    tool_name: Option<&str>,
+    reasoning_content: Option<&str>,
+    attachments: Option<&str>,
+) -> Result<String, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = time::now_iso();
 
     sqlx::query(
-        "INSERT INTO chat_messages (id, session_id, role, content, reasoning_content, tool_calls, tool_call_id, tool_name, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, attachments, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO chat_messages (id, session_id, role, content, display_content, reasoning_content, tool_calls, tool_call_id, tool_name, model, tokens_used, tokens_in, tokens_in_hit, tokens_out, attachments, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&id)
     .bind(session_id)
     .bind(role)
     .bind(content)
+    .bind(display_content)
     .bind(reasoning_content)
     .bind(tool_calls)
     .bind(tool_call_id)

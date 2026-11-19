@@ -128,6 +128,19 @@ pub async fn collect_missing_blob_hashes(
             consider(&rel_path);
         }
     }
+    // Inbound remote files (chat attachments). Same blob store, separate
+    // synced index; tolerate absence on pre-migration databases.
+    if let Ok(remote_rows) = sqlx::query_as::<_, (String,)>(
+        "SELECT 'blobs/' || hash || '.' || ext FROM remote_artifacts \
+         WHERE hash <> '' AND ext <> ''",
+    )
+    .fetch_all(db)
+    .await
+    {
+        for (rel_path,) in remote_rows {
+            consider(&rel_path);
+        }
+    }
     Ok(missing)
 }
 

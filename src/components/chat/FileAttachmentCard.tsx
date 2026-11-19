@@ -10,7 +10,7 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import type { ChatAttachment } from '@/lib/types';
-import { fileBrowserGetInfo, fileBrowserOpenInSystem, remoteAttachmentRetry } from '@/lib/tauri';
+import { artifactResolve, fileBrowserGetInfo, fileBrowserOpenInSystem, remoteAttachmentRetry } from '@/lib/tauri';
 
 function humanSize(bytes?: number): string {
   if (!bytes || bytes <= 0) return '';
@@ -48,16 +48,19 @@ export function FileAttachmentCard({
 }) {
   const [missing, setMissing] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [resolvedPath, setResolvedPath] = useState<string | undefined>(undefined);
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState<string | null>(null);
   const name = att.name || '文件';
   const size = humanSize(att.size);
   const status = att.status ?? 'ok';
+  const effectivePath = att.path || resolvedPath;
+  const inboundArtifact = !att.path && !!att.artifact_id;
   const Icon = iconFor(att.mime || '');
   const isImage = (att.mime || '').startsWith('image/');
   const thumb = useMemo(
-    () => (isImage && att.path && status !== 'pending' ? convertFileSrc(att.path) : ''),
-    [att.path, isImage, status],
+    () => (isImage && effectivePath && status !== 'pending' ? convertFileSrc(effectivePath) : ''),
+    [effectivePath, isImage, status],
   );
 
   // A conversation synced from another device carries the sender's absolute
@@ -79,6 +82,7 @@ export function FileAttachmentCard({
   }, [att.path, status]);
 
   const canRetry =
+    !inboundArtifact &&
     status === 'failed' &&
     !missing &&
     !retrying &&
@@ -102,12 +106,21 @@ export function FileAttachmentCard({
   };
 
   const openFile = async () => {
-    if (!att.path || missing || busy) return;
+    if (missing || busy) return;
     setBusy(true);
     try {
-      await fileBrowserOpenInSystem(att.path);
+      let path = att.path || resolvedPath;
+      if (!path && att.artifact_id) {
+        path = await artifactResolve(att.artifact_id);
+        setResolvedPath(path);
+      }
+      if (!path) {
+        setMissing(true);
+        return;
+      }
+      await fileBrowserOpenInSystem(path);
     } catch {
-      // Synced from another device: the path is correct but the file isn't here.
+      // Remote blob not downloaded yet, or the local path was from another device.
       setMissing(true);
     } finally {
       setBusy(false);
@@ -124,6 +137,8 @@ export function FileAttachmentCard({
         <Loader2 size={10} className="animate-spin" />
         发送中
       </span>
+    ) : inboundArtifact ? (
+      <span className="text-codex-muted">远程附件</span>
     ) : status === 'failed' ? (
       <span
         className="inline-flex items-center gap-1 text-danger"
@@ -141,8 +156,8 @@ export function FileAttachmentCard({
     <button
       type="button"
       onClick={openFile}
-      disabled={missing || status === 'pending' || !att.path}
-      title={missing ? '文件仅存在于发送它的设备上' : att.path || name}
+      disabled={missing || status === 'pending' || (!att.path && !att.artifact_id)}
+      title={missing ? '文件尚未同步到本机' : att.path || name}
       className="group flex items-center gap-2 max-w-[280px] rounded-lg border border-codex-border/60 bg-codex-surface/80 px-2.5 py-2 text-left hover:border-codex-accent/50 disabled:cursor-default disabled:hover:border-codex-border/60"
     >
       {thumb && !missing ? (
@@ -166,7 +181,7 @@ export function FileAttachmentCard({
           {missing && <span>· 文件不在此设备</span>}
         </span>
       </span>
-      {!missing && status !== 'pending' && att.path && (
+      {!missing && status !== 'pending' && (att.path || att.artifact_id) && (
         <ExternalLink size={11} className="shrink-0 text-codex-muted opacity-0 group-hover:opacity-100" />
       )}
     </button>

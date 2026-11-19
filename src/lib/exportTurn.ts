@@ -19,7 +19,7 @@ function turnBody(
 ): string[] {
   const lines: string[] = [];
   lines.push(`${h} 用户消息`, '');
-  lines.push(userMessage?.content.trim() || '（未找到本轮用户消息）', '');
+  lines.push((userMessage?.display_content ?? userMessage?.content)?.trim() || '（未找到本轮用户消息）', '');
 
   const sorted = [...steps].sort((a, b) => a.step_index - b.step_index);
   if (sorted.length > 0) {

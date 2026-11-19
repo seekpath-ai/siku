@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Query, State, WebSocketUpgrade},
+    extract::{Json, Query, State, WebSocketUpgrade},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
@@ -990,6 +990,134 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, claims: Claims) 
     let _ = result;
 }
 
+// ── Remote channel lease API ───────────────────────────────────────────────
+//
+// Authoritative single-writer leases for remote IM pollers. The relay owns
+// the CAS; clients never race on a CRDT row. The manifest is opaque to the
+// relay (a hash of the remote tables/cursor) and lets a standby verify it has
+// applied the owner's state before taking over.
+
+#[derive(Deserialize)]
+struct LeaseAcquireRequest {
+    channel: String,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    manifest: Option<String>,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct LeaseRenewRequest {
+    channel: String,
+    epoch: u64,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    manifest: Option<String>,
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct LeaseReleaseRequest {
+    channel: String,
+}
+
+#[derive(Deserialize)]
+struct LeaseQuery {
+    channel: String,
+}
+
+#[derive(Serialize)]
+struct LeaseResponse {
+    granted: bool,
+    lease: Option<db::RemoteLease>,
+}
+
+fn lease_ttl(req: Option<u64>) -> u64 {
+    req.unwrap_or(90).clamp(30, 600)
+}
+
+fn device_name(state: &AppState, claims: &auth::Claims) -> String {
+    state
+        .db
+        .get_device(&claims.device_id)
+        .map(|d| d.name)
+        .unwrap_or_default()
+}
+
+async fn api_remote_lease_acquire(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<LeaseAcquireRequest>,
+) -> Result<axum::Json<LeaseResponse>, (StatusCode, String)> {
+    let claims = bearer_claims(&state, &headers)?;
+    let lease = state.db.acquire_remote_lease(
+        &claims.sub,
+        &req.channel,
+        &claims.device_id,
+        &device_name(&state, &claims),
+        req.cursor.as_deref().unwrap_or(""),
+        req.manifest.as_deref().unwrap_or(""),
+        lease_ttl(req.ttl_seconds),
+    );
+    Ok(axum::Json(LeaseResponse {
+        granted: lease.is_some(),
+        lease,
+    }))
+}
+
+async fn api_remote_lease_renew(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<LeaseRenewRequest>,
+) -> Result<axum::Json<LeaseResponse>, (StatusCode, String)> {
+    let claims = bearer_claims(&state, &headers)?;
+    let lease = state.db.renew_remote_lease(
+        &claims.sub,
+        &req.channel,
+        &claims.device_id,
+        req.epoch,
+        req.cursor.as_deref().unwrap_or(""),
+        req.manifest.as_deref().unwrap_or(""),
+        lease_ttl(req.ttl_seconds),
+    );
+    Ok(axum::Json(LeaseResponse {
+        granted: lease.is_some(),
+        lease,
+    }))
+}
+
+async fn api_remote_lease_release(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<LeaseReleaseRequest>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let claims = bearer_claims(&state, &headers)?;
+    state
+        .db
+        .release_remote_lease(&claims.sub, &req.channel, &claims.device_id);
+    Ok(axum::Json(serde_json::json!({ "ok": true })))
+}
+
+async fn api_remote_lease_get(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<LeaseQuery>,
+) -> Result<axum::Json<LeaseResponse>, (StatusCode, String)> {
+    let claims = bearer_claims(&state, &headers)?;
+    let lease = state.db.get_remote_lease(&claims.sub, &q.channel);
+    Ok(axum::Json(LeaseResponse {
+        granted: lease
+            .as_ref()
+            .map(|l| l.owner_device_id == claims.device_id)
+            .unwrap_or(false),
+        lease,
+    }))
+}
+
 // ── Application builder (also used by tests) ───────────────────────────────
 
 fn app(state: Arc<AppState>) -> Router {
@@ -1003,6 +1131,10 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/api/refresh", post(api_refresh))
         .route("/api/devices", get(api_list_devices))
         .route("/api/devices/:id", patch(api_rename_device).delete(api_remove_device))
+        .route("/api/remote/lease", get(api_remote_lease_get))
+        .route("/api/remote/lease/acquire", post(api_remote_lease_acquire))
+        .route("/api/remote/lease/renew", post(api_remote_lease_renew))
+        .route("/api/remote/lease/release", post(api_remote_lease_release))
         .route("/api/plans", get(api_plans))
         .route("/api/storage", get(api_storage))
         .route(
@@ -3002,6 +3134,85 @@ mod tests {
             .collect();
         assert!(pay::parse_private_key(&bare_pkcs1).is_ok());
         assert!(pay::parse_private_key("not-a-key").is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_lease_http_requires_auth_and_hands_off_cursor() {
+        std::env::set_var("JWT_SECRET", "test-secret");
+        let state = Arc::new(AppState::new());
+        seed_account(&state);
+        let token_a = state.auth.issue_device_token("user-1", "device-a").unwrap();
+        let token_b = state.auth.issue_device_token("user-1", "device-b").unwrap();
+
+        let (status, _) = http_json(
+            state.clone(),
+            "GET",
+            "/api/remote/lease?channel=weixin",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, body) = http_json(
+            state.clone(),
+            "POST",
+            "/api/remote/lease/acquire",
+            Some(&token_a),
+            Some(serde_json::json!({"channel":"weixin","cursor":"cursor-a"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["granted"], true);
+        assert_eq!(body["lease"]["cursor"], "cursor-a");
+        let epoch_a = body["lease"]["epoch"].as_u64().unwrap();
+
+        let (status, body) = http_json(
+            state.clone(),
+            "POST",
+            "/api/remote/lease/acquire",
+            Some(&token_b),
+            Some(serde_json::json!({"channel":"weixin","cursor":"stale-b"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["granted"], false);
+
+        let (status, _) = http_json(
+            state.clone(),
+            "POST",
+            "/api/remote/lease/release",
+            Some(&token_a),
+            Some(serde_json::json!({"channel":"weixin"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = http_json(
+            state.clone(),
+            "POST",
+            "/api/remote/lease/acquire",
+            Some(&token_b),
+            Some(serde_json::json!({"channel":"weixin","cursor":"stale-b"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["granted"], true);
+        assert_eq!(body["lease"]["cursor"], "cursor-a");
+        let epoch_b = body["lease"]["epoch"].as_u64().unwrap();
+        assert!(epoch_b > epoch_a);
+
+        let (status, body) = http_json(
+            state.clone(),
+            "POST",
+            "/api/remote/lease/renew",
+            Some(&token_b),
+            Some(serde_json::json!({"channel":"weixin","epoch":epoch_b,"cursor":"cursor-b"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["granted"], true);
+        assert_eq!(body["lease"]["cursor"], "cursor-b");
     }
 
     #[tokio::test]

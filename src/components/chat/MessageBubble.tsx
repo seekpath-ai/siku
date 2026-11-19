@@ -149,6 +149,10 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
     () => parseAttachments(message.attachments).filter(isOutboundFile),
     [message.attachments],
   );
+  const userFiles = useMemo(
+    () => (isUser ? parseAttachments(message.attachments).filter(isOutboundFile) : []),
+    [isUser, message.attachments],
+  );
   const hasLegacyReasoning = !!message.reasoning_content;
   const hasLegacyToolCalls = toolCalls.length > 0;
   const hasSteps = agentSteps.length > 0;
@@ -199,12 +203,15 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
   // footer is split out first so it can be rendered as a compact grid instead
   // of one block-level Markdown list row per file. Hook stays above the early
   // return below.
+  const displayContent = isUser
+    ? message.display_content ?? message.content
+    : message.content;
   const splitContent = useMemo(
     () =>
       isUser
-        ? { body: message.content, artifacts: [] }
-        : splitArtifactSection(message.content),
-    [isUser, message.content],
+        ? { body: displayContent, artifacts: [] }
+        : splitArtifactSection(displayContent),
+    [isUser, displayContent],
   );
   const normalizedContent = useMemo(
     () => (isUser ? splitContent.body : normalizeMathDelimiters(splitContent.body)),
@@ -215,7 +222,7 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
 
   const handleCopy = async () => {
     try {
-      await navigator.clipboard.writeText(message.content);
+      await navigator.clipboard.writeText(displayContent);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch { /* ignore */ }
@@ -339,13 +346,15 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
       >
         {isUser ? (
           <>
-            <CollapsibleText
-              maxHeight={240}
-              gradientFrom="from-codex-hover"
-              buttonClassName="mt-1 inline-flex items-center gap-0.5 text-[11px] text-codex-muted hover:text-codex-primary transition-colors"
-            >
-              <UserText content={message.content} />
-            </CollapsibleText>
+            {displayContent.trim() && (
+              <CollapsibleText
+                maxHeight={240}
+                gradientFrom="from-codex-hover"
+                buttonClassName="mt-1 inline-flex items-center gap-0.5 text-[11px] text-codex-muted hover:text-codex-primary transition-colors"
+              >
+                <UserText content={displayContent} />
+              </CollapsibleText>
+            )}
             {message.attachments && (
               <div className="flex flex-wrap gap-2 mt-2">
                 {parseAttachments(message.attachments)
@@ -358,6 +367,9 @@ function MessageBubbleInner({ message, agentSteps = [], prevUserMessage, highlig
                       className="max-w-[120px] max-h-[120px] object-cover rounded-lg border border-codex-border/50"
                     />
                   ))}
+                {userFiles.map((att, idx) => (
+                  <FileAttachmentCard key={`file-${idx}`} att={att} />
+                ))}
               </div>
             )}
           </>

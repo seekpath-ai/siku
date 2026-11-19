@@ -196,37 +196,162 @@ async fn run_monitor(
         .await
         .map(|s| s.get_updates_buf)
         .unwrap_or_default();
-    let mut checkpoint = BufCheckpoint::new(&db);
-    let mut connected_once = false;
+    let device_id = crate::core::settings_service::load_device_settings(&db)
+        .await
+        .map(|s| s.device_id)
+        .unwrap_or_default();
 
-    // Startup grace on takeover: the previous holder's fresher cursor may
-    // still be syncing in — polling immediately with our stale local cursor
-    // makes the server replay backlog the other device already answered.
-    // Give sync a short window to deliver the row. Skipped for a fresh
-    // binding (an empty cursor starts from "now", no backlog to replay).
-    if !buf.is_empty() {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Preferred path: the relay owns the single-writer lease and the last
+    // cursor. Fall back to the synced local lease only when no relay account
+    // is configured (legacy single-device mode) or the relay predates the
+    // lease API.
+    let relay_base = relay_url(&db).await;
+    let mut relay_epoch: Option<u64> = None;
+    let manifest = remote_state_manifest(&db).await;
+    let mut relay_usable = false;
+    if let Some(base) = relay_base.as_deref() {
+        let lease_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
-            tokio::select! {
-                _ = cancel.cancelled() => return Ok(()),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+            let current = match relay_lease_get(&db, base).await {
+                Ok(v) => {
+                    relay_usable = true;
+                    v
+                }
+                Err(RelayLeaseError::Unsupported) => {
+                    tracing::warn!("weixin: relay lease API unsupported; using local lease");
+                    break;
+                }
+                Err(RelayLeaseError::Transient(e)) => {
+                    // A timeout/5xx must NOT fall back to a local lease:
+                    // another device may still hold the relay lease.
+                    tracing::warn!(error = %e, "weixin: relay lease temporarily unavailable; staying standby");
+                    if std::time::Instant::now() >= lease_deadline {
+                        return Ok(());
+                    }
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                    }
+                    continue;
+                }
+            };
+            let live = current
+                .as_ref()
+                .map(|l| {
+                    chrono::DateTime::parse_from_rfc3339(&l.expires_at)
+                        .map(|t| t.with_timezone(&chrono::Utc) > chrono::Utc::now())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if let Some(lease) = current.as_ref() {
+                if !lease.manifest.is_empty()
+                    && !wait_for_manifest(&db, &cancel, &lease.manifest, std::time::Duration::from_secs(60)).await
+                {
+                    tracing::warn!("weixin: remote manifest not caught up; staying standby");
+                    return Ok(());
+                }
             }
-            if adopt_synced_cursor(&db, &mut buf, None).await
-                || std::time::Instant::now() >= deadline
-            {
-                break;
+            if !live || current.as_ref().map(|l| l.owner_device_id == device_id).unwrap_or(true) {
+                match relay_lease_acquire(&db, base, &buf, &manifest).await {
+                    Ok(Some(grant)) => {
+                        if !grant.cursor.is_empty() {
+                            buf = grant.cursor;
+                        }
+                        relay_epoch = Some(grant.epoch);
+                        tracing::info!(
+                            epoch = grant.epoch,
+                            cursor_len = buf.chars().count(),
+                            "weixin: acquired relay single-writer lease"
+                        );
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(RelayLeaseError::Unsupported) => {
+                        tracing::warn!("weixin: relay lease API unsupported; using local lease");
+                        relay_usable = false;
+                        break;
+                    }
+                    Err(RelayLeaseError::Transient(e)) => {
+                        tracing::warn!(error = %e, "weixin: relay lease acquire failed; staying standby");
+                        return Ok(());
+                    }
+                }
+            }
+            if std::time::Instant::now() >= lease_deadline {
+                tracing::warn!("weixin: relay lease held by another device; staying standby");
+                return Ok(());
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    if relay_epoch.is_some() {
+                        relay_lease_release(&db, base).await;
+                    }
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
             }
         }
     }
+    if !relay_usable {
+        // Legacy local fallback: synced CRDT lease, still guarded by the
+        // manifest state barrier below.
+        if !buf.is_empty() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !lease_row_exists(&db, "weixin").await
+                && std::time::Instant::now() < deadline
+            {
+                tokio::select! {
+                    _ = cancel.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                }
+            }
+        }
+        if !wait_for_lease_state(&db, &cancel, std::time::Duration::from_secs(60)).await {
+            tracing::warn!("weixin: remote state not caught up; staying standby");
+            return Ok(());
+        }
+        let lease_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            if let Some(cursor) = acquire_channel_lease(&db, "weixin", &device_id, &buf).await {
+                if !cursor.is_empty() {
+                    buf = cursor;
+                }
+                tracing::info!(cursor_len = buf.chars().count(), "weixin: acquired local single-writer lease");
+                break;
+            }
+            if std::time::Instant::now() >= lease_deadline {
+                tracing::warn!("weixin: channel lease held by another device; staying standby");
+                return Ok(());
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+            }
+        }
+    }
+    let mut checkpoint = BufCheckpoint::new(&db);
+    let mut connected_once = false;
 
     loop {
-        // A fresher cursor may also arrive mid-session (handoff while this
-        // device was already polling on a stale one): adopt before polling.
-        adopt_synced_cursor(&db, &mut buf, checkpoint.last_persisted()).await;
+        let manifest_now = remote_state_manifest(&db).await;
+        if !renew_active_lease(
+            &db,
+            relay_base.as_deref(),
+            relay_epoch,
+            &device_id,
+            &buf,
+            &manifest_now,
+        )
+        .await
+        {
+            tracing::warn!("weixin: lost channel lease; stopping poller");
+            return Ok(());
+        }
         let poll = get_updates(&http, &base_url, &cfg.bot_token, &buf);
         let resp = tokio::select! {
             _ = cancel.cancelled() => {
                 checkpoint.flush().await;
+                release_active_lease(&db, relay_base.as_deref(), relay_epoch, &device_id).await;
                 return Ok(());
             }
             r = poll => r,
@@ -236,12 +361,14 @@ async fn run_monitor(
             Err(e) => {
                 if cancel.is_cancelled() {
                     checkpoint.flush().await;
+                    release_active_lease(&db, relay_base.as_deref(), relay_epoch, &device_id).await;
                     return Ok(());
                 }
                 tracing::warn!(error = %e, "weixin getupdates failed, retrying in 5s");
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         checkpoint.flush().await;
+                        release_active_lease(&db, relay_base.as_deref(), relay_epoch, &device_id).await;
                         return Ok(());
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
@@ -264,6 +391,7 @@ async fn run_monitor(
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         checkpoint.flush().await;
+                        release_active_lease(&db, relay_base.as_deref(), relay_epoch, &device_id).await;
                         return Ok(());
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(STALE_BACKOFF_SECS)) => {}
@@ -278,6 +406,7 @@ async fn run_monitor(
             tokio::select! {
                 _ = cancel.cancelled() => {
                     checkpoint.flush().await;
+                    release_active_lease(&db, relay_base.as_deref(), relay_epoch, &device_id).await;
                     return Ok(());
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
@@ -296,6 +425,16 @@ async fn run_monitor(
             if !new_buf.is_empty() && new_buf != buf {
                 buf = new_buf.to_string();
                 checkpoint.mark(&buf).await;
+                let manifest_now = remote_state_manifest(&db).await;
+                let _ = renew_active_lease(
+                    &db,
+                    relay_base.as_deref(),
+                    relay_epoch,
+                    &device_id,
+                    &buf,
+                    &manifest_now,
+                )
+                .await;
             }
         }
 
@@ -314,10 +453,6 @@ struct BufCheckpoint<'a> {
     db: &'a sqlx::SqlitePool,
     last: std::time::Instant,
     dirty: Option<String>,
-    /// Last cursor value this device persisted. Re-reading the synced row
-    /// must distinguish our own writes (ignore) from a previous holder's
-    /// (adopt) — cursors are opaque, so this is the only available signal.
-    last_persisted: Option<String>,
 }
 
 impl BufCheckpoint<'_> {
@@ -328,12 +463,7 @@ impl BufCheckpoint<'_> {
             db,
             last: std::time::Instant::now() - Self::INTERVAL,
             dirty: None,
-            last_persisted: None,
         }
-    }
-
-    fn last_persisted(&self) -> Option<&str> {
-        self.last_persisted.as_deref()
     }
 
     async fn mark(&mut self, buf: &str) {
@@ -346,31 +476,405 @@ impl BufCheckpoint<'_> {
     async fn flush(&mut self) {
         if let Some(buf) = self.dirty.take() {
             persist_updates_buf(self.db, &buf).await;
-            self.last_persisted = Some(buf);
             self.last = std::time::Instant::now();
         }
     }
 }
 
-/// Adopt a cursor that the synced `remote_weixin_state` row holds and that
-/// differs from both our in-memory cursor and the last value we persisted
-/// ourselves: under single-active arbitration such a value could only have
-/// been written by the previous connection holder, so it is fresher.
-async fn adopt_synced_cursor(
+const LEASE_TTL_SECS: i64 = 90;
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct RelayLease {
+    owner_device_id: String,
+    epoch: u64,
+    cursor: String,
+    #[serde(default)]
+    manifest: String,
+    expires_at: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RelayLeaseResponse {
+    #[serde(default)]
+    granted: bool,
+    lease: Option<RelayLease>,
+}
+
+#[derive(Debug)]
+enum RelayLeaseError {
+    /// Relay predates the lease API (404/405): local fallback is safe.
+    Unsupported,
+    /// Timeout/5xx/auth failure: do NOT fall back; stay standby.
+    Transient(String),
+}
+
+impl std::fmt::Display for RelayLeaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported => f.write_str("relay lease API unsupported"),
+            Self::Transient(e) => write!(f, "relay lease temporarily unavailable: {e}"),
+        }
+    }
+}
+
+fn classify_lease_error(error: String) -> RelayLeaseError {
+    if error.starts_with("404") || error.starts_with("405") {
+        RelayLeaseError::Unsupported
+    } else {
+        RelayLeaseError::Transient(error)
+    }
+}
+
+async fn relay_url(db: &sqlx::SqlitePool) -> Option<String> {
+    crate::core::settings_service::get_device_setting(
+        db,
+        crate::commands::account::ACCOUNT_RELAY_URL_KEY,
+    )
+    .await
+    .ok()
+    .flatten()
+    .filter(|u| !u.is_empty())
+}
+
+async fn relay_lease_get(
     db: &sqlx::SqlitePool,
-    buf: &mut String,
-    last_persisted: Option<&str>,
+    base: &str,
+) -> Result<Option<RelayLease>, RelayLeaseError> {
+    let (_, text) = crate::commands::account::auth_request(
+        db,
+        base,
+        reqwest::Method::GET,
+        "api/remote/lease?channel=weixin",
+        None,
+    )
+    .await
+    .map_err(classify_lease_error)?;
+    let resp: RelayLeaseResponse =
+        serde_json::from_str(&text).map_err(|e| RelayLeaseError::Transient(e.to_string()))?;
+    Ok(resp.lease)
+}
+
+async fn relay_lease_acquire(
+    db: &sqlx::SqlitePool,
+    base: &str,
+    cursor: &str,
+    manifest: &str,
+) -> Result<Option<RelayLease>, RelayLeaseError> {
+    let (_, text) = crate::commands::account::auth_request(
+        db,
+        base,
+        reqwest::Method::POST,
+        "api/remote/lease/acquire",
+        Some(serde_json::json!({
+            "channel": "weixin",
+            "cursor": cursor,
+            "manifest": manifest,
+            "ttl_seconds": LEASE_TTL_SECS,
+        })),
+    )
+    .await
+    .map_err(classify_lease_error)?;
+    let resp: RelayLeaseResponse =
+        serde_json::from_str(&text).map_err(|e| RelayLeaseError::Transient(e.to_string()))?;
+    Ok(resp.lease.filter(|_| resp.granted))
+}
+
+async fn relay_lease_renew(
+    db: &sqlx::SqlitePool,
+    base: &str,
+    epoch: u64,
+    cursor: &str,
+    manifest: &str,
 ) -> bool {
-    let remote = crate::core::settings_service::load_weixin_state(db)
+    match crate::commands::account::auth_request(
+        db,
+        base,
+        reqwest::Method::POST,
+        "api/remote/lease/renew",
+        Some(serde_json::json!({
+            "channel": "weixin",
+            "epoch": epoch,
+            "cursor": cursor,
+            "manifest": manifest,
+            "ttl_seconds": LEASE_TTL_SECS,
+        })),
+    )
+    .await
+    {
+        Ok((_, text)) => serde_json::from_str::<RelayLeaseResponse>(&text)
+            .map(|r| r.granted && r.lease.is_some())
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+async fn relay_lease_release(db: &sqlx::SqlitePool, base: &str) {
+    let _ = crate::commands::account::auth_request(
+        db,
+        base,
+        reqwest::Method::POST,
+        "api/remote/lease/release",
+        Some(serde_json::json!({ "channel": "weixin" })),
+    )
+    .await;
+}
+
+/// Version watermark of the remote tables that must be present before a
+/// standby takes over. This is deliberately not a global db_version and not a
+/// full-table hash: extra local rows must not deadlock a takeover.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Default)]
+struct RemoteManifest {
+    cursor: String,
+    msg_ids_ts: String,
+    chats_updated: String,
+    inbound_updated: String,
+    turns_updated: String,
+}
+
+async fn remote_state_manifest(db: &sqlx::SqlitePool) -> String {
+    let cursor = crate::core::settings_service::load_weixin_state(db)
         .await
         .map(|s| s.get_updates_buf)
         .unwrap_or_default();
-    if !remote.is_empty() && remote != *buf && Some(remote.as_str()) != last_persisted {
-        tracing::info!("weixin: adopted fresher cursor synced from the previous holder");
-        *buf = remote;
+    let scalar = |sql: &'static str| async move {
+        sqlx::query_scalar::<_, String>(sql)
+            .fetch_one(db)
+            .await
+            .unwrap_or_default()
+    };
+    let manifest = RemoteManifest {
+        cursor,
+        msg_ids_ts: scalar("SELECT COALESCE(MAX(ts), '') FROM remote_msg_ids").await,
+        chats_updated: scalar("SELECT COALESCE(MAX(updated_at), '') FROM remote_chats").await,
+        inbound_updated: scalar("SELECT COALESCE(MAX(updated_at), '') FROM remote_inbound").await,
+        turns_updated: scalar("SELECT COALESCE(MAX(updated_at), '') FROM remote_turns").await,
+    };
+    serde_json::to_string(&manifest).unwrap_or_default()
+}
+
+fn manifest_covers(local: &RemoteManifest, target: &RemoteManifest) -> bool {
+    local.msg_ids_ts >= target.msg_ids_ts
+        && local.chats_updated >= target.chats_updated
+        && local.inbound_updated >= target.inbound_updated
+        && local.turns_updated >= target.turns_updated
+}
+
+async fn wait_for_manifest(
+    db: &sqlx::SqlitePool,
+    cancel: &CancellationToken,
+    target: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    if target.is_empty() {
         return true;
     }
-    false
+    let target: RemoteManifest = match serde_json::from_str(target) {
+        Ok(v) => v,
+        // Legacy opaque manifest: exact equality is the only safe fallback.
+        Err(_) => {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if remote_state_manifest(db).await == target {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => return false,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+                }
+            }
+        }
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let local = remote_state_manifest(db).await;
+        if let Ok(local) = serde_json::from_str::<RemoteManifest>(&local) {
+            if manifest_covers(&local, &target) {
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return false,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+        }
+    }
+}
+
+/// Try to become the single writer for a remote channel. Returns the cursor
+/// to start from when acquired; `None` means another live device owns it.
+async fn acquire_channel_lease(
+    db: &sqlx::SqlitePool,
+    channel: &str,
+    device_id: &str,
+    local_cursor: &str,
+) -> Option<String> {
+    let now = chrono::Utc::now();
+    let expires = (now + chrono::Duration::seconds(LEASE_TTL_SECS)).to_rfc3339();
+    let now_s = now.to_rfc3339();
+    let state_epoch = crate::sync::crdt::current_db_version(db).await.unwrap_or(0);
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT owner_device_id, cursor, expires_at FROM remote_channel_lease WHERE channel = ?",
+    )
+    .bind(channel)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let (cursor, can_take) = match row {
+        None => (local_cursor.to_string(), true),
+        Some((owner, cursor, expires_at)) => {
+            let expired = chrono::DateTime::parse_from_rfc3339(&expires_at)
+                .map(|t| t.with_timezone(&chrono::Utc) <= now)
+                .unwrap_or(true);
+            let owned = owner == device_id;
+            let cursor = if cursor.is_empty() {
+                local_cursor.to_string()
+            } else {
+                cursor
+            };
+            (cursor, owned || expired)
+        }
+    };
+    if !can_take {
+        return None;
+    }
+    let res = sqlx::query(
+        "INSERT INTO remote_channel_lease
+         (channel, owner_device_id, owner_name, epoch, cursor, state_epoch, updated_at, expires_at)
+         VALUES (?, ?, '', 1, ?, ?, ?, ?)
+         ON CONFLICT(channel) DO UPDATE SET
+           owner_device_id = excluded.owner_device_id,
+           epoch = remote_channel_lease.epoch + 1,
+           cursor = excluded.cursor,
+           state_epoch = excluded.state_epoch,
+           updated_at = excluded.updated_at,
+           expires_at = excluded.expires_at",
+    )
+    .bind(channel)
+    .bind(device_id)
+    .bind(&cursor)
+    .bind(state_epoch)
+    .bind(&now_s)
+    .bind(&expires)
+    .execute(db)
+    .await
+    .is_ok();
+    res.then_some(cursor)
+}
+
+async fn lease_row_exists(db: &sqlx::SqlitePool, channel: &str) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM remote_channel_lease WHERE channel = ?")
+        .bind(channel)
+        .fetch_one(db)
+        .await
+        .unwrap_or(0)
+        > 0
+}
+
+/// Wait until this device has applied the synced state that the lease's
+/// owner recorded. `state_epoch` is a CR-SQLite db_version, so this is a real
+/// per-channel barrier rather than "initial mailbox page finished".
+async fn wait_for_lease_state(
+    db: &sqlx::SqlitePool,
+    cancel: &tokio_util::sync::CancellationToken,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let target: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(MAX(state_epoch), 0) FROM remote_channel_lease WHERE channel = 'weixin'",
+        )
+        .fetch_one(db)
+        .await
+        .unwrap_or(0);
+        if target <= 0 {
+            return true;
+        }
+        let current = crate::sync::crdt::current_db_version(db).await.unwrap_or(0);
+        if current >= target {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                target_epoch = target,
+                local_epoch = current,
+                "weixin: lease state barrier timed out"
+            );
+            return false;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return false,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+        }
+    }
+}
+
+async fn renew_channel_lease(
+    db: &sqlx::SqlitePool,
+    channel: &str,
+    device_id: &str,
+    cursor: &str,
+) -> bool {
+    let now = chrono::Utc::now();
+    let expires = (now + chrono::Duration::seconds(LEASE_TTL_SECS)).to_rfc3339();
+    let state_epoch = crate::sync::crdt::current_db_version(db).await.unwrap_or(0);
+    sqlx::query(
+        "UPDATE remote_channel_lease
+         SET cursor = ?, state_epoch = ?, updated_at = ?, expires_at = ?
+         WHERE channel = ? AND owner_device_id = ?",
+    )
+    .bind(cursor)
+    .bind(state_epoch)
+    .bind(now.to_rfc3339())
+    .bind(expires)
+    .bind(channel)
+    .bind(device_id)
+    .execute(db)
+    .await
+    .map(|r| r.rows_affected() == 1)
+    .unwrap_or(false)
+}
+
+async fn renew_active_lease(
+    db: &sqlx::SqlitePool,
+    relay_base: Option<&str>,
+    relay_epoch: Option<u64>,
+    device_id: &str,
+    cursor: &str,
+    manifest: &str,
+) -> bool {
+    match (relay_base, relay_epoch) {
+        (Some(base), Some(epoch)) => relay_lease_renew(db, base, epoch, cursor, manifest).await,
+        _ => renew_channel_lease(db, "weixin", device_id, cursor).await,
+    }
+}
+
+async fn release_active_lease(
+    db: &sqlx::SqlitePool,
+    relay_base: Option<&str>,
+    relay_epoch: Option<u64>,
+    device_id: &str,
+) {
+    match (relay_base, relay_epoch) {
+        (Some(base), Some(_)) => relay_lease_release(db, base).await,
+        _ => release_channel_lease(db, "weixin", device_id).await,
+    }
+}
+
+async fn release_channel_lease(db: &sqlx::SqlitePool, channel: &str, device_id: &str) {
+    let _ = sqlx::query(
+        "UPDATE remote_channel_lease SET expires_at = ''
+         WHERE channel = ? AND owner_device_id = ?",
+    )
+    .bind(channel)
+    .bind(device_id)
+    .execute(db)
+    .await;
 }
 
 async fn get_updates(
@@ -1743,5 +2247,81 @@ mod typing_tests {
         let now = Instant::now();
         cache.store("u1", "", now);
         assert_eq!(cache.lookup("u1", now).as_deref(), Some(""));
+    }
+}
+
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    async fn db() -> sqlx::SqlitePool {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE remote_channel_lease (
+                channel TEXT NOT NULL DEFAULT '',
+                owner_device_id TEXT NOT NULL DEFAULT '',
+                owner_name TEXT NOT NULL DEFAULT '',
+                epoch INTEGER NOT NULL DEFAULT 0,
+                cursor TEXT NOT NULL DEFAULT '',
+                state_epoch INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (channel)
+            )",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn manifest_watermark_allows_extra_local_rows() {
+        let target = RemoteManifest {
+            cursor: "a".into(),
+            msg_ids_ts: "2026-11-19T00:00:00Z".into(),
+            chats_updated: "2026-11-19T00:00:00Z".into(),
+            inbound_updated: "2026-11-19T00:00:00Z".into(),
+            turns_updated: "2026-11-19T00:00:00Z".into(),
+        };
+        let local = RemoteManifest {
+            cursor: "b".into(),
+            msg_ids_ts: "2026-11-19T00:01:00Z".into(),
+            chats_updated: "2026-11-19T00:01:00Z".into(),
+            inbound_updated: "2026-11-19T00:01:00Z".into(),
+            turns_updated: "2026-11-19T00:01:00Z".into(),
+        };
+        assert!(manifest_covers(&local, &target));
+        let behind = RemoteManifest {
+            inbound_updated: "2026-11-18T23:59:00Z".into(),
+            ..local
+        };
+        assert!(!manifest_covers(&behind, &target));
+    }
+
+    #[tokio::test]
+    async fn lease_is_single_writer_and_hands_off_the_latest_cursor() {
+        let db = db().await;
+        let first = acquire_channel_lease(&db, "weixin", "dev-a", "cursor-a")
+            .await
+            .expect("first owner");
+        assert_eq!(first, "cursor-a");
+        assert!(acquire_channel_lease(&db, "weixin", "dev-b", "stale-b").await.is_none());
+
+        sqlx::query("UPDATE remote_channel_lease SET expires_at = '2000-01-01T00:00:00Z'")
+            .execute(&db)
+            .await
+            .unwrap();
+        let takeover = acquire_channel_lease(&db, "weixin", "dev-b", "stale-b")
+            .await
+            .expect("expired lease takeover");
+        assert_eq!(takeover, "cursor-a", "must use the previous holder's cursor");
+        assert!(!renew_channel_lease(&db, "weixin", "dev-a", "cursor-a").await);
+        assert!(renew_channel_lease(&db, "weixin", "dev-b", "cursor-b").await);
     }
 }

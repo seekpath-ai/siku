@@ -75,6 +75,18 @@ pub struct Order {
     pub trade_no: Option<String>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RemoteLease {
+    pub channel: String,
+    pub owner_device_id: String,
+    pub owner_name: String,
+    pub epoch: u64,
+    pub cursor: String,
+    pub manifest: String,
+    pub updated_at: String,
+    pub expires_at: String,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Snapshot {
     users: HashMap<String, User>,
@@ -82,6 +94,10 @@ struct Snapshot {
     email_to_user: HashMap<String, String>,
     #[serde(default)]
     orders: HashMap<String, Order>,
+    /// Authoritative single-writer leases for remote IM channels, scoped by
+    /// account. key = "<user_id>:<channel>".
+    #[serde(default)]
+    remote_leases: HashMap<String, RemoteLease>,
 }
 
 pub struct Db {
@@ -513,6 +529,128 @@ impl Db {
         self.persist(&snap);
         Ok(Activation::Fulfilled(order))
     }
+    fn lease_key(user_id: &str, channel: &str) -> String {
+        format!("{user_id}:{channel}")
+    }
+
+    pub fn get_remote_lease(&self, user_id: &str, channel: &str) -> Option<RemoteLease> {
+        let snap = self.inner.lock().unwrap();
+        snap.remote_leases.get(&Self::lease_key(user_id, channel)).cloned()
+    }
+
+    /// Atomic acquire/renew. A different live owner is rejected; an expired
+    /// owner is taken over with the previous cursor/manifest preserved.
+    pub fn acquire_remote_lease(
+        &self,
+        user_id: &str,
+        channel: &str,
+        device_id: &str,
+        device_name: &str,
+        cursor: &str,
+        manifest: &str,
+        ttl_seconds: u64,
+    ) -> Option<RemoteLease> {
+        let mut snap = self.inner.lock().unwrap();
+        let key = Self::lease_key(user_id, channel);
+        let now = chrono::Utc::now();
+        let now_s = now.to_rfc3339();
+        let expires = (now + chrono::Duration::seconds(ttl_seconds as i64)).to_rfc3339();
+        let prev = snap.remote_leases.get(&key).cloned();
+        if let Some(ref lease) = prev {
+            let live = chrono::DateTime::parse_from_rfc3339(&lease.expires_at)
+                .map(|t| t.with_timezone(&chrono::Utc) > now)
+                .unwrap_or(false);
+            if live && lease.owner_device_id != device_id {
+                return None;
+            }
+        }
+        let epoch = match prev {
+            Some(ref p) if p.owner_device_id == device_id => p.epoch,
+            Some(ref p) => p.epoch + 1,
+            None => 1,
+        };
+        // The server's last cursor is authoritative on takeover; a client's
+        // local cursor may be stale by hours. Only a first-ever lease seeds
+        // from the client.
+        let cursor = match prev {
+            Some(ref p) => p.cursor.clone(),
+            None => cursor.to_string(),
+        };
+        let manifest = match prev {
+            Some(ref p) => p.manifest.clone(),
+            None => manifest.to_string(),
+        };
+        let lease = RemoteLease {
+            channel: channel.to_string(),
+            owner_device_id: device_id.to_string(),
+            owner_name: device_name.to_string(),
+            epoch,
+            cursor,
+            manifest,
+            updated_at: now_s,
+            expires_at: expires,
+        };
+        snap.remote_leases.insert(key, lease.clone());
+        self.persist(&snap);
+        Some(lease)
+    }
+
+    pub fn renew_remote_lease(
+        &self,
+        user_id: &str,
+        channel: &str,
+        device_id: &str,
+        epoch: u64,
+        cursor: &str,
+        manifest: &str,
+        ttl_seconds: u64,
+    ) -> Option<RemoteLease> {
+        let mut snap = self.inner.lock().unwrap();
+        let key = Self::lease_key(user_id, channel);
+        let now = chrono::Utc::now();
+        let now_s = now.to_rfc3339();
+        {
+            let lease = snap.remote_leases.get_mut(&key)?;
+            if lease.owner_device_id != device_id || lease.epoch != epoch {
+                return None;
+            }
+            let live = chrono::DateTime::parse_from_rfc3339(&lease.expires_at)
+                .map(|t| t.with_timezone(&chrono::Utc) > now)
+                .unwrap_or(false);
+            if !live {
+                return None;
+            }
+            lease.cursor = if cursor.is_empty() { lease.cursor.clone() } else { cursor.to_string() };
+            lease.manifest = if manifest.is_empty() { lease.manifest.clone() } else { manifest.to_string() };
+            lease.updated_at = now_s;
+            lease.expires_at = (now + chrono::Duration::seconds(ttl_seconds as i64)).to_rfc3339();
+        }
+        let lease = snap.remote_leases.get(&key).cloned();
+        self.persist(&snap);
+        lease
+    }
+
+    pub fn release_remote_lease(&self, user_id: &str, channel: &str, device_id: &str) {
+        let mut snap = self.inner.lock().unwrap();
+        let key = Self::lease_key(user_id, channel);
+        let owned = snap
+            .remote_leases
+            .get(&key)
+            .map(|l| l.owner_device_id == device_id)
+            .unwrap_or(false);
+        if let Some(lease) = snap.remote_leases.get_mut(&key) {
+            if owned {
+                // Keep the cursor/manifest for the next owner; only expire
+                // the write grant. Removing the row would make a takeover
+                // seed from a stale client cursor.
+                lease.expires_at = "1970-01-01T00:00:00Z".to_string();
+                lease.updated_at = crate::now_iso();
+                self.persist(&snap);
+            }
+        }
+    }
+
+
 }
 
 /// 订单履约结果：首次履约（配额已发放）或幂等命中（订单早已支付，未做任何变更）。
@@ -525,4 +663,45 @@ pub fn init(path: &Path) -> anyhow::Result<Db> {
     let db = Db::new(path).context("init account db")?;
     info!(db = %path.display(), "account database ready");
     Ok(db)
+
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    #[test]
+    fn lease_cas_hands_off_the_preserved_cursor() {
+        let db = Db::new(Path::new(":memory:")).unwrap();
+        let a = db
+            .acquire_remote_lease("u1", "weixin", "dev-a", "A", "cursor-a", "manifest-a", 90)
+            .expect("A lease");
+        assert_eq!(a.epoch, 1);
+        assert!(db
+            .acquire_remote_lease("u1", "weixin", "dev-b", "B", "stale-b", "", 90)
+            .is_none());
+        assert!(db
+            .renew_remote_lease("u1", "weixin", "dev-a", a.epoch, "cursor-b", "manifest-b", 90)
+            .is_some());
+        // Force expiry without changing the cursor; B's takeover must receive
+        // the previous holder's cursor and manifest.
+        {
+            let mut snap = db.inner.lock().unwrap();
+            snap.remote_leases.get_mut("u1:weixin").unwrap().expires_at =
+                "2000-01-01T00:00:00Z".to_string();
+        }
+        let b = db
+            .acquire_remote_lease("u1", "weixin", "dev-b", "B", "stale-b", "", 90)
+            .expect("B takeover");
+        assert_eq!(b.epoch, 2);
+        assert_eq!(b.cursor, "cursor-b");
+        assert_eq!(b.manifest, "manifest-b");
+        assert!(db
+            .renew_remote_lease("u1", "weixin", "dev-a", 1, "x", "", 90)
+            .is_none());
+        db.release_remote_lease("u1", "weixin", "dev-b");
+        let released = db.get_remote_lease("u1", "weixin").expect("lease retained");
+        assert_eq!(released.owner_device_id, "dev-b");
+        assert_eq!(released.cursor, "cursor-b");
+    }
 }

@@ -359,6 +359,8 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     session_id TEXT NOT NULL DEFAULT '',
     role TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL DEFAULT '',
+    -- Human-facing body when content carries hidden agent context.
+    display_content TEXT,
     reasoning_content TEXT,
     tool_calls TEXT,
     tool_call_id TEXT,
@@ -931,4 +933,63 @@ CREATE TABLE IF NOT EXISTS remote_msg_ids (
     id TEXT NOT NULL DEFAULT '',
     ts TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (id)
+);
+
+-- Durable inbound turn ledger (replay/crash safety). States:
+-- running | done | failed.
+CREATE TABLE IF NOT EXISTS remote_inbound (
+    id TEXT NOT NULL DEFAULT '',
+    channel TEXT NOT NULL DEFAULT '',
+    chat_id TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL DEFAULT '',
+    msg_id TEXT NOT NULL DEFAULT '',
+    sent_at_ms INTEGER,
+    state TEXT NOT NULL DEFAULT 'pending',
+    turn_key TEXT NOT NULL DEFAULT '',
+    claimed_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (id)
+);
+
+-- One durable turn per batch (sorted inbound ledger ids).
+CREATE TABLE IF NOT EXISTS remote_turns (
+    turn_key TEXT NOT NULL DEFAULT '',
+    channel TEXT NOT NULL DEFAULT '',
+    chat_id TEXT NOT NULL DEFAULT '',
+    msg_ids TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'running',
+    claimed_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (turn_key)
+);
+
+-- Inbound remote files: bytes in blobs/<hash>.<ext>, this is the synced
+-- device-independent reference + extracted text.
+CREATE TABLE IF NOT EXISTS remote_artifacts (
+    artifact_id TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    channel TEXT NOT NULL DEFAULT '',
+    chat_id TEXT NOT NULL DEFAULT '',
+    msg_id TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    mime TEXT NOT NULL DEFAULT '',
+    size INTEGER NOT NULL DEFAULT 0,
+    hash TEXT NOT NULL DEFAULT '',
+    ext TEXT NOT NULL DEFAULT '',
+    extracted_text TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (artifact_id)
+);
+
+-- Single-writer lease per remote channel; cursor is the latest checkpoint.
+CREATE TABLE IF NOT EXISTS remote_channel_lease (
+    channel TEXT NOT NULL DEFAULT '',
+    owner_device_id TEXT NOT NULL DEFAULT '',
+    owner_name TEXT NOT NULL DEFAULT '',
+    epoch INTEGER NOT NULL DEFAULT 0,
+    cursor TEXT NOT NULL DEFAULT '',
+    state_epoch INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (channel)
 );

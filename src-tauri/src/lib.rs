@@ -14,6 +14,9 @@ use tracing::info;
 pub struct AppState {
     pub db: sqlx::SqlitePool,
     pub app_data_dir: std::path::PathBuf,
+    /// Process start, used by remote channels to absorb a startup backlog
+    /// before normal replay/age rules are trusted.
+    pub started_at: std::time::Instant,
     pub approval_senders: std::sync::Arc<
         tokio::sync::Mutex<
             std::collections::HashMap<
@@ -594,6 +597,7 @@ pub fn run() {
                 handle2.manage(AppState {
                     db,
                     app_data_dir,
+                    started_at: std::time::Instant::now(),
                     approval_senders: std::sync::Arc::new(tokio::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),

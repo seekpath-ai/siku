@@ -31,7 +31,7 @@ impl Tool for BrowserConnectTool {
             ToolParameter {
                 name: "mode".into(),
                 param_type: "string".into(),
-                description: "persistent | temporary | attach. Default: the configured default mode (persistent unless changed in Settings)".into(),
+                description: "persistent | temporary | attach. Default: persistent. The Settings UI only manages the persistent profile; temporary/attach are for one-off or advanced jobs.".into(),
                 required: false,
             },
             ToolParameter {

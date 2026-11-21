@@ -43,7 +43,7 @@
 | `note_write` | 笔记 | ❌ | 创建或更新笔记 |
 | `web_fetch` | 网络 | ✅ | 抓取 URL 并返回纯文本内容 |
 | `web_search` | 网络 | ✅ | 按用户配置的引擎链搜索网页（Bing/DuckDuckGo/Tavily/Brave/SearXNG 按序回退） |
-| `browser_connect` | 浏览器 | ❌ | 启动/附加真实 Chrome/Edge（persistent/temporary/attach 三模式），幂等复用 |
+| `browser_connect` | 浏览器 | ❌ | 启动/附加真实 Chrome/Edge；工具层支持 persistent/temporary/attach，设置页只管理 persistent |
 | `browser_close` | 浏览器 | ❌ | 关闭浏览器连接（attach 模式只断开，不关闭用户的浏览器） |
 | `browser_navigate` | 浏览器 | ❌ | 活动标签页导航到 URL，等待加载完成 |
 | `browser_tabs` | 浏览器 | ❌ | 列出/切换/关闭标签页 |
@@ -200,7 +200,7 @@ L1 浏览器自动化：经 CDP 驱动**本机真实的 Chrome/Edge**（不内�
 **使用约束（模型与用户都应知道）：**
 
 - 浏览器是 **headed 窗口**，要求桌面已登录且**未锁屏**；锁屏时操作会失败，远程（微信/飞书）发起浏览器任务前需确认电脑前有人或屏幕可用。
-- 三种供给模式（`browser_connect` 的 `mode`）：`persistent`（默认，思库管理的独立持久 profile，站点登录态长期保留——Chrome 136+ 拒绝在默认用户 profile 上开 CDP，故用独立 profile）、`temporary`（干净临时 profile，一次性任务）、`attach`（附加到用户以 `--remote-debugging-port` 启动的浏览器，**永不关闭**它）。
+- `browser_connect` 在工具层支持三种连接模式（`mode`）：`persistent`（默认，思库管理的独立持久 profile，站点登录态长期保留——Chrome 136+ 拒绝在默认用户 profile 上开 CDP，故用独立 profile）、`temporary`（干净临时 profile，一次性任务）、`attach`（附加到用户以 `--remote-debugging-port` 启动的浏览器，**永不关闭**它）。设置页只管理 persistent 自动化浏览器，不提供 temporary/attach 的 UI。
 - **快照即眼睛**：`browser_snapshot` 把可见可交互元素映射为编号 ref（`[3-12]`），click/type 都按 ref 操作；DOM 变化后 ref 失效，工具会明确报错要求重新快照。截图（`browser_screenshot`）只在视觉/布局相关时使用。
 - **人机验证**：navigate/click 后自动检测（reCAPTCHA/hCaptcha/Cloudflare/GeeTest/Arkose），命中即在结果中警告；`browser_captcha_wait` 发桌面通知并把标签页置前，轮询等待用户手动完成（默认 5 分钟，可续等）。绝不尝试绕过验证。
 - 产出落盘在会话写入目录的 `screenshots/`、`downloads/`；下载得到的 PDF 可直接 `paper_import` 入文献库。
@@ -219,6 +219,8 @@ L1 浏览器自动化：经 CDP 驱动**本机真实的 Chrome/Edge**（不内�
 ### `browser_connect`
 
 启动或附加浏览器。幂等：已有健康连接直接复用；连接失活（用户关了窗口）自动重建。
+
+设置页只有 **persistent 自动化浏览器** 一项配置；`temporary` 和 `attach` 是工具层的一次性/高级连接方式，不通过设置页切换。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|

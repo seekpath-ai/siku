@@ -15,7 +15,7 @@
 
 <img src="docs/media/siku-hero.gif" alt="思库：AI 总结有据，引用可回原文" width="900" />
 
-[观看 59 秒完整演示](docs/media/siku-full.mp4)
+[观看完整演示（官网）](https://seekpath.com.cn/siku#demo)
 
 ## 30 秒了解
 

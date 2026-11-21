@@ -1,8 +1,8 @@
 # Agent 工具清单
 
-思库（Siku）的 Agent 基于 ReAct 循环，通过 **Tool Registry** 动态注册可用工具。默认注册表包含 41 个内置工具，此外每个会话可挂载若干 `skill_<name>` 技能工具（见[技能工具](#技能工具)）。
+思库（Siku）的 Agent 基于 ReAct 循环，通过 **Tool Registry** 动态注册可用工具。默认注册表包含 42 个内置工具；远程会话会额外注册 `send_file_to_user`。每个会话还可以挂载若干 `skill_<name>` 技能工具（见[技能工具](#技能工具)）。
 
-> 本文档对应版本：`v2.0.1`
+> 本文档对应版本：`v2.1.4`
 
 ## 目录
 
@@ -49,6 +49,7 @@
 | `browser_tabs` | 浏览器 | ❌ | 列出/切换/关闭标签页 |
 | `browser_wait` | 浏览器 | ✅ | 等待 CSS 选择器出现或定时休眠 |
 | `browser_snapshot` | 浏览器 | ✅ | DOM 快照：可见可交互元素映射为编号 ref（模型的"眼睛"） |
+| `browser_read` | 浏览器 | ✅ | 读取当前标签页渲染后的正文（JS/登录态页面） |
 | `browser_click` | 浏览器 | ❌ | 按 ref 点击元素（真实鼠标事件） |
 | `browser_type` | 浏览器 | ❌ | 按 ref 输入文本（真实按键，支持清空/回车） |
 | `browser_scroll` | 浏览器 | ✅ | 滚动页面或把 ref 元素滚入视野 |
@@ -71,7 +72,7 @@
 | `ask_user` | 交互 | ✅ | 向用户发起结构化选择/填空 |
 | `set_app_theme` | 系统 | ✅ | 切换应用 UI 主题（预设或单色调覆盖），即时生效 |
 | `read_media_file` | 视觉 | ✅ | 用视觉模型分析图片 |
-| `send_file_to_user` | 文件 | ❌ | 把本机文件发到用户的微信/飞书（仅远程会话；群聊/只读/总开关关闭时调用会返回原因，见 `remote-channels.md` §7） |
+| `send_file_to_user` | 文件 | ❌ | 把本机文件发到用户的微信/飞书（仅远程会话；群聊/只读/总开关关闭时调用会返回原因，见 [远程接入](remote-channels.md#媒体与文件)） |
 | `memory_read` | 长期记忆 | ✅ | 读取本会话的长期记忆文档 |
 | `memory_write` | 长期记忆 | ❌ | 追加或覆盖写入长期记忆 |
 | `memory_recall` | 长期记忆 | ✅ | 检索历史对话原文（含工具调用详情） |
@@ -203,7 +204,17 @@ L1 浏览器自动化：经 CDP 驱动**本机真实的 Chrome/Edge**（不内�
 - **快照即眼睛**：`browser_snapshot` 把可见可交互元素映射为编号 ref（`[3-12]`），click/type 都按 ref 操作；DOM 变化后 ref 失效，工具会明确报错要求重新快照。截图（`browser_screenshot`）只在视觉/布局相关时使用。
 - **人机验证**：navigate/click 后自动检测（reCAPTCHA/hCaptcha/Cloudflare/GeeTest/Arkose），命中即在结果中警告；`browser_captcha_wait` 发桌面通知并把标签页置前，轮询等待用户手动完成（默认 5 分钟，可续等）。绝不尝试绕过验证。
 - 产出落盘在会话写入目录的 `screenshots/`、`downloads/`；下载得到的 PDF 可直接 `paper_import` 入文献库。
-- 设置页「浏览器」可覆盖可执行文件路径与默认连接模式；应用退出时自动关闭思库启动的浏览器。
+- 设置页「浏览器」可覆盖可执行文件路径与持久化 profile 目录；应用退出时自动关闭思库启动的浏览器。
+
+推荐链路：
+
+```text
+读正文：browser_connect → browser_navigate → browser_read
+做操作：browser_connect → browser_navigate → browser_snapshot
+        → browser_click / browser_type → browser_snapshot
+```
+
+`browser_read` 负责“看文字”，`browser_snapshot` 负责“找元素”。需要登录态、JavaScript 渲染或被普通 HTTP 抓取拦截时，优先走浏览器链路。
 
 ### `browser_connect`
 
@@ -211,7 +222,7 @@ L1 浏览器自动化：经 CDP 驱动**本机真实的 Chrome/Edge**（不内�
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `mode` | string | ❌ | `persistent`（默认，可用设置页改默认值）/ `temporary` / `attach` |
+| `mode` | string | ❌ | `persistent`（默认）/ `temporary` / `attach` |
 | `port` | integer | ❌ | attach 模式的调试端口，默认 9222 |
 
 ### `browser_close`
@@ -251,6 +262,21 @@ DOM 快照：返回页面标题/URL 与全部可见可交互元素（链接/按�
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `include_text` | boolean | ❌ | 同时返回页面可见正文（前 4000 字符），默认 false |
+
+### `browser_read`
+
+读取当前标签页渲染后的正文。适合 JavaScript 渲染页面、需要登录态的页面，以及直接 HTTP 抓取被拦截的站点；`web_fetch` 不执行页面 JavaScript。
+
+- 默认优先读取 `article` / `main`，正文不足时回退到 `body`
+- 可选先导航到 `url`
+- 返回标题、最终 URL 与正文
+- 默认最多 20000 字符，最大 50000 字符
+- 只读；遇到验证码仍使用 `browser_captcha_wait`
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `url` | string | ❌ | 可选：先导航到该 URL，再读取 |
+| `max_chars` | integer | ❌ | 最大返回字符数，默认 20000，上限 50000 |
 
 ### `browser_click`
 
@@ -392,7 +418,7 @@ PDF 结果提示可接 `paper_import`。
 
 > 为什么不做成"不注册"：工具缺失对模型是**无信息**的，它会以为能力仍在，转而尝试 `bash`/文件工具拼凑，浪费整轮。
 
-它**不自己发送**：把文件登记进本轮的出站队列（`OutboundFile`），回合结束时由 `run_agent_turn` 序列化进 assistant 行的 `attachments`，再由路由层上传投递——保证"对话里看到的"和"手机上收到的"是同一份记录（`docs/remote-channels.md` §7.1）。
+它**不自己发送**：把文件登记进本轮的出站队列（`OutboundFile`），回合结束时由 `run_agent_turn` 序列化进 assistant 行的 `attachments`，再由路由层上传投递——保证"对话里看到的"和"手机上收到的"是同一份记录（见[远程接入](remote-channels.md#媒体与文件)）。
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|

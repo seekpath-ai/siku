@@ -61,7 +61,7 @@
 
 ### Agent + 本地工具
 
-- ReAct 引擎 + 41 个内置工具：文献、笔记、文件、浏览器、Shell、后台任务、长期记忆
+- ReAct 引擎 + 42 个内置工具：文献、笔记、文件、浏览器、Shell、后台任务、长期记忆
 - 工具按会话审批：只读工具自动放行，写/执行类工具需要确认
 - 可挂载 Skill（文件夹/zip），支持「AI 审查」后再启用
 - 支持 OpenAI / Anthropic / DeepSeek / SiliconFlow / Ollama / Qwen / Zhipu / Kimi / Gemini
@@ -173,7 +173,7 @@ flowchart TB
   SVC --> PDF["PDF 解析 / pdfium"]
   SVC --> AGENT["ReAct Agent"]
   AGENT --> LLM["LLM Providers"]
-  AGENT --> TOOLS["41 tools / Skills"]
+  AGENT --> TOOLS["42 tools / Skills"]
   SVC --> SYNC["WebRTC P2P + Relay"]
 ```
 
@@ -207,7 +207,7 @@ docs/media/          README 演示 GIF 与完整视频
 |---|---|---|
 | **Stable** | 本地文献库、PDF 阅读、引用回跳 | 主链路 |
 | **Stable** | 笔记、双链、Markdown/PDF 导出 | 主链路 |
-| **Stable** | Agent 对话、41 个内置工具 | 本地工具按审批执行 |
+| **Stable** | Agent 对话、42 个内置工具 | 本地工具按审批执行 |
 | **Stable** | FTS5 关键词检索 | 开箱即用 |
 | **Beta** | 语义检索 | 需配置 OpenAI 兼容 embedding 端点 |
 | **Beta** | 多设备同步 | WebRTC P2P + 中继，需登录同一账号 |
